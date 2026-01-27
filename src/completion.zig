@@ -266,6 +266,11 @@ pub fn handleTabCompletion(self: *Shell) !void {
         if (inserted_slash) {
             try self.renderLine();
         }
+        // empty line hint if directory is empty (like completion menu but empty)
+        if (pattern.len == 0 and std.mem.endsWith(u8, effective_word, "/")) {
+            try self.stdout().writeAll("\r\n\r\n\x1b[1A"); // newline, blank, move up
+            try self.stdout().flush();
+        }
         return;
     } else if (matches.items.len == 1) {
         const match = matches.items[0];
