@@ -134,6 +134,7 @@ pub fn handleTabCompletion(self: *Shell) !void {
         _ = self.edit_buf.insertSlice("/");
         effective_word_end = word_end + 1;
         inserted_slash = true;
+        self.skip_next_slash = true; // skip if user types / right after
 
         // append / conceptually for pattern matching
         if (word.len + 1 < expanded_word_buf.len) {

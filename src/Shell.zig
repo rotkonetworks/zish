@@ -203,6 +203,7 @@ completion_original_len: usize = 0,
 completion_pattern_len: usize = 0,
 completion_menu_lines: usize = 0,
 completion_displayed: bool = false,
+skip_next_slash: bool = false, // set after completion inserts / for directory
 
 // git info display (set via .zishrc: set git_prompt on)
 show_git_info: bool = false,
@@ -822,6 +823,13 @@ fn handleAction(self: *Shell, action: Action) !void {
                     try self.showSearchMatch();
                 }
             } else {
+                // Skip duplicate slash right after completion inserted one
+                if (char == '/' and self.skip_next_slash) {
+                    self.skip_next_slash = false;
+                    return; // don't insert, don't redraw
+                }
+                self.skip_next_slash = false; // clear for any other char
+
                 // Use new edit_buf for insertion
                 if (!self.edit_buf.insert(char)) return;
 
