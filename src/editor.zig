@@ -30,10 +30,6 @@ pub const EditBuffer = struct {
 
     pub fn insert(self: *Self, char: u8) bool {
         if (self.len >= LINE_BUF_SIZE - 1) return false;
-        // skip duplicate slashes (e.g. after directory completion adds /)
-        if (char == '/' and self.cursor > 0 and self.text[self.cursor - 1] == '/') {
-            return true; // pretend we inserted it
-        }
         // shift right from cursor
         if (self.cursor < self.len) {
             std.mem.copyBackwards(
