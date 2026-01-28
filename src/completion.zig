@@ -635,6 +635,17 @@ pub fn handleCompletionCycle(self: *Shell, direction: CycleDirection) !void {
     const old_index = self.completion_index;
     const nothing_selected = old_index >= self.completion_matches.items.len;
 
+    // zsh-style: if current selection is a directory and Tab pressed, drill into it
+    if (direction == .forward and !nothing_selected) {
+        const current_match = self.completion_matches.items[self.completion_index];
+        if (std.mem.endsWith(u8, current_match, "/")) {
+            // accept current completion and re-trigger to show contents
+            exitCompletionMode(self);
+            try self.renderLine();
+            return try handleTabCompletion(self);
+        }
+    }
+
     switch (direction) {
         .forward => {
             if (nothing_selected) {
