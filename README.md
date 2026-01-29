@@ -154,6 +154,10 @@ select text then operate:
 | `Ctrl-w` | delete word back |
 | `Ctrl-c` | cancel |
 
+## platform
+
+linux only. no macos support - uses linux-specific syscalls and maintainer has no way to test mac builds. PRs welcome if someone wants to add libc abstraction layer.
+
 ## status
 
-v0.7.0 - production ready
+v0.10.2 - production ready
