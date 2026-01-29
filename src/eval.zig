@@ -957,12 +957,23 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     };
 
     if (pid == 0) {
+        // child: create own process group and take terminal control
+        // this allows TUI apps (like claude) to work properly
+        const child_pid = std.os.linux.getpid();
+        std.posix.setpgid(0, 0) catch {};
+        if (is_tty) {
+            std.posix.tcsetpgrp(std.posix.STDIN_FILENO, child_pid) catch {};
+        }
+
         // Build environment in child process (after fork, safe from parent interference)
         const envp = buildEnvironment(shell) catch @as([*:null]const ?[*:0]const u8, @ptrCast(std.os.environ.ptr));
         std.posix.execvpeZ(argv[0].?, argv, envp) catch {
             std.posix.exit(127);
         };
     }
+
+    // parent: also set child's pgrp (race avoidance)
+    std.posix.setpgid(pid, pid) catch {};
 
     // parent - ignore SIGINT while child runs
     var old_sigint: std.posix.Sigaction = undefined;
@@ -976,6 +987,13 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
 
     // wait for child
     const result = std.posix.waitpid(pid, 0);
+
+    // take back terminal control
+    if (is_tty) {
+        const shell_pgid: std.posix.pid_t = @intCast(std.os.linux.syscall1(.getpgid, 0));
+        std.posix.tcsetpgrp(std.posix.STDIN_FILENO, shell_pgid) catch {};
+    }
+
     if (std.posix.W.IFEXITED(result.status)) {
         const code = std.posix.W.EXITSTATUS(result.status);
         if (code == 127) {
