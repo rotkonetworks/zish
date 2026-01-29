@@ -204,6 +204,7 @@ completion_pattern_len: usize = 0,
 completion_menu_lines: usize = 0,
 completion_displayed: bool = false,
 skip_next_slash: bool = false, // set after completion inserts / for directory
+ctrl_d_pending: bool = false, // double ctrl+d to exit
 
 // git info display (set via .zishrc: set git_prompt on)
 show_git_info: bool = false,
@@ -756,6 +757,11 @@ fn log(self: *Shell, last_action: Action) !void {
 }
 
 fn handleAction(self: *Shell, action: Action) !void {
+    // reset ctrl+d pending on any other action
+    if (action != .exit_shell and action != .none) {
+        self.ctrl_d_pending = false;
+    }
+
     switch (action) {
         .none => {},
 
@@ -780,8 +786,16 @@ fn handleAction(self: *Shell, action: Action) !void {
         },
 
         .exit_shell => {
-            self.running = false;
-            try self.stdout().writeByte('\n');
+            // double ctrl+d to exit (like zsh)
+            if (self.ctrl_d_pending) {
+                self.running = false;
+                try self.stdout().writeByte('\n');
+            } else {
+                self.ctrl_d_pending = true;
+                try self.stdout().writeAll("\r\n(press ctrl+d again to exit)\r\n");
+                try self.stdout().flush();
+                try self.renderLine();
+            }
         },
 
         .suspend_shell => {
