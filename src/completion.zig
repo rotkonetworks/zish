@@ -324,6 +324,7 @@ pub fn handleTabCompletion(self: *Shell) !void {
         self.completion_original_len = self.edit_buf.len;
         self.completion_pattern_len = pattern.len;
 
+        try self.renderLine();
         try displayCompletions(self);
     }
 }
@@ -601,6 +602,7 @@ fn showCompletionMatches(self: *Shell, matches: *std.ArrayList([]const u8), word
     self.completion_original_len = self.edit_buf.len;
     self.completion_pattern_len = pattern.len;
 
+    try self.renderLine();
     try displayCompletions(self);
     return true;
 }
@@ -635,35 +637,38 @@ pub fn handleCompletionCycle(self: *Shell, direction: CycleDirection) !void {
     const old_index = self.completion_index;
     const nothing_selected = old_index >= self.completion_matches.items.len;
 
-    // zsh-style: if current selection is a directory and Tab pressed, drill into it
-    if (direction == .forward and !nothing_selected) {
+    // calculate new index first
+    var new_index: usize = undefined;
+    switch (direction) {
+        .forward => {
+            if (nothing_selected) {
+                new_index = 0;
+            } else {
+                new_index = (self.completion_index + 1) % self.completion_matches.items.len;
+            }
+        },
+        .backward => {
+            if (nothing_selected) {
+                new_index = self.completion_matches.items.len - 1;
+            } else if (self.completion_index == 0) {
+                new_index = self.completion_matches.items.len - 1;
+            } else {
+                new_index = self.completion_index - 1;
+            }
+        },
+    }
+
+    // zsh-style: if cycling back to same directory (wrapped), drill into it
+    if (direction == .forward and !nothing_selected and new_index == old_index) {
         const current_match = self.completion_matches.items[self.completion_index];
         if (std.mem.endsWith(u8, current_match, "/")) {
-            // accept current completion and re-trigger to show contents
             exitCompletionMode(self);
             try self.renderLine();
             return try handleTabCompletion(self);
         }
     }
 
-    switch (direction) {
-        .forward => {
-            if (nothing_selected) {
-                self.completion_index = 0;
-            } else {
-                self.completion_index = (self.completion_index + 1) % self.completion_matches.items.len;
-            }
-        },
-        .backward => {
-            if (nothing_selected) {
-                self.completion_index = self.completion_matches.items.len - 1;
-            } else if (self.completion_index == 0) {
-                self.completion_index = self.completion_matches.items.len - 1;
-            } else {
-                self.completion_index -= 1;
-            }
-        },
-    }
+    self.completion_index = new_index;
 
     try applyCompletion(self, self.completion_pattern_len);
 
