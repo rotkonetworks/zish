@@ -385,8 +385,8 @@ fn showSearchMatch(self: *Shell) !void {
     const writer = self.stdout();
     const search_term = self.search_buffer[0..self.search_len];
 
-    // clear line and show search prompt with query
-    try writer.writeAll("\r\x1b[K(reverse-i-search): ");
+    // clear line and everything below (search result may wrap)
+    try writer.writeAll("\r\x1b[J(reverse-i-search): ");
     try writer.writeAll(search_term);
 
     // find and show best match
@@ -696,30 +696,23 @@ fn handleResize(self: *Shell) !void {
     }
     self.last_resize_time = now;
 
-    const old_width = self.terminal_width;
-    const old_height = self.terminal_height;
-
     // update stored dimensions
     self.terminal_width = new_size.width;
     self.terminal_height = new_size.height;
 
     if (self.completion_mode and self.completion_displayed) {
-        // smart clearing: only clear if we're shrinking or need to reflow
-        if (new_size.width < old_width or new_size.height < old_height) {
-            // terminal shrank, need full clear
-            if (self.completion_menu_lines > 0) {
-                try self.stdout().print("\x1b[{d}A", .{self.completion_menu_lines});
-            }
-            try self.stdout().writeAll("\x1b[J");
-        } else {
-            // terminal grew, just reposition
-            if (self.completion_menu_lines > 0) {
-                try self.stdout().print("\x1b[{d}A", .{self.completion_menu_lines});
-            }
-            try self.stdout().writeAll("\x1b[J");
+        // clear everything from command start down, then redraw
+        // move to start of command area
+        if (self.term_view.term.row > 0) {
+            try self.stdout().print("\x1b[{d}A", .{self.term_view.term.row});
         }
+        try self.stdout().writeAll("\r\x1b[J");
+        self.term_view.term.row = 0;
+        self.term_view.term.col = 0;
+        self.term_view.last_hash = 0;
 
-        // redraw with new dimensions
+        // redraw command line and completion menu
+        try self.renderLine();
         try completion_mod.displayCompletions(self);
     } else {
         // just redraw the current line
@@ -1015,8 +1008,11 @@ fn handleAction(self: *Shell, action: Action) !void {
                 self.terminal_cursor_row = 0;
                 try self.setCursorStyle(.bar);
 
-                if (self.running)
+                if (self.running) {
+                    // sync history from other sessions before next prompt
+                    if (self.history) |h| h.sync();
                     try self.renderLine();
+                }
             }
         },
 
@@ -1078,10 +1074,15 @@ fn handleAction(self: *Shell, action: Action) !void {
         .enter_search_mode => |direction| {
             self.search_mode = true;
             self.search_len = 0;
+            // clear all wrapped rows of the command line first
+            if (self.term_view.term.row > 0) {
+                try self.stdout().print("\x1b[{d}A", .{self.term_view.term.row});
+            }
+            try self.stdout().writeAll("\r\x1b[J");
             if (direction == .backward) {
-                try self.stdout().writeAll("\r\x1b[K(reverse-i-search): ");
+                try self.stdout().writeAll("(reverse-i-search): ");
             } else {
-                try self.stdout().writeAll("\r\x1b[K(forward-i-search): ");
+                try self.stdout().writeAll("(forward-i-search): ");
             }
         },
 
@@ -1269,10 +1270,17 @@ fn handleCursorMovement(self: *Shell, move_action: MoveCursorAction) !void {
     if (new_pos == old_pos) return;
 
     self.edit_buf.cursor = @intCast(new_pos);
-    
-    // For multiline content, use renderLine for proper positioning
-    if (std.mem.indexOfScalar(u8, cmd, '\n') != null) {
-        try self.stdout().flush(); // sync buffers before term_view render
+
+    // Use renderLine when content wraps across terminal rows
+    // (multiline content OR single-line that exceeds terminal width)
+    var prompt_buf: [256]u8 = undefined;
+    const prompt_info = self.buildPrompt(&prompt_buf);
+    const total_width = @as(usize, prompt_info.visible_len) + cmd.len;
+    const wraps = std.mem.indexOfScalar(u8, cmd, '\n') != null or
+        (self.terminal_width > 0 and total_width > self.terminal_width);
+
+    if (wraps) {
+        try self.stdout().flush();
         try self.renderLine();
     } else {
         const steps = if (new_pos > old_pos)

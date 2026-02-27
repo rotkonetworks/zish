@@ -267,9 +267,9 @@ pub fn handleTabCompletion(self: *Shell) !void {
         if (inserted_slash) {
             try self.renderLine();
         }
-        // empty line hint if directory is empty (like completion menu but empty)
+        // empty line hint if directory is empty
         if (pattern.len == 0 and std.mem.endsWith(u8, effective_word, "/")) {
-            try self.stdout().writeAll("\r\n\r\n\x1b[1A"); // newline, blank, move up
+            try self.stdout().writeAll("\x1b[s\n\n\x1b[u");
             try self.stdout().flush();
         }
         return;
@@ -612,10 +612,14 @@ pub fn exitCompletionMode(self: *Shell) void {
 
     // clear the completion menu if displayed
     if (self.completion_displayed and self.completion_menu_lines > 0) {
-        // move down past current line, clear menu, move back up
-        self.stdout().writeByte('\n') catch {};
-        self.stdout().writeAll("\x1b[J") catch {}; // clear to end of screen
-        self.stdout().print("\x1b[{d}A", .{1}) catch {}; // back up one line
+        // save cursor, move to bottom of command area, clear below, restore
+        self.stdout().writeAll("\x1b[s") catch {};
+        const cmd_rows = self.term_view.term.rows_owned;
+        const cursor_row = self.term_view.term.row;
+        if (cmd_rows > cursor_row + 1) {
+            self.stdout().print("\x1b[{d}B", .{cmd_rows - cursor_row - 1}) catch {};
+        }
+        self.stdout().writeAll("\n\x1b[J\x1b[u") catch {};
         self.stdout().flush() catch {};
     }
 
@@ -673,8 +677,10 @@ pub fn handleCompletionCycle(self: *Shell, direction: CycleDirection) !void {
     try applyCompletion(self, self.completion_pattern_len);
 
     if (self.completion_displayed) {
-        // clear menu and command line, redraw both
-        // go to start of line, clear everything below
+        // clear command + menu from start of command area
+        if (self.term_view.term.row > 0) {
+            try self.stdout().print("\x1b[{d}A", .{self.term_view.term.row});
+        }
         try self.stdout().writeAll("\r\x1b[J");
         try self.stdout().flush();
         // reset TermView state so it redraws from scratch
@@ -711,6 +717,15 @@ pub fn displayCompletions(self: *Shell) !void {
     const term_height = self.terminal_height;
     const max_menu_height = if (term_height > 3) term_height - 3 else 1;
 
+    // save cursor position; move to bottom of command area before writing menu
+    try self.stdout().writeAll("\x1b[s");
+    const cmd_rows = self.term_view.term.rows_owned;
+    const cursor_row = self.term_view.term.row;
+    const rows_below_cursor = if (cmd_rows > cursor_row + 1) cmd_rows - cursor_row - 1 else 0;
+    if (rows_below_cursor > 0) {
+        try self.stdout().print("\x1b[{d}B", .{rows_below_cursor});
+    }
+
     if (term_width < 80) {
         try self.stdout().writeByte('\n');
 
@@ -746,8 +761,8 @@ pub fn displayCompletions(self: *Shell) !void {
             self.completion_menu_lines = items_to_show;
         }
 
-        // move cursor back up to command line (+1 for the initial newline before menu)
-        try self.stdout().print("\x1b[{d}A", .{self.completion_menu_lines + 1});
+        // restore cursor to command line position
+        try self.stdout().writeAll("\x1b[u");
         try self.stdout().flush();
         self.completion_displayed = true;
         return;
@@ -803,8 +818,8 @@ pub fn displayCompletions(self: *Shell) !void {
         self.completion_menu_lines += 1;
     }
 
-    // move cursor back up to command line (+1 for the initial newline before menu)
-    try self.stdout().print("\x1b[{d}A", .{self.completion_menu_lines + 1});
+    // restore cursor to command line position
+    try self.stdout().writeAll("\x1b[u");
     try self.stdout().flush();
     self.completion_displayed = true;
 }

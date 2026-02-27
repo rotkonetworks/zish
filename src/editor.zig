@@ -527,6 +527,10 @@ pub const TermView = struct {
         hl.flushWord(self);
         _ = self.emit(Color.reset);
 
+        // clear any leftover content after our text (handles content
+        // growing to more rows and old rows from content shrinking)
+        _ = self.emit("\x1b[J");
+
         // compute where we ended up
         var end_row: u16 = 0;
         col = prompt_visible_len;
