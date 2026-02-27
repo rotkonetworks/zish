@@ -255,11 +255,14 @@ pub const Parser = struct {
     fn parsesimplecommand(self: *Self) parsererror!*const ast.AstNode {
         var words = try std.ArrayList(*const ast.AstNode).initCapacity(self.builder.arena.allocator(), 32);
 
+        // collect leading assignments (VAR=value prefix syntax)
+        var prefix_assignments = try std.ArrayList(*const ast.AstNode).initCapacity(self.builder.arena.allocator(), 4);
+
         while (self.current_token.ty != .Eof) {
             switch (self.current_token.ty) {
                 .Word => {
                     // Check for POSIX function definition: name() { ... }
-                    if (words.items.len == 0 and self.peek_token.ty == .LeftParen) {
+                    if (words.items.len == 0 and prefix_assignments.items.len == 0 and self.peek_token.ty == .LeftParen) {
                         const name_token = self.current_token;
                         try self.nextToken(); // consume name
                         if (self.current_token.ty == .LeftParen) {
@@ -280,21 +283,20 @@ pub const Parser = struct {
                     }
 
                     // Check if this word is an assignment (contains =)
-                    // Only treat as assignment if it's the first word
+                    // Only treat as assignment if no command words yet
                     if (words.items.len == 0 and std.mem.indexOfScalar(u8, self.current_token.value, '=') != null) {
                         const eq_pos = std.mem.indexOfScalar(u8, self.current_token.value, '=').?;
-                        // This is an assignment like VAR=value
                         const token = self.current_token;
 
-                        // Extract name and value BEFORE calling nextToken()
-                        // because nextToken() may overwrite the lexer buffer
                         const name = token.value[0..eq_pos];
                         const value = token.value[eq_pos + 1 ..];
 
-                        // Create assignment node (duplicates strings into arena)
                         const assignment = try self.builder.createassignment(name, value, token.line, token.column);
                         try self.nextToken();
-                        return assignment;
+
+                        // collect as prefix — don't return yet, there may be a command following
+                        try prefix_assignments.append(self.builder.arena.allocator(), assignment);
+                        continue;
                     } else {
                         // Regular word (or assignment as argument to a command)
                         const word = try self.parseword();
@@ -303,18 +305,20 @@ pub const Parser = struct {
                 },
                 .String, .DoubleQuotedString => {
                     // Check if this quoted token is an assignment (VAR="value")
-                    // Only treat as assignment if it's the first word
+                    // Only treat as assignment if no command words yet
                     if (words.items.len == 0 and std.mem.indexOfScalar(u8, self.current_token.value, '=') != null) {
                         const eq_pos = std.mem.indexOfScalar(u8, self.current_token.value, '=').?;
                         const token = self.current_token;
 
-                        // Extract name and value BEFORE calling nextToken()
                         const name = token.value[0..eq_pos];
                         const value = token.value[eq_pos + 1 ..];
 
                         const assignment = try self.builder.createassignment(name, value, token.line, token.column);
                         try self.nextToken();
-                        return assignment;
+
+                        // collect as prefix
+                        try prefix_assignments.append(self.builder.arena.allocator(), assignment);
+                        continue;
                     } else {
                         const word = try self.parseword();
                         try words.append(self.builder.arena.allocator(), word);
@@ -346,8 +350,48 @@ pub const Parser = struct {
             }
         }
 
+        // bare assignments with no command following — return as-is
+        if (words.items.len == 0 and prefix_assignments.items.len > 0) {
+            if (prefix_assignments.items.len == 1) {
+                return prefix_assignments.items[0];
+            }
+            return self.builder.createlist(
+                prefix_assignments.items,
+                prefix_assignments.items[0].line,
+                prefix_assignments.items[0].column,
+            );
+        }
+
         if (words.items.len == 0) {
             return error.EmptyCommand;
+        }
+
+        // if we have prefix assignments, build combined children:
+        // [assign1, assign2, ..., word0, word1, ...]
+        // and store assignment count in value field
+        if (prefix_assignments.items.len > 0) {
+            const allocator = self.builder.arena.allocator();
+            const n_prefix = prefix_assignments.items.len;
+            const total = n_prefix + words.items.len;
+
+            var children = try allocator.alloc(*const ast.AstNode, total);
+            @memcpy(children[0..n_prefix], prefix_assignments.items);
+            @memcpy(children[n_prefix..total], words.items);
+
+            // encode prefix count as value string
+            var count_buf: [16]u8 = undefined;
+            const count_str = std.fmt.bufPrint(&count_buf, "{d}", .{n_prefix}) catch "0";
+
+            var cmd = try self.builder.createnode(
+                .command,
+                count_str,
+                children,
+                children[n_prefix].line,
+                children[n_prefix].column,
+            );
+
+            cmd = try self.parseredirects(cmd);
+            return cmd;
         }
 
         var cmd = try self.builder.createcommand(

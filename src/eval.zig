@@ -566,10 +566,75 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     // clean up any process substitution children when command finishes
     defer cleanupProcessSubst(shell);
 
-    const raw_cmd = node.children[0].value;
+    // parse prefix assignment count from value field
+    const n_prefix: usize = if (node.value.len > 0)
+        std.fmt.parseInt(usize, node.value, 10) catch 0
+    else
+        0;
+
+    // set prefix env vars (temporarily) and track names for cleanup
+    var prefix_names: [16][]const u8 = undefined;
+    var prefix_had_old: [16]bool = undefined;
+    var prefix_old_vals: [16][]const u8 = undefined;
+    var prefix_tmp_vals: [16][]const u8 = undefined;
+    const actual_prefix = @min(n_prefix, 16);
+
+    for (0..actual_prefix) |i| {
+        const assign = node.children[i];
+        if (assign.node_type != .assignment or assign.children.len != 2) {
+            prefix_had_old[i] = false;
+            prefix_names[i] = "";
+            prefix_tmp_vals[i] = "";
+            continue;
+        }
+        const name = assign.children[0].value;
+        const raw_val = assign.children[1].value;
+
+        // expand variables in the value
+        const expanded = shell.expandVariables(raw_val) catch shell.allocator.dupe(u8, raw_val) catch raw_val;
+
+        prefix_names[i] = name;
+        prefix_tmp_vals[i] = expanded;
+        if (shell.variables.getPtr(name)) |val_ptr| {
+            prefix_had_old[i] = true;
+            prefix_old_vals[i] = val_ptr.*;
+            val_ptr.* = expanded;
+        } else {
+            prefix_had_old[i] = false;
+            const name_copy = shell.allocator.dupe(u8, name) catch continue;
+            shell.variables.put(name_copy, expanded) catch {
+                shell.allocator.free(name_copy);
+                continue;
+            };
+        }
+    }
+
+    // cleanup: restore or remove prefix vars after command
+    defer for (0..actual_prefix) |i| {
+        if (prefix_names[i].len == 0) continue;
+        if (prefix_had_old[i]) {
+            // restore old value, free the temp
+            if (shell.variables.getPtr(prefix_names[i])) |val_ptr| {
+                val_ptr.* = prefix_old_vals[i];
+            }
+            shell.allocator.free(prefix_tmp_vals[i]);
+        } else {
+            // remove the var we added (fetchRemove frees key for us)
+            if (shell.variables.fetchRemove(prefix_names[i])) |kv| {
+                shell.allocator.free(kv.key);
+                shell.allocator.free(kv.value);
+            }
+        }
+    };
+
+    // command children start after prefix assignments
+    const cmd_children = node.children[n_prefix..];
+    if (cmd_children.len == 0) return 0; // bare prefix-only (shouldn't reach here)
+
+    const raw_cmd = cmd_children[0].value;
 
     // Fast path for simple builtins - no allocation needed
-    if (raw_cmd.len <= 8 and node.children.len == 1) {
+    if (raw_cmd.len <= 8 and cmd_children.len == 1) {
         if (std.mem.eql(u8, raw_cmd, "true") or (raw_cmd.len == 1 and raw_cmd[0] == ':')) return 0;
         if (std.mem.eql(u8, raw_cmd, "false")) return 1;
         if (std.mem.eql(u8, raw_cmd, "continue")) return 253;
@@ -578,7 +643,8 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
 
     // Fast path for test builtin - avoid allocations in tight loops
     // Falls back to normal path if args too large for stack buffers
-    if ((raw_cmd.len == 1 and raw_cmd[0] == '[') or std.mem.eql(u8, raw_cmd, "test")) {
+    // Skip fast paths when prefix assignments exist (node.children layout differs)
+    if (n_prefix == 0 and ((raw_cmd.len == 1 and raw_cmd[0] == '[') or std.mem.eql(u8, raw_cmd, "test"))) {
         if (evaluateTestBuiltinFast(shell, node)) |result| {
             return result;
         } else |err| switch (err) {
@@ -590,9 +656,9 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     // Fast path for echo builtin - avoid allocations in tight loops
     // Skip fast path if any arg has command substitution $(cmd) (not $((arith)))
     // Falls back to normal path if args too large for stack buffers
-    if (std.mem.eql(u8, raw_cmd, "echo")) {
+    if (n_prefix == 0 and std.mem.eql(u8, raw_cmd, "echo")) {
         var needs_full_expansion = false;
-        for (node.children[1..]) |arg_node| {
+        for (cmd_children[1..]) |arg_node| {
             const arg = arg_node.value;
             // Check for features that need full expansion path:
             // - Command substitution $(...)
@@ -651,7 +717,7 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
             try new_cmd.appendSlice(shell.allocator, alias_value);
 
             // append remaining arguments
-            for (node.children[1..]) |arg_node| {
+            for (cmd_children[1..]) |arg_node| {
                 try new_cmd.append(shell.allocator, ' ');
                 try new_cmd.appendSlice(shell.allocator, arg_node.value);
             }
@@ -692,7 +758,7 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
         }
     }
 
-    for (node.children[1..]) |arg_node| {
+    for (cmd_children[1..]) |arg_node| {
         const arg = arg_node.value;
 
         // Skip brace expansion for single-quoted strings

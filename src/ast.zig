@@ -299,9 +299,17 @@ fn validatenode(node: *const AstNode) !void {
     switch (node.node_type) {
         .command => {
             if (node.children.len == 0) return error.EmptyCommand;
-            // first child must be a word (command name)
-            if (node.children[0].node_type != .word and node.children[0].node_type != .string) {
-                return error.InvalidCommandName;
+            // parse prefix assignment count from value field
+            const n_prefix: usize = if (node.value.len > 0)
+                std.fmt.parseInt(usize, node.value, 10) catch 0
+            else
+                0;
+            // first non-prefix child must be a word (command name)
+            if (n_prefix < node.children.len) {
+                const cmd_child = node.children[n_prefix];
+                if (cmd_child.node_type != .word and cmd_child.node_type != .string) {
+                    return error.InvalidCommandName;
+                }
             }
         },
         .if_statement => {
