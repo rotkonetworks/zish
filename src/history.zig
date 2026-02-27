@@ -41,6 +41,7 @@ pub const History = struct {
     // encrypted persistence
     crypto: *CryptoContext,
     log_writer: LogWriter,
+    log_offset: u64, // file position after last read
     dirty: bool, // needs save
 
     const Self = @This();
@@ -78,6 +79,7 @@ pub const History = struct {
             .hash_map = hash_map,
             .crypto = crypto,
             .log_writer = log_writer,
+            .log_offset = 0,
             .dirty = false,
         };
 
@@ -191,10 +193,41 @@ pub const History = struct {
             .exit_code = entry.exit_code,
             .flags = entry.flags,
             .frequency = entry.frequency,
+            .timestamp = entry.timestamp,
         };
 
         try self.log_writer.append(log_entry);
         self.dirty = false; // just saved
+
+        // track our own writes so sync() skips them
+        self.log_offset = self.getLogFileSize();
+    }
+
+    /// import new entries written by other sessions since last read
+    pub fn sync(self: *Self) void {
+        var reader = LogReader.init(self.allocator, self.crypto) catch return;
+        defer reader.deinit();
+
+        var end_offset: u64 = 0;
+        const new_entries = reader.readFrom(self.log_offset, &end_offset) catch return;
+        defer {
+            for (new_entries) |entry| {
+                self.allocator.free(entry.command);
+            }
+            self.allocator.free(new_entries);
+        }
+
+        if (new_entries.len == 0) {
+            self.log_offset = end_offset;
+            return;
+        }
+
+        for (new_entries) |entry| {
+            self.mergeEntry(entry) catch {};
+        }
+
+        self.log_offset = end_offset;
+        self.sortByTimestamp();
     }
 
     // Security: Validate that command contains only safe characters
@@ -320,6 +353,7 @@ pub const History = struct {
                 .exit_code = entry.exit_code,
                 .flags = entry.flags,
                 .frequency = entry.frequency,
+                .timestamp = entry.timestamp,
             };
 
             try self.log_writer.append(log_entry);
@@ -333,7 +367,8 @@ pub const History = struct {
         var reader = try LogReader.init(self.allocator, self.crypto);
         defer reader.deinit();
 
-        const entries = try reader.readAll();
+        var end_offset: u64 = 0;
+        const entries = try reader.readAllTracked(&end_offset);
         defer {
             for (entries) |entry| {
                 self.allocator.free(entry.command);
@@ -345,6 +380,130 @@ pub const History = struct {
         for (entries) |entry| {
             self.mergeEntry(entry) catch {};
         }
+
+        // sort by timestamp to restore chronological order
+        self.sortByTimestamp();
+
+        // compact on startup if bloated (>2x unique entries)
+        // fast: batch write + single fsync, no per-entry overhead
+        if (entries.len > self.entries.items.len * 2) {
+            self.compact() catch |err| {
+                std.log.warn("failed to compact history log: {}", .{err});
+                self.log_offset = end_offset;
+            };
+        } else {
+            self.log_offset = end_offset;
+        }
+    }
+
+    /// sort entries by timestamp and rebuild hash_map indices
+    fn sortByTimestamp(self: *Self) void {
+        std.sort.insertion(HistoryEntry, self.entries.items, {}, struct {
+            fn lessThan(_: void, a: HistoryEntry, b: HistoryEntry) bool {
+                return a.timestamp < b.timestamp;
+            }
+        }.lessThan);
+
+        // rebuild hash_map with new indices
+        self.hash_map.clearRetainingCapacity();
+        for (self.entries.items, 0..) |entry, i| {
+            self.hash_map.put(entry.command_hash, @intCast(i)) catch {};
+        }
+    }
+
+    /// rewrite log file with only current deduplicated entries
+    /// single open, batch writes, one fsync, atomic rename
+    fn compact(self: *Self) !void {
+        const log_path = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/current.log.enc",
+            .{self.log_writer.log_dir},
+        );
+        defer self.allocator.free(log_path);
+
+        const tmp_path = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/current.log.enc.tmp",
+            .{self.log_writer.log_dir},
+        );
+        defer self.allocator.free(tmp_path);
+
+        // write all entries to temp file in one batch
+        const file = try std.fs.createFileAbsolute(tmp_path, .{ .mode = 0o600 });
+        errdefer {
+            file.close();
+            std.fs.deleteFileAbsolute(tmp_path) catch {};
+        }
+
+        var seq: u64 = 0;
+        for (self.entries.items) |entry| {
+            const command = self.getCommand(entry);
+
+            const log_entry = log_mod.EntryData{
+                .command_hash = entry.command_hash,
+                .command = command,
+                .exit_code = entry.exit_code,
+                .flags = entry.flags,
+                .frequency = entry.frequency,
+                .timestamp = entry.timestamp,
+            };
+
+            const plaintext = try log_entry.serialize(self.allocator);
+            defer self.allocator.free(plaintext);
+
+            var header = log_mod.EntryHeader{
+                .magic = "ZENT".*,
+                .version = 1,
+                .reserved = 0,
+                .entry_len = 0,
+                .instance = self.log_writer.instance_id,
+                .sequence = seq,
+                .timestamp = entry.timestamp,
+                .padding = [_]u8{0} ** 6,
+            };
+
+            var aad_buf: [24]u8 = undefined;
+            @memcpy(aad_buf[0..4], &header.magic);
+            aad_buf[4] = header.version;
+            aad_buf[5] = header.reserved;
+            aad_buf[6] = header.instance;
+            aad_buf[7] = 0;
+            std.mem.writeInt(u64, aad_buf[8..16], header.sequence, .little);
+            std.mem.writeInt(u64, aad_buf[16..24], header.timestamp, .little);
+
+            const encrypted = try self.crypto.encrypt(plaintext, &aad_buf);
+            defer self.allocator.free(encrypted);
+
+            header.entry_len = @intCast(encrypted.len);
+
+            try file.writeAll(std.mem.asBytes(&header));
+            try file.writeAll(encrypted);
+            seq += 1;
+        }
+
+        // one fsync, then atomic rename
+        try file.sync();
+        file.close();
+
+        try std.fs.renameAbsolute(tmp_path, log_path);
+
+        self.log_writer.sequence = seq;
+        self.log_offset = self.getLogFileSize();
+    }
+
+    fn getLogFileSize(self: *Self) u64 {
+        const log_path = std.fmt.allocPrint(
+            self.allocator,
+            "{s}/current.log.enc",
+            .{self.log_writer.log_dir},
+        ) catch return 0;
+        defer self.allocator.free(log_path);
+
+        const file = std.fs.openFileAbsolute(log_path, .{}) catch return 0;
+        defer file.close();
+
+        const stat = file.stat() catch return 0;
+        return stat.size;
     }
 
     /// re-encrypt all history with a new key
@@ -378,28 +537,20 @@ pub const History = struct {
 
     /// merge single entry from disk into memory
     pub fn mergeEntry(self: *Self, disk_entry: log_mod.EntryData) !void {
+        const disk_ts: u32 = if (disk_entry.timestamp > 0)
+            @intCast(@min(disk_entry.timestamp, std.math.maxInt(u32)))
+        else
+            @intCast(std.time.timestamp());
+
         // check if exists in memory
         if (self.hash_map.get(disk_entry.command_hash)) |existing_index| {
-            // merge: higher frequency + newer timestamp wins, move to end for recency
-            var memory_entry = self.entries.items[existing_index];
+            // merge: keep highest frequency, newest timestamp, update in place
+            var memory_entry = &self.entries.items[existing_index];
 
             memory_entry.frequency = @max(memory_entry.frequency, disk_entry.frequency);
-            memory_entry.timestamp = @intCast(std.time.timestamp()); // use current time for recency
+            memory_entry.timestamp = @max(memory_entry.timestamp, disk_ts);
             memory_entry.flags |= disk_entry.flags;
             memory_entry.exit_code = disk_entry.exit_code;
-
-            // move to end for recency (same logic as addCommand)
-            const last_index: u32 = @intCast(self.entries.items.len - 1);
-            if (existing_index != last_index) {
-                const last_entry = self.entries.items[last_index];
-                self.entries.items[existing_index] = last_entry;
-                self.entries.items[last_index] = memory_entry;
-
-                try self.hash_map.put(last_entry.command_hash, existing_index);
-                try self.hash_map.put(disk_entry.command_hash, last_index);
-            } else {
-                self.entries.items[last_index] = memory_entry;
-            }
         } else {
             // add new entry from disk
             if (self.string_pool_used + disk_entry.command.len > self.string_pool.len) {
@@ -418,7 +569,7 @@ pub const History = struct {
                 .command_offset = command_offset,
                 .command_len = @intCast(disk_entry.command.len),
                 .frequency = disk_entry.frequency,
-                .timestamp = @intCast(std.time.timestamp()),
+                .timestamp = disk_ts,
                 .exit_code = disk_entry.exit_code,
                 .flags = disk_entry.flags,
             };

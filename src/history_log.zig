@@ -37,8 +37,9 @@ pub const EntryData = struct {
     exit_code: u8,
     flags: u8,
     frequency: u16,
+    timestamp: u64, // from log header, 0 = not set
 
-    fn serialize(self: EntryData, allocator: std.mem.Allocator) ![]u8 {
+    pub fn serialize(self: EntryData, allocator: std.mem.Allocator) ![]u8 {
         // format: hash(8) + cmd_len(2) + cmd + exit(1) + flags(1) + freq(2)
         const total_len = 8 + 2 + self.command.len + 1 + 1 + 2;
         var buf = try allocator.alloc(u8, total_len);
@@ -102,6 +103,7 @@ pub const EntryData = struct {
             .exit_code = exit_code,
             .flags = flags,
             .frequency = frequency,
+            .timestamp = 0, // filled from header after deserialize
         };
     }
 };
@@ -156,7 +158,7 @@ pub const LogWriter = struct {
             .entry_len = 0, // placeholder
             .instance = self.instance_id,
             .sequence = self.sequence,
-            .timestamp = @intCast(std.time.timestamp()),
+            .timestamp = if (entry.timestamp > 0) entry.timestamp else @intCast(std.time.timestamp()),
             .padding = [_]u8{0} ** 6,
         };
 
@@ -241,6 +243,12 @@ pub const LogReader = struct {
 
     /// read all entries from all log files
     pub fn readAll(self: *LogReader) ![]EntryData {
+        var end_offset: u64 = 0;
+        return self.readAllTracked(&end_offset);
+    }
+
+    /// read all entries and report final file offset
+    pub fn readAllTracked(self: *LogReader, end_offset: *u64) ![]EntryData {
         var entries = try std.ArrayList(EntryData).initCapacity(self.allocator, 100);
         errdefer {
             for (entries.items) |entry| {
@@ -257,16 +265,44 @@ pub const LogReader = struct {
         );
         defer self.allocator.free(log_path);
 
-        self.readFile(log_path, &entries) catch {
+        self.readFileFrom(log_path, &entries, 0, end_offset) catch {
             // silently ignore - file might not exist or be corrupted
         };
 
         return entries.toOwnedSlice(self.allocator);
     }
 
-    fn readFile(self: *LogReader, path: []const u8, entries: *std.ArrayList(EntryData)) !void {
+    /// read entries appended after the given offset
+    pub fn readFrom(self: *LogReader, offset: u64, end_offset: *u64) ![]EntryData {
+        var entries = try std.ArrayList(EntryData).initCapacity(self.allocator, 16);
+        errdefer {
+            for (entries.items) |entry| {
+                self.allocator.free(entry.command);
+            }
+            entries.deinit(self.allocator);
+        }
+
+        const log_path = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/current.log.enc",
+            .{self.log_dir}
+        );
+        defer self.allocator.free(log_path);
+
+        self.readFileFrom(log_path, &entries, offset, end_offset) catch {
+            // silently ignore
+        };
+
+        return entries.toOwnedSlice(self.allocator);
+    }
+
+    fn readFileFrom(self: *LogReader, path: []const u8, entries: *std.ArrayList(EntryData), start_offset: u64, end_offset: *u64) !void {
         const file = try fs.openFileAbsolute(path, .{});
         defer file.close();
+
+        if (start_offset > 0) {
+            try file.seekTo(start_offset);
+        }
 
         while (true) {
             // read header
@@ -308,12 +344,15 @@ pub const LogReader = struct {
             defer self.allocator.free(plaintext);
 
             // deserialize (silently skip malformed entries)
-            const entry = EntryData.deserialize(plaintext, self.allocator) catch {
+            var entry = EntryData.deserialize(plaintext, self.allocator) catch {
                 continue;
             };
+            entry.timestamp = header.timestamp;
 
             try entries.append(self.allocator, entry);
         }
+
+        end_offset.* = file.getPos() catch start_offset;
     }
 };
 
@@ -354,6 +393,7 @@ test "serialize and deserialize entry" {
         .exit_code = 0,
         .flags = 1,
         .frequency = 5,
+        .timestamp = 0,
     };
 
     const serialized = try original.serialize(allocator);
