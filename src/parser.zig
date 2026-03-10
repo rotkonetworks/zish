@@ -455,7 +455,8 @@ pub const Parser = struct {
         // create node BEFORE nextToken to avoid buffer overwrite
         // (nextToken may reuse the buffer that token.value points to)
         const node = switch (token.ty) {
-            .Word, .DoubleQuotedString => try self.builder.createword(token.value, token.line, token.column),
+            .Word => try self.builder.createword(token.value, token.line, token.column),
+            .DoubleQuotedString => try self.builder.createdoublequoted(token.value, token.line, token.column),
             .String => try self.builder.createstring(token.value, token.line, token.column),
             .ProcessSubstIn => blk: {
                 const marked = try std.fmt.allocPrint(self.builder.arena.allocator(), "<({s})", .{token.value});

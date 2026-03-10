@@ -22,6 +22,7 @@ pub const NodeType = enum {
     redirect, // >, >>, <, 2>, 2>>, 2>&1, >&2, &>, &>>
     test_expression, // [[ ... ]]
     word,
+    double_quoted, // double-quoted string: expand vars/cmds but no word splitting or glob
     string,
     number,
 };
@@ -169,6 +170,10 @@ pub const AstBuilder = struct {
         return self.createnode(.word, value, &[_]*const AstNode{}, line, column);
     }
 
+    pub fn createdoublequoted(self: *Self, value: []const u8, line: u32, column: u32) !*const AstNode {
+        return self.createnode(.double_quoted, value, &[_]*const AstNode{}, line, column);
+    }
+
     pub fn createstring(self: *Self, value: []const u8, line: u32, column: u32) !*const AstNode {
         return self.createnode(.string, value, &[_]*const AstNode{}, line, column);
     }
@@ -307,7 +312,7 @@ fn validatenode(node: *const AstNode) !void {
             // first non-prefix child must be a word (command name)
             if (n_prefix < node.children.len) {
                 const cmd_child = node.children[n_prefix];
-                if (cmd_child.node_type != .word and cmd_child.node_type != .string) {
+                if (cmd_child.node_type != .word and cmd_child.node_type != .double_quoted and cmd_child.node_type != .string) {
                     return error.InvalidCommandName;
                 }
             }

@@ -761,9 +761,17 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     for (cmd_children[1..]) |arg_node| {
         const arg = arg_node.value;
 
-        // Skip brace expansion for single-quoted strings
+        // Skip all expansion for single-quoted strings
         if (arg_node.node_type == .string) {
             try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, arg));
+            continue;
+        }
+
+        // Double-quoted strings: expand vars/cmds but no word splitting or glob
+        if (arg_node.node_type == .double_quoted) {
+            const var_expanded_result = try shell.expandVariablesZ(arg);
+            defer var_expanded_result.deinit(shell.allocator);
+            try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, var_expanded_result.slice));
             continue;
         }
 
@@ -772,6 +780,9 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
             try expanded_args.append(shell.allocator, proc_path);
             continue;
         }
+
+        // Check if original arg has command substitution (for word splitting)
+        const needs_word_split = hasCommandSubstitution(arg);
 
         // Step 1: Brace expansion {a,b,c} or {1..5}
         const brace_results = if (Shell.hasBracePattern(arg))
@@ -783,25 +794,52 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
         const items_to_expand = if (brace_results) |br| br else &[_][]const u8{arg};
 
         for (items_to_expand) |item| {
-            // Step 2: Variable expansion
+            // Step 2: Variable expansion (includes command substitution)
             const var_expanded_result = try shell.expandVariablesZ(item);
             defer var_expanded_result.deinit(shell.allocator);
             const var_expanded = var_expanded_result.slice;
 
-            // Step 3: Glob expansion (only if pattern contains glob chars)
-            if (glob.hasGlobChars(var_expanded)) {
-                const glob_results = try glob.expandGlob(shell.allocator, var_expanded);
-                defer glob.freeGlobResults(shell.allocator, glob_results);
-
-                if (glob_results.len == 0) {
-                    try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, var_expanded));
-                } else {
-                    for (glob_results) |match| {
-                        try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, match));
+            // Step 2.5: Word splitting for unquoted command substitution results
+            // POSIX: unquoted $() results are split on IFS (default: space/tab/newline)
+            if (needs_word_split) {
+                var split_iter = std.mem.tokenizeAny(u8, var_expanded, " \t\n");
+                var has_any = false;
+                while (split_iter.next()) |word| {
+                    has_any = true;
+                    // Step 3: Glob expansion on each split word
+                    if (glob.hasGlobChars(word)) {
+                        const glob_results = try glob.expandGlob(shell.allocator, word);
+                        defer glob.freeGlobResults(shell.allocator, glob_results);
+                        if (glob_results.len == 0) {
+                            try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, word));
+                        } else {
+                            for (glob_results) |match| {
+                                try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, match));
+                            }
+                        }
+                    } else {
+                        try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, word));
                     }
                 }
+                // If command substitution produced empty output, skip the argument
+                // (POSIX: empty unquoted expansion produces no fields)
+                if (!has_any) continue;
             } else {
-                try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, var_expanded));
+                // Step 3: Glob expansion (only if pattern contains glob chars)
+                if (glob.hasGlobChars(var_expanded)) {
+                    const glob_results = try glob.expandGlob(shell.allocator, var_expanded);
+                    defer glob.freeGlobResults(shell.allocator, glob_results);
+
+                    if (glob_results.len == 0) {
+                        try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, var_expanded));
+                    } else {
+                        for (glob_results) |match| {
+                            try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, match));
+                        }
+                    }
+                } else {
+                    try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, var_expanded));
+                }
             }
         }
     }
@@ -1625,9 +1663,24 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
             continue;
         }
 
+        // Double-quoted: expand vars/cmds but no word splitting
+        if (value_node.node_type == .double_quoted) {
+            const var_expanded = try shell.expandVariables(raw_value);
+            defer shell.allocator.free(var_expanded);
+            setForVariableFast(cached_value_ptr.?, var_expanded, &loop_buf, &heap_buf, shell.allocator);
+            last_status = try evaluateAst(shell, body);
+            if (last_status == 254) {
+                should_break = true;
+                break :outer;
+            }
+            if (last_status == 253) last_status = 0;
+            continue;
+        }
+
         const has_brace = Shell.hasBracePattern(raw_value);
         const needs_var_expansion = std.mem.indexOfScalar(u8, raw_value, '$') != null;
         const has_glob = glob.hasGlobChars(raw_value);
+        const needs_word_split = hasCommandSubstitution(raw_value);
 
         // Fast path: no special expansion needed
         if (!has_brace and !needs_var_expansion and !has_glob) {
@@ -1657,6 +1710,34 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
             else
                 try shell.allocator.dupe(u8, brace_item);
             defer shell.allocator.free(var_expanded);
+
+            // Step 2.5: Word splitting for unquoted command substitution
+            if (needs_word_split) {
+                var split_iter = std.mem.tokenizeAny(u8, var_expanded, " \t\n");
+                while (split_iter.next()) |word| {
+                    // Step 3: Glob expansion on each split word
+                    if (glob.hasGlobChars(word)) {
+                        const glob_results = try glob.expandGlob(shell.allocator, word);
+                        defer glob.freeGlobResults(shell.allocator, glob_results);
+                        const items = if (glob_results.len == 0)
+                            &[_][]const u8{word}
+                        else
+                            glob_results;
+                        for (items) |item| {
+                            setForVariableFast(cached_value_ptr.?, item, &loop_buf, &heap_buf, shell.allocator);
+                            last_status = try evaluateAst(shell, body);
+                            if (last_status == 254) { should_break = true; break :outer; }
+                            if (last_status == 253) { last_status = 0; continue; }
+                        }
+                    } else {
+                        setForVariableFast(cached_value_ptr.?, word, &loop_buf, &heap_buf, shell.allocator);
+                        last_status = try evaluateAst(shell, body);
+                        if (last_status == 254) { should_break = true; break :outer; }
+                        if (last_status == 253) { last_status = 0; continue; }
+                    }
+                }
+                continue;
+            }
 
             // Step 3: Glob expansion
             if (glob.hasGlobChars(var_expanded)) {

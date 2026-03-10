@@ -443,10 +443,12 @@ pub const TermView = struct {
             return;
         }
 
+        const w = self.term.width;
+        const cont_marker_len: u16 = 2; // "│ "
+
         // compute cursor position in content
         var cursor_row: u16 = 0;
         var cursor_col: u16 = prompt_visible_len;
-        const cont_marker_len: u16 = 2; // "│ "
 
         for (text[0..buf.cursor]) |c| {
             if (c == '\n') {
@@ -454,25 +456,9 @@ pub const TermView = struct {
                 cursor_col = cont_marker_len;
             } else {
                 cursor_col += 1;
-                if (cursor_col >= self.term.width) {
+                if (w > 0 and cursor_col >= w) {
                     cursor_row += 1;
                     cursor_col = 0;
-                }
-            }
-        }
-
-        // compute total rows
-        var total_rows: u16 = 1;
-        var col: u16 = prompt_visible_len;
-        for (text) |c| {
-            if (c == '\n') {
-                total_rows += 1;
-                col = cont_marker_len;
-            } else {
-                col += 1;
-                if (col >= self.term.width) {
-                    total_rows += 1;
-                    col = 0;
                 }
             }
         }
@@ -482,26 +468,18 @@ pub const TermView = struct {
             _ = self.emitCSI("{d}A", .{self.term.row});
         }
         _ = self.emit("\r");
-        self.term.row = 0;
-        self.term.col = 0;
 
-        // clear old lines (limit to prevent runaway)
-        const clear_rows = @min(self.term.rows_owned, self.term.height);
-        for (0..clear_rows) |i| {
-            self.clearLine();
-            if (i < clear_rows - 1) {
-                _ = self.emit("\x1b[1B"); // down
-            }
-        }
-
-        // back to start
-        if (clear_rows > 1) {
-            _ = self.emitCSI("{d}A", .{clear_rows - 1});
-        }
-        _ = self.emit("\r");
+        // clear from start of our region to end of screen
+        // this is simpler and more reliable than per-line clearing,
+        // and avoids disturbing soft-wrap metadata on individual lines
+        _ = self.emit("\x1b[J");
 
         // emit prompt
         _ = self.emit(prompt);
+
+        // track rendering position as we emit
+        var render_row: u16 = 0;
+        var render_col: u16 = prompt_visible_len;
 
         // emit content with syntax highlighting and continuation markers
         var hl = SyntaxHighlighter{};
@@ -513,6 +491,8 @@ pub const TermView = struct {
             if (c == '\n') {
                 hl.flushWord(self);
                 _ = self.emit(Color.reset);
+                // clear to end of line before newline to avoid trailing artifacts
+                self.clearToEOL();
                 _ = self.emitByte('\n');
                 _ = self.emit(Color.gray);
                 _ = self.emit("│");
@@ -520,40 +500,32 @@ pub const TermView = struct {
                 _ = self.emitByte(' ');
                 hl.at_line_start = true;
                 hl.first_word = true; // new line = new command context
+                render_row += 1;
+                render_col = cont_marker_len;
             } else {
                 hl.feed(self, c);
+                render_col += 1;
+                if (w > 0 and render_col >= w) {
+                    render_row += 1;
+                    render_col = 0;
+                }
             }
         }
         hl.flushWord(self);
         _ = self.emit(Color.reset);
 
-        // clear any leftover content after our text (handles content
-        // growing to more rows and old rows from content shrinking)
+        // clear any leftover content after our text
         _ = self.emit("\x1b[J");
 
-        // compute where we ended up
-        var end_row: u16 = 0;
-        col = prompt_visible_len;
-        for (text) |c| {
-            if (c == '\n') {
-                end_row += 1;
-                col = cont_marker_len;
-            } else {
-                col += 1;
-                if (col >= self.term.width) {
-                    end_row += 1;
-                    col = 0;
-                }
-            }
-        }
-        self.term.row = end_row;
-        self.term.col = col;
+        // use tracked position (not recomputed) for cursor state
+        self.term.row = render_row;
+        self.term.col = render_col;
 
         // move to cursor position
         self.moveTo(cursor_row, cursor_col);
 
-        // update state
-        self.term.rows_owned = total_rows;
+        // update state — total_rows matches render_row + 1
+        self.term.rows_owned = render_row + 1;
         self.last_hash = hash;
         self.last_cursor = buf.cursor;
 

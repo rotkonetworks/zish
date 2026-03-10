@@ -957,9 +957,7 @@ fn handleAction(self: *Shell, action: Action) !void {
                     if (!is_escaped) {
                         // Line continuation - insert newline and continue editing
                         _ = self.edit_buf.insert('\n');
-                        try self.stdout().writeByte('\n');
-                        try self.stdout().writeAll("> ");
-                        try self.stdout().flush();
+                        try self.renderLine();
                         return;
                     }
                 }
@@ -969,9 +967,7 @@ fn handleAction(self: *Shell, action: Action) !void {
                     if (!heredocComplete(command, delim)) {
                         // Need more input - continue editing
                         _ = self.edit_buf.insert('\n');
-                        try self.stdout().writeByte('\n');
-                        try self.stdout().writeAll("> ");
-                        try self.stdout().flush();
+                        try self.renderLine();
                         return;
                     }
                 }
@@ -1870,9 +1866,17 @@ pub fn executeCommand(self: *Shell, command: []const u8) !u8 {
     const trimmed = std.mem.trim(u8, command, " \t\r\n");
     if (trimmed.len == 0) return 0;
 
-    // TODO: alias expansion should be done at parse time for full script
-    // for now just pass the full script to the parser
-    const exit_code = try self.executeCommandInternal(trimmed);
+    // Preprocess heredoc: convert << DELIM ... DELIM to file redirect
+    const processed = if (findHeredocDelimiter(trimmed)) |delim|
+        (if (heredocComplete(trimmed, delim))
+            preprocessHeredoc(self.allocator, trimmed, delim) catch trimmed
+        else
+            trimmed)
+    else
+        trimmed;
+    defer if (processed.ptr != trimmed.ptr) self.allocator.free(processed);
+
+    const exit_code = try self.executeCommandInternal(processed);
     self.last_exit_code = exit_code;
     return exit_code;
 }
@@ -2837,6 +2841,8 @@ fn preprocessHeredoc(allocator: std.mem.Allocator, command: []const u8, delimite
     // Find where content ends (at delimiter line)
     // Scan line by line from content_start
     var content_end = content_start;
+    var suffix_start: usize = command.len; // text after closing delimiter
+    var found_delim = false;
     var line_start = content_start;
     while (line_start < command.len) {
         // find end of this line
@@ -2847,10 +2853,13 @@ fn preprocessHeredoc(allocator: std.mem.Allocator, command: []const u8, delimite
         if (std.mem.eql(u8, line, delimiter)) {
             // This line is the delimiter - content ends before this line
             content_end = line_start;
+            found_delim = true;
             // remove trailing newline from content if present
             if (content_end > content_start and command[content_end - 1] == '\n') {
                 content_end -= 1;
             }
+            // suffix is everything after the delimiter line
+            suffix_start = if (line_end < command.len) line_end + 1 else line_end;
             break;
         }
 
@@ -2863,11 +2872,12 @@ fn preprocessHeredoc(allocator: std.mem.Allocator, command: []const u8, delimite
     }
 
     // Handle case where no delimiter was found (shouldn't happen if heredocComplete returned true)
-    if (content_end == content_start and content_start < command.len) {
+    if (!found_delim and content_start < command.len) {
         content_end = command.len;
     }
 
     const content = command[content_start..content_end];
+    const suffix = std.mem.trim(u8, command[suffix_start..], " \t\r\n");
 
     // Write content to a temp file (use timestamp for uniqueness)
     const ts = std.time.milliTimestamp();
@@ -2879,11 +2889,22 @@ fn preprocessHeredoc(allocator: std.mem.Allocator, command: []const u8, delimite
     file.writeAll(content) catch return error.WriteError;
     file.writeAll("\n") catch return error.WriteError;
 
-    // Build new command: prefix < /tmp/zish_heredoc_TS
-    const result = try allocator.alloc(u8, prefix.len + 2 + tmp_path.len);
-    @memcpy(result[0..prefix.len], prefix);
-    @memcpy(result[prefix.len..][0..2], "< ");
-    @memcpy(result[prefix.len + 2 ..][0..tmp_path.len], tmp_path);
+    // Build new command: prefix < /tmp/zish_heredoc_TS; suffix
+    const need_suffix = suffix.len > 0;
+    const total_len = prefix.len + 2 + tmp_path.len + if (need_suffix) 1 + suffix.len else 0;
+    const result = try allocator.alloc(u8, total_len);
+    var pos: usize = 0;
+    @memcpy(result[pos..][0..prefix.len], prefix);
+    pos += prefix.len;
+    @memcpy(result[pos..][0..2], "< ");
+    pos += 2;
+    @memcpy(result[pos..][0..tmp_path.len], tmp_path);
+    pos += tmp_path.len;
+    if (need_suffix) {
+        result[pos] = '\n';
+        pos += 1;
+        @memcpy(result[pos..][0..suffix.len], suffix);
+    }
 
     return result;
 }
