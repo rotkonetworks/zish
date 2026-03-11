@@ -4,8 +4,11 @@
 
 const std = @import("std");
 const q = @import("agent_queue.zig");
+const log_mod = @import("agent_log.zig");
 
 pub const AgentQueues = q.AgentQueues;
+pub const SessionLog = log_mod.SessionLog;
+pub const AgentConfig = log_mod.AgentConfig;
 
 // ============================================================
 // Configuration
@@ -19,29 +22,25 @@ pub const Config = struct {
     api_key: []const u8 = "",
     base_url: []const u8 = "https://api.anthropic.com",
     max_tokens: u32 = 8192,
+    max_tool_iterations: u32 = 10,
 
-    pub fn fromEnv(allocator: std.mem.Allocator) Config {
-        var cfg = Config{};
+    pub fn fromAgentConfig(ac: log_mod.AgentConfig) Config {
+        var cfg = Config{
+            .model = ac.model,
+            .api_key = ac.api_key,
+            .base_url = ac.base_url,
+            .max_tokens = ac.max_tokens,
+            .max_tool_iterations = ac.max_tool_iterations,
+        };
 
-        // provider
-        if (std.process.getEnvVarOwned(allocator, "ZISH_AGENT_PROVIDER") catch null) |p| {
-            defer allocator.free(p);
-            if (std.mem.eql(u8, p, "ollama")) cfg.provider = .ollama
-            else if (std.mem.eql(u8, p, "openai")) cfg.provider = .openai_compat;
+        // determine provider enum from string
+        if (std.mem.eql(u8, ac.provider, "ollama")) {
+            cfg.provider = .ollama;
+        } else if (std.mem.eql(u8, ac.provider, "openai")) {
+            cfg.provider = .openai_compat;
+        } else {
+            cfg.provider = .anthropic;
         }
-
-        // api key - try ZISH_AGENT_KEY then ANTHROPIC_API_KEY
-        const key = (std.process.getEnvVarOwned(allocator, "ZISH_AGENT_KEY") catch null)
-            orelse (std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY") catch null);
-        if (key) |k| cfg.api_key = k; // NOTE: leaked on purpose (static lifetime for thread)
-
-        // base url
-        const url = std.process.getEnvVarOwned(allocator, "ZISH_AGENT_URL") catch null;
-        if (url) |u| cfg.base_url = u;
-
-        // model
-        const model = std.process.getEnvVarOwned(allocator, "ZISH_AGENT_MODEL") catch null;
-        if (model) |m| cfg.model = m;
 
         // ollama defaults
         if (cfg.provider == .ollama) {
@@ -54,6 +53,18 @@ pub const Config = struct {
         }
 
         return cfg;
+    }
+
+    pub fn fromEnv(allocator: std.mem.Allocator) Config {
+        return Config.fromAgentConfig(log_mod.AgentConfig.load(allocator));
+    }
+
+    pub fn providerStr(self: *const Config) []const u8 {
+        return switch (self.provider) {
+            .anthropic => "anthropic",
+            .ollama => "ollama",
+            .openai_compat => "openai",
+        };
     }
 };
 
@@ -131,22 +142,48 @@ const TOOLS_JSON =
 // HTTP + SSE streaming
 // ============================================================
 
+fn getGitBranch(buf: []u8) ![]const u8 {
+    const result = std.process.Child.run(.{
+        .allocator = std.heap.page_allocator,
+        .argv = &[_][]const u8{ "git", "rev-parse", "--abbrev-ref", "HEAD" },
+        .max_output_bytes = 256,
+    }) catch return error.GitFailed;
+    defer std.heap.page_allocator.free(result.stdout);
+    defer std.heap.page_allocator.free(result.stderr);
+    const trimmed = std.mem.trimRight(u8, result.stdout, "\n\r ");
+    if (trimmed.len == 0) return error.GitFailed;
+    const n = @min(trimmed.len, buf.len);
+    @memcpy(buf[0..n], trimmed[0..n]);
+    return buf[0..n];
+}
+
 const AgentThread = struct {
     allocator: std.mem.Allocator,
     queues: *AgentQueues,
     config: Config,
     history: ConversationHistory,
+    session_log: ?SessionLog,
 
     fn init(allocator: std.mem.Allocator, queues: *AgentQueues, config: Config) AgentThread {
+        // get cwd and git branch for session metadata
+        var cwd_buf: [256]u8 = undefined;
+        const cwd = std.process.getCwd(&cwd_buf) catch "/";
+        var branch_buf: [64]u8 = undefined;
+        const git_branch = getGitBranch(&branch_buf) catch "unknown";
+
+        const session = SessionLog.create(allocator, cwd, git_branch, config.providerStr(), config.model) catch null;
+
         return .{
             .allocator = allocator,
             .queues = queues,
             .config = config,
             .history = ConversationHistory.init(allocator),
+            .session_log = session,
         };
     }
 
     fn deinit(self: *AgentThread) void {
+        if (self.session_log) |*sl| sl.close();
         self.history.deinit();
     }
 
@@ -170,6 +207,7 @@ const AgentThread = struct {
                 var errbuf: [256]u8 = undefined;
                 const msg = std.fmt.bufPrint(&errbuf, "agent error: {}", .{err}) catch "agent error";
                 _ = self.queues.output.push(.error_msg, msg);
+                if (self.session_log) |*sl| sl.logError(msg) catch {};
             };
 
             self.queues.setBusy(false);
@@ -180,10 +218,12 @@ const AgentThread = struct {
     fn processQuery(self: *AgentThread, query: []const u8) !void {
         // add user message to history
         try self.history.add(.user, query);
+        if (self.session_log) |*sl| sl.logUser(query) catch {};
 
         // tool loop: keep calling API until no more tool_use
         var iteration: usize = 0;
-        while (iteration < 10) : (iteration += 1) {
+        const max_iter = self.config.max_tool_iterations;
+        while (iteration < max_iter) : (iteration += 1) {
             if (self.queues.checkCancel()) return;
 
             const response = try self.callAPI();
@@ -192,14 +232,19 @@ const AgentThread = struct {
             // add assistant response to history
             if (response.text.len > 0) {
                 try self.history.add(.assistant, response.text);
+                if (self.session_log) |*sl| sl.logAssistant(response.text) catch {};
             }
 
             if (!response.has_tool_call) break; // done
 
-            // execute tool
+            // log + execute tool
             if (self.queues.checkCancel()) return;
+            if (self.session_log) |*sl| sl.logToolCall("Bash", response.tool_command) catch {};
+
             const tool_output = try self.executeBash(response.tool_command);
             defer self.allocator.free(tool_output);
+
+            if (self.session_log) |*sl| sl.logToolResult("Bash", tool_output, 0) catch {};
 
             // add tool result to history as user message
             const result_buf = try self.allocator.alloc(u8, tool_output.len + 64);
@@ -208,6 +253,8 @@ const AgentThread = struct {
                 "[tool result]\n{s}", .{tool_output}) catch tool_output;
             try self.history.add(.user, result_msg);
         }
+
+        if (self.session_log) |*sl| sl.logDone() catch {};
     }
 
     const APIResponse = struct {

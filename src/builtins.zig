@@ -2295,17 +2295,38 @@ fn setOptind(shell: *Shell, optind: usize) !void {
 
 // ============ agent builtin ============
 
+const agent_mod = @import("agent.zig");
+const agent_log = @import("agent_log.zig");
+
 fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
     const out = shell.stdout();
 
+    if (args.len < 2) {
+        try out.writeAll(
+            \\Usage: agent <query>        - ask the agent something
+            \\       agent stop           - cancel current work (also Ctrl+G)
+            \\       agent status         - show idle/busy state
+            \\       agent sessions       - list saved sessions
+            \\       agent config         - show current configuration
+            \\       agent clear          - clear conversation history
+            \\
+        );
+        try out.flush();
+        return 0;
+    }
+
+    const subcmd = args[1];
+
     // agent stop
-    if (args.len >= 2 and std.mem.eql(u8, args[1], "stop")) {
+    if (std.mem.eql(u8, subcmd, "stop")) {
         shell.agent.cancel();
+        try out.writeAll("agent: cancelled\n");
+        try out.flush();
         return 0;
     }
 
     // agent status
-    if (args.len >= 2 and std.mem.eql(u8, args[1], "status")) {
+    if (std.mem.eql(u8, subcmd, "status")) {
         if (shell.agent.isBusy()) {
             try out.writeAll("agent: busy\n");
         } else {
@@ -2315,36 +2336,72 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
         return 0;
     }
 
-    // agent "query..." - send query to agent
-    if (args.len >= 2) {
-        // join all args after "agent" as the query
-        var query_buf: [4096]u8 = undefined;
-        var pos: usize = 0;
-        for (args[1..], 0..) |arg, i| {
-            if (i > 0 and pos < query_buf.len - 1) {
-                query_buf[pos] = ' ';
-                pos += 1;
+    // agent sessions
+    if (std.mem.eql(u8, subcmd, "sessions")) {
+        var sessions: std.ArrayList(agent_log.SessionInfo) = .{};
+        defer sessions.deinit(shell.allocator);
+        agent_log.listSessions(shell.allocator, &sessions) catch {};
+
+        if (sessions.items.len == 0) {
+            try out.writeAll("No saved sessions.\n");
+        } else {
+            try out.writeAll("ID             Created     Status  CWD\n");
+            // show last 20 sessions
+            const start = if (sessions.items.len > 20) sessions.items.len - 20 else 0;
+            for (sessions.items[start..]) |info| {
+                try out.print("{s}  {d:<10}  {s:<6}  {s}\n", .{
+                    info.id, info.created, info.status, info.cwd,
+                });
             }
-            const space = @min(arg.len, query_buf.len - pos);
-            @memcpy(query_buf[pos..][0..space], arg[0..space]);
-            pos += space;
-            if (pos >= query_buf.len) break;
         }
-        if (!shell.agent.query(query_buf[0..pos])) {
-            try out.writeAll("agent: busy, use 'agent stop' or Ctrl+G to cancel\n");
-            try out.flush();
-            return 1;
-        }
+        try out.flush();
         return 0;
     }
 
-    // no args: print help
-    try out.writeAll(
-        \\Usage: agent <query>
-        \\       agent stop    - cancel current work (also Ctrl+G)
-        \\       agent status  - show idle/busy state
-        \\
-    );
-    try out.flush();
+    // agent config
+    if (std.mem.eql(u8, subcmd, "config")) {
+        const cfg = agent_log.AgentConfig.load(shell.allocator);
+        try out.print("provider:   {s}\n", .{cfg.provider});
+        try out.print("model:      {s}\n", .{cfg.model});
+        try out.print("base_url:   {s}\n", .{cfg.base_url});
+        try out.print("api_key:    {s}\n", .{if (cfg.api_key.len > 0) "***set***" else "(not set)"});
+        if (cfg.api_key_cmd.len > 0) {
+            try out.print("api_key_cmd: {s}\n", .{cfg.api_key_cmd});
+        }
+        try out.print("max_tokens: {d}\n", .{cfg.max_tokens});
+        try out.print("max_iters:  {d}\n", .{cfg.max_tool_iterations});
+        try out.flush();
+        return 0;
+    }
+
+    // agent clear
+    if (std.mem.eql(u8, subcmd, "clear")) {
+        // stop and restart agent to clear conversation
+        shell.agent.stop();
+        shell.agent.start() catch {};
+        try out.writeAll("agent: conversation cleared\n");
+        try out.flush();
+        return 0;
+    }
+
+    // agent "query..." - send query to agent
+    // join all args after "agent" as the query
+    var query_buf: [4096]u8 = undefined;
+    var pos: usize = 0;
+    for (args[1..], 0..) |arg, i| {
+        if (i > 0 and pos < query_buf.len - 1) {
+            query_buf[pos] = ' ';
+            pos += 1;
+        }
+        const space = @min(arg.len, query_buf.len - pos);
+        @memcpy(query_buf[pos..][0..space], arg[0..space]);
+        pos += space;
+        if (pos >= query_buf.len) break;
+    }
+    if (!shell.agent.query(query_buf[0..pos])) {
+        try out.writeAll("agent: busy, use 'agent stop' or Ctrl+G to cancel\n");
+        try out.flush();
+        return 1;
+    }
     return 0;
 }
