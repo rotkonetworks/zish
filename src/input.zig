@@ -8,6 +8,7 @@ pub fn ctrlKey(comptime char_code: u8) u8 {
 
 // Control key constants
 pub const CTRL_C = ctrlKey('c');
+pub const CTRL_G = ctrlKey('g');
 pub const CTRL_L = ctrlKey('l');
 pub const CTRL_D = ctrlKey('d');
 pub const CTRL_R = ctrlKey('r');
@@ -118,6 +119,7 @@ pub const Action = union(enum) {
     enter_paste_mode,
     exit_paste_mode,
     suspend_shell,
+    cancel_agent, // Ctrl+G: cancel agent work
 };
 
 const CTRL_W = 23;
@@ -130,6 +132,7 @@ pub fn insertModeAction(char: u8) Action {
         CTRL_L => .clear_screen,
         CTRL_D => .exit_shell,
         CTRL_R => .{ .enter_search_mode = .backward }, // reverse history search
+        CTRL_G => .cancel_agent,
         CTRL_Z => .suspend_shell,
         CTRL_W => .delete_word_backward,
         '\t' => .tap_complete,
@@ -182,6 +185,7 @@ pub fn normalModeAction(char: u8) Action {
         '\n' => .execute_command,
 
         CTRL_C => .cancel,
+        CTRL_G => .cancel_agent,
         CTRL_Z => .suspend_shell,
 
         else => .none,

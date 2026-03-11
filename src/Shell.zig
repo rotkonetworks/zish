@@ -15,6 +15,7 @@ const git = @import("git.zig");
 const jobs = @import("jobs.zig");
 const editor = @import("editor.zig");
 const vim = @import("vim.zig");
+const agent_mod = @import("agent.zig");
 
 // Re-export from input module (for compatibility)
 const VimMode = input_mod.VimMode;
@@ -32,6 +33,7 @@ const CycleDirection = input_mod.CycleDirection;
 
 // Control key constants
 const CTRL_C = input_mod.CTRL_C;
+const CTRL_G = input_mod.CTRL_G;
 const CTRL_L = input_mod.CTRL_L;
 const CTRL_D = input_mod.CTRL_D;
 const CTRL_Z = input_mod.CTRL_Z;
@@ -227,6 +229,9 @@ log_file: ?std.fs.File = null,
 // PATH lookup cache - maps command name -> full path
 path_cache: std.StringHashMap([]const u8),
 
+// embedded LLM agent
+agent: agent_mod.AgentContext,
+
 pub fn init(allocator: std.mem.Allocator) !*Shell {
     return initWithOptions(allocator, true);
 }
@@ -282,6 +287,7 @@ fn initWithOptions(allocator: std.mem.Allocator, load_config: bool) !*Shell {
         .stdout_writer = .init(.stdout(), writer_buffer),
         .path_cache = std.StringHashMap([]const u8).init(allocator),
         .job_table = jobs.JobTable.init(allocator),
+        .agent = agent_mod.AgentContext.init(allocator),
     };
 
     // don't enable raw mode here - will be enabled by run() for interactive mode
@@ -568,6 +574,9 @@ pub fn run(self: *Shell) !void {
     const initial_cursor = if (self.vim_mode == .normal) CursorStyle.block else CursorStyle.bar;
     try self.setCursorStyle(initial_cursor);
 
+    // start agent background thread (optional - silently skip if thread fails)
+    self.agent.start() catch {};
+
     try self.renderLine();
 
     var last_action: Action = .none;
@@ -579,11 +588,17 @@ pub fn run(self: *Shell) !void {
             try self.handleResize();
         }
 
+        // drain any pending agent output
+        _ = try self.agent.drainOutput(self.stdout());
+
         try self.log(last_action);
         last_action = try self.readNextAction();
         try self.handleAction(last_action);
         try self.stdout().flush();
     }
+
+    // stop agent thread on shell exit
+    self.agent.stop();
 }
 
 pub inline fn stdout(self: *Shell) *std.Io.Writer {
@@ -788,6 +803,14 @@ fn handleAction(self: *Shell, action: Action) !void {
                 try self.stdout().writeAll("\r\n(press ctrl+d again to exit)\r\n");
                 try self.stdout().flush();
                 try self.renderLine();
+            }
+        },
+
+        .cancel_agent => {
+            if (self.agent.isBusy()) {
+                self.agent.cancel();
+                try self.stdout().writeAll("^G\n");
+                try self.stdout().flush();
             }
         },
 
@@ -1510,6 +1533,7 @@ fn insertModeAction(char: u8) Action {
     return switch (char) {
         '\n' => .execute_command,
         CTRL_C => .cancel,
+        CTRL_G => .cancel_agent,
         CTRL_L => .clear_screen,
         CTRL_D => .exit_shell,
         CTRL_Z => .suspend_shell,
@@ -1566,6 +1590,7 @@ fn normalModeAction(char: u8) Action {
         '\n' => .execute_command,
 
         CTRL_C => .cancel,
+        CTRL_G => .cancel_agent,
         CTRL_Z => .suspend_shell,
 
         else => .none,

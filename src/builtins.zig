@@ -46,6 +46,8 @@ pub fn isBuiltin(name: []const u8) bool {
         "time",
         // zish specific (handled in eval.zig)
         "chpw",
+        // agent
+        "agent",
     };
     for (implemented_builtins) |b| {
         if (std.mem.eql(u8, name, b)) return true;
@@ -123,6 +125,9 @@ pub fn dispatch(shell: *Shell, cmd_name: []const u8, args: []const []const u8) !
 
     // zish specific
     if (std.mem.eql(u8, cmd_name, "chpw")) return null; // handled in eval.zig for now (complex)
+
+    // agent
+    if (std.mem.eql(u8, cmd_name, "agent")) return try agentCmd(shell, args);
 
     return null; // not a builtin
 }
@@ -2286,4 +2291,60 @@ fn setOptind(shell: *Shell, optind: usize) !void {
     var buf: [16]u8 = undefined;
     const str = std.fmt.bufPrint(&buf, "{d}", .{optind}) catch "1";
     try setVar(shell, "OPTIND", str);
+}
+
+// ============ agent builtin ============
+
+fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
+    const out = shell.stdout();
+
+    // agent stop
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "stop")) {
+        shell.agent.cancel();
+        return 0;
+    }
+
+    // agent status
+    if (args.len >= 2 and std.mem.eql(u8, args[1], "status")) {
+        if (shell.agent.isBusy()) {
+            try out.writeAll("agent: busy\n");
+        } else {
+            try out.writeAll("agent: idle\n");
+        }
+        try out.flush();
+        return 0;
+    }
+
+    // agent "query..." - send query to agent
+    if (args.len >= 2) {
+        // join all args after "agent" as the query
+        var query_buf: [4096]u8 = undefined;
+        var pos: usize = 0;
+        for (args[1..], 0..) |arg, i| {
+            if (i > 0 and pos < query_buf.len - 1) {
+                query_buf[pos] = ' ';
+                pos += 1;
+            }
+            const space = @min(arg.len, query_buf.len - pos);
+            @memcpy(query_buf[pos..][0..space], arg[0..space]);
+            pos += space;
+            if (pos >= query_buf.len) break;
+        }
+        if (!shell.agent.query(query_buf[0..pos])) {
+            try out.writeAll("agent: busy, use 'agent stop' or Ctrl+G to cancel\n");
+            try out.flush();
+            return 1;
+        }
+        return 0;
+    }
+
+    // no args: print help
+    try out.writeAll(
+        \\Usage: agent <query>
+        \\       agent stop    - cancel current work (also Ctrl+G)
+        \\       agent status  - show idle/busy state
+        \\
+    );
+    try out.flush();
+    return 0;
 }
