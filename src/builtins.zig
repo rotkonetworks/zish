@@ -2403,5 +2403,45 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
         try out.flush();
         return 1;
     }
+
+    // in non-interactive mode (-c), wait for agent to finish and drain output
+    if (!std.posix.isatty(std.posix.STDIN_FILENO)) {
+        const agent_queue = @import("agent_queue.zig");
+        var msg: agent_queue.Msg = undefined;
+        var done = false;
+        // wait up to 60 seconds
+        var ticks: usize = 0;
+        while (!done and ticks < 1200) : (ticks += 1) {
+            while (shell.agent.queues.output.pop(&msg)) {
+                switch (msg.kind) {
+                    .text_delta => try out.writeAll(msg.slice()),
+                    .tool_call => {
+                        try out.writeAll("\x1b[90m");
+                        try out.writeAll(msg.slice());
+                        try out.writeAll("\x1b[0m\n");
+                    },
+                    .tool_done => {
+                        try out.writeAll("\x1b[90m");
+                        try out.writeAll(msg.slice());
+                        try out.writeAll("\x1b[0m\n");
+                    },
+                    .error_msg => {
+                        try out.writeAll("\x1b[31m");
+                        try out.writeAll("agent: ");
+                        try out.writeAll(msg.slice());
+                        try out.writeAll("\x1b[0m\n");
+                    },
+                    .done => {
+                        done = true;
+                    },
+                    .cancel => {
+                        done = true;
+                    },
+                }
+            }
+            try out.flush();
+            if (!done) std.Thread.sleep(50 * std.time.ns_per_ms);
+        }
+    }
     return 0;
 }

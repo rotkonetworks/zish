@@ -18,7 +18,7 @@ pub const Provider = enum { anthropic, ollama, openai_compat };
 
 pub const Config = struct {
     provider: Provider = .anthropic,
-    model: []const u8 = "claude-opus-4-6-20251101",
+    model: []const u8 = "claude-opus-4-6",
     api_key: []const u8 = "",
     base_url: []const u8 = "https://api.anthropic.com",
     max_tokens: u32 = 8192,
@@ -47,7 +47,7 @@ pub const Config = struct {
             if (cfg.base_url.len == 0 or std.mem.eql(u8, cfg.base_url, "https://api.anthropic.com")) {
                 cfg.base_url = "http://localhost:11434";
             }
-            if (std.mem.eql(u8, cfg.model, "claude-opus-4-6-20251101")) {
+            if (std.mem.eql(u8, cfg.model, "claude-opus-4-6")) {
                 cfg.model = "llama3.2";
             }
         }
@@ -76,11 +76,14 @@ const MAX_HISTORY = 20;
 const MAX_CONTENT_LEN = 65536;
 
 const Role = enum { user, assistant };
+const MsgKindH = enum { text, tool_use_response, tool_result };
 
 const Message = struct {
     role: Role,
-    content: []u8,
+    kind: MsgKindH,
+    content: []u8, // for text: raw text; for tool_use_response: pre-built JSON content array; for tool_result: pre-built JSON content array
     content_len: usize,
+    alloc_len: usize, // actual allocation size for freeing
 };
 
 const ConversationHistory = struct {
@@ -94,29 +97,39 @@ const ConversationHistory = struct {
 
     fn deinit(self: *ConversationHistory) void {
         for (0..self.count) |i| {
-            self.allocator.free(self.messages[i].content[0..MAX_CONTENT_LEN]);
+            self.allocator.free(self.messages[i].content[0..self.messages[i].alloc_len]);
         }
     }
 
     fn add(self: *ConversationHistory, role: Role, content: []const u8) !void {
+        return self.addKind(role, .text, content);
+    }
+
+    fn addKind(self: *ConversationHistory, role: Role, kind: MsgKindH, content: []const u8) !void {
         if (self.count >= MAX_HISTORY) {
             // drop oldest two (user+assistant pair)
             const n = 2;
-            self.allocator.free(self.messages[0].content[0..MAX_CONTENT_LEN]);
-            self.allocator.free(self.messages[1].content[0..MAX_CONTENT_LEN]);
+            self.allocator.free(self.messages[0].content[0..self.messages[0].alloc_len]);
+            self.allocator.free(self.messages[1].content[0..self.messages[1].alloc_len]);
             std.mem.copyForwards(Message, self.messages[0..self.count - n], self.messages[n..self.count]);
             self.count -= n;
         }
-        const buf = try self.allocator.alloc(u8, MAX_CONTENT_LEN);
-        const n = @min(content.len, MAX_CONTENT_LEN);
-        @memcpy(buf[0..n], content[0..n]);
-        self.messages[self.count] = .{ .role = role, .content = buf, .content_len = n };
+        const alloc_size = @max(content.len, 1);
+        const buf = try self.allocator.alloc(u8, alloc_size);
+        @memcpy(buf[0..content.len], content);
+        self.messages[self.count] = .{
+            .role = role,
+            .kind = kind,
+            .content = buf,
+            .content_len = content.len,
+            .alloc_len = alloc_size,
+        };
         self.count += 1;
     }
 
     fn clear(self: *ConversationHistory) void {
         for (0..self.count) |i| {
-            self.allocator.free(self.messages[i].content[0..MAX_CONTENT_LEN]);
+            self.allocator.free(self.messages[i].content[0..self.messages[i].alloc_len]);
         }
         self.count = 0;
     }
@@ -294,23 +307,48 @@ const AgentThread = struct {
             if (self.queues.checkCancel()) return;
 
             const response = try self.callAPI();
-            defer self.allocator.free(response.text);
+            defer self.allocator.free(response.text_alloc);
 
-            // add assistant response to history
-            if (response.text.len > 0) {
-                try self.history.add(.assistant, response.text);
-                if (self.session_log) |*sl| sl.logAssistant(response.text) catch {};
+            if (!response.has_tool_call) {
+                // plain text response — add to history and done
+                if (response.text.len > 0) {
+                    try self.history.add(.assistant, response.text);
+                    if (self.session_log) |*sl| sl.logAssistant(response.text) catch {};
+                }
+                break;
             }
 
-            if (!response.has_tool_call) break; // done
-
-            // dispatch tool by name
-            if (self.queues.checkCancel()) return;
+            // tool use response — build proper assistant content with tool_use block
             const tool_name = response.tool_name;
-            const tool_input = response.tool_command; // raw JSON input
+            const tool_input = response.tool_command;
+            const tool_id = response.tool_use_id;
+
+            // Build assistant message with content blocks: [text (if any), tool_use]
+            var assist_buf: [MAX_CONTENT_LEN]u8 = undefined;
+            var assist_fbs = std.io.fixedBufferStream(&assist_buf);
+            const aw = assist_fbs.writer();
+            aw.writeByte('[') catch {};
+            if (response.text.len > 0) {
+                aw.writeAll("{\"type\":\"text\",\"text\":") catch {};
+                writeJSONString(aw, response.text) catch {};
+                aw.writeAll("},") catch {};
+                if (self.session_log) |*sl| sl.logAssistant(response.text) catch {};
+            }
+            aw.print("{{\"type\":\"tool_use\",\"id\":\"{s}\",\"name\":\"{s}\",\"input\":{s}}}", .{
+                tool_id, tool_name, tool_input,
+            }) catch {};
+            aw.writeByte(']') catch {};
+            try self.history.addKind(.assistant, .tool_use_response, assist_buf[0..assist_fbs.pos]);
+
+            // Notify user about tool call
+            var notify_buf: [256]u8 = undefined;
+            const notify = std.fmt.bufPrint(&notify_buf, "Tool: {s}", .{tool_name}) catch "Tool call";
+            _ = self.queues.output.push(.tool_call, notify);
 
             if (self.session_log) |*sl| sl.logToolCall(tool_name, tool_input) catch {};
 
+            // dispatch tool
+            if (self.queues.checkCancel()) return;
             const tool_output = self.dispatchTool(tool_name, tool_input) catch |err| blk: {
                 var errbuf: [256]u8 = undefined;
                 const msg = std.fmt.bufPrint(&errbuf, "tool error: {}", .{err}) catch "tool error";
@@ -320,12 +358,15 @@ const AgentThread = struct {
 
             if (self.session_log) |*sl| sl.logToolResult(tool_name, tool_output, 0) catch {};
 
-            // add tool result to history as user message
-            const result_buf = try self.allocator.alloc(u8, tool_output.len + 64);
-            defer self.allocator.free(result_buf);
-            const result_msg = std.fmt.bufPrint(result_buf,
-                "[tool result]\n{s}", .{tool_output}) catch tool_output;
-            try self.history.add(.user, result_msg);
+            // Build tool_result user message
+            var result_json_buf = try self.allocator.alloc(u8, tool_output.len + 256);
+            defer self.allocator.free(result_json_buf);
+            var result_fbs = std.io.fixedBufferStream(result_json_buf);
+            const rw = result_fbs.writer();
+            rw.print("[{{\"type\":\"tool_result\",\"tool_use_id\":\"{s}\",\"content\":", .{tool_id}) catch {};
+            writeJSONString(rw, tool_output) catch {};
+            rw.writeAll("}]") catch {};
+            try self.history.addKind(.user, .tool_result, result_json_buf[0..result_fbs.pos]);
         }
 
         if (self.session_log) |*sl| sl.logDone() catch {};
@@ -365,10 +406,12 @@ const AgentThread = struct {
     }
 
     const APIResponse = struct {
-        text: []u8,           // owned by caller
+        text: []u8,           // sub-slice of text_alloc (the actual content)
+        text_alloc: []u8,     // full allocation — caller must free this
         has_tool_call: bool,
-        tool_command: []const u8, // slice into text or static
+        tool_command: []const u8, // raw JSON input for the tool
         tool_name: []const u8,
+        tool_use_id: []const u8, // Anthropic tool_use block id
     };
 
     fn callAPI(self: *AgentThread) !APIResponse {
@@ -387,29 +430,41 @@ const AgentThread = struct {
             const msg = &self.history.messages[i];
             const role_str = if (msg.role == .user) "user" else "assistant";
             const content = msg.content[0..msg.content_len];
-            try w.print("{{\"role\":\"{s}\",\"content\":", .{role_str});
-            try writeJSONString(w, content);
-            try w.writeByte('}');
+            switch (msg.kind) {
+                .text => {
+                    try w.print("{{\"role\":\"{s}\",\"content\":", .{role_str});
+                    try writeJSONString(w, content);
+                    try w.writeByte('}');
+                },
+                .tool_use_response, .tool_result => {
+                    // content is pre-built JSON content array
+                    try w.print("{{\"role\":\"{s}\",\"content\":{s}}}", .{ role_str, content });
+                },
+            }
         }
         try w.writeByte(']');
         return buf[0..fbs.pos];
     }
 
     fn callAnthropic(self: *AgentThread) !APIResponse {
-        // Build request body
+        // Build request body with proper JSON escaping
         var body_buf: [MAX_CONTENT_LEN * 4]u8 = undefined;
         var msg_buf: [MAX_CONTENT_LEN * 3]u8 = undefined;
         const messages_json = try self.buildMessagesJSON(&msg_buf);
 
-        const body = std.fmt.bufPrint(&body_buf,
-            \\{{"model":"{s}","max_tokens":{d},"stream":true,"system":"{s}","messages":{s},"tools":{s}}}
-            , .{
-                self.config.model,
-                self.config.max_tokens,
-                self.systemPrompt(),
-                messages_json,
-                TOOLS_JSON,
-            }) catch return error.BodyTooLarge;
+        var fbs = std.io.fixedBufferStream(&body_buf);
+        const w = fbs.writer();
+        w.print("{{\"model\":\"{s}\",\"max_tokens\":{d},\"stream\":true,\"system\":", .{
+            self.config.model,
+            self.config.max_tokens,
+        }) catch return error.BodyTooLarge;
+        writeJSONString(w, self.systemPrompt()) catch return error.BodyTooLarge;
+        w.print(",\"messages\":{s},\"tools\":{s}}}", .{
+            messages_json,
+            TOOLS_JSON,
+        }) catch return error.BodyTooLarge;
+
+        const body = body_buf[0..fbs.pos];
 
         // Build URL
         var url_buf: [256]u8 = undefined;
@@ -444,75 +499,111 @@ const AgentThread = struct {
         var tool_cmd_len: usize = 0;
         var tool_name_buf: [64]u8 = undefined;
         var tool_name_len: usize = 0;
+        var tool_id_buf: [64]u8 = undefined;
+        var tool_id_len: usize = 0;
         var has_tool_call = false;
 
-        // HTTP client
-        var client = std.http.Client{ .allocator = self.allocator };
-        defer client.deinit();
+        // Build curl command with headers
+        var argv_buf: [30][]const u8 = undefined;
+        var argc: usize = 0;
 
-        const uri = std.Uri.parse(url) catch return error.InvalidURL;
+        argv_buf[argc] = "curl";
+        argc += 1;
+        argv_buf[argc] = "-sS"; // silent but show errors
+        argc += 1;
+        argv_buf[argc] = "-N"; // no-buffer (for streaming)
+        argc += 1;
+        argv_buf[argc] = "--max-time";
+        argc += 1;
+        argv_buf[argc] = "120";
+        argc += 1;
+        argv_buf[argc] = "-X";
+        argc += 1;
+        argv_buf[argc] = "POST";
+        argc += 1;
+        argv_buf[argc] = "-H";
+        argc += 1;
+        argv_buf[argc] = "Content-Type: application/json";
+        argc += 1;
 
-        // Build extra headers for auth
-        var extra_headers: [3]std.http.Header = undefined;
-        var header_count: usize = 0;
-        var auth_buf: [512]u8 = undefined; // lives until request headers are sent
+        // Provider-specific headers
+        var header_bufs: [7][512]u8 = undefined;
+        var hdr_idx: usize = 0;
 
         switch (provider) {
             .anthropic => {
-                extra_headers[header_count] = .{ .name = "x-api-key", .value = self.config.api_key };
-                header_count += 1;
-                extra_headers[header_count] = .{ .name = "anthropic-version", .value = "2023-06-01" };
-                header_count += 1;
-                extra_headers[header_count] = .{ .name = "anthropic-beta", .value = "tools-2024-04-04" };
-                header_count += 1;
+                // API key
+                const h0 = std.fmt.bufPrint(&header_bufs[hdr_idx], "x-api-key: {s}", .{self.config.api_key}) catch "";
+                argv_buf[argc] = "-H";
+                argc += 1;
+                argv_buf[argc] = h0;
+                argc += 1;
+                hdr_idx += 1;
+
+                argv_buf[argc] = "-H";
+                argc += 1;
+                argv_buf[argc] = "anthropic-version: 2023-06-01";
+                argc += 1;
+
+                // Claude Code identification headers
+                argv_buf[argc] = "-H";
+                argc += 1;
+                argv_buf[argc] = "User-Agent: Anthropic/JS 0.74.0";
+                argc += 1;
+                argv_buf[argc] = "-H";
+                argc += 1;
+                argv_buf[argc] = "x-service-name: claude-code";
+                argc += 1;
             },
             .ollama, .openai_compat => {
                 if (self.config.api_key.len > 0) {
-                    const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{self.config.api_key}) catch self.config.api_key;
-                    extra_headers[header_count] = .{ .name = "Authorization", .value = auth };
-                    header_count += 1;
+                    const h0 = std.fmt.bufPrint(&header_bufs[hdr_idx], "Authorization: Bearer {s}", .{self.config.api_key}) catch "";
+                    argv_buf[argc] = "-H";
+                    argc += 1;
+                    argv_buf[argc] = h0;
+                    argc += 1;
+                    hdr_idx += 1;
                 }
             },
         }
 
-        var req = try client.request(.POST, uri, .{
-            .headers = .{ .content_type = .{ .override = "application/json" } },
-            .extra_headers = extra_headers[0..header_count],
-            .redirect_behavior = .unhandled,
-        });
-        defer req.deinit();
+        // URL and body via stdin
+        argv_buf[argc] = "-d";
+        argc += 1;
+        argv_buf[argc] = "@-"; // read body from stdin
+        argc += 1;
+        argv_buf[argc] = url;
+        argc += 1;
 
-        // Send body
-        req.transfer_encoding = .{ .content_length = body.len };
-        var bw = try req.sendBodyUnflushed(&.{});
-        try bw.writer.writeAll(body);
-        try bw.end();
-        try req.connection.?.flush();
+        // Spawn curl process
+        var child = std.process.Child.init(argv_buf[0..argc], self.allocator);
+        child.stdin_behavior = .Pipe;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Pipe;
+        child.spawn() catch return error.CurlFailed;
+        errdefer _ = child.wait() catch {};
 
-        // Receive response head
-        var response = try req.receiveHead(&.{});
-
-        if (response.head.status != .ok) {
-            _ = self.queues.output.push(.error_msg, "HTTP error from API");
-            self.allocator.free(text_buf);
-            return error.HTTPError;
+        // Write body to curl stdin
+        if (child.stdin) |*stdin_pipe| {
+            stdin_pipe.writeAll(body) catch {};
+            stdin_pipe.close();
+            child.stdin = null;
         }
 
-        // Stream SSE response via body reader
-        var transfer_buf: [64]u8 = undefined;
-        const body_reader = response.reader(&transfer_buf);
-        var sse_buf: [8192]u8 = undefined;
+        // Read streaming SSE output from curl stdout
+        const stdout_file = child.stdout.?;
+        var sse_buf: [16384]u8 = undefined;
         var sse_pos: usize = 0;
 
         outer: while (true) {
             if (self.queues.checkCancel()) {
+                _ = child.kill() catch {};
+                _ = child.wait() catch {};
                 self.allocator.free(text_buf);
                 return error.Cancelled;
             }
 
-            // Read more data
-            var bufs: [1][]u8 = .{sse_buf[sse_pos..]};
-            const n = body_reader.readVec(&bufs) catch break;
+            const n = stdout_file.read(sse_buf[sse_pos..]) catch break;
             if (n == 0) break;
             sse_pos += n;
 
@@ -533,6 +624,7 @@ const AgentThread = struct {
                         parseAnthropicDelta(data, &text_buf, &text_len,
                             &tool_cmd_buf, &tool_cmd_len,
                             &tool_name_buf, &tool_name_len,
+                            &tool_id_buf, &tool_id_len,
                             &has_tool_call, self.queues);
                     },
                     .ollama, .openai_compat => {
@@ -550,11 +642,37 @@ const AgentThread = struct {
             }
         }
 
+        // Check for curl errors
+        if (child.stderr) |*stderr_pipe| {
+            var err_out: [1024]u8 = undefined;
+            const err_n = stderr_pipe.read(&err_out) catch 0;
+            if (err_n > 0) {
+                _ = self.queues.output.push(.error_msg, err_out[0..err_n]);
+            }
+        }
+
+        _ = child.wait() catch {};
+
+        // If no text was received but no tool call, check if response was an error
+        if (text_len == 0 and !has_tool_call) {
+            // The response might have been a non-streaming error JSON
+            if (sse_pos > 0) {
+                const remaining = sse_buf[0..sse_pos];
+                if (std.mem.indexOf(u8, remaining, "\"error\"")) |_| {
+                    _ = self.queues.output.push(.error_msg, remaining);
+                    self.allocator.free(text_buf);
+                    return error.HTTPError;
+                }
+            }
+        }
+
         return APIResponse{
             .text = text_buf[0..text_len],
+            .text_alloc = text_buf,
             .has_tool_call = has_tool_call,
             .tool_command = tool_cmd_buf[0..tool_cmd_len],
             .tool_name = tool_name_buf[0..tool_name_len],
+            .tool_use_id = tool_id_buf[0..tool_id_len],
         };
     }
 
@@ -733,6 +851,8 @@ fn parseAnthropicDelta(
     tool_cmd_len: *usize,
     tool_name_buf: *[64]u8,
     tool_name_len: *usize,
+    tool_id_buf: *[64]u8,
+    tool_id_len: *usize,
     has_tool_call: *bool,
     queues: *AgentQueues,
 ) void {
@@ -740,9 +860,6 @@ fn parseAnthropicDelta(
     const type_val = jsonGetStr(data, "type") orelse return;
 
     if (std.mem.eql(u8, type_val, "content_block_start")) {
-        // Check if it's a tool_use block
-        const block_type = jsonGetStr(data, "type") orelse "";
-        _ = block_type;
         if (std.mem.indexOf(u8, data, "\"tool_use\"") != null) {
             has_tool_call.* = true;
             // extract tool name
@@ -750,6 +867,12 @@ fn parseAnthropicDelta(
                 const n = @min(name.len, 64);
                 @memcpy(tool_name_buf[0..n], name[0..n]);
                 tool_name_len.* = n;
+            }
+            // extract tool_use id
+            if (jsonGetStr(data, "id")) |id| {
+                const n = @min(id.len, 64);
+                @memcpy(tool_id_buf[0..n], id[0..n]);
+                tool_id_len.* = n;
             }
         }
         return;
@@ -769,8 +892,11 @@ fn parseAnthropicDelta(
         // input_json_delta (tool arguments)
         if (std.mem.indexOf(u8, data, "\"input_json_delta\"") != null) {
             if (jsonGetStr(data, "partial_json")) |chunk| {
-                const n = @min(chunk.len, 4096 - tool_cmd_len.*);
-                @memcpy(tool_cmd_buf[tool_cmd_len.*..][0..n], chunk[0..n]);
+                // partial_json is a JSON string value — unescape it to get raw JSON fragment
+                var unescape_buf: [4096]u8 = undefined;
+                const unescaped = unescapeJSON(chunk, &unescape_buf) orelse chunk;
+                const n = @min(unescaped.len, 4096 - tool_cmd_len.*);
+                @memcpy(tool_cmd_buf[tool_cmd_len.*..][0..n], unescaped[0..n]);
                 tool_cmd_len.* += n;
             }
         }
@@ -879,6 +1005,8 @@ pub const AgentContext = struct {
 
     /// Send a query to the agent. Returns false if agent is busy.
     pub fn query(self: *AgentContext, text: []const u8) bool {
+        // auto-start agent thread if not running (e.g. in -c mode)
+        if (self.thread == null) self.start() catch return false;
         if (self.queues.isBusy()) return false;
         return self.queues.request.push(.text_delta, text);
     }

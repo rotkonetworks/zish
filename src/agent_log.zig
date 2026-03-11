@@ -419,7 +419,7 @@ pub const AgentConfig = struct {
     pub fn load(allocator: std.mem.Allocator) AgentConfig {
         var cfg = AgentConfig{
             .provider = "anthropic",
-            .model = "claude-opus-4-6-20251101",
+            .model = "claude-opus-4-6",
             .base_url = "https://api.anthropic.com",
             .api_key = "",
             .api_key_cmd = "",
@@ -437,6 +437,11 @@ pub const AgentConfig = struct {
         // if api_key still empty and api_key_cmd is set, run it
         if (cfg.api_key.len == 0 and cfg.api_key_cmd.len > 0) {
             cfg.resolveApiKeyCmd(allocator);
+        }
+
+        // if still no key, try Claude Code OAuth credentials (~/.claude/.credentials.json)
+        if (cfg.api_key.len == 0 and std.mem.eql(u8, cfg.provider, "anthropic")) {
+            cfg.loadClaudeCodeCredentials(allocator);
         }
 
         return cfg;
@@ -486,6 +491,28 @@ pub const AgentConfig = struct {
             self.api_key = key; // stdout is leaked (owned by allocator, static lifetime)
         } else {
             allocator.free(result.stdout);
+        }
+    }
+
+    /// Load OAuth access token from Claude Code's credentials file (~/.claude/.credentials.json)
+    fn loadClaudeCodeCredentials(self: *AgentConfig, allocator: std.mem.Allocator) void {
+        const home = std.process.getEnvVarOwned(allocator, "HOME") catch return;
+        defer allocator.free(home);
+
+        var path_buf: [MAX_PATH]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/.claude/.credentials.json", .{home}) catch return;
+
+        const content = std.fs.cwd().readFileAlloc(allocator, path, 8192) catch return;
+        // content is intentionally leaked — strings reference into it
+
+        // extract accessToken from nested claudeAiOauth object
+        // format: {"claudeAiOauth":{"accessToken":"sk-ant-oat01-...","expiresAt":...}}
+        if (std.mem.indexOf(u8, content, "\"accessToken\"")) |_| {
+            if (jsonExtractStr(content, "accessToken")) |token| {
+                if (token.len > 0) {
+                    self.api_key = token;
+                }
+            }
         }
     }
 };

@@ -588,11 +588,17 @@ pub fn run(self: *Shell) !void {
             try self.handleResize();
         }
 
-        // drain any pending agent output
-        _ = try self.agent.drainOutput(self.stdout());
+        // drain any pending agent output (terminal-aware)
+        try self.drainAgentOutput();
 
         try self.log(last_action);
-        last_action = try self.readNextAction();
+
+        // when agent is busy, use poll so we can keep draining output
+        if (self.agent.isBusy()) {
+            last_action = self.pollNextAction() catch .none;
+        } else {
+            last_action = try self.readNextAction();
+        }
         try self.handleAction(last_action);
         try self.stdout().flush();
     }
@@ -809,8 +815,14 @@ fn handleAction(self: *Shell, action: Action) !void {
         .cancel_agent => {
             if (self.agent.isBusy()) {
                 self.agent.cancel();
-                try self.stdout().writeAll("^G\n");
+                // move below prompt content before printing
+                self.term_view.moveTo(self.term_view.term.rows_owned -| 1, 0);
+                self.term_view.clearToEOL();
+                try self.term_view.flush();
+                try self.stdout().writeAll("\r\n^G agent cancelled\n");
                 try self.stdout().flush();
+                self.term_view.finishLine();
+                try self.renderLine();
             }
         },
 
@@ -1487,6 +1499,76 @@ fn isWordChar(c: u8) bool {
 
 fn isWhitespace(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\n';
+}
+
+/// Drain agent output with proper terminal coordination.
+/// Clears the current prompt, writes agent output below, then re-renders.
+fn drainAgentOutput(self: *Shell) !void {
+    const q = @import("agent_queue.zig");
+    var msg: q.Msg = undefined;
+    var wrote = false;
+    const writer = self.stdout();
+
+    while (self.agent.queues.output.pop(&msg)) {
+        if (!wrote) {
+            // first message: move cursor to end of displayed content and clear prompt
+            self.term_view.moveTo(self.term_view.term.rows_owned -| 1, 0);
+            self.term_view.clearToEOL();
+            try self.term_view.flush();
+            // move below displayed content
+            try writer.writeAll("\r\n");
+            wrote = true;
+        }
+
+        switch (msg.kind) {
+            .text_delta => try writer.writeAll(msg.slice()),
+            .tool_call => {
+                try writer.writeAll("\x1b[90m"); // dim gray
+                try writer.writeAll(msg.slice());
+                try writer.writeAll("\x1b[0m\n");
+            },
+            .tool_done => {
+                try writer.writeAll("\x1b[90m");
+                try writer.writeAll(msg.slice());
+                try writer.writeAll("\x1b[0m\n");
+            },
+            .error_msg => {
+                try writer.writeAll("\x1b[31m"); // red
+                try writer.writeAll("agent: ");
+                try writer.writeAll(msg.slice());
+                try writer.writeAll("\x1b[0m\n");
+            },
+            .done => {
+                try writer.writeByte('\n');
+            },
+            .cancel => {},
+        }
+    }
+
+    if (wrote) {
+        try writer.flush();
+        // reset term_view state so prompt re-renders cleanly on new line
+        self.term_view.finishLine();
+        try self.renderLine();
+    }
+}
+
+/// Non-blocking input read using poll. Returns .none if no input available within timeout.
+/// Used when agent is busy so we can interleave output draining with input reading.
+fn pollNextAction(self: *Shell) !Action {
+    const stdin_fd = std.posix.STDIN_FILENO;
+    var fds = [_]std.posix.pollfd{.{
+        .fd = stdin_fd,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+
+    // 50ms timeout — responsive enough for streaming, not too CPU-hot
+    const poll_result = std.posix.poll(&fds, 50) catch return .none;
+    if (poll_result == 0) return .none; // timeout, no input
+
+    // input available, read normally
+    return self.readNextAction();
 }
 
 fn readNextAction(self: *Shell) !Action {
