@@ -147,12 +147,36 @@ pub const SessionLog = struct {
             f.close();
             self.file = null;
         }
+        // remove ctl FIFO (signals session is no longer active)
+        var ctl_buf: [MAX_PATH]u8 = undefined;
+        if (self.ctlPath(&ctl_buf)) |p| {
+            std.fs.cwd().deleteFile(p) catch {};
+        }
         // update meta.json with final message count
         self.updateMeta() catch {};
     }
 
     fn dirPath(self: *const SessionLog) []const u8 {
         return self.dir_buf[0..self.dir_len];
+    }
+
+    /// Path to the control FIFO for remote attach
+    pub fn ctlPath(self: *const SessionLog, buf: *[MAX_PATH]u8) ?[]const u8 {
+        return std.fmt.bufPrint(buf, "{s}/ctl", .{self.dirPath()}) catch null;
+    }
+
+    /// Create the ctl FIFO. Returns the fd opened for read+write (non-blocking).
+    /// Opened RDWR so the agent itself keeps a writer reference, preventing
+    /// EOF when an attached client disconnects.
+    pub fn createCtlFifo(self: *const SessionLog) ?std.posix.fd_t {
+        var path_buf: [MAX_PATH]u8 = undefined;
+        const path = self.ctlPath(&path_buf) orelse return null;
+        // Create FIFO (named pipe) via mknod with S.IFIFO
+        const path_z = toNullTerminated(path) orelse return null;
+        _ = std.os.linux.mknod(path_z, std.os.linux.S.IFIFO | 0o660, 0);
+        // Open RDWR non-blocking — RDWR keeps a writer ref so reads don't EOF
+        const fd = std.posix.open(path, .{ .ACCMODE = .RDWR, .NONBLOCK = true }, 0) catch return null;
+        return fd;
     }
 
     // ── Logging functions ──
@@ -675,4 +699,13 @@ pub fn jsonExtractInt(json: []const u8, key: []const u8) ?u32 {
     while (end < trimmed.len and trimmed[end] >= '0' and trimmed[end] <= '9') : (end += 1) {}
     if (end == 0) return null;
     return std.fmt.parseInt(u32, trimmed[0..end], 10) catch null;
+}
+
+/// Convert a slice to a null-terminated pointer using a threadlocal buffer.
+threadlocal var nt_buf: [MAX_PATH + 1]u8 = undefined;
+fn toNullTerminated(s: []const u8) ?[*:0]const u8 {
+    if (s.len >= MAX_PATH) return null;
+    @memcpy(nt_buf[0..s.len], s);
+    nt_buf[s.len] = 0;
+    return @ptrCast(&nt_buf);
 }

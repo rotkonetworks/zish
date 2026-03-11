@@ -492,7 +492,8 @@ const TOOLS_JSON =
     \\{"name":"Edit","description":"Make exact string replacements in a file. Must Read the file first. The old_string must appear exactly once in the file (or use replace_all).","input_schema":{"type":"object","properties":{"file_path":{"type":"string","description":"Absolute path to the file"},"old_string":{"type":"string","description":"Exact text to find and replace"},"new_string":{"type":"string","description":"Replacement text"},"replace_all":{"type":"boolean","description":"Replace all occurrences (default: false)"}},"required":["file_path","old_string","new_string"]}},
     \\{"name":"Write","description":"Create a new file or completely overwrite an existing one. For modifying existing files, prefer Edit.","input_schema":{"type":"object","properties":{"file_path":{"type":"string","description":"Absolute path"},"content":{"type":"string","description":"Complete file content"}},"required":["file_path","content"]}},
     \\{"name":"Glob","description":"Find files matching a glob pattern. Returns matching file paths.","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern (e.g. **/*.zig, src/*.rs)"},"path":{"type":"string","description":"Directory to search in (default: cwd)"}},"required":["pattern"]}},
-    \\{"name":"Grep","description":"Search file contents with regex. Returns matching lines with file:line format.","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern to search for"},"path":{"type":"string","description":"File or directory to search"},"glob":{"type":"string","description":"Filter files by glob (e.g. *.zig)"}},"required":["pattern"]}}
+    \\{"name":"Grep","description":"Search file contents with regex. Returns matching lines with file:line format.","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern to search for"},"path":{"type":"string","description":"File or directory to search"},"glob":{"type":"string","description":"Filter files by glob (e.g. *.zig)"}},"required":["pattern"]}},
+    \\{"name":"Agent","description":"Spawn a subagent to handle a task autonomously in the background. Use for research, exploration, or parallel work. The subagent has Read/Glob/Grep/Bash tools. Launch multiple agents concurrently for independent tasks.","input_schema":{"type":"object","properties":{"prompt":{"type":"string","description":"Detailed task description for the subagent"},"description":{"type":"string","description":"Short 3-5 word summary of the task"}},"required":["prompt","description"]}}
     \\]
 ;
 
@@ -514,6 +515,61 @@ fn getGitBranch(buf: []u8) ![]const u8 {
     @memcpy(buf[0..n], trimmed[0..n]);
     return buf[0..n];
 }
+
+// ============================================================
+// SubAgent — lightweight agent thread for parallel tasks
+// ============================================================
+
+const MAX_SUBAGENTS = 8;
+const SUBAGENT_RESULT_MAX = 32768;
+
+const SubAgentStatus = enum(u8) { running, done, failed };
+
+const SubAgent = struct {
+    thread: ?std.Thread = null,
+    status: SubAgentStatus = .running,
+    // Result buffer — subagent writes here, main agent reads when done
+    result_buf: [SUBAGENT_RESULT_MAX]u8 = undefined,
+    result_len: u32 = 0,
+    // ID and description for tracking
+    id_buf: [16]u8 = undefined,
+    id_len: u8 = 0,
+    desc_buf: [128]u8 = undefined,
+    desc_len: u8 = 0,
+    // Cancellation
+    cancel_requested: bool = false,
+
+    fn id(self: *const SubAgent) []const u8 {
+        return self.id_buf[0..self.id_len];
+    }
+
+    fn desc(self: *const SubAgent) []const u8 {
+        return self.desc_buf[0..self.desc_len];
+    }
+
+    fn result(self: *const SubAgent) []const u8 {
+        return self.result_buf[0..self.result_len];
+    }
+
+    fn requestCancel(self: *SubAgent) void {
+        @atomicStore(bool, &self.cancel_requested, true, .release);
+    }
+
+    fn checkCancel(self: *SubAgent) bool {
+        return @atomicLoad(bool, &self.cancel_requested, .acquire);
+    }
+
+    fn isDone(self: *const SubAgent) bool {
+        return @atomicLoad(SubAgentStatus, &@constCast(self).status, .acquire) != .running;
+    }
+
+    fn setResult(self: *SubAgent, text: []const u8, status: SubAgentStatus) void {
+        const n = @min(text.len, SUBAGENT_RESULT_MAX);
+        @memcpy(self.result_buf[0..n], text[0..n]);
+        self.result_len = @intCast(n);
+        @atomicStore(SubAgentStatus, &self.status, status, .release);
+    }
+};
 
 const AgentThread = struct {
     allocator: std.mem.Allocator,
@@ -539,6 +595,10 @@ const AgentThread = struct {
     allow_edit: bool = false,
     allow_write: bool = false,
     allow_plugins: u16 = 0, // bitmask for plugin tools
+    // Subagent pool
+    subagents: [MAX_SUBAGENTS]SubAgent = [_]SubAgent{.{}} ** MAX_SUBAGENTS,
+    subagent_count: u8 = 0,
+    next_subagent_id: u16 = 1,
 
     fn init(allocator: std.mem.Allocator, queues: *AgentQueues, config: Config) AgentThread {
         var self = AgentThread{
@@ -686,35 +746,196 @@ const AgentThread = struct {
     }
 
     fn deinit(self: *AgentThread) void {
+        // join all subagent threads
+        for (&self.subagents, 0..) |*sa, i| {
+            if (i >= self.subagent_count) break;
+            if (sa.thread) |t| {
+                sa.requestCancel();
+                t.join();
+                sa.thread = null;
+            }
+        }
         if (self.session_log) |*sl| sl.close();
         self.history.deinit();
     }
 
-    /// Main agent loop: process requests from main thread
+    // ============================================================
+    // Subagent management
+    // ============================================================
+
+    fn spawnSubAgent(self: *AgentThread, prompt: []const u8, description: []const u8) ![]const u8 {
+        // Find a free slot (reuse completed subagents)
+        var slot: ?usize = null;
+        for (&self.subagents, 0..) |*sa, i| {
+            if (i >= self.subagent_count) break;
+            if (sa.isDone() and sa.thread != null) {
+                sa.thread.?.join();
+                sa.thread = null;
+            }
+            if (sa.thread == null and sa.isDone()) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot == null and self.subagent_count < MAX_SUBAGENTS) {
+            slot = self.subagent_count;
+            self.subagent_count += 1;
+        }
+        if (slot == null) return error.TooManySubagents;
+
+        const sa = &self.subagents[slot.?];
+        sa.* = .{}; // reset
+
+        // Generate ID
+        const id_num = self.next_subagent_id;
+        self.next_subagent_id += 1;
+        const id_str = std.fmt.bufPrint(&sa.id_buf, "sa-{d}", .{id_num}) catch "sa-?";
+        sa.id_len = @intCast(id_str.len);
+
+        // Copy description
+        const dn = @min(description.len, sa.desc_buf.len);
+        @memcpy(sa.desc_buf[0..dn], description[0..dn]);
+        sa.desc_len = @intCast(dn);
+
+        // Log spawn
+        if (self.session_log) |*sl| sl.logAgentSpawn(sa.id(), "subagent", description) catch {};
+
+        // Notify user
+        var notify_buf: [256]u8 = undefined;
+        const notify = std.fmt.bufPrint(&notify_buf, "Subagent {s}: {s}", .{ sa.id(), sa.desc() }) catch "Subagent spawned";
+        _ = self.queues.output.push(.tool_call, notify);
+
+        // Copy prompt for the subagent thread (stack-allocated prompt won't survive)
+        const prompt_copy = try self.allocator.dupe(u8, prompt);
+
+        // Config and system prompt: safe to reference self.* because
+        // deinit() joins all subagent threads before freeing AgentThread.
+        const cfg = self.config;
+
+        // Spawn thread
+        sa.thread = std.Thread.spawn(.{}, subAgentThreadFn, .{
+            self.allocator, sa, prompt_copy, cfg, &self.system_prompt_buf, self.system_prompt_len,
+        }) catch {
+            self.allocator.free(prompt_copy);
+            sa.setResult("Failed to spawn subagent thread", .failed);
+            return error.SpawnFailed;
+        };
+
+        return sa.id();
+    }
+
+    fn collectSubAgent(self: *AgentThread, agent_id: []const u8, timeout_ms: u64) []const u8 {
+        // Find the subagent
+        for (&self.subagents, 0..) |*sa, i| {
+            if (i >= self.subagent_count) break;
+            if (std.mem.eql(u8, sa.id(), agent_id)) {
+                // Wait for completion with timeout
+                const deadline = @as(u64, @intCast(std.time.milliTimestamp())) + timeout_ms;
+                while (!sa.isDone()) {
+                    if (@as(u64, @intCast(std.time.milliTimestamp())) >= deadline) {
+                        sa.requestCancel();
+                        return "Subagent timed out";
+                    }
+                    if (self.queues.checkCancel()) {
+                        sa.requestCancel();
+                        return "Cancelled";
+                    }
+                    std.Thread.sleep(50 * std.time.ns_per_ms);
+                }
+                // Join thread
+                if (sa.thread) |t| {
+                    t.join();
+                    sa.thread = null;
+                }
+                // Log result
+                if (self.session_log) |*sl| sl.logAgentResult(sa.id(), sa.result()) catch {};
+                return sa.result();
+            }
+        }
+        return "Unknown subagent ID";
+    }
+
+    fn listSubAgents(self: *AgentThread, buf: []u8) []const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+        if (self.subagent_count == 0) {
+            w.writeAll("No subagents.\n") catch {};
+            return buf[0..fbs.pos];
+        }
+        for (&self.subagents, 0..) |*sa, i| {
+            if (i >= self.subagent_count) break;
+            const status_str = switch (@atomicLoad(SubAgentStatus, &sa.status, .acquire)) {
+                .running => "running",
+                .done => "done",
+                .failed => "failed",
+            };
+            w.print("{s} [{s}] {s}\n", .{ sa.id(), status_str, sa.desc() }) catch {};
+        }
+        return buf[0..fbs.pos];
+    }
+
+    /// Main agent loop: process requests from main thread and remote attach (FIFO)
     fn run(self: *AgentThread) void {
+        // Create ctl FIFO for remote attach
+        const ctl_fd: ?std.posix.fd_t = if (self.session_log) |*sl| sl.createCtlFifo() else null;
+        defer if (ctl_fd) |fd| std.posix.close(fd);
+
         var req_msg: q.Msg = undefined;
+        var fifo_buf: [4096]u8 = undefined;
+        var fifo_line: [4096]u8 = undefined;
+        var fifo_line_len: usize = 0;
+
         while (true) {
-            // poll for new request
-            if (!self.queues.request.pop(&req_msg)) {
-                std.Thread.sleep(10 * std.time.ns_per_ms);
+            // Check SPSC queue first
+            if (self.queues.request.pop(&req_msg)) {
+                if (req_msg.kind == .cancel) break;
+                const query_text = req_msg.slice();
+                self.queues.clearCancel();
+                self.queues.setBusy(true);
+                self.processQuery(query_text) catch |err| {
+                    var errbuf: [256]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&errbuf, "agent error: {}", .{err}) catch "agent error";
+                    _ = self.queues.output.push(.error_msg, msg);
+                    if (self.session_log) |*sl| sl.logError(msg) catch {};
+                };
+                self.queues.setBusy(false);
+                _ = self.queues.output.push(.done, "");
                 continue;
             }
 
-            if (req_msg.kind == .cancel) break; // shutdown
+            // Check FIFO for remote input (non-blocking)
+            if (ctl_fd) |fd| {
+                const n = std.posix.read(fd, &fifo_buf) catch 0;
+                if (n > 0) {
+                    // Accumulate into fifo_line, process complete lines
+                    for (fifo_buf[0..n]) |byte| {
+                        if (byte == '\n') {
+                            if (fifo_line_len > 0) {
+                                const line = std.mem.trim(u8, fifo_line[0..fifo_line_len], " \t\r");
+                                if (line.len > 0) {
+                                    self.queues.clearCancel();
+                                    self.queues.setBusy(true);
+                                    self.processQuery(line) catch |err| {
+                                        var errbuf: [256]u8 = undefined;
+                                        const msg = std.fmt.bufPrint(&errbuf, "agent error: {}", .{err}) catch "agent error";
+                                        _ = self.queues.output.push(.error_msg, msg);
+                                        if (self.session_log) |*sl| sl.logError(msg) catch {};
+                                    };
+                                    self.queues.setBusy(false);
+                                    _ = self.queues.output.push(.done, "");
+                                }
+                            }
+                            fifo_line_len = 0;
+                        } else if (fifo_line_len < fifo_line.len) {
+                            fifo_line[fifo_line_len] = byte;
+                            fifo_line_len += 1;
+                        }
+                    }
+                    continue; // check for more
+                }
+            }
 
-            const query = req_msg.slice();
-            self.queues.clearCancel();
-            self.queues.setBusy(true);
-
-            self.processQuery(query) catch |err| {
-                var errbuf: [256]u8 = undefined;
-                const msg = std.fmt.bufPrint(&errbuf, "agent error: {}", .{err}) catch "agent error";
-                _ = self.queues.output.push(.error_msg, msg);
-                if (self.session_log) |*sl| sl.logError(msg) catch {};
-            };
-
-            self.queues.setBusy(false);
-            _ = self.queues.output.push(.done, "");
+            std.Thread.sleep(10 * std.time.ns_per_ms);
         }
     }
 
@@ -922,6 +1143,22 @@ const AgentThread = struct {
             const path = extractJsonField(tool_input, "path");
             const file_glob = extractJsonField(tool_input, "glob");
             return self.executeGrep(pattern, path, file_glob);
+        }
+        if (std.mem.eql(u8, tool_name, "Agent")) {
+            const prompt_raw = extractJsonField(tool_input, "prompt") orelse return error.MissingPrompt;
+            const desc_raw = extractJsonField(tool_input, "description") orelse "subagent task";
+            var prompt_buf: [4096]u8 = undefined;
+            const prompt = unescapeJSON(prompt_raw, &prompt_buf) orelse prompt_raw;
+            var desc_buf2: [128]u8 = undefined;
+            const description = unescapeJSON(desc_raw, &desc_buf2) orelse desc_raw;
+            const agent_id = self.spawnSubAgent(prompt, description) catch |err| {
+                var errbuf: [256]u8 = undefined;
+                const msg = std.fmt.bufPrint(&errbuf, "Failed to spawn subagent: {}", .{err}) catch "spawn failed";
+                return self.allocator.dupe(u8, msg);
+            };
+            // Wait for result (timeout 120s)
+            const result = self.collectSubAgent(agent_id, 120_000);
+            return self.allocator.dupe(u8, result);
         }
         // Check plugin tools
         for (self.plugin_tools[0..self.plugin_count], 0..) |*pt, pi| {
@@ -2101,6 +2338,177 @@ pub const AgentContext = struct {
         return wrote;
     }
 };
+
+/// Subagent thread: runs a single query, stores result, exits.
+/// Has read-only tools (Read/Glob/Grep/Bash). No confirmation needed.
+fn subAgentThreadFn(
+    allocator: std.mem.Allocator,
+    sa: *SubAgent,
+    prompt_owned: []const u8,
+    config: Config,
+    sys_prompt: *const [8192]u8,
+    sys_prompt_len: u16,
+) void {
+    defer allocator.free(prompt_owned);
+
+    // Create a minimal agent — no session log, no plugin tools, auto-allow all
+    var dummy_queues: AgentQueues = .{};
+    var agent = AgentThread{
+        .allocator = allocator,
+        .queues = &dummy_queues,
+        .config = config,
+        .history = ConversationHistory.init(allocator),
+        .session_log = null,
+        .cwd = undefined,
+        .cwd_len = 0,
+        .git_branch = undefined,
+        .git_branch_len = 0,
+        .system_prompt_buf = sys_prompt.*,
+        .system_prompt_len = sys_prompt_len,
+        .plugin_tools = [_]PluginTool{.{}} ** MAX_PLUGIN_TOOLS,
+        .plugin_count = 0,
+        .all_tools_json = undefined,
+        .all_tools_json_len = 0,
+        .allow_bash = true,
+        .allow_edit = false,
+        .allow_write = false,
+        .allow_plugins = 0,
+    };
+    // Set cwd
+    const cwd = std.process.getCwd(&agent.cwd) catch "/";
+    agent.cwd_len = @intCast(cwd.len);
+
+    // Build subagent-specific tools (read-only: Bash, Read, Glob, Grep — no Edit/Write/Agent)
+    const SUBAGENT_TOOLS =
+        \\[
+        \\{"name":"Bash","description":"Run a shell command.","input_schema":{"type":"object","properties":{"command":{"type":"string","description":"Shell command to run"}},"required":["command"]}},
+        \\{"name":"Read","description":"Read a file. Returns contents with line numbers.","input_schema":{"type":"object","properties":{"file_path":{"type":"string","description":"Absolute path to the file"},"offset":{"type":"integer","description":"Line offset (optional)"},"limit":{"type":"integer","description":"Max lines (optional)"}},"required":["file_path"]}},
+        \\{"name":"Glob","description":"Find files matching a glob pattern.","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern"},"path":{"type":"string","description":"Directory (default: cwd)"}},"required":["pattern"]}},
+        \\{"name":"Grep","description":"Search file contents with regex.","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern"},"path":{"type":"string","description":"File or directory"},"glob":{"type":"string","description":"Filter files by glob"}},"required":["pattern"]}}
+        \\]
+    ;
+    @memcpy(agent.all_tools_json[0..SUBAGENT_TOOLS.len], SUBAGENT_TOOLS);
+    agent.all_tools_json_len = SUBAGENT_TOOLS.len;
+
+    defer agent.history.deinit();
+
+    // Add a system instruction for the subagent role
+    agent.history.add(.user, prompt_owned) catch {
+        sa.setResult("Failed to add prompt to history", .failed);
+        return;
+    };
+    if (agent.session_log) |*sl| sl.logUser(prompt_owned) catch {};
+
+    // Process with tool loop (same as main agent but limited iterations)
+    var iteration: usize = 0;
+    const max_iter: usize = 15;
+    var final_text: []const u8 = "";
+    var final_alloc: ?[]u8 = null;
+    defer if (final_alloc) |fa| allocator.free(fa);
+
+    while (iteration < max_iter) : (iteration += 1) {
+        if (sa.checkCancel()) {
+            sa.setResult("Cancelled", .failed);
+            return;
+        }
+
+        const response = agent.callAPI() catch |err| {
+            var errbuf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&errbuf, "API error: {}", .{err}) catch "API error";
+            sa.setResult(msg, .failed);
+            return;
+        };
+
+        if (!response.has_tool_call) {
+            // Final text response
+            if (response.text.len > 0) {
+                final_text = response.text;
+                // Keep alloc alive until we copy to result
+                if (final_alloc) |fa| allocator.free(fa);
+                final_alloc = response.text_alloc;
+            } else {
+                allocator.free(response.text_alloc);
+            }
+            break;
+        }
+
+        // Tool use — dispatch it
+        const tool_name = response.tool_name;
+        const tool_input = response.tool_command;
+        const tool_id = response.tool_use_id;
+
+        // Build assistant history entry
+        var assist_buf: [MAX_CONTENT_LEN]u8 = undefined;
+        var assist_fbs = std.io.fixedBufferStream(&assist_buf);
+        const aw = assist_fbs.writer();
+        aw.writeByte('[') catch {};
+        if (response.text.len > 0) {
+            aw.writeAll("{\"type\":\"text\",\"text\":") catch {};
+            writeJSONString(aw, response.text) catch {};
+            aw.writeAll("},") catch {};
+        }
+        const effective_input = if (tool_input.len == 0) "{}" else tool_input;
+        aw.print("{{\"type\":\"tool_use\",\"id\":\"{s}\",\"name\":\"{s}\",\"input\":{s}}}", .{
+            tool_id, tool_name, effective_input,
+        }) catch {};
+        aw.writeByte(']') catch {};
+        agent.history.addKind(.assistant, .tool_use_response, assist_buf[0..assist_fbs.pos]) catch {};
+        allocator.free(response.text_alloc);
+
+        // Dispatch tool (subagent: no Edit/Write/Agent, auto-allow Bash)
+        const tool_output = agent.dispatchTool(tool_name, tool_input) catch |err| blk: {
+            var errbuf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&errbuf, "tool error: {}", .{err}) catch "tool error";
+            break :blk allocator.dupe(u8, msg) catch {
+                sa.setResult("alloc failed", .failed);
+                return;
+            };
+        };
+        defer allocator.free(tool_output);
+
+        // Build tool_result
+        const MAX_TOOL_OUTPUT = 16384;
+        const truncated = tool_output.len > MAX_TOOL_OUTPUT;
+        const effective_output = if (truncated) tool_output[0..MAX_TOOL_OUTPUT] else tool_output;
+        const extra: usize = if (truncated) 100 else 0;
+        var result_json_buf = allocator.alloc(u8, effective_output.len * 2 + 256 + extra) catch {
+            sa.setResult("alloc failed", .failed);
+            return;
+        };
+        defer allocator.free(result_json_buf);
+        var result_fbs = std.io.fixedBufferStream(result_json_buf);
+        const rw = result_fbs.writer();
+        rw.print("[{{\"type\":\"tool_result\",\"tool_use_id\":\"{s}\",\"content\":", .{tool_id}) catch {};
+        if (truncated) {
+            // Manually write JSON string with truncation notice inside
+            rw.writeByte('"') catch {};
+            for (effective_output) |c| {
+                switch (c) {
+                    '"' => rw.writeAll("\\\"") catch {},
+                    '\\' => rw.writeAll("\\\\") catch {},
+                    '\n' => rw.writeAll("\\n") catch {},
+                    '\r' => rw.writeAll("\\r") catch {},
+                    '\t' => rw.writeAll("\\t") catch {},
+                    else => {
+                        if (c < 0x20) {
+                            rw.writeAll("\\u00") catch {};
+                            const hex = "0123456789abcdef";
+                            rw.writeByte(hex[c >> 4]) catch {};
+                            rw.writeByte(hex[c & 0x0f]) catch {};
+                        } else rw.writeByte(c) catch {};
+                    },
+                }
+            }
+            rw.writeAll("\\n... [truncated]\"") catch {};
+        } else {
+            writeJSONString(rw, effective_output) catch {};
+        }
+        rw.writeAll("}]") catch {};
+        agent.history.addKind(.user, .tool_result, result_json_buf[0..result_fbs.pos]) catch {};
+    }
+
+    sa.setResult(if (final_text.len > 0) final_text else "No response from subagent", if (final_text.len > 0) .done else .failed);
+}
 
 fn agentThreadFn(allocator: std.mem.Allocator, queues: *AgentQueues, model_override: ?[]const u8) void {
     var ac = log_mod.AgentConfig.load(allocator);
