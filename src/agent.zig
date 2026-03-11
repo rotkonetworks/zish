@@ -18,11 +18,12 @@ pub const Provider = enum { anthropic, ollama, openai_compat };
 
 pub const Config = struct {
     provider: Provider = .anthropic,
-    model: []const u8 = "claude-opus-4-6",
+    model: []const u8 = "claude-sonnet-4-6",
     api_key: []const u8 = "",
     base_url: []const u8 = "https://api.anthropic.com",
     max_tokens: u32 = 8192,
     max_tool_iterations: u32 = 10,
+    auto_allow: bool = false,
 
     pub fn fromAgentConfig(ac: log_mod.AgentConfig) Config {
         var cfg = Config{
@@ -31,6 +32,7 @@ pub const Config = struct {
             .base_url = ac.base_url,
             .max_tokens = ac.max_tokens,
             .max_tool_iterations = ac.max_tool_iterations,
+            .auto_allow = ac.auto_allow,
         };
 
         // determine provider enum from string
@@ -47,7 +49,7 @@ pub const Config = struct {
             if (cfg.base_url.len == 0 or std.mem.eql(u8, cfg.base_url, "https://api.anthropic.com")) {
                 cfg.base_url = "http://localhost:11434";
             }
-            if (std.mem.eql(u8, cfg.model, "claude-opus-4-6")) {
+            if (std.mem.eql(u8, cfg.model, "claude-sonnet-4-6")) {
                 cfg.model = "llama3.2";
             }
         }
@@ -67,6 +69,337 @@ pub const Config = struct {
         };
     }
 };
+
+// ============================================================
+// Plugin tools — loaded from ~/.zish/agent-tools.json
+// ============================================================
+
+const MAX_PLUGIN_TOOLS = 16;
+const MAX_PLUGIN_PARAMS = 8;
+
+const PluginParam = struct {
+    name_buf: [64]u8 = undefined,
+    name_len: u8 = 0,
+    type_buf: [16]u8 = undefined,
+    type_len: u8 = 0,
+    desc_buf: [256]u8 = undefined,
+    desc_len: u16 = 0,
+
+    fn name(self: *const PluginParam) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+    fn desc(self: *const PluginParam) []const u8 {
+        return self.desc_buf[0..self.desc_len];
+    }
+    fn paramType(self: *const PluginParam) []const u8 {
+        if (self.type_len == 0) return "string";
+        return self.type_buf[0..self.type_len];
+    }
+};
+
+const PluginTool = struct {
+    name_buf: [64]u8 = undefined,
+    name_len: u8 = 0,
+    desc_buf: [512]u8 = undefined,
+    desc_len: u16 = 0,
+    cmd_buf: [512]u8 = undefined,
+    cmd_len: u16 = 0,
+    confirm: bool = false,
+    params: [MAX_PLUGIN_PARAMS]PluginParam = [_]PluginParam{.{}} ** MAX_PLUGIN_PARAMS,
+    param_count: u8 = 0,
+    required_mask: u8 = 0, // bitmask of required params
+
+    fn name(self: *const PluginTool) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+    fn desc(self: *const PluginTool) []const u8 {
+        return self.desc_buf[0..self.desc_len];
+    }
+    fn command(self: *const PluginTool) []const u8 {
+        return self.cmd_buf[0..self.cmd_len];
+    }
+};
+
+/// Load plugin tools from ~/.zish/agent-tools.json
+/// Format: [{"name":"...", "description":"...", "command":"...", "confirm":true,
+///           "parameters":{"param":{"type":"string","description":"..."}},
+///           "required":["param"]}]
+fn loadPluginTools(tools: *[MAX_PLUGIN_TOOLS]PluginTool) u8 {
+    const home = std.process.getEnvVarOwned(std.heap.page_allocator, "HOME") catch return 0;
+    defer std.heap.page_allocator.free(home);
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/.zish/agent-tools.json", .{home}) catch return 0;
+    const content = std.fs.cwd().readFileAlloc(std.heap.page_allocator, path, 32768) catch return 0;
+    defer std.heap.page_allocator.free(content);
+
+    var count: u8 = 0;
+
+    // Simple JSON array parser: find each top-level object { ... }
+    var depth: i32 = 0;
+    var obj_start: ?usize = null;
+    var in_string = false;
+    var i: usize = 0;
+    while (i < content.len) : (i += 1) {
+        if (content[i] == '\\' and in_string) {
+            i += 1; // skip escaped char
+            continue;
+        }
+        if (content[i] == '"') {
+            in_string = !in_string;
+            continue;
+        }
+        if (in_string) continue;
+
+        if (content[i] == '{') {
+            depth += 1;
+            if (depth == 1 and obj_start == null) obj_start = i;
+        } else if (content[i] == '}') {
+            depth -= 1;
+            if (depth == 0) {
+                if (obj_start) |start| {
+                    if (count < MAX_PLUGIN_TOOLS) {
+                        parsePluginTool(content[start .. i + 1], &tools[count]);
+                        if (tools[count].name_len > 0) count += 1;
+                    }
+                    obj_start = null;
+                }
+            }
+        }
+    }
+    return count;
+}
+
+fn parsePluginTool(json: []const u8, tool: *PluginTool) void {
+    // Extract simple fields
+    if (jsonGetStr(json, "name")) |v| {
+        const n = @min(v.len, 64);
+        @memcpy(tool.name_buf[0..n], v[0..n]);
+        tool.name_len = @intCast(n);
+    }
+    if (jsonGetStr(json, "description")) |v| {
+        const n = @min(v.len, 512);
+        @memcpy(tool.desc_buf[0..n], v[0..n]);
+        tool.desc_len = @intCast(n);
+    }
+    if (jsonGetStr(json, "command")) |v| {
+        const n = @min(v.len, 512);
+        @memcpy(tool.cmd_buf[0..n], v[0..n]);
+        tool.cmd_len = @intCast(n);
+    }
+    // Check "confirm":true
+    if (std.mem.indexOf(u8, json, "\"confirm\"")) |idx| {
+        const after = json[@min(idx + 9, json.len)..];
+        const trimmed = std.mem.trimLeft(u8, after, " \t\n\r:");
+        tool.confirm = std.mem.startsWith(u8, trimmed, "true");
+    }
+
+    // Parse parameters object: "parameters": { "name": {"type":"...", "description":"..."}, ... }
+    if (std.mem.indexOf(u8, json, "\"parameters\"")) |param_idx| {
+        const after_key = json[@min(param_idx + 12, json.len)..];
+        const trimmed = std.mem.trimLeft(u8, after_key, " \t\n\r:");
+        if (trimmed.len > 0 and trimmed[0] == '{') {
+            // Find matching closing brace
+            var pdepth: i32 = 0;
+            var pi: usize = 0;
+            var pin_string = false;
+            while (pi < trimmed.len) : (pi += 1) {
+                if (trimmed[pi] == '\\' and pin_string) {
+                    pi += 1;
+                    continue;
+                }
+                if (trimmed[pi] == '"') {
+                    pin_string = !pin_string;
+                    continue;
+                }
+                if (pin_string) continue;
+                if (trimmed[pi] == '{') pdepth += 1;
+                if (trimmed[pi] == '}') {
+                    pdepth -= 1;
+                    if (pdepth == 0) break;
+                }
+            }
+            if (pdepth == 0) {
+                parsePluginParams(trimmed[1..pi], tool);
+            }
+        }
+    }
+
+    // Parse required array
+    if (std.mem.indexOf(u8, json, "\"required\"")) |req_idx| {
+        const after_key = json[@min(req_idx + 10, json.len)..];
+        const trimmed = std.mem.trimLeft(u8, after_key, " \t\n\r:");
+        if (trimmed.len > 0 and trimmed[0] == '[') {
+            const end = std.mem.indexOfScalar(u8, trimmed, ']') orelse trimmed.len;
+            const arr = trimmed[1..end];
+            // Find each quoted string and match against param names
+            var si: usize = 0;
+            while (si < arr.len) : (si += 1) {
+                if (arr[si] == '"') {
+                    const str_end = std.mem.indexOfScalarPos(u8, arr, si + 1, '"') orelse break;
+                    const req_name = arr[si + 1 .. str_end];
+                    // mark matching param as required
+                    for (0..tool.param_count) |pi| {
+                        if (std.mem.eql(u8, tool.params[pi].name(), req_name)) {
+                            tool.required_mask |= @as(u8, 1) << @intCast(pi);
+                        }
+                    }
+                    si = str_end;
+                }
+            }
+        }
+    }
+}
+
+fn parsePluginParams(params_json: []const u8, tool: *PluginTool) void {
+    // Parse: "name": {"type":"...", "description":"..."}, "name2": ...
+    var pos: usize = 0;
+    while (pos < params_json.len and tool.param_count < MAX_PLUGIN_PARAMS) {
+        // Find next quoted key
+        const key_start = std.mem.indexOfScalarPos(u8, params_json, pos, '"') orelse break;
+        const key_end = std.mem.indexOfScalarPos(u8, params_json, key_start + 1, '"') orelse break;
+        const param_name = params_json[key_start + 1 .. key_end];
+
+        // Find the value object { ... }
+        const obj_start = std.mem.indexOfScalarPos(u8, params_json, key_end + 1, '{') orelse break;
+        var depth: i32 = 0;
+        var oi: usize = obj_start;
+        var oin_string = false;
+        while (oi < params_json.len) : (oi += 1) {
+            if (params_json[oi] == '\\' and oin_string) {
+                oi += 1;
+                continue;
+            }
+            if (params_json[oi] == '"') {
+                oin_string = !oin_string;
+                continue;
+            }
+            if (oin_string) continue;
+            if (params_json[oi] == '{') depth += 1;
+            if (params_json[oi] == '}') {
+                depth -= 1;
+                if (depth == 0) break;
+            }
+        }
+
+        const pi = tool.param_count;
+        const n = @min(param_name.len, 64);
+        @memcpy(tool.params[pi].name_buf[0..n], param_name[0..n]);
+        tool.params[pi].name_len = @intCast(n);
+
+        const obj = params_json[obj_start .. oi + 1];
+        if (jsonGetStr(obj, "type")) |t| {
+            const tn = @min(t.len, 16);
+            @memcpy(tool.params[pi].type_buf[0..tn], t[0..tn]);
+            tool.params[pi].type_len = @intCast(tn);
+        }
+        if (jsonGetStr(obj, "description")) |d| {
+            const dn = @min(d.len, 256);
+            @memcpy(tool.params[pi].desc_buf[0..dn], d[0..dn]);
+            tool.params[pi].desc_len = @intCast(dn);
+        }
+
+        tool.param_count += 1;
+        pos = oi + 1;
+    }
+}
+
+/// Build Anthropic tools JSON array including built-in + plugin tools
+fn buildToolsJson(plugins: []const PluginTool, count: u8, buf: []u8) u16 {
+    var fbs = std.io.fixedBufferStream(buf);
+    const w = fbs.writer();
+
+    // Start with built-in tools (strip outer [] from TOOLS_JSON)
+    w.writeByte('[') catch return 0;
+    // TOOLS_JSON starts with [ and ends with ], skip them
+    const inner = std.mem.trim(u8, TOOLS_JSON, " \n\r\t");
+    if (inner.len > 2) {
+        w.writeAll(inner[1 .. inner.len - 1]) catch return 0;
+    }
+
+    // Append plugin tools
+    for (plugins[0..count]) |*pt| {
+        w.writeAll(",{\"name\":\"") catch return 0;
+        w.writeAll(pt.name()) catch return 0;
+        w.writeAll("\",\"description\":\"") catch return 0;
+        // escape description for JSON
+        for (pt.desc()) |c| {
+            switch (c) {
+                '"' => w.writeAll("\\\"") catch return 0,
+                '\\' => w.writeAll("\\\\") catch return 0,
+                '\n' => w.writeAll("\\n") catch return 0,
+                else => w.writeByte(c) catch return 0,
+            }
+        }
+        w.writeAll("\",\"input_schema\":{\"type\":\"object\",\"properties\":{") catch return 0;
+
+        for (0..pt.param_count) |pi| {
+            if (pi > 0) w.writeByte(',') catch return 0;
+            w.writeByte('"') catch return 0;
+            w.writeAll(pt.params[pi].name()) catch return 0;
+            w.writeAll("\":{\"type\":\"") catch return 0;
+            w.writeAll(pt.params[pi].paramType()) catch return 0;
+            w.writeAll("\",\"description\":\"") catch return 0;
+            for (pt.params[pi].desc()) |c| {
+                switch (c) {
+                    '"' => w.writeAll("\\\"") catch return 0,
+                    '\\' => w.writeAll("\\\\") catch return 0,
+                    '\n' => w.writeAll("\\n") catch return 0,
+                    else => w.writeByte(c) catch return 0,
+                }
+            }
+            w.writeAll("\"}") catch return 0;
+        }
+
+        w.writeAll("}") catch return 0; // close properties
+
+        // required array
+        if (pt.required_mask != 0) {
+            w.writeAll(",\"required\":[") catch return 0;
+            var first = true;
+            for (0..pt.param_count) |pi| {
+                if (pt.required_mask & (@as(u8, 1) << @intCast(pi)) != 0) {
+                    if (!first) w.writeByte(',') catch return 0;
+                    w.writeByte('"') catch return 0;
+                    w.writeAll(pt.params[pi].name()) catch return 0;
+                    w.writeByte('"') catch return 0;
+                    first = false;
+                }
+            }
+            w.writeByte(']') catch return 0;
+        }
+
+        w.writeAll("}}") catch return 0; // close input_schema and tool object
+    }
+
+    w.writeByte(']') catch return 0;
+    return @intCast(fbs.pos);
+}
+
+/// Shell-escape a value for safe inclusion in a command
+fn shellEscape(value: []const u8, buf: []u8) ?[]const u8 {
+    var i: usize = 0;
+    if (i >= buf.len) return null;
+    buf[i] = '\'';
+    i += 1;
+    for (value) |c| {
+        if (c == '\'') {
+            if (i + 4 > buf.len) return null;
+            buf[i] = '\'';
+            buf[i + 1] = '\\';
+            buf[i + 2] = '\'';
+            buf[i + 3] = '\'';
+            i += 4;
+        } else {
+            if (i >= buf.len) return null;
+            buf[i] = c;
+            i += 1;
+        }
+    }
+    if (i >= buf.len) return null;
+    buf[i] = '\'';
+    i += 1;
+    return buf[0..i];
+}
 
 // ============================================================
 // Conversation history
@@ -140,20 +473,26 @@ const ConversationHistory = struct {
 // ============================================================
 
 const SYSTEM_PROMPT_PREFIX =
-    \\You are a shell assistant inside zish. Be concise.
-    \\When modifying files, explain briefly what and why.
-    \\Do NOT run destructive commands (rm -rf, git push --force, DROP TABLE, etc.) without warning the user.
-    \\Prefer Read/Glob/Grep tools over Bash for file operations — they are faster and safer.
+    \\You are a coding assistant embedded in zish shell. Be concise and direct.
+    \\
+    \\IMPORTANT RULES:
+    \\- Always Read a file before editing it. Use Edit (not Write) to modify existing files.
+    \\- Prefer Read/Glob/Grep over Bash for file operations — they are faster and safer.
+    \\- Do NOT run destructive commands (rm -rf, git push --force, DROP TABLE) without explicit user approval.
+    \\- When writing code, prioritize correctness and simplicity. Don't over-engineer.
+    \\- Explain changes briefly. Lead with actions, not explanations.
+    \\- For multi-step tasks, proceed autonomously using tools — don't ask permission for each step.
     \\
 ;
 
 const TOOLS_JSON =
     \\[
-    \\{"name":"Bash","description":"Run a shell command","input_schema":{"type":"object","properties":{"command":{"type":"string","description":"Shell command to run"},"description":{"type":"string","description":"What this command does"}},"required":["command"]}},
-    \\{"name":"Read","description":"Read a file's contents","input_schema":{"type":"object","properties":{"file_path":{"type":"string","description":"Absolute path to the file"}},"required":["file_path"]}},
-    \\{"name":"Write","description":"Write content to a file (creates or overwrites)","input_schema":{"type":"object","properties":{"file_path":{"type":"string","description":"Absolute path"},"content":{"type":"string","description":"File content to write"}},"required":["file_path","content"]}},
-    \\{"name":"Glob","description":"Find files matching a glob pattern","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern (e.g. **/*.zig, src/*.rs)"},"path":{"type":"string","description":"Directory to search in (default: cwd)"}},"required":["pattern"]}},
-    \\{"name":"Grep","description":"Search file contents with regex","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern to search for"},"path":{"type":"string","description":"File or directory to search"},"glob":{"type":"string","description":"Filter files by glob (e.g. *.zig)"}},"required":["pattern"]}}
+    \\{"name":"Bash","description":"Run a shell command. Use for system operations, git, builds, installs.","input_schema":{"type":"object","properties":{"command":{"type":"string","description":"Shell command to run"},"description":{"type":"string","description":"Brief description of what this does"}},"required":["command"]}},
+    \\{"name":"Read","description":"Read a file. Always read before editing. Returns file contents with line numbers.","input_schema":{"type":"object","properties":{"file_path":{"type":"string","description":"Absolute path to the file"},"offset":{"type":"integer","description":"Line number to start from (1-based, optional)"},"limit":{"type":"integer","description":"Max lines to read (optional)"}},"required":["file_path"]}},
+    \\{"name":"Edit","description":"Make exact string replacements in a file. Must Read the file first. The old_string must appear exactly once in the file (or use replace_all).","input_schema":{"type":"object","properties":{"file_path":{"type":"string","description":"Absolute path to the file"},"old_string":{"type":"string","description":"Exact text to find and replace"},"new_string":{"type":"string","description":"Replacement text"},"replace_all":{"type":"boolean","description":"Replace all occurrences (default: false)"}},"required":["file_path","old_string","new_string"]}},
+    \\{"name":"Write","description":"Create a new file or completely overwrite an existing one. For modifying existing files, prefer Edit.","input_schema":{"type":"object","properties":{"file_path":{"type":"string","description":"Absolute path"},"content":{"type":"string","description":"Complete file content"}},"required":["file_path","content"]}},
+    \\{"name":"Glob","description":"Find files matching a glob pattern. Returns matching file paths.","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern (e.g. **/*.zig, src/*.rs)"},"path":{"type":"string","description":"Directory to search in (default: cwd)"}},"required":["pattern"]}},
+    \\{"name":"Grep","description":"Search file contents with regex. Returns matching lines with file:line format.","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern to search for"},"path":{"type":"string","description":"File or directory to search"},"glob":{"type":"string","description":"Filter files by glob (e.g. *.zig)"}},"required":["pattern"]}}
     \\]
 ;
 
@@ -186,8 +525,20 @@ const AgentThread = struct {
     cwd_len: u16,
     git_branch: [64]u8,
     git_branch_len: u8,
-    system_prompt_buf: [2048]u8,
+    system_prompt_buf: [8192]u8,
     system_prompt_len: u16,
+    // Token usage tracking (cumulative for session)
+    total_input_tokens: u32 = 0,
+    total_output_tokens: u32 = 0,
+    plugin_tools: [MAX_PLUGIN_TOOLS]PluginTool,
+    plugin_count: u8,
+    all_tools_json: [16384]u8,
+    all_tools_json_len: u16,
+    // Session-level "always allow" flags
+    allow_bash: bool = false,
+    allow_edit: bool = false,
+    allow_write: bool = false,
+    allow_plugins: u16 = 0, // bitmask for plugin tools
 
     fn init(allocator: std.mem.Allocator, queues: *AgentQueues, config: Config) AgentThread {
         var self = AgentThread{
@@ -202,6 +553,10 @@ const AgentThread = struct {
             .git_branch_len = 0,
             .system_prompt_buf = undefined,
             .system_prompt_len = 0,
+            .plugin_tools = [_]PluginTool{.{}} ** MAX_PLUGIN_TOOLS,
+            .plugin_count = 0,
+            .all_tools_json = undefined,
+            .all_tools_json_len = 0,
         };
 
         // get cwd
@@ -214,6 +569,18 @@ const AgentThread = struct {
 
         // build system prompt with context
         self.buildSystemPrompt();
+
+        // load plugin tools
+        self.plugin_count = loadPluginTools(&self.plugin_tools);
+        self.all_tools_json_len = buildToolsJson(&self.plugin_tools, self.plugin_count, &self.all_tools_json);
+
+        // auto-allow all tools if configured
+        if (config.auto_allow) {
+            self.allow_bash = true;
+            self.allow_edit = true;
+            self.allow_write = true;
+            self.allow_plugins = 0xFFFF;
+        }
 
         // create session log
         self.session_log = SessionLog.create(allocator, self.cwdSlice(), self.branchSlice(), config.providerStr(), config.model) catch null;
@@ -233,14 +600,14 @@ const AgentThread = struct {
         var fbs = std.io.fixedBufferStream(&self.system_prompt_buf);
         const w = fbs.writer();
         w.writeAll(SYSTEM_PROMPT_PREFIX) catch return;
-        w.print("\\nWorking directory: {s}\\n", .{self.cwdSlice()}) catch return;
-        w.print("Git branch: {s}\\n", .{self.branchSlice()}) catch return;
+        w.print("\nWorking directory: {s}\n", .{self.cwdSlice()}) catch return;
+        w.print("Git branch: {s}\n", .{self.branchSlice()}) catch return;
 
         // try to list top-level files for project context
         if (std.fs.cwd().openDir(self.cwdSlice(), .{ .iterate = true })) |dir_handle| {
             var dir = dir_handle;
             defer dir.close();
-            w.writeAll("\\nProject files: ") catch return;
+            w.writeAll("\nProject files: ") catch return;
             var count: usize = 0;
             var iter = dir.iterate();
             while (iter.next() catch null) |entry| {
@@ -252,14 +619,70 @@ const AgentThread = struct {
                     break;
                 }
             }
-            w.writeAll("\\n") catch return;
+            w.writeAll("\n") catch return;
         } else |_| {}
+
+        // Load CLAUDE.md project instructions (check cwd, then parent dirs)
+        self.loadClaudeMd(w);
 
         self.system_prompt_len = @intCast(fbs.pos);
     }
 
+    fn loadClaudeMd(self: *AgentThread, w: anytype) void {
+        // Try cwd first, then walk up to find project instructions
+        // Checks: CLAUDE.md, AGENTS.md, .claude/CLAUDE.md, .claude/AGENTS.md
+        var dir_path: [256]u8 = undefined;
+        @memcpy(dir_path[0..self.cwd_len], self.cwd[0..self.cwd_len]);
+        var path_len = self.cwd_len;
+
+        const filenames = [_]struct { name: []const u8, subdir: []const u8 }{
+            .{ .name = "CLAUDE.md", .subdir = "" },
+            .{ .name = "AGENTS.md", .subdir = "" },
+            .{ .name = "CLAUDE.md", .subdir = ".claude/" },
+            .{ .name = "AGENTS.md", .subdir = ".claude/" },
+        };
+
+        // Track which files we've loaded to avoid duplicates
+        var loaded_claude = false;
+        var loaded_agents = false;
+
+        var attempts: u8 = 0;
+        while (attempts < 8) : (attempts += 1) {
+            for (filenames) |f| {
+                const is_agents = std.mem.eql(u8, f.name, "AGENTS.md");
+                if (is_agents and loaded_agents) continue;
+                if (!is_agents and loaded_claude) continue;
+
+                var file_path: [512]u8 = undefined;
+                const fp = std.fmt.bufPrint(&file_path, "{s}/{s}{s}", .{ dir_path[0..path_len], f.subdir, f.name }) catch continue;
+
+                if (std.fs.cwd().readFileAlloc(std.heap.page_allocator, fp, 4096)) |content| {
+                    defer std.heap.page_allocator.free(content);
+                    w.print("\n# Project Instructions ({s})\n", .{f.name}) catch return;
+                    const max = @min(content.len, 3072);
+                    w.writeAll(content[0..max]) catch return;
+                    w.writeByte('\n') catch return;
+                    if (is_agents) loaded_agents = true else loaded_claude = true;
+                } else |_| {}
+            }
+
+            if (loaded_claude and loaded_agents) break;
+
+            // Walk up to parent directory
+            if (std.mem.lastIndexOfScalar(u8, dir_path[0..path_len], '/')) |slash| {
+                if (slash == 0) break; // at root
+                path_len = @intCast(slash);
+            } else break;
+        }
+    }
+
     fn systemPrompt(self: *const AgentThread) []const u8 {
         return self.system_prompt_buf[0..self.system_prompt_len];
+    }
+
+    fn toolsJson(self: *const AgentThread) []const u8 {
+        if (self.all_tools_json_len > 0) return self.all_tools_json[0..self.all_tools_json_len];
+        return TOOLS_JSON;
     }
 
     fn deinit(self: *AgentThread) void {
@@ -300,6 +723,10 @@ const AgentThread = struct {
         try self.history.add(.user, query);
         if (self.session_log) |*sl| sl.logUser(query) catch {};
 
+        // track tokens for this query (across multiple API calls in tool loop)
+        var query_input_tokens: u32 = 0;
+        var query_output_tokens: u32 = 0;
+
         // tool loop: keep calling API until no more tool_use
         var iteration: usize = 0;
         const max_iter = self.config.max_tool_iterations;
@@ -308,6 +735,10 @@ const AgentThread = struct {
 
             const response = try self.callAPI();
             defer self.allocator.free(response.text_alloc);
+
+            // accumulate tokens
+            query_input_tokens += response.input_tokens;
+            query_output_tokens += response.output_tokens;
 
             if (!response.has_tool_call) {
                 // plain text response — add to history and done
@@ -334,8 +765,9 @@ const AgentThread = struct {
                 aw.writeAll("},") catch {};
                 if (self.session_log) |*sl| sl.logAssistant(response.text) catch {};
             }
+            const effective_input = if (tool_input.len == 0) "{}" else tool_input;
             aw.print("{{\"type\":\"tool_use\",\"id\":\"{s}\",\"name\":\"{s}\",\"input\":{s}}}", .{
-                tool_id, tool_name, tool_input,
+                tool_id, tool_name, effective_input,
             }) catch {};
             aw.writeByte(']') catch {};
             try self.history.addKind(.assistant, .tool_use_response, assist_buf[0..assist_fbs.pos]);
@@ -358,32 +790,126 @@ const AgentThread = struct {
 
             if (self.session_log) |*sl| sl.logToolResult(tool_name, tool_output, 0) catch {};
 
+            // Truncate tool output to prevent body overflow (max 16KB for API)
+            const MAX_TOOL_OUTPUT = 16384;
+            const truncated = tool_output.len > MAX_TOOL_OUTPUT;
+            const effective_output = if (truncated) tool_output[0..MAX_TOOL_OUTPUT] else tool_output;
+
             // Build tool_result user message
-            var result_json_buf = try self.allocator.alloc(u8, tool_output.len + 256);
+            const extra: usize = if (truncated) 100 else 0; // for truncation notice
+            var result_json_buf = try self.allocator.alloc(u8, effective_output.len * 2 + 256 + extra);
             defer self.allocator.free(result_json_buf);
             var result_fbs = std.io.fixedBufferStream(result_json_buf);
             const rw = result_fbs.writer();
             rw.print("[{{\"type\":\"tool_result\",\"tool_use_id\":\"{s}\",\"content\":", .{tool_id}) catch {};
-            writeJSONString(rw, tool_output) catch {};
+            if (truncated) {
+                // Write truncated output with notice
+                rw.writeByte('"') catch {};
+                for (effective_output) |c| {
+                    switch (c) {
+                        '"' => rw.writeAll("\\\"") catch {},
+                        '\\' => rw.writeAll("\\\\") catch {},
+                        '\n' => rw.writeAll("\\n") catch {},
+                        '\r' => rw.writeAll("\\r") catch {},
+                        '\t' => rw.writeAll("\\t") catch {},
+                        else => {
+                            if (c < 0x20) {
+                                rw.writeAll("\\u00") catch {};
+                                const hex = "0123456789abcdef";
+                                rw.writeByte(hex[c >> 4]) catch {};
+                                rw.writeByte(hex[c & 0x0f]) catch {};
+                            } else rw.writeByte(c) catch {};
+                        },
+                    }
+                }
+                rw.writeAll("\\n... [truncated]\"") catch {};
+            } else {
+                writeJSONString(rw, effective_output) catch {};
+            }
             rw.writeAll("}]") catch {};
             try self.history.addKind(.user, .tool_result, result_json_buf[0..result_fbs.pos]);
+        }
+
+        // Update cumulative totals and send usage info
+        self.total_input_tokens += query_input_tokens;
+        self.total_output_tokens += query_output_tokens;
+        if (query_input_tokens > 0 or query_output_tokens > 0) {
+            var usage_buf: [256]u8 = undefined;
+            // Estimate cost: Sonnet 4.6 is $3/MTok input, $15/MTok output
+            const input_cost = @as(f64, @floatFromInt(self.total_input_tokens)) * 3.0 / 1_000_000.0;
+            const output_cost = @as(f64, @floatFromInt(self.total_output_tokens)) * 15.0 / 1_000_000.0;
+            const total_cost = input_cost + output_cost;
+            const usage_msg = std.fmt.bufPrint(&usage_buf, "tokens: {d}↑ {d}↓ | session: {d}↑ {d}↓ (${d:.4})", .{
+                query_input_tokens, query_output_tokens,
+                self.total_input_tokens, self.total_output_tokens,
+                total_cost,
+            }) catch "usage unavailable";
+            _ = self.queues.output.push(.usage_info, usage_msg);
         }
 
         if (self.session_log) |*sl| sl.logDone() catch {};
     }
 
+    fn confirmTool(self: *AgentThread, tool_name: []const u8, detail: []const u8, allowed: *bool) bool {
+        if (allowed.*) return true;
+        const result = self.waitForConfirm(detail);
+        switch (result) {
+            .deny => return false,
+            .allow_once => return true,
+            .allow_always => {
+                allowed.* = true;
+                var msg_buf: [128]u8 = undefined;
+                const msg = std.fmt.bufPrint(&msg_buf, "Auto-allowing {s} for this session", .{tool_name}) catch "Auto-allowed";
+                _ = self.queues.output.push(.tool_call, msg);
+                return true;
+            },
+        }
+    }
+
     fn dispatchTool(self: *AgentThread, tool_name: []const u8, tool_input: []const u8) ![]u8 {
         if (std.mem.eql(u8, tool_name, "Bash")) {
             const cmd = extractJsonField(tool_input, "command") orelse return error.MissingCommand;
+            var unescape_buf: [8192]u8 = undefined;
+            const preview = unescapeJSON(cmd, &unescape_buf) orelse cmd;
+            var detail_buf: [512]u8 = undefined;
+            const detail = std.fmt.bufPrint(&detail_buf, "$ {s}", .{preview}) catch preview;
+            if (!self.confirmTool("Bash", detail, &self.allow_bash))
+                return self.allocator.dupe(u8, "Tool execution denied by user.");
             return self.executeBash(cmd);
         }
         if (std.mem.eql(u8, tool_name, "Read")) {
             const path = extractJsonField(tool_input, "file_path") orelse return error.MissingPath;
-            return self.executeRead(path);
+            const offset_str = extractJsonField(tool_input, "offset");
+            const limit_str = extractJsonField(tool_input, "limit");
+            const offset: usize = if (offset_str) |s| std.fmt.parseInt(usize, s, 10) catch 0 else 0;
+            const limit: usize = if (limit_str) |s| std.fmt.parseInt(usize, s, 10) catch 0 else 0;
+            return self.executeRead(path, offset, limit);
+        }
+        if (std.mem.eql(u8, tool_name, "Edit")) {
+            const path = extractJsonField(tool_input, "file_path") orelse return error.MissingPath;
+            const old_str = extractJsonField(tool_input, "old_string") orelse return error.MissingContent;
+            const new_str = extractJsonField(tool_input, "new_string") orelse return error.MissingContent;
+            const replace_all = if (std.mem.indexOf(u8, tool_input, "\"replace_all\"")) |idx| blk: {
+                const after = tool_input[@min(idx + 13, tool_input.len)..];
+                break :blk std.mem.indexOf(u8, after, "true") != null;
+            } else false;
+            var path_buf2: [512]u8 = undefined;
+            const rp = unescapeJSON(path, &path_buf2) orelse path;
+            var detail_buf: [512]u8 = undefined;
+            const detail = std.fmt.bufPrint(&detail_buf, "Edit {s}", .{rp}) catch rp;
+            if (!self.confirmTool("Edit", detail, &self.allow_edit))
+                return self.allocator.dupe(u8, "Tool execution denied by user.");
+            return self.executeEdit(path, old_str, new_str, replace_all);
         }
         if (std.mem.eql(u8, tool_name, "Write")) {
             const path = extractJsonField(tool_input, "file_path") orelse return error.MissingPath;
             const content = extractJsonField(tool_input, "content") orelse return error.MissingContent;
+            var path_buf2: [512]u8 = undefined;
+            const rp = unescapeJSON(path, &path_buf2) orelse path;
+            var detail_buf: [512]u8 = undefined;
+            const detail = std.fmt.bufPrint(&detail_buf, "Write {s}", .{rp}) catch rp;
+            if (!self.confirmTool("Write", detail, &self.allow_write))
+                return self.allocator.dupe(u8, "Tool execution denied by user.");
             return self.executeWrite(path, content);
         }
         if (std.mem.eql(u8, tool_name, "Glob")) {
@@ -397,7 +923,123 @@ const AgentThread = struct {
             const file_glob = extractJsonField(tool_input, "glob");
             return self.executeGrep(pattern, path, file_glob);
         }
+        // Check plugin tools
+        for (self.plugin_tools[0..self.plugin_count], 0..) |*pt, pi| {
+            if (std.mem.eql(u8, tool_name, pt.name())) {
+                return self.executePluginTool(pt, @intCast(pi), tool_input);
+            }
+        }
         return error.UnknownTool;
+    }
+
+    fn executePluginTool(self: *AgentThread, pt: *const PluginTool, plugin_idx: u4, tool_input: []const u8) ![]u8 {
+        // Substitute {param_name} placeholders in the command template
+        var cmd_buf: [4096]u8 = undefined;
+        var cmd_len: usize = 0;
+        const template = pt.command();
+        var ti: usize = 0;
+
+        while (ti < template.len) {
+            if (template[ti] == '{') {
+                // Find closing brace
+                const close = std.mem.indexOfScalarPos(u8, template, ti + 1, '}') orelse {
+                    if (cmd_len < cmd_buf.len) {
+                        cmd_buf[cmd_len] = template[ti];
+                        cmd_len += 1;
+                    }
+                    ti += 1;
+                    continue;
+                };
+                const param_name = template[ti + 1 .. close];
+                // Look up param value from tool_input JSON
+                const raw_value = extractJsonField(tool_input, param_name) orelse "";
+                // Unescape JSON string
+                var unescape_buf: [2048]u8 = undefined;
+                const value = unescapeJSON(raw_value, &unescape_buf) orelse raw_value;
+                // Shell-escape and substitute
+                var esc_buf: [2048]u8 = undefined;
+                const escaped = shellEscape(value, &esc_buf) orelse value;
+                const n = @min(escaped.len, cmd_buf.len - cmd_len);
+                @memcpy(cmd_buf[cmd_len..][0..n], escaped[0..n]);
+                cmd_len += n;
+                ti = close + 1;
+            } else {
+                if (cmd_len < cmd_buf.len) {
+                    cmd_buf[cmd_len] = template[ti];
+                    cmd_len += 1;
+                }
+                ti += 1;
+            }
+        }
+
+        const final_cmd = cmd_buf[0..cmd_len];
+
+        // Notify user about the command
+        var notif_buf: [512]u8 = undefined;
+        const notif = std.fmt.bufPrint(&notif_buf, "{s}: {s}", .{ pt.name(), final_cmd }) catch final_cmd;
+        _ = self.queues.output.push(.tool_call, notif);
+
+        // Confirmation flow if required
+        if (pt.confirm) {
+            const bit = @as(u16, 1) << plugin_idx;
+            if (self.allow_plugins & bit == 0) {
+                const result = self.waitForConfirm(final_cmd);
+                switch (result) {
+                    .deny => return self.allocator.dupe(u8, "Tool execution cancelled by user."),
+                    .allow_once => {},
+                    .allow_always => {
+                        self.allow_plugins |= bit;
+                        var abuf: [128]u8 = undefined;
+                        const amsg = std.fmt.bufPrint(&abuf, "Auto-allowing {s} for this session", .{pt.name()}) catch "Auto-allowed";
+                        _ = self.queues.output.push(.tool_call, amsg);
+                    },
+                }
+            }
+        }
+
+        // Execute the command
+        const result = std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = &[_][]const u8{ "/bin/sh", "-c", final_cmd },
+            .max_output_bytes = 65536,
+        }) catch |err| {
+            var errbuf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&errbuf, "exec failed: {}", .{err}) catch "exec failed";
+            return self.allocator.dupe(u8, msg);
+        };
+        defer self.allocator.free(result.stderr);
+
+        _ = self.queues.output.push(.tool_done, result.stdout);
+        return result.stdout;
+    }
+
+    const ConfirmResult = enum { deny, allow_once, allow_always };
+
+    fn waitForConfirm(self: *AgentThread, command: []const u8) ConfirmResult {
+        // Send confirmation request to main thread
+        var confirm_buf: [512]u8 = undefined;
+        const confirm_msg = std.fmt.bufPrint(&confirm_buf, "Execute: {s}", .{command}) catch command;
+        self.queues.output.pushWait(.confirm_request, confirm_msg);
+
+        // Wait for response (up to 60 seconds)
+        var msg: q.Msg = undefined;
+        var ticks: usize = 0;
+        while (ticks < 6000) : (ticks += 1) {
+            if (self.queues.checkCancel()) return .deny;
+            if (self.queues.request.pop(&msg)) {
+                if (msg.kind == .confirm_response) {
+                    if (msg.len == 0) return .deny;
+                    return switch (msg.data[0]) {
+                        'y', 'Y' => .allow_once,
+                        'a', 'A', '!' => .allow_always,
+                        else => .deny,
+                    };
+                }
+                if (msg.kind == .cancel) return .deny;
+            }
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
+        return .deny; // timeout
     }
 
     /// Extract a field value from tool input JSON, unescaping JSON strings
@@ -412,13 +1054,33 @@ const AgentThread = struct {
         tool_command: []const u8, // raw JSON input for the tool
         tool_name: []const u8,
         tool_use_id: []const u8, // Anthropic tool_use block id
+        input_tokens: u32 = 0,
+        output_tokens: u32 = 0,
     };
 
     fn callAPI(self: *AgentThread) !APIResponse {
-        return switch (self.config.provider) {
-            .anthropic => self.callAnthropic(),
-            .ollama, .openai_compat => self.callOpenAICompat(),
-        };
+        // Retry with exponential backoff on transient errors
+        var attempt: u8 = 0;
+        const max_retries: u8 = 3;
+        while (true) {
+            const result = switch (self.config.provider) {
+                .anthropic => self.callAnthropic(),
+                .ollama, .openai_compat => self.callOpenAICompat(),
+            };
+            if (result) |resp| {
+                return resp;
+            } else |err| {
+                attempt += 1;
+                if (attempt >= max_retries or self.queues.checkCancel()) return err;
+                // Notify user about retry
+                var retry_buf: [128]u8 = undefined;
+                const retry_msg = std.fmt.bufPrint(&retry_buf, "API error, retrying ({d}/{d})...", .{ attempt, max_retries }) catch "Retrying...";
+                _ = self.queues.output.push(.tool_call, retry_msg);
+                // Exponential backoff: 2s, 4s
+                const delay_ms: u64 = @as(u64, 2000) * (@as(u64, 1) << @intCast(attempt - 1));
+                std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+            }
+        }
     }
 
     fn buildMessagesJSON(self: *AgentThread, buf: []u8) ![]const u8 {
@@ -461,7 +1123,7 @@ const AgentThread = struct {
         writeJSONString(w, self.systemPrompt()) catch return error.BodyTooLarge;
         w.print(",\"messages\":{s},\"tools\":{s}}}", .{
             messages_json,
-            TOOLS_JSON,
+            self.toolsJson(),
         }) catch return error.BodyTooLarge;
 
         const body = body_buf[0..fbs.pos];
@@ -502,9 +1164,11 @@ const AgentThread = struct {
         var tool_id_buf: [64]u8 = undefined;
         var tool_id_len: usize = 0;
         var has_tool_call = false;
+        var resp_input_tokens: u32 = 0;
+        var resp_output_tokens: u32 = 0;
 
         // Build curl command with headers
-        var argv_buf: [30][]const u8 = undefined;
+        var argv_buf: [50][]const u8 = undefined;
         var argc: usize = 0;
 
         argv_buf[argc] = "curl";
@@ -527,7 +1191,7 @@ const AgentThread = struct {
         argc += 1;
 
         // Provider-specific headers
-        var header_bufs: [7][512]u8 = undefined;
+        var header_bufs: [2][512]u8 = undefined;
         var hdr_idx: usize = 0;
 
         switch (provider) {
@@ -540,12 +1204,17 @@ const AgentThread = struct {
                 argc += 1;
                 hdr_idx += 1;
 
+                // Anthropic API version and beta features
                 argv_buf[argc] = "-H";
                 argc += 1;
                 argv_buf[argc] = "anthropic-version: 2023-06-01";
                 argc += 1;
+                argv_buf[argc] = "-H";
+                argc += 1;
+                argv_buf[argc] = "anthropic-beta: prompt-caching-scope-2026-01-05";
+                argc += 1;
 
-                // Claude Code identification headers
+                // Claude Code SDK identification (Anthropic TypeScript SDK 0.74.0)
                 argv_buf[argc] = "-H";
                 argc += 1;
                 argv_buf[argc] = "User-Agent: Anthropic/JS 0.74.0";
@@ -553,6 +1222,34 @@ const AgentThread = struct {
                 argv_buf[argc] = "-H";
                 argc += 1;
                 argv_buf[argc] = "x-service-name: claude-code";
+                argc += 1;
+                argv_buf[argc] = "-H";
+                argc += 1;
+                argv_buf[argc] = "X-Stainless-Lang: js";
+                argc += 1;
+                argv_buf[argc] = "-H";
+                argc += 1;
+                argv_buf[argc] = "X-Stainless-Package-Version: 0.74.0";
+                argc += 1;
+                argv_buf[argc] = "-H";
+                argc += 1;
+                argv_buf[argc] = "X-Stainless-Runtime: node";
+                argc += 1;
+                argv_buf[argc] = "-H";
+                argc += 1;
+                argv_buf[argc] = "X-Stainless-Runtime-Version: v25.7.0";
+                argc += 1;
+                argv_buf[argc] = "-H";
+                argc += 1;
+                argv_buf[argc] = "X-Stainless-OS: Linux";
+                argc += 1;
+                argv_buf[argc] = "-H";
+                argc += 1;
+                argv_buf[argc] = "X-Stainless-Arch: x64";
+                argc += 1;
+                argv_buf[argc] = "-H";
+                argc += 1;
+                argv_buf[argc] = "X-Stainless-Helper-Method: stream";
                 argc += 1;
             },
             .ollama, .openai_compat => {
@@ -592,7 +1289,7 @@ const AgentThread = struct {
 
         // Read streaming SSE output from curl stdout
         const stdout_file = child.stdout.?;
-        var sse_buf: [16384]u8 = undefined;
+        var sse_buf: [65536]u8 = undefined;
         var sse_pos: usize = 0;
 
         outer: while (true) {
@@ -625,7 +1322,8 @@ const AgentThread = struct {
                             &tool_cmd_buf, &tool_cmd_len,
                             &tool_name_buf, &tool_name_len,
                             &tool_id_buf, &tool_id_len,
-                            &has_tool_call, self.queues);
+                            &has_tool_call, self.queues,
+                            &resp_input_tokens, &resp_output_tokens);
                     },
                     .ollama, .openai_compat => {
                         parseOpenAIDelta(data, &text_buf, &text_len, self.queues);
@@ -673,6 +1371,8 @@ const AgentThread = struct {
             .tool_command = tool_cmd_buf[0..tool_cmd_len],
             .tool_name = tool_name_buf[0..tool_name_len],
             .tool_use_id = tool_id_buf[0..tool_id_len],
+            .input_tokens = resp_input_tokens,
+            .output_tokens = resp_output_tokens,
         };
     }
 
@@ -701,20 +1401,55 @@ const AgentThread = struct {
         return result.stdout;
     }
 
-    fn executeRead(self: *AgentThread, path: []const u8) ![]u8 {
+    fn executeRead(self: *AgentThread, path: []const u8, offset: usize, limit: usize) ![]u8 {
         var path_buf: [512]u8 = undefined;
         const real_path = unescapeJSON(path, &path_buf) orelse path;
 
         var notif_buf: [512]u8 = undefined;
-        const notif = std.fmt.bufPrint(&notif_buf, "Read {s}", .{real_path}) catch real_path;
-        _ = self.queues.output.push(.tool_call, notif);
+        if (offset > 0 or limit > 0) {
+            const notif = std.fmt.bufPrint(&notif_buf, "Read {s}:{d}", .{ real_path, offset }) catch real_path;
+            _ = self.queues.output.push(.tool_call, notif);
+        } else {
+            const notif = std.fmt.bufPrint(&notif_buf, "Read {s}", .{real_path}) catch real_path;
+            _ = self.queues.output.push(.tool_call, notif);
+        }
 
         const content = std.fs.cwd().readFileAlloc(self.allocator, real_path, 512 * 1024) catch |err| {
             var errbuf: [256]u8 = undefined;
             const msg = std.fmt.bufPrint(&errbuf, "read error: {s}: {}", .{ real_path, err }) catch "read error";
             return self.allocator.dupe(u8, msg);
         };
-        return content;
+        defer self.allocator.free(content);
+
+        // Add line numbers and apply offset/limit
+        var result: std.ArrayList(u8) = .{};
+        var line_num: usize = 1;
+        var start: usize = 0;
+        const start_line = if (offset > 0) offset else 1;
+        const max_lines = if (limit > 0) limit else 2000;
+        var lines_output: usize = 0;
+
+        while (start <= content.len and lines_output < max_lines) {
+            const end = if (start < content.len)
+                (std.mem.indexOfScalarPos(u8, content, start, '\n') orelse content.len)
+            else
+                content.len;
+
+            if (line_num >= start_line) {
+                result.writer(self.allocator).print("{d:>6}\t", .{line_num}) catch break;
+                if (start < content.len) {
+                    result.appendSlice(self.allocator, content[start..end]) catch break;
+                }
+                result.append(self.allocator, '\n') catch break;
+                lines_output += 1;
+            }
+
+            if (end >= content.len) break;
+            start = end + 1;
+            line_num += 1;
+        }
+
+        return result.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
     }
 
     fn executeWrite(self: *AgentThread, path: []const u8, content: []const u8) ![]u8 {
@@ -750,6 +1485,103 @@ const AgentThread = struct {
         return self.allocator.dupe(u8, result);
     }
 
+    fn executeEdit(self: *AgentThread, path: []const u8, old_str: []const u8, new_str: []const u8, replace_all: bool) ![]u8 {
+        var path_buf: [512]u8 = undefined;
+        const real_path = unescapeJSON(path, &path_buf) orelse path;
+
+        // Unescape the search and replace strings
+        const old_buf = try self.allocator.alloc(u8, old_str.len);
+        defer self.allocator.free(old_buf);
+        const real_old = unescapeJSON(old_str, old_buf) orelse old_str;
+
+        const new_buf = try self.allocator.alloc(u8, new_str.len);
+        defer self.allocator.free(new_buf);
+        const real_new = unescapeJSON(new_str, new_buf) orelse new_str;
+
+        var notif_buf: [512]u8 = undefined;
+        const notif = std.fmt.bufPrint(&notif_buf, "Edit {s}", .{real_path}) catch real_path;
+        _ = self.queues.output.push(.tool_call, notif);
+
+        // Read current file content
+        const content = std.fs.cwd().readFileAlloc(self.allocator, real_path, 512 * 1024) catch |err| {
+            var errbuf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&errbuf, "edit error: cannot read {s}: {}", .{ real_path, err }) catch "read error";
+            return self.allocator.dupe(u8, msg);
+        };
+        defer self.allocator.free(content);
+
+        // Find occurrences
+        if (std.mem.indexOf(u8, content, real_old) == null) {
+            return self.allocator.dupe(u8, "edit error: old_string not found in file");
+        }
+
+        if (!replace_all) {
+            // Check uniqueness
+            if (std.mem.indexOf(u8, content, real_old)) |first| {
+                if (std.mem.indexOfPos(u8, content, first + real_old.len, real_old) != null) {
+                    return self.allocator.dupe(u8, "edit error: old_string found multiple times. Use replace_all:true or provide more context.");
+                }
+            }
+        }
+
+        // Backup before editing
+        if (self.session_log) |*sl| sl.backupFile(real_path) catch {};
+
+        // Build new content with replacements
+        var result_content: std.ArrayList(u8) = .{};
+        defer result_content.deinit(self.allocator);
+        var pos: usize = 0;
+        var replacements: usize = 0;
+
+        while (pos < content.len) {
+            if (std.mem.indexOfPos(u8, content, pos, real_old)) |match_start| {
+                result_content.appendSlice(self.allocator, content[pos..match_start]) catch return error.OutOfMemory;
+                result_content.appendSlice(self.allocator, real_new) catch return error.OutOfMemory;
+                pos = match_start + real_old.len;
+                replacements += 1;
+                if (!replace_all) break;
+            } else {
+                result_content.appendSlice(self.allocator, content[pos..]) catch return error.OutOfMemory;
+                break;
+            }
+        }
+        // Append remaining if we broke early
+        if (pos < content.len and !replace_all) {
+            result_content.appendSlice(self.allocator, content[pos..]) catch return error.OutOfMemory;
+        }
+
+        // Write back
+        const file = std.fs.cwd().createFile(real_path, .{}) catch |err| {
+            var errbuf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&errbuf, "edit error: cannot write {s}: {}", .{ real_path, err }) catch "write error";
+            return self.allocator.dupe(u8, msg);
+        };
+        defer file.close();
+        file.writeAll(result_content.items) catch |err| {
+            var errbuf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&errbuf, "write error: {}", .{err}) catch "write error";
+            return self.allocator.dupe(u8, msg);
+        };
+
+        // Show diff preview in tool output
+        var diff_result: std.ArrayList(u8) = .{};
+        const dw = diff_result.writer(self.allocator);
+        dw.print("Edited {s}: {d} replacement(s)\n", .{ real_path, replacements }) catch {};
+        // Show context: what was replaced
+        const old_preview = if (real_old.len > 200) real_old[0..200] else real_old;
+        const new_preview = if (real_new.len > 200) real_new[0..200] else real_new;
+        dw.writeAll("--- old\n") catch {};
+        dw.writeAll(old_preview) catch {};
+        if (real_old.len > 200) dw.writeAll("...") catch {};
+        dw.writeAll("\n+++ new\n") catch {};
+        dw.writeAll(new_preview) catch {};
+        if (real_new.len > 200) dw.writeAll("...") catch {};
+        dw.writeByte('\n') catch {};
+
+        _ = self.queues.output.push(.tool_done, diff_result.items);
+        return diff_result.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
+    }
+
     fn executeGlob(self: *AgentThread, pattern: []const u8, search_path: ?[]const u8) ![]u8 {
         var pattern_buf: [256]u8 = undefined;
         const real_pattern = unescapeJSON(pattern, &pattern_buf) orelse pattern;
@@ -763,13 +1595,25 @@ const AgentThread = struct {
             _ = self.queues.output.push(.tool_call, notif);
         }
 
-        // use find command as backend (simple, works everywhere)
+        // use find command as backend
         var cmd_buf: [1024]u8 = undefined;
-        const dir = if (search_path) |p| blk: {
-            var p_buf: [256]u8 = undefined;
-            break :blk unescapeJSON(p, &p_buf) orelse p;
-        } else ".";
-        const cmd = std.fmt.bufPrint(&cmd_buf, "find {s} -name '{s}' -type f 2>/dev/null | head -100 | sort", .{ dir, real_pattern }) catch return error.PatternTooLong;
+        var dir_buf: [256]u8 = undefined;
+        const dir = if (search_path) |p| (unescapeJSON(p, &dir_buf) orelse p) else ".";
+
+        // Handle ** glob patterns: find -name doesn't support **
+        // Convert **/* to just find all files; *.ext to find -name '*.ext'
+        const cmd = blk: {
+            if (std.mem.indexOf(u8, real_pattern, "**") != null) {
+                // ** means recursive — just list all files, optionally filtered by extension
+                // Extract extension filter if pattern is like **/*.ext
+                if (std.mem.lastIndexOfScalar(u8, real_pattern, '.')) |dot| {
+                    const ext = real_pattern[dot..];
+                    break :blk std.fmt.bufPrint(&cmd_buf, "find {s} -type f -name '*{s}' 2>/dev/null | head -200 | sort", .{ dir, ext }) catch return error.PatternTooLong;
+                }
+                break :blk std.fmt.bufPrint(&cmd_buf, "find {s} -type f 2>/dev/null | head -200 | sort", .{dir}) catch return error.PatternTooLong;
+            }
+            break :blk std.fmt.bufPrint(&cmd_buf, "find {s} -name '{s}' -type f 2>/dev/null | head -200 | sort", .{ dir, real_pattern }) catch return error.PatternTooLong;
+        };
 
         const result = std.process.Child.run(.{
             .allocator = self.allocator,
@@ -855,9 +1699,22 @@ fn parseAnthropicDelta(
     tool_id_len: *usize,
     has_tool_call: *bool,
     queues: *AgentQueues,
+    input_tokens: *u32,
+    output_tokens: *u32,
 ) void {
     // Extract "type" field
     const type_val = jsonGetStr(data, "type") orelse return;
+
+    // message_start has input token count
+    if (std.mem.eql(u8, type_val, "message_start")) {
+        if (jsonGetInt(data, "input_tokens")) |n| input_tokens.* = @intCast(n);
+        return;
+    }
+    // message_delta has output token count
+    if (std.mem.eql(u8, type_val, "message_delta")) {
+        if (jsonGetInt(data, "output_tokens")) |n| output_tokens.* = @intCast(n);
+        return;
+    }
 
     if (std.mem.eql(u8, type_val, "content_block_start")) {
         if (std.mem.indexOf(u8, data, "\"tool_use\"") != null) {
@@ -885,7 +1742,7 @@ fn parseAnthropicDelta(
                 const decoded = unescapeJSON(text, text_buf.*[text_len.*..]) orelse text;
                 text_len.* += decoded.len;
                 if (text_len.* > text_buf.len) text_len.* = text_buf.len;
-                _ = queues.output.push(.text_delta, decoded);
+                queues.output.pushWait(.text_delta, decoded);
             }
             return;
         }
@@ -914,7 +1771,7 @@ fn parseOpenAIDelta(
         const decoded = unescapeJSON(text, text_buf.*[text_len.*..]) orelse text;
         text_len.* += decoded.len;
         if (text_len.* > text_buf.len) text_len.* = text_buf.len;
-        _ = queues.output.push(.text_delta, decoded);
+        queues.output.pushWait(.text_delta, decoded);
     }
 }
 
@@ -933,6 +1790,20 @@ fn jsonGetStr(json: []const u8, key: []const u8) ?[]const u8 {
         if (trimmed[i] == '"') return trimmed[1..i];
     }
     return null;
+}
+
+/// Extract integer value from JSON by key
+fn jsonGetInt(json: []const u8, key: []const u8) ?u64 {
+    var key_buf: [128]u8 = undefined;
+    const quoted_key = std.fmt.bufPrint(&key_buf, "\"{s}\":", .{key}) catch return null;
+    const idx = std.mem.indexOf(u8, json, quoted_key) orelse return null;
+    const after = json[idx + quoted_key.len..];
+    const trimmed = std.mem.trimLeft(u8, after, " \t");
+    // Find the end of the number
+    var end: usize = 0;
+    while (end < trimmed.len and (trimmed[end] >= '0' and trimmed[end] <= '9')) : (end += 1) {}
+    if (end == 0) return null;
+    return std.fmt.parseInt(u64, trimmed[0..end], 10) catch null;
 }
 
 /// Unescape JSON string escapes (\n, \t, \\, \") into dest buffer
@@ -962,6 +1833,11 @@ fn unescapeJSON(src: []const u8, dest: []u8) ?[]const u8 {
     return dest[0..di];
 }
 
+/// Public wrapper for unescapeJSON (used by builtins for log display)
+pub fn unescapeJSONPublic(src: []const u8, dest: []u8) ?[]const u8 {
+    return unescapeJSON(src, dest);
+}
+
 fn writeJSONString(w: anytype, s: []const u8) !void {
     try w.writeByte('"');
     for (s) |c| {
@@ -971,11 +1847,165 @@ fn writeJSONString(w: anytype, s: []const u8) !void {
             '\n' => try w.writeAll("\\n"),
             '\r' => try w.writeAll("\\r"),
             '\t' => try w.writeAll("\\t"),
-            else => try w.writeByte(c),
+            else => {
+                if (c < 0x20) {
+                    // escape control characters as \u00XX
+                    try w.writeAll("\\u00");
+                    const hex = "0123456789abcdef";
+                    try w.writeByte(hex[c >> 4]);
+                    try w.writeByte(hex[c & 0x0f]);
+                } else {
+                    try w.writeByte(c);
+                }
+            },
         }
     }
     try w.writeByte('"');
 }
+
+// ============================================================
+// Markdown terminal renderer (streaming-aware)
+// ============================================================
+
+/// Tracks state for rendering markdown with ANSI codes across streamed chunks
+pub const MarkdownRenderer = struct {
+    in_code_block: bool = false,
+    in_bold: bool = false,
+    in_inline_code: bool = false,
+    line_start: bool = true,
+
+    /// Process a chunk of text and write ANSI-formatted output
+    pub fn render(self: *MarkdownRenderer, writer: anytype, text: []const u8) !void {
+        var i: usize = 0;
+        while (i < text.len) {
+            const c = text[i];
+
+            // Handle code blocks (```)
+            if (c == '`') {
+                // Check for ``` (code block fence)
+                if (i + 2 < text.len and text[i + 1] == '`' and text[i + 2] == '`') {
+                    if (!self.in_code_block) {
+                        self.in_code_block = true;
+                        // Skip language identifier on same line
+                        var skip = i + 3;
+                        while (skip < text.len and text[skip] != '\n') : (skip += 1) {}
+                        // Print header bar
+                        // Extract lang name if present
+                        const lang = std.mem.trim(u8, text[i + 3 .. skip], " \t\r");
+                        if (lang.len > 0) {
+                            try writer.writeAll("\x1b[90m─── ");
+                            try writer.writeAll(lang);
+                            try writer.writeAll(" ───\x1b[0m\n");
+                        } else {
+                            try writer.writeAll("\x1b[90m──────────\x1b[0m\n");
+                        }
+                        try writer.writeAll("\x1b[36m"); // cyan for code
+                        i = if (skip < text.len) skip + 1 else skip;
+                        self.line_start = true;
+                        continue;
+                    } else {
+                        self.in_code_block = false;
+                        try writer.writeAll("\x1b[0m");
+                        try writer.writeAll("\x1b[90m──────────\x1b[0m");
+                        i += 3;
+                        // skip rest of line
+                        while (i < text.len and text[i] != '\n') : (i += 1) {}
+                        self.line_start = true;
+                        continue;
+                    }
+                }
+
+                // Inline code (single `)
+                if (!self.in_code_block) {
+                    if (!self.in_inline_code) {
+                        self.in_inline_code = true;
+                        try writer.writeAll("\x1b[36m"); // cyan
+                    } else {
+                        self.in_inline_code = false;
+                        try writer.writeAll("\x1b[0m");
+                    }
+                    i += 1;
+                    continue;
+                }
+            }
+
+            // Inside code blocks, just pass through (already colored)
+            if (self.in_code_block) {
+                try writer.writeByte(c);
+                self.line_start = (c == '\n');
+                i += 1;
+                continue;
+            }
+
+            // Headers at line start
+            if (self.line_start and c == '#') {
+                var level: usize = 0;
+                var hi = i;
+                while (hi < text.len and text[hi] == '#') : (hi += 1) { level += 1; }
+                if (hi < text.len and text[hi] == ' ') {
+                    // It's a header
+                    try writer.writeAll("\x1b[1;33m"); // bold yellow
+                    i = hi + 1; // skip "# "
+                    // Write the rest of the line
+                    while (i < text.len and text[i] != '\n') {
+                        try writer.writeByte(text[i]);
+                        i += 1;
+                    }
+                    try writer.writeAll("\x1b[0m");
+                    if (i < text.len) {
+                        try writer.writeByte('\n');
+                        i += 1;
+                    }
+                    self.line_start = true;
+                    continue;
+                }
+            }
+
+            // Bold (**text**)
+            if (c == '*' and i + 1 < text.len and text[i + 1] == '*') {
+                if (!self.in_bold) {
+                    self.in_bold = true;
+                    try writer.writeAll("\x1b[1m"); // bold
+                } else {
+                    self.in_bold = false;
+                    try writer.writeAll("\x1b[0m");
+                }
+                i += 2;
+                continue;
+            }
+
+            // List items at line start
+            if (self.line_start and (c == '-' or c == '*') and i + 1 < text.len and text[i + 1] == ' ') {
+                try writer.writeAll("\x1b[33m•\x1b[0m "); // yellow bullet
+                i += 2;
+                self.line_start = false;
+                continue;
+            }
+
+            // Numbered list at line start
+            if (self.line_start and c >= '0' and c <= '9') {
+                var ni = i;
+                while (ni < text.len and text[ni] >= '0' and text[ni] <= '9') : (ni += 1) {}
+                if (ni < text.len and text[ni] == '.' and ni + 1 < text.len and text[ni + 1] == ' ') {
+                    try writer.writeAll("\x1b[33m");
+                    try writer.writeAll(text[i..ni + 1]);
+                    try writer.writeAll("\x1b[0m ");
+                    i = ni + 2;
+                    self.line_start = false;
+                    continue;
+                }
+            }
+
+            try writer.writeByte(c);
+            self.line_start = (c == '\n');
+            i += 1;
+        }
+    }
+
+    pub fn reset(self: *MarkdownRenderer) void {
+        self.* = .{};
+    }
+};
 
 // ============================================================
 // Public API — thread entry point
@@ -985,14 +2015,28 @@ pub const AgentContext = struct {
     queues: AgentQueues = .{},
     thread: ?std.Thread = null,
     allocator: std.mem.Allocator,
+    model_override: [64]u8 = undefined,
+    model_override_len: u8 = 0,
 
     pub fn init(allocator: std.mem.Allocator) AgentContext {
         return .{ .allocator = allocator };
     }
 
+    /// Set a model override for the next agent thread start
+    pub fn setModel(self: *AgentContext, model: []const u8) void {
+        const n = @min(model.len, 64);
+        @memcpy(self.model_override[0..n], model[0..n]);
+        self.model_override_len = @intCast(n);
+    }
+
+    pub fn getModelOverride(self: *const AgentContext) ?[]const u8 {
+        if (self.model_override_len == 0) return null;
+        return self.model_override[0..self.model_override_len];
+    }
+
     pub fn start(self: *AgentContext) !void {
         if (self.thread != null) return;
-        self.thread = try std.Thread.spawn(.{}, agentThreadFn, .{ self.allocator, &self.queues });
+        self.thread = try std.Thread.spawn(.{}, agentThreadFn, .{ self.allocator, &self.queues, self.getModelOverride() });
     }
 
     pub fn stop(self: *AgentContext) void {
@@ -1003,11 +2047,11 @@ pub const AgentContext = struct {
         }
     }
 
-    /// Send a query to the agent. Returns false if agent is busy.
+    /// Send a query to the agent. Returns false if queue is full.
+    /// Queries are queued and processed sequentially — safe to call while agent is busy.
     pub fn query(self: *AgentContext, text: []const u8) bool {
         // auto-start agent thread if not running (e.g. in -c mode)
         if (self.thread == null) self.start() catch return false;
-        if (self.queues.isBusy()) return false;
         return self.queues.request.push(.text_delta, text);
     }
 
@@ -1043,6 +2087,11 @@ pub const AgentContext = struct {
                     try writer.writeAll(msg.slice());
                     try writer.writeAll("\x1b[0m\n");
                 },
+                .usage_info => {
+                    try writer.writeAll("\x1b[90m");
+                    try writer.writeAll(msg.slice());
+                    try writer.writeAll("\x1b[0m\n");
+                },
                 .done => {
                     try writer.writeByte('\n');
                 },
@@ -1053,9 +2102,16 @@ pub const AgentContext = struct {
     }
 };
 
-fn agentThreadFn(allocator: std.mem.Allocator, queues: *AgentQueues) void {
-    const config = Config.fromEnv(allocator);
+fn agentThreadFn(allocator: std.mem.Allocator, queues: *AgentQueues, model_override: ?[]const u8) void {
+    var ac = log_mod.AgentConfig.load(allocator);
+    var config = Config.fromAgentConfig(ac);
+    if (model_override) |m| config.model = m;
     var agent = AgentThread.init(allocator, queues, config);
-    defer agent.deinit();
+    // Config slices now point into ac's tracked buffers — must keep ac alive
+    // until agent is done, then free both
+    defer {
+        agent.deinit();
+        ac.deinit();
+    }
     agent.run();
 }

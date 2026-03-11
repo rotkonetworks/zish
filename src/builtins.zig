@@ -2302,20 +2302,45 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
     const out = shell.stdout();
 
     if (args.len < 2) {
-        try out.writeAll(
-            \\Usage: agent <query>        - ask the agent something
-            \\       agent stop           - cancel current work (also Ctrl+G)
-            \\       agent status         - show idle/busy state
-            \\       agent sessions       - list saved sessions
-            \\       agent config         - show current configuration
-            \\       agent clear          - clear conversation history
-            \\
-        );
-        try out.flush();
-        return 0;
+        // interactive agent mode
+        return agentInteractive(shell);
     }
 
-    const subcmd = args[1];
+    var subcmd = args[1];
+    var arg_start: usize = 1;
+
+    // Handle -m <model> flag (must be before subcommand)
+    if (std.mem.eql(u8, subcmd, "-m") and args.len >= 3) {
+        const model = args[2];
+        // Resolve model aliases
+        const resolved = if (std.mem.eql(u8, model, "opus"))
+            "claude-opus-4-6"
+        else if (std.mem.eql(u8, model, "sonnet"))
+            "claude-sonnet-4-6"
+        else if (std.mem.eql(u8, model, "haiku"))
+            "claude-haiku-4-5-20251001"
+        else
+            model;
+
+        // Set model override and restart agent
+        shell.agent.setModel(resolved);
+        shell.agent.stop();
+        try out.print("\x1b[90mSwitching to {s}\x1b[0m\n", .{resolved});
+        try out.flush();
+
+        arg_start = 3;
+        if (args.len < 4) {
+            // agent -m opus (no further args) — enter interactive mode
+            return agentInteractive(shell);
+        }
+        subcmd = args[3];
+        arg_start = 3;
+    }
+
+    // agent c / agent continue — re-enter interactive mode (same as bare agent)
+    if (std.mem.eql(u8, subcmd, "c") or std.mem.eql(u8, subcmd, "continue")) {
+        return agentInteractive(shell);
+    }
 
     // agent stop
     if (std.mem.eql(u8, subcmd, "stop")) {
@@ -2345,12 +2370,25 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
         if (sessions.items.len == 0) {
             try out.writeAll("No saved sessions.\n");
         } else {
-            try out.writeAll("ID             Created     Status  CWD\n");
+            try out.writeAll("ID             Created              CWD\n");
             // show last 20 sessions
             const start = if (sessions.items.len > 20) sessions.items.len - 20 else 0;
-            for (sessions.items[start..]) |info| {
-                try out.print("{s}  {d:<10}  {s:<6}  {s}\n", .{
-                    info.id, info.created, info.status, info.cwd,
+            for (sessions.items[start..]) |*info| {
+                // format timestamp as date
+                const epoch_secs: u64 = if (info.created > 0) @intCast(info.created) else 0;
+                const es = std.time.epoch.EpochSeconds{ .secs = epoch_secs };
+                const day = es.getEpochDay();
+                const yd = day.calculateYearDay();
+                const md = yd.calculateMonthDay();
+                const ds = es.getDaySeconds();
+                try out.print("{s}  {d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}  {s}\n", .{
+                    @as([]const u8, &info.id),
+                    yd.year,
+                    @intFromEnum(md.month),
+                    md.day_index + 1,
+                    ds.getHoursIntoDay(),
+                    ds.getMinutesIntoHour(),
+                    info.cwd(),
                 });
             }
         }
@@ -2360,7 +2398,8 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
 
     // agent config
     if (std.mem.eql(u8, subcmd, "config")) {
-        const cfg = agent_log.AgentConfig.load(shell.allocator);
+        var cfg = agent_log.AgentConfig.load(shell.allocator);
+        defer cfg.deinit();
         try out.print("provider:   {s}\n", .{cfg.provider});
         try out.print("model:      {s}\n", .{cfg.model});
         try out.print("base_url:   {s}\n", .{cfg.base_url});
@@ -2384,11 +2423,45 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
         return 0;
     }
 
+    // agent log [session-id] — view conversation log
+    if (std.mem.eql(u8, subcmd, "log")) {
+        return agentLog(shell, args);
+    }
+
+    // agent help
+    if (std.mem.eql(u8, subcmd, "help")) {
+        try out.writeAll(
+            \\Usage: agent [command|query]
+            \\
+            \\Commands:
+            \\  agent              Enter interactive agent mode
+            \\  agent c|continue   Re-enter interactive mode (continue session)
+            \\  agent stop         Cancel current operation
+            \\  agent status       Show agent status (busy/idle)
+            \\  agent sessions     List recent sessions
+            \\  agent log [id]     View conversation log (latest or by session id)
+            \\  agent config       Show current configuration
+            \\  agent clear        Reset conversation history
+            \\  agent help         Show this help
+            \\
+            \\  agent <query>      Send a one-shot query
+            \\
+            \\Interactive mode commands:
+            \\  /compact           Summarize conversation to save context
+            \\  /help              Show interactive help
+            \\  clear              Reset conversation
+            \\  exit, quit, Ctrl+D Leave agent mode
+            \\
+        );
+        try out.flush();
+        return 0;
+    }
+
     // agent "query..." - send query to agent
-    // join all args after "agent" as the query
+    // join all args after "agent" (or after -m <model>) as the query
     var query_buf: [4096]u8 = undefined;
     var pos: usize = 0;
-    for (args[1..], 0..) |arg, i| {
+    for (args[arg_start..], 0..) |arg, i| {
         if (i > 0 and pos < query_buf.len - 1) {
             query_buf[pos] = ' ';
             pos += 1;
@@ -2431,6 +2504,12 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
                         try out.writeAll(msg.slice());
                         try out.writeAll("\x1b[0m\n");
                     },
+                    .confirm_request => {
+                        // auto-deny in non-interactive mode
+                        _ = shell.agent.queues.request.push(.confirm_response, "n");
+                    },
+                    .usage_info => {},
+                    .confirm_response => {},
                     .done => {
                         done = true;
                     },
@@ -2443,5 +2522,523 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
             if (!done) std.Thread.sleep(50 * std.time.ns_per_ms);
         }
     }
+    return 0;
+}
+
+fn getTermRows() u16 {
+    const TIOCGWINSZ = 0x5413;
+    const Winsize = extern struct { ws_row: u16, ws_col: u16, ws_xpixel: u16, ws_ypixel: u16 };
+    var ws: Winsize = undefined;
+    if (std.posix.system.ioctl(std.posix.STDOUT_FILENO, TIOCGWINSZ, @intFromPtr(&ws)) == 0 and ws.ws_row > 0)
+        return ws.ws_row;
+    return 24;
+}
+
+fn getTermCols() u16 {
+    const TIOCGWINSZ = 0x5413;
+    const Winsize = extern struct { ws_row: u16, ws_col: u16, ws_xpixel: u16, ws_ypixel: u16 };
+    var ws: Winsize = undefined;
+    if (std.posix.system.ioctl(std.posix.STDOUT_FILENO, TIOCGWINSZ, @intFromPtr(&ws)) == 0 and ws.ws_col > 0)
+        return ws.ws_col;
+    return 80;
+}
+
+fn agentInteractive(shell: *Shell) !u8 {
+    const out = shell.stdout();
+    const agent_queue = @import("agent_queue.zig");
+
+    const was_running = shell.agent.thread != null;
+
+    // Ensure agent thread is running
+    shell.agent.start() catch {
+        try out.writeAll("\x1b[31magent: failed to start\x1b[0m\n");
+        try out.flush();
+        return 1;
+    };
+
+    var cfg = agent_log.AgentConfig.load(shell.allocator);
+    var model_buf: [64]u8 = undefined;
+    const model_src = shell.agent.getModelOverride() orelse cfg.model;
+    const model_name = model_buf[0..model_src.len];
+    @memcpy(model_name, model_src);
+    cfg.deinit();
+
+    // Get terminal dimensions
+    const term_rows = getTermRows();
+    const term_cols = getTermCols();
+    const output_rows = term_rows - 2; // reserve 2 rows: separator + input
+
+    // --- Setup TUI layout ---
+    // Scroll the terminal down to make room, then set up scroll region
+    // This keeps output in main scrollback (no alternate screen)
+    {
+        var si: u16 = 0;
+        while (si < term_rows) : (si += 1) try out.writeByte('\n');
+    }
+    try out.print("\x1b[{d};1H", .{@as(u16, 1)}); // cursor to top
+    try out.print("\x1b[1;{d}r", .{output_rows}); // set scroll region (output area)
+
+    // Show header in output area
+    if (was_running) {
+        try out.print("\x1b[1;34m\xe2\x95\xad\xe2\x94\x80 Agent Mode \x1b[0m\x1b[90m({s} \xe2\x80\x94 continuing)\x1b[0m\n", .{model_name});
+    } else {
+        try out.print("\x1b[1;34m\xe2\x95\xad\xe2\x94\x80 Agent Mode \x1b[0m\x1b[90m({s} \xe2\x80\x94 /help for commands)\x1b[0m\n", .{model_name});
+    }
+
+    // Draw separator line (fixed at output_rows+1, outside scroll region)
+    try out.print("\x1b[{d};1H", .{output_rows + 1});
+    try out.writeAll("\x1b[90m");
+    {
+        var ci: u16 = 0;
+        while (ci < term_cols) : (ci += 1) try out.writeAll("\xe2\x94\x80");
+    }
+    try out.writeAll("\x1b[0m");
+
+    // Draw initial input bar (last row, outside scroll region)
+    try out.print("\x1b[{d};1H", .{term_rows});
+    try out.writeAll("\x1b[2K\x1b[1;34m\xe2\x95\xb0\xe2\x94\x80>\x1b[0m ");
+    try out.flush();
+
+    // Position cursor in output area for output
+    try out.print("\x1b[{d};1H", .{@as(u16, 2)}); // below header
+
+    // Helper to restore terminal on exit
+    const ExitHelper = struct {
+        fn restore(w: anytype, rows: u16) void {
+            w.print("\x1b[1;{d}r", .{rows}) catch {}; // reset scroll region
+            w.print("\x1b[{d};1H", .{rows}) catch {}; // cursor to bottom
+            w.writeAll("\x1b[2K\n") catch {}; // clear input line
+            w.flush() catch {};
+        }
+    };
+
+    // State
+    var line_buf: [4096]u8 = undefined;
+    var line_len: usize = 0;
+    var md: agent_mod.MarkdownRenderer = .{};
+    var last_was_text = false;
+    var agent_active = false;
+    var in_confirm = false;
+    var cursor_in_output = true; // track where cursor is
+
+    // Helper: redraw input bar — just moves cursor there, draws, does NOT save/restore
+    const InputBar = struct {
+        fn draw(w: anytype, rows: u16, buf: []const u8, len: usize) void {
+            // Move to input row, clear, draw prompt + content
+            w.print("\x1b[{d};1H\x1b[2K\x1b[1;34m\xe2\x95\xb0\xe2\x94\x80>\x1b[0m ", .{rows}) catch {};
+            if (len > 0) w.writeAll(buf[0..len]) catch {};
+        }
+    };
+
+    // Helper: ensure cursor is in output scroll region
+    const moveCursorToOutput = struct {
+        fn f(w: anytype, rows: u16) void {
+            // Move to bottom of scroll region — new output will scroll
+            w.print("\x1b[{d};1H", .{rows}) catch {};
+        }
+    };
+
+    // Main event loop
+    while (true) {
+        // If not agent active and cursor in output, move to input bar
+        if (!agent_active and !in_confirm and cursor_in_output) {
+            InputBar.draw(out, term_rows, &line_buf, line_len);
+            cursor_in_output = false;
+            try out.flush();
+        }
+
+        // Poll stdin
+        var poll_fds = [_]std.posix.pollfd{.{
+            .fd = std.posix.STDIN_FILENO,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        }};
+        const poll_timeout: i32 = if (agent_active) 20 else 100;
+        const poll_n = std.posix.poll(&poll_fds, poll_timeout) catch 0;
+
+        // --- Drain agent output (always goes to scroll region) ---
+        var got_output = false;
+        var msg: agent_queue.Msg = undefined;
+        while (shell.agent.queues.output.pop(&msg)) {
+            got_output = true;
+
+            if (!agent_active and msg.kind != .done and msg.kind != .usage_info and msg.kind != .confirm_response) {
+                agent_active = true;
+            }
+
+            // Save cursor, jump to output region, write, restore cursor to input
+            if (!cursor_in_output and msg.kind != .done and msg.kind != .confirm_request) {
+                try out.writeAll("\x1b7"); // save cursor position
+            }
+
+            // Ensure we're in the scroll region for output
+            if (!cursor_in_output) {
+                moveCursorToOutput.f(out, output_rows);
+                cursor_in_output = true;
+            }
+
+            switch (msg.kind) {
+                .text_delta => {
+                    try md.render(out, msg.slice());
+                    last_was_text = true;
+                },
+                .tool_call => {
+                    if (last_was_text) try out.writeAll("\x1b[0m\n");
+                    last_was_text = false;
+                    try out.writeAll("\x1b[90m");
+                    try out.writeAll(msg.slice());
+                    try out.writeAll("\x1b[0m\n");
+                },
+                .tool_done => {
+                    last_was_text = false;
+                },
+                .error_msg => {
+                    if (last_was_text) try out.writeAll("\x1b[0m\n");
+                    last_was_text = false;
+                    try out.writeAll("\x1b[31m");
+                    try out.writeAll(msg.slice());
+                    try out.writeAll("\x1b[0m\n");
+                },
+                .usage_info => {
+                    if (last_was_text) try out.writeAll("\x1b[0m\n");
+                    last_was_text = false;
+                    try out.writeAll("\x1b[90m");
+                    try out.writeAll(msg.slice());
+                    try out.writeAll("\x1b[0m\n");
+                },
+                .done => {
+                    if (last_was_text) try out.writeAll("\x1b[0m\n");
+                    last_was_text = false;
+                    md.reset();
+                    agent_active = false;
+                    cursor_in_output = true; // will jump to input on next iteration
+                },
+                .confirm_request => {
+                    if (last_was_text) try out.writeByte('\n');
+                    last_was_text = false;
+                    in_confirm = true;
+                    // Show confirm in the input bar area
+                    try out.print("\x1b[{d};1H\x1b[2K", .{term_rows});
+                    try out.writeAll("\x1b[33m");
+                    try out.writeAll(msg.slice());
+                    try out.writeAll(" [y/n/a] \x1b[0m");
+                    cursor_in_output = false;
+                },
+                .confirm_response => {},
+                .cancel => {
+                    agent_active = false;
+                    cursor_in_output = true;
+                },
+            }
+        }
+        if (got_output) {
+            // Save output cursor, redraw input bar, restore output cursor
+            if (cursor_in_output) {
+                try out.writeAll("\x1b7"); // save output position
+                InputBar.draw(out, term_rows, &line_buf, line_len);
+                try out.writeAll("\x1b8"); // restore to output area
+            }
+            try out.flush();
+        }
+
+        // --- Handle stdin ---
+        if (poll_n > 0 and (poll_fds[0].revents & std.posix.POLL.IN) != 0) {
+            var byte: [1]u8 = undefined;
+            const n = std.fs.File.stdin().read(&byte) catch break;
+            if (n == 0) {
+                // Restore terminal and exit
+                ExitHelper.restore(out, term_rows);
+                return 0;
+            }
+
+            // Confirmation mode
+            if (in_confirm) {
+                if (byte[0] == 'y' or byte[0] == 'Y') {
+                    _ = shell.agent.queues.request.push(.confirm_response, "y");
+                } else if (byte[0] == 'a' or byte[0] == 'A' or byte[0] == '!') {
+                    _ = shell.agent.queues.request.push(.confirm_response, "a");
+                } else {
+                    _ = shell.agent.queues.request.push(.confirm_response, "n");
+                }
+                in_confirm = false;
+                // Redraw input bar
+                InputBar.draw(out, term_rows, &line_buf, line_len);
+                cursor_in_output = false;
+                try out.flush();
+                continue;
+            }
+
+            // Ctrl+C / Ctrl+G
+            if (byte[0] == 3 or byte[0] == 7) {
+                if (agent_active) {
+                    shell.agent.cancel();
+                    // Show cancelled in output area
+                    if (cursor_in_output) {
+                        try out.writeAll("\x1b[0m\n\x1b[33m\xe2\x9a\xa1 cancelled\x1b[0m\n");
+                    } else {
+                        moveCursorToOutput.f(out, output_rows);
+                        try out.writeAll("\x1b[0m\n\x1b[33m\xe2\x9a\xa1 cancelled\x1b[0m\n");
+                    }
+                    md.reset();
+                    agent_active = false;
+                    last_was_text = false;
+                    cursor_in_output = true;
+                } else if (line_len > 0) {
+                    line_len = 0;
+                    InputBar.draw(out, term_rows, &line_buf, 0);
+                    cursor_in_output = false;
+                } else {
+                    // Exit
+                    ExitHelper.restore(out, term_rows);
+                    return 0;
+                }
+                try out.flush();
+                continue;
+            }
+
+            // Ctrl+D — exit on empty line
+            if (byte[0] == 4) {
+                if (line_len == 0) {
+                    ExitHelper.restore(out, term_rows);
+                    return 0;
+                }
+                continue;
+            }
+
+            // Escape sequence handling (arrow keys etc) — skip for now
+            if (byte[0] == 27) {
+                // Read and discard escape sequences
+                var esc_buf: [8]u8 = undefined;
+                var esc_poll = [_]std.posix.pollfd{.{
+                    .fd = std.posix.STDIN_FILENO,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                }};
+                if ((std.posix.poll(&esc_poll, 10) catch 0) > 0) {
+                    _ = std.fs.File.stdin().read(&esc_buf) catch {};
+                }
+                continue;
+            }
+
+            // Enter — submit
+            if (byte[0] == '\n' or byte[0] == '\r') {
+                const query = std.mem.trim(u8, line_buf[0..line_len], " \t");
+                line_len = 0;
+
+                if (query.len == 0) {
+                    InputBar.draw(out, term_rows, &line_buf, 0);
+                    cursor_in_output = false;
+                    try out.flush();
+                    continue;
+                }
+
+                // Show user message in output area
+                if (!cursor_in_output) {
+                    moveCursorToOutput.f(out, output_rows);
+                    cursor_in_output = true;
+                }
+                try out.writeAll("\n\x1b[1;32m\xe2\x9d\xaf \x1b[0m"); // ❯
+                try out.writeAll(query);
+                try out.writeByte('\n');
+
+                // Clear input bar
+                InputBar.draw(out, term_rows, &line_buf, 0);
+                try out.flush();
+
+                // Handle local commands
+                if (std.mem.eql(u8, query, "exit") or std.mem.eql(u8, query, "quit")) {
+                    ExitHelper.restore(out, term_rows);
+                    return 0;
+                }
+                if (std.mem.eql(u8, query, "clear")) {
+                    shell.agent.stop();
+                    shell.agent.start() catch {};
+                    try out.writeAll("\x1b[2J\x1b[1;1H"); // clear output area
+                    try out.writeAll("\x1b[90mconversation cleared\x1b[0m\n");
+                    try out.flush();
+                    cursor_in_output = true;
+                    continue;
+                }
+                if (std.mem.eql(u8, query, "/compact") or std.mem.eql(u8, query, "compact")) {
+                    if (shell.agent.query("Please provide a brief summary of our conversation so far in 2-3 sentences, focusing on what was accomplished and any important context. Start with 'Summary:' and be concise.")) {
+                        try out.writeAll("\x1b[90mCompacting...\x1b[0m\n");
+                        try out.flush();
+                        agent_active = true;
+                    }
+                    continue;
+                }
+                if (std.mem.eql(u8, query, "/help") or std.mem.eql(u8, query, "help")) {
+                    try out.writeAll(
+                        \\\x1b[1mAgent Mode Commands:\x1b[0m
+                        \\  \x1b[33mexit\x1b[0m / \x1b[33mquit\x1b[0m / \x1b[33mCtrl+D\x1b[0m  — leave agent mode
+                        \\  \x1b[33mclear\x1b[0m                — reset conversation
+                        \\  \x1b[33m/compact\x1b[0m             — summarize conversation
+                        \\  \x1b[33m/help\x1b[0m                — show this help
+                        \\
+                        \\  Type while the agent responds — messages queue up.
+                        \\  \x1b[33mCtrl+C\x1b[0m cancels when busy, clears/exits when idle.
+                        \\
+                    );
+                    try out.flush();
+                    continue;
+                }
+
+                // Send query
+                if (!shell.agent.query(query)) {
+                    try out.writeAll("\x1b[31mqueue full, try again\x1b[0m\n");
+                    try out.flush();
+                } else {
+                    agent_active = true;
+                }
+                continue;
+            }
+
+            // Backspace
+            if (byte[0] == 127 or byte[0] == 8) {
+                if (line_len > 0) {
+                    line_len -= 1;
+                    InputBar.draw(out, term_rows, &line_buf, line_len);
+                    if (agent_active) {
+                        try out.writeAll("\x1b8"); // restore to output area
+                        cursor_in_output = true;
+                    } else {
+                        cursor_in_output = false;
+                    }
+                    try out.flush();
+                }
+                continue;
+            }
+
+            // Regular character
+            if (byte[0] >= 0x20 or byte[0] == '\t') {
+                if (line_len < line_buf.len - 1) {
+                    line_buf[line_len] = byte[0];
+                    line_len += 1;
+                    // Always update input bar (even while agent streams)
+                    InputBar.draw(out, term_rows, &line_buf, line_len);
+                    if (agent_active) {
+                        // Restore cursor to output area so streaming continues there
+                        try out.writeAll("\x1b8"); // restore saved cursor
+                        cursor_in_output = true;
+                    } else {
+                        cursor_in_output = false;
+                    }
+                    try out.flush();
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+fn agentLog(shell: *Shell, args: []const []const u8) !u8 {
+    const out = shell.stdout();
+
+    // Determine session ID: arg or latest
+    var session_id: []const u8 = "";
+    if (args.len >= 3) {
+        session_id = args[2];
+    } else {
+        // Find most recent session
+        var sessions: std.ArrayList(agent_log.SessionInfo) = .{};
+        defer sessions.deinit(shell.allocator);
+        agent_log.listSessions(shell.allocator, &sessions) catch {};
+        if (sessions.items.len == 0) {
+            try out.writeAll("No sessions found.\n");
+            try out.flush();
+            return 1;
+        }
+        const last = &sessions.items[sessions.items.len - 1];
+        session_id = &last.id;
+    }
+
+    // Read conversation.jsonl for this session
+    var base_buf: [512]u8 = undefined;
+    const base = agent_log.getBaseDir(&base_buf) orelse {
+        try out.writeAll("Cannot find ~/.zish directory.\n");
+        try out.flush();
+        return 1;
+    };
+
+    var path_buf: [512]u8 = undefined;
+    const conv_path = std.fmt.bufPrint(&path_buf, "{s}/sessions/{s}/conversation.jsonl", .{ base, session_id }) catch {
+        try out.writeAll("Path too long.\n");
+        try out.flush();
+        return 1;
+    };
+
+    const content = std.fs.cwd().readFileAlloc(shell.allocator, conv_path, 512 * 1024) catch {
+        try out.print("Session not found: {s}\n", .{session_id});
+        try out.flush();
+        return 1;
+    };
+    defer shell.allocator.free(content);
+
+    // Also read meta.json for context
+    var meta_path_buf: [512]u8 = undefined;
+    const meta_path = std.fmt.bufPrint(&meta_path_buf, "{s}/sessions/{s}/meta.json", .{ base, session_id }) catch "";
+    if (std.fs.cwd().readFileAlloc(shell.allocator, meta_path, 4096)) |meta| {
+        defer shell.allocator.free(meta);
+        try out.writeAll("\x1b[1;34m─── Session ");
+        try out.writeAll(session_id);
+        try out.writeAll(" ───\x1b[0m\n");
+        if (agent_log.jsonExtractStr(meta, "cwd")) |cwd| {
+            try out.print("\x1b[90mcwd: {s}\x1b[0m\n", .{cwd});
+        }
+        if (agent_log.jsonExtractStr(meta, "model")) |model| {
+            try out.print("\x1b[90mmodel: {s}\x1b[0m\n", .{model});
+        }
+        try out.writeByte('\n');
+    } else |_| {}
+
+    // Parse and display JSONL entries
+    var line_iter = std.mem.splitScalar(u8, content, '\n');
+    var md: agent_mod.MarkdownRenderer = .{};
+
+    while (line_iter.next()) |line| {
+        if (line.len < 5) continue;
+
+        // Extract entry type
+        const entry_type = agent_log.jsonExtractStr(line, "t") orelse continue;
+
+        if (std.mem.eql(u8, entry_type, "u")) {
+            // User message
+            if (agent_log.jsonExtractStr(line, "content")) |msg_content| {
+                try out.writeAll("\x1b[1;32m❯ \x1b[0m");
+                try out.writeAll(msg_content);
+                try out.writeByte('\n');
+                md.reset();
+            }
+        } else if (std.mem.eql(u8, entry_type, "a")) {
+            // Assistant message
+            if (agent_log.jsonExtractStr(line, "content")) |msg_content| {
+                // Unescape JSON escapes for display
+                var unescape_buf: [8192]u8 = undefined;
+                const unescaped = agent_mod.unescapeJSONPublic(msg_content, &unescape_buf) orelse msg_content;
+                try md.render(out, unescaped);
+                try out.writeAll("\x1b[0m\n");
+                md.reset();
+            }
+        } else if (std.mem.eql(u8, entry_type, "tc")) {
+            // Tool call
+            if (agent_log.jsonExtractStr(line, "tool")) |tool| {
+                try out.writeAll("\x1b[90m  Tool: ");
+                try out.writeAll(tool);
+                try out.writeAll("\x1b[0m\n");
+            }
+        } else if (std.mem.eql(u8, entry_type, "e")) {
+            // Error
+            if (agent_log.jsonExtractStr(line, "content")) |msg_content| {
+                try out.writeAll("\x1b[31m  ");
+                try out.writeAll(msg_content);
+                try out.writeAll("\x1b[0m\n");
+            }
+        } else if (std.mem.eql(u8, entry_type, "d")) {
+            // Done separator
+            try out.writeAll("\x1b[90m  ───\x1b[0m\n");
+        }
+    }
+
+    try out.flush();
     return 0;
 }

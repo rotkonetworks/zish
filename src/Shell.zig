@@ -231,6 +231,8 @@ path_cache: std.StringHashMap([]const u8),
 
 // embedded LLM agent
 agent: agent_mod.AgentContext,
+agent_output_active: bool = false,
+agent_md: agent_mod.MarkdownRenderer = .{},
 
 pub fn init(allocator: std.mem.Allocator) !*Shell {
     return initWithOptions(allocator, true);
@@ -364,6 +366,9 @@ pub fn deinit(self: *Shell) void {
 
     // cleanup traps
     self.traps.deinit();
+
+    // stop agent thread so it can clean up
+    self.agent.stop();
 
     self.allocator.free(self.clipboard);
     self.allocator.free(self.search_buffer);
@@ -1502,54 +1507,102 @@ fn isWhitespace(c: u8) bool {
 }
 
 /// Drain agent output with proper terminal coordination.
-/// Clears the current prompt, writes agent output below, then re-renders.
+/// Clears the current prompt on first output, then streams directly.
+/// Re-renders prompt only when agent is done.
 fn drainAgentOutput(self: *Shell) !void {
     const q = @import("agent_queue.zig");
     var msg: q.Msg = undefined;
     var wrote = false;
+    var last_was_text = false;
     const writer = self.stdout();
 
     while (self.agent.queues.output.pop(&msg)) {
-        if (!wrote) {
-            // first message: move cursor to end of displayed content and clear prompt
+        if (!self.agent_output_active) {
+            // first message of a new agent response: clear prompt and move below
             self.term_view.moveTo(self.term_view.term.rows_owned -| 1, 0);
             self.term_view.clearToEOL();
             try self.term_view.flush();
-            // move below displayed content
             try writer.writeAll("\r\n");
-            wrote = true;
+            self.agent_output_active = true;
         }
+        wrote = true;
 
         switch (msg.kind) {
-            .text_delta => try writer.writeAll(msg.slice()),
+            .text_delta => {
+                try self.agent_md.render(writer, msg.slice());
+                last_was_text = true;
+            },
             .tool_call => {
-                try writer.writeAll("\x1b[90m"); // dim gray
+                if (last_was_text) try writer.writeAll("\x1b[0m\n");
+                last_was_text = false;
+                try writer.writeAll("\x1b[90m");
                 try writer.writeAll(msg.slice());
                 try writer.writeAll("\x1b[0m\n");
             },
             .tool_done => {
+                last_was_text = false;
                 try writer.writeAll("\x1b[90m");
                 try writer.writeAll(msg.slice());
                 try writer.writeAll("\x1b[0m\n");
             },
             .error_msg => {
-                try writer.writeAll("\x1b[31m"); // red
+                if (last_was_text) try writer.writeAll("\x1b[0m\n");
+                last_was_text = false;
+                try writer.writeAll("\x1b[31m");
                 try writer.writeAll("agent: ");
                 try writer.writeAll(msg.slice());
                 try writer.writeAll("\x1b[0m\n");
             },
             .done => {
+                if (last_was_text) try writer.writeAll("\x1b[0m");
+                last_was_text = false;
                 try writer.writeByte('\n');
+                self.agent_md.reset();
+                self.agent_output_active = false;
+                // re-render prompt now that agent is done
+                try writer.flush();
+                self.term_view.finishLine();
+                try self.renderLine();
             },
-            .cancel => {},
+            .confirm_request => {
+                if (last_was_text) try writer.writeByte('\n');
+                last_was_text = false;
+                // Show confirmation prompt
+                try writer.writeAll("\x1b[33m");
+                try writer.writeAll(msg.slice());
+                try writer.writeAll(" [y/n/a] \x1b[0m");
+                try writer.flush();
+                // Read single keystroke (terminal is in raw mode)
+                var resp: [1]u8 = undefined;
+                const n = std.posix.read(std.posix.STDIN_FILENO, &resp) catch 0;
+                if (n > 0 and (resp[0] == 'y' or resp[0] == 'Y')) {
+                    _ = self.agent.queues.request.push(.confirm_response, "y");
+                    try writer.writeAll("y\n");
+                } else if (n > 0 and (resp[0] == 'a' or resp[0] == 'A' or resp[0] == '!')) {
+                    _ = self.agent.queues.request.push(.confirm_response, "a");
+                    try writer.writeAll("a (always)\n");
+                } else {
+                    _ = self.agent.queues.request.push(.confirm_response, "n");
+                    try writer.writeAll("n\n");
+                }
+                try writer.flush();
+            },
+            .usage_info => {
+                last_was_text = false;
+                try writer.writeAll("\x1b[90m"); // dim
+                try writer.writeAll(msg.slice());
+                try writer.writeAll("\x1b[0m\n");
+            },
+            .confirm_response => {}, // handled on agent side
+            .cancel => {
+                last_was_text = false;
+                self.agent_output_active = false;
+            },
         }
     }
 
     if (wrote) {
         try writer.flush();
-        // reset term_view state so prompt re-renders cleanly on new line
-        self.term_view.finishLine();
-        try self.renderLine();
     }
 }
 

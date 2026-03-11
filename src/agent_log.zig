@@ -415,17 +415,44 @@ pub const AgentConfig = struct {
     max_tokens: u32,
     max_tool_iterations: u32,
     max_agents: u8,
+    auto_allow: bool,
+
+    // Allocation tracking for proper cleanup
+    // Max 7 possible: file content, creds content, 4 env vars, api_key_cmd stdout
+    alloc_bufs: [8]?[]const u8 = .{null} ** 8,
+    alloc_count: u8 = 0,
+    owned_allocator: ?std.mem.Allocator = null,
+
+    fn trackAlloc(self: *AgentConfig, buf: []const u8) void {
+        std.debug.assert(self.alloc_count < 8);
+        self.alloc_bufs[self.alloc_count] = buf;
+        self.alloc_count += 1;
+    }
+
+    pub fn deinit(self: *AgentConfig) void {
+        if (self.owned_allocator) |a| {
+            for (self.alloc_bufs[0..self.alloc_count]) |maybe_buf| {
+                if (maybe_buf) |buf| {
+                    const mut: []u8 = @constCast(buf);
+                    a.free(mut);
+                }
+            }
+        }
+        self.alloc_count = 0;
+    }
 
     pub fn load(allocator: std.mem.Allocator) AgentConfig {
         var cfg = AgentConfig{
             .provider = "anthropic",
-            .model = "claude-opus-4-6",
+            .model = "claude-sonnet-4-6",
             .base_url = "https://api.anthropic.com",
             .api_key = "",
             .api_key_cmd = "",
             .max_tokens = 8192,
             .max_tool_iterations = 10,
             .max_agents = 8,
+            .auto_allow = false,
+            .owned_allocator = allocator,
         };
 
         // try loading from file first
@@ -455,6 +482,7 @@ pub const AgentConfig = struct {
         const path = std.fmt.bufPrint(&path_buf, "{s}/agent.json", .{base}) catch return;
 
         const content = std.fs.cwd().readFileAlloc(allocator, path, 8192) catch return;
+        self.trackAlloc(content);
         // simple key extraction (no full JSON parser needed)
         if (jsonExtractStr(content, "provider")) |v| self.provider = v;
         if (jsonExtractStr(content, "model")) |v| self.model = v;
@@ -464,18 +492,33 @@ pub const AgentConfig = struct {
         if (jsonExtractInt(content, "max_tokens")) |v| self.max_tokens = v;
         if (jsonExtractInt(content, "max_tool_iterations")) |v| self.max_tool_iterations = v;
         if (jsonExtractInt(content, "max_agents")) |v| self.max_agents = @intCast(@min(v, 16));
-        // NOTE: content is leaked on purpose (strings reference into it)
+        // Check "auto_allow": true
+        if (std.mem.indexOf(u8, content, "\"auto_allow\"")) |idx| {
+            const after = content[@min(idx + 12, content.len)..];
+            const trimmed = std.mem.trimLeft(u8, after, " \t\n\r:");
+            self.auto_allow = std.mem.startsWith(u8, trimmed, "true");
+        }
     }
 
     fn loadFromEnv(self: *AgentConfig, allocator: std.mem.Allocator) void {
         if (std.process.getEnvVarOwned(allocator, "ZISH_AGENT_PROVIDER") catch null) |p| {
-            self.provider = p; // leaked
+            self.provider = p;
+            self.trackAlloc(p);
         }
         const key = (std.process.getEnvVarOwned(allocator, "ZISH_AGENT_KEY") catch null)
             orelse (std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY") catch null);
-        if (key) |k| self.api_key = k;
-        if (std.process.getEnvVarOwned(allocator, "ZISH_AGENT_URL") catch null) |u| self.base_url = u;
-        if (std.process.getEnvVarOwned(allocator, "ZISH_AGENT_MODEL") catch null) |m| self.model = m;
+        if (key) |k| {
+            self.api_key = k;
+            self.trackAlloc(k);
+        }
+        if (std.process.getEnvVarOwned(allocator, "ZISH_AGENT_URL") catch null) |u| {
+            self.base_url = u;
+            self.trackAlloc(u);
+        }
+        if (std.process.getEnvVarOwned(allocator, "ZISH_AGENT_MODEL") catch null) |m| {
+            self.model = m;
+            self.trackAlloc(m);
+        }
     }
 
     fn resolveApiKeyCmd(self: *AgentConfig, allocator: std.mem.Allocator) void {
@@ -488,7 +531,8 @@ pub const AgentConfig = struct {
         // trim trailing newline
         const key = std.mem.trimRight(u8, result.stdout, "\n\r ");
         if (key.len > 0) {
-            self.api_key = key; // stdout is leaked (owned by allocator, static lifetime)
+            self.api_key = key;
+            self.trackAlloc(result.stdout);
         } else {
             allocator.free(result.stdout);
         }
@@ -503,7 +547,7 @@ pub const AgentConfig = struct {
         const path = std.fmt.bufPrint(&path_buf, "{s}/.claude/.credentials.json", .{home}) catch return;
 
         const content = std.fs.cwd().readFileAlloc(allocator, path, 8192) catch return;
-        // content is intentionally leaked — strings reference into it
+        self.trackAlloc(content);
 
         // extract accessToken from nested claudeAiOauth object
         // format: {"claudeAiOauth":{"accessToken":"sk-ant-oat01-...","expiresAt":...}}
@@ -524,8 +568,17 @@ pub const AgentConfig = struct {
 pub const SessionInfo = struct {
     id: [SESSION_ID_LEN]u8,
     created: i64,
-    cwd: []const u8,
-    status: []const u8,
+    cwd_buf: [128]u8,
+    cwd_len: u8,
+    status_buf: [16]u8,
+    status_len: u8,
+
+    pub fn cwd(self: *const SessionInfo) []const u8 {
+        return self.cwd_buf[0..self.cwd_len];
+    }
+    pub fn status(self: *const SessionInfo) []const u8 {
+        return self.status_buf[0..self.status_len];
+    }
 };
 
 pub fn listSessions(allocator: std.mem.Allocator, out: *std.ArrayList(SessionInfo)) !void {
@@ -547,10 +600,22 @@ pub fn listSessions(allocator: std.mem.Allocator, out: *std.ArrayList(SessionInf
         var info = SessionInfo{
             .id = undefined,
             .created = 0,
-            .cwd = jsonExtractStr(line, "cwd") orelse "",
-            .status = jsonExtractStr(line, "status") orelse "unknown",
+            .cwd_buf = undefined,
+            .cwd_len = 0,
+            .status_buf = undefined,
+            .status_len = 0,
         };
         @memcpy(&info.id, id_str[0..SESSION_ID_LEN]);
+        if (jsonExtractStr(line, "cwd")) |s| {
+            const n = @min(s.len, 128);
+            @memcpy(info.cwd_buf[0..n], s[0..n]);
+            info.cwd_len = @intCast(n);
+        }
+        if (jsonExtractStr(line, "status")) |s| {
+            const n = @min(s.len, 16);
+            @memcpy(info.status_buf[0..n], s[0..n]);
+            info.status_len = @intCast(n);
+        }
         if (jsonExtractInt(line, "created")) |ts| info.created = @intCast(ts);
         try out.append(allocator, info);
     }
@@ -581,7 +646,7 @@ fn writeJsonStr(w: anytype, s: []const u8) !void {
     try w.writeByte('"');
 }
 
-fn jsonExtractStr(json: []const u8, key: []const u8) ?[]const u8 {
+pub fn jsonExtractStr(json: []const u8, key: []const u8) ?[]const u8 {
     var key_buf: [128]u8 = undefined;
     const quoted_key = std.fmt.bufPrint(&key_buf, "\"{s}\":", .{key}) catch return null;
     const idx = std.mem.indexOf(u8, json, quoted_key) orelse return null;
@@ -599,7 +664,7 @@ fn jsonExtractStr(json: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
-fn jsonExtractInt(json: []const u8, key: []const u8) ?u32 {
+pub fn jsonExtractInt(json: []const u8, key: []const u8) ?u32 {
     var key_buf: [128]u8 = undefined;
     const quoted_key = std.fmt.bufPrint(&key_buf, "\"{s}\":", .{key}) catch return null;
     const idx = std.mem.indexOf(u8, json, quoted_key) orelse return null;

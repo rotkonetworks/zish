@@ -8,12 +8,15 @@ pub const MAX_MSG_LEN = 4096;
 pub const QUEUE_CAPACITY = 64; // power of 2
 
 pub const MsgKind = enum(u8) {
-    text_delta,  // streamed text chunk from model
-    tool_call,   // agent is running a tool (name + cmd)
-    tool_done,   // tool finished (exit code)
-    done,        // agent finished turn
-    error_msg,   // something went wrong
-    cancel,      // cancel signal
+    text_delta,       // streamed text chunk from model
+    tool_call,        // agent is running a tool (name + cmd)
+    tool_done,        // tool finished (exit code)
+    done,             // agent finished turn
+    error_msg,        // something went wrong
+    cancel,           // cancel signal
+    confirm_request,  // agent -> main: "Run this command? [y/N]"
+    confirm_response, // main -> agent: "y" or "n"
+    usage_info,       // agent -> main: token usage "input:N output:N cost:$X.XX"
 };
 
 pub const Msg = struct {
@@ -68,6 +71,13 @@ pub fn Queue(comptime capacity: usize) type {
             out.* = self.slots[head & MASK];
             @atomicStore(usize, &self.head, head +% 1, .release);
             return true;
+        }
+
+        /// Producer: enqueue a message, spinning until space is available.
+        pub fn pushWait(self: *Self, kind: MsgKind, text: []const u8) void {
+            while (!self.push(kind, text)) {
+                std.Thread.sleep(1 * std.time.ns_per_ms);
+            }
         }
 
         pub fn isEmpty(self: *const Self) bool {
