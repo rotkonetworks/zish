@@ -126,16 +126,22 @@ const ConversationHistory = struct {
 // Tool definitions
 // ============================================================
 
-const SYSTEM_PROMPT =
-    \\You are a helpful shell assistant running inside zish shell.
-    \\You can run bash commands to help the user.
-    \\Be concise. When running commands, explain briefly what you're doing.
-    \\The user's working directory is provided in the query context.
+const SYSTEM_PROMPT_PREFIX =
+    \\You are a shell assistant inside zish. Be concise.
+    \\When modifying files, explain briefly what and why.
+    \\Do NOT run destructive commands (rm -rf, git push --force, DROP TABLE, etc.) without warning the user.
+    \\Prefer Read/Glob/Grep tools over Bash for file operations — they are faster and safer.
     \\
 ;
 
 const TOOLS_JSON =
-    \\[{"name":"Bash","description":"Run a shell command and get its output","input_schema":{"type":"object","properties":{"command":{"type":"string","description":"The shell command to run"}},"required":["command"]}}]
+    \\[
+    \\{"name":"Bash","description":"Run a shell command","input_schema":{"type":"object","properties":{"command":{"type":"string","description":"Shell command to run"},"description":{"type":"string","description":"What this command does"}},"required":["command"]}},
+    \\{"name":"Read","description":"Read a file's contents","input_schema":{"type":"object","properties":{"file_path":{"type":"string","description":"Absolute path to the file"}},"required":["file_path"]}},
+    \\{"name":"Write","description":"Write content to a file (creates or overwrites)","input_schema":{"type":"object","properties":{"file_path":{"type":"string","description":"Absolute path"},"content":{"type":"string","description":"File content to write"}},"required":["file_path","content"]}},
+    \\{"name":"Glob","description":"Find files matching a glob pattern","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern (e.g. **/*.zig, src/*.rs)"},"path":{"type":"string","description":"Directory to search in (default: cwd)"}},"required":["pattern"]}},
+    \\{"name":"Grep","description":"Search file contents with regex","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern to search for"},"path":{"type":"string","description":"File or directory to search"},"glob":{"type":"string","description":"Filter files by glob (e.g. *.zig)"}},"required":["pattern"]}}
+    \\]
 ;
 
 // ============================================================
@@ -163,23 +169,84 @@ const AgentThread = struct {
     config: Config,
     history: ConversationHistory,
     session_log: ?SessionLog,
+    cwd: [256]u8,
+    cwd_len: u16,
+    git_branch: [64]u8,
+    git_branch_len: u8,
+    system_prompt_buf: [2048]u8,
+    system_prompt_len: u16,
 
     fn init(allocator: std.mem.Allocator, queues: *AgentQueues, config: Config) AgentThread {
-        // get cwd and git branch for session metadata
-        var cwd_buf: [256]u8 = undefined;
-        const cwd = std.process.getCwd(&cwd_buf) catch "/";
-        var branch_buf: [64]u8 = undefined;
-        const git_branch = getGitBranch(&branch_buf) catch "unknown";
-
-        const session = SessionLog.create(allocator, cwd, git_branch, config.providerStr(), config.model) catch null;
-
-        return .{
+        var self = AgentThread{
             .allocator = allocator,
             .queues = queues,
             .config = config,
             .history = ConversationHistory.init(allocator),
-            .session_log = session,
+            .session_log = undefined,
+            .cwd = undefined,
+            .cwd_len = 0,
+            .git_branch = undefined,
+            .git_branch_len = 0,
+            .system_prompt_buf = undefined,
+            .system_prompt_len = 0,
         };
+
+        // get cwd
+        const cwd = std.process.getCwd(&self.cwd) catch "/";
+        self.cwd_len = @intCast(cwd.len);
+
+        // get git branch
+        const branch = getGitBranch(&self.git_branch) catch "unknown";
+        self.git_branch_len = @intCast(branch.len);
+
+        // build system prompt with context
+        self.buildSystemPrompt();
+
+        // create session log
+        self.session_log = SessionLog.create(allocator, self.cwdSlice(), self.branchSlice(), config.providerStr(), config.model) catch null;
+
+        return self;
+    }
+
+    fn cwdSlice(self: *const AgentThread) []const u8 {
+        return self.cwd[0..self.cwd_len];
+    }
+
+    fn branchSlice(self: *const AgentThread) []const u8 {
+        return self.git_branch[0..self.git_branch_len];
+    }
+
+    fn buildSystemPrompt(self: *AgentThread) void {
+        var fbs = std.io.fixedBufferStream(&self.system_prompt_buf);
+        const w = fbs.writer();
+        w.writeAll(SYSTEM_PROMPT_PREFIX) catch return;
+        w.print("\\nWorking directory: {s}\\n", .{self.cwdSlice()}) catch return;
+        w.print("Git branch: {s}\\n", .{self.branchSlice()}) catch return;
+
+        // try to list top-level files for project context
+        if (std.fs.cwd().openDir(self.cwdSlice(), .{ .iterate = true })) |dir_handle| {
+            var dir = dir_handle;
+            defer dir.close();
+            w.writeAll("\\nProject files: ") catch return;
+            var count: usize = 0;
+            var iter = dir.iterate();
+            while (iter.next() catch null) |entry| {
+                if (count > 0) w.writeAll(", ") catch return;
+                w.writeAll(entry.name) catch return;
+                count += 1;
+                if (count >= 20) {
+                    w.writeAll(", ...") catch return;
+                    break;
+                }
+            }
+            w.writeAll("\\n") catch return;
+        } else |_| {}
+
+        self.system_prompt_len = @intCast(fbs.pos);
+    }
+
+    fn systemPrompt(self: *const AgentThread) []const u8 {
+        return self.system_prompt_buf[0..self.system_prompt_len];
     }
 
     fn deinit(self: *AgentThread) void {
@@ -237,14 +304,21 @@ const AgentThread = struct {
 
             if (!response.has_tool_call) break; // done
 
-            // log + execute tool
+            // dispatch tool by name
             if (self.queues.checkCancel()) return;
-            if (self.session_log) |*sl| sl.logToolCall("Bash", response.tool_command) catch {};
+            const tool_name = response.tool_name;
+            const tool_input = response.tool_command; // raw JSON input
 
-            const tool_output = try self.executeBash(response.tool_command);
+            if (self.session_log) |*sl| sl.logToolCall(tool_name, tool_input) catch {};
+
+            const tool_output = self.dispatchTool(tool_name, tool_input) catch |err| blk: {
+                var errbuf: [256]u8 = undefined;
+                const msg = std.fmt.bufPrint(&errbuf, "tool error: {}", .{err}) catch "tool error";
+                break :blk try self.allocator.dupe(u8, msg);
+            };
             defer self.allocator.free(tool_output);
 
-            if (self.session_log) |*sl| sl.logToolResult("Bash", tool_output, 0) catch {};
+            if (self.session_log) |*sl| sl.logToolResult(tool_name, tool_output, 0) catch {};
 
             // add tool result to history as user message
             const result_buf = try self.allocator.alloc(u8, tool_output.len + 64);
@@ -255,6 +329,39 @@ const AgentThread = struct {
         }
 
         if (self.session_log) |*sl| sl.logDone() catch {};
+    }
+
+    fn dispatchTool(self: *AgentThread, tool_name: []const u8, tool_input: []const u8) ![]u8 {
+        if (std.mem.eql(u8, tool_name, "Bash")) {
+            const cmd = extractJsonField(tool_input, "command") orelse return error.MissingCommand;
+            return self.executeBash(cmd);
+        }
+        if (std.mem.eql(u8, tool_name, "Read")) {
+            const path = extractJsonField(tool_input, "file_path") orelse return error.MissingPath;
+            return self.executeRead(path);
+        }
+        if (std.mem.eql(u8, tool_name, "Write")) {
+            const path = extractJsonField(tool_input, "file_path") orelse return error.MissingPath;
+            const content = extractJsonField(tool_input, "content") orelse return error.MissingContent;
+            return self.executeWrite(path, content);
+        }
+        if (std.mem.eql(u8, tool_name, "Glob")) {
+            const pattern = extractJsonField(tool_input, "pattern") orelse return error.MissingPattern;
+            const path = extractJsonField(tool_input, "path");
+            return self.executeGlob(pattern, path);
+        }
+        if (std.mem.eql(u8, tool_name, "Grep")) {
+            const pattern = extractJsonField(tool_input, "pattern") orelse return error.MissingPattern;
+            const path = extractJsonField(tool_input, "path");
+            const file_glob = extractJsonField(tool_input, "glob");
+            return self.executeGrep(pattern, path, file_glob);
+        }
+        return error.UnknownTool;
+    }
+
+    /// Extract a field value from tool input JSON, unescaping JSON strings
+    fn extractJsonField(json: []const u8, key: []const u8) ?[]const u8 {
+        return jsonGetStr(json, key);
     }
 
     const APIResponse = struct {
@@ -299,7 +406,7 @@ const AgentThread = struct {
             , .{
                 self.config.model,
                 self.config.max_tokens,
-                SYSTEM_PROMPT,
+                self.systemPrompt(),
                 messages_json,
                 TOOLS_JSON,
             }) catch return error.BodyTooLarge;
@@ -452,14 +559,18 @@ const AgentThread = struct {
     }
 
     fn executeBash(self: *AgentThread, command: []const u8) ![]u8 {
+        // unescape JSON string escapes in the command
+        var cmd_buf: [8192]u8 = undefined;
+        const cmd = unescapeJSON(command, &cmd_buf) orelse command;
+
         // notify main thread
         var notif_buf: [512]u8 = undefined;
-        const notif = std.fmt.bufPrint(&notif_buf, "$ {s}", .{command}) catch command;
+        const notif = std.fmt.bufPrint(&notif_buf, "$ {s}", .{cmd}) catch cmd;
         _ = self.queues.output.push(.tool_call, notif);
 
         const result = std.process.Child.run(.{
             .allocator = self.allocator,
-            .argv = &[_][]const u8{ "/bin/sh", "-c", command },
+            .argv = &[_][]const u8{ "/bin/sh", "-c", cmd },
             .max_output_bytes = 65536,
         }) catch |err| {
             var errbuf: [128]u8 = undefined;
@@ -468,10 +579,145 @@ const AgentThread = struct {
         };
         defer self.allocator.free(result.stderr);
 
-        // send tool output to main thread for display
         _ = self.queues.output.push(.tool_done, result.stdout);
+        return result.stdout;
+    }
 
-        return result.stdout; // caller frees
+    fn executeRead(self: *AgentThread, path: []const u8) ![]u8 {
+        var path_buf: [512]u8 = undefined;
+        const real_path = unescapeJSON(path, &path_buf) orelse path;
+
+        var notif_buf: [512]u8 = undefined;
+        const notif = std.fmt.bufPrint(&notif_buf, "Read {s}", .{real_path}) catch real_path;
+        _ = self.queues.output.push(.tool_call, notif);
+
+        const content = std.fs.cwd().readFileAlloc(self.allocator, real_path, 512 * 1024) catch |err| {
+            var errbuf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&errbuf, "read error: {s}: {}", .{ real_path, err }) catch "read error";
+            return self.allocator.dupe(u8, msg);
+        };
+        return content;
+    }
+
+    fn executeWrite(self: *AgentThread, path: []const u8, content: []const u8) ![]u8 {
+        var path_buf: [512]u8 = undefined;
+        const real_path = unescapeJSON(path, &path_buf) orelse path;
+
+        // unescape content
+        const content_buf = try self.allocator.alloc(u8, content.len);
+        defer self.allocator.free(content_buf);
+        const real_content = unescapeJSON(content, content_buf) orelse content;
+
+        var notif_buf: [512]u8 = undefined;
+        const notif = std.fmt.bufPrint(&notif_buf, "Write {s} ({d} bytes)", .{ real_path, real_content.len }) catch real_path;
+        _ = self.queues.output.push(.tool_call, notif);
+
+        // backup existing file before overwriting
+        if (self.session_log) |*sl| sl.backupFile(real_path) catch {};
+
+        const file = std.fs.cwd().createFile(real_path, .{}) catch |err| {
+            var errbuf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&errbuf, "write error: {s}: {}", .{ real_path, err }) catch "write error";
+            return self.allocator.dupe(u8, msg);
+        };
+        defer file.close();
+        file.writeAll(real_content) catch |err| {
+            var errbuf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&errbuf, "write error: {}", .{err}) catch "write error";
+            return self.allocator.dupe(u8, msg);
+        };
+
+        var result_buf: [128]u8 = undefined;
+        const result = std.fmt.bufPrint(&result_buf, "Wrote {d} bytes to {s}", .{ real_content.len, real_path }) catch "ok";
+        return self.allocator.dupe(u8, result);
+    }
+
+    fn executeGlob(self: *AgentThread, pattern: []const u8, search_path: ?[]const u8) ![]u8 {
+        var pattern_buf: [256]u8 = undefined;
+        const real_pattern = unescapeJSON(pattern, &pattern_buf) orelse pattern;
+
+        var notif_buf: [512]u8 = undefined;
+        if (search_path) |p| {
+            const notif = std.fmt.bufPrint(&notif_buf, "Glob {s} in {s}", .{ real_pattern, p }) catch real_pattern;
+            _ = self.queues.output.push(.tool_call, notif);
+        } else {
+            const notif = std.fmt.bufPrint(&notif_buf, "Glob {s}", .{real_pattern}) catch real_pattern;
+            _ = self.queues.output.push(.tool_call, notif);
+        }
+
+        // use find command as backend (simple, works everywhere)
+        var cmd_buf: [1024]u8 = undefined;
+        const dir = if (search_path) |p| blk: {
+            var p_buf: [256]u8 = undefined;
+            break :blk unescapeJSON(p, &p_buf) orelse p;
+        } else ".";
+        const cmd = std.fmt.bufPrint(&cmd_buf, "find {s} -name '{s}' -type f 2>/dev/null | head -100 | sort", .{ dir, real_pattern }) catch return error.PatternTooLong;
+
+        const result = std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = &[_][]const u8{ "/bin/sh", "-c", cmd },
+            .max_output_bytes = 65536,
+        }) catch |err| {
+            var errbuf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&errbuf, "glob error: {}", .{err}) catch "glob error";
+            return self.allocator.dupe(u8, msg);
+        };
+        defer self.allocator.free(result.stderr);
+        return result.stdout;
+    }
+
+    fn executeGrep(self: *AgentThread, pattern: []const u8, search_path: ?[]const u8, file_glob: ?[]const u8) ![]u8 {
+        var pattern_buf: [256]u8 = undefined;
+        const real_pattern = unescapeJSON(pattern, &pattern_buf) orelse pattern;
+
+        var notif_buf: [512]u8 = undefined;
+        const notif = std.fmt.bufPrint(&notif_buf, "Grep '{s}'", .{real_pattern}) catch real_pattern;
+        _ = self.queues.output.push(.tool_call, notif);
+
+        // build grep/rg command
+        var cmd_buf: [1024]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&cmd_buf);
+        const w = fbs.writer();
+        w.writeAll("grep -rn --include='*'") catch return error.CmdTooLong;
+        if (file_glob) |g| {
+            var g_buf: [128]u8 = undefined;
+            const real_g = unescapeJSON(g, &g_buf) orelse g;
+            w.print(" --include='{s}'", .{real_g}) catch {};
+        }
+        w.writeAll(" -- ") catch {};
+        // escape pattern for shell
+        w.writeByte('\'') catch {};
+        for (real_pattern) |c| {
+            if (c == '\'') {
+                w.writeAll("'\\''") catch {};
+            } else {
+                w.writeByte(c) catch {};
+            }
+        }
+        w.writeByte('\'') catch {};
+
+        if (search_path) |p| {
+            var p_buf: [256]u8 = undefined;
+            const real_p = unescapeJSON(p, &p_buf) orelse p;
+            w.print(" {s}", .{real_p}) catch {};
+        } else {
+            w.writeAll(" .") catch {};
+        }
+        w.writeAll(" 2>/dev/null | head -100") catch {};
+
+        const cmd = cmd_buf[0..fbs.pos];
+
+        const result = std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = &[_][]const u8{ "/bin/sh", "-c", cmd },
+            .max_output_bytes = 65536,
+        }) catch |err| {
+            var errbuf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&errbuf, "grep error: {}", .{err}) catch "grep error";
+            return self.allocator.dupe(u8, msg);
+        };
+        defer self.allocator.free(result.stderr);
+        return result.stdout;
     }
 };
 

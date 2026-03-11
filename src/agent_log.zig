@@ -245,11 +245,18 @@ pub const SessionLog = struct {
         ensureDir(backups_dir) catch return;
 
         // hash the path
+        var full_hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(file_path, &full_hash, .{});
         var path_hash: [16]u8 = undefined;
-        const full_hash = std.crypto.hash.sha2.Sha256.hash(file_path, .{});
         @memcpy(&path_hash, full_hash[0..16]);
+        // manual hex encoding
         var hex_buf: [32]u8 = undefined;
-        const hex_str = std.fmt.bufPrint(&hex_buf, "{}", .{std.fmt.fmtSliceHexLower(&path_hash)}) catch return;
+        const hex_chars = "0123456789abcdef";
+        for (path_hash, 0..) |byte, i| {
+            hex_buf[i * 2] = hex_chars[byte >> 4];
+            hex_buf[i * 2 + 1] = hex_chars[byte & 0x0f];
+        }
+        const hex_str = hex_buf[0..32];
 
         // find next version number
         var version: u32 = 1;
