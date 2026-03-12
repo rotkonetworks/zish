@@ -3,6 +3,9 @@ const std = @import("std");
 const Shell = @import("Shell.zig");
 const ast = @import("ast.zig");
 const parser = @import("parser.zig");
+const input_mod = @import("input.zig");
+const BindableAction = input_mod.BindableAction;
+const editor = @import("editor.zig");
 
 // directory stack for pushd/popd
 var dir_stack: std.ArrayList([]const u8) = undefined;
@@ -954,6 +957,9 @@ fn set(shell: *Shell, args: []const []const u8) !u8 {
             if (i + 1 < args.len) i += 1;
         } else if (std.mem.eql(u8, arg, "pipefail")) {
             shell.opt_pipefail = enabled;
+            if (i + 1 < args.len) i += 1;
+        } else if (std.mem.eql(u8, arg, "autosuggestion") or std.mem.eql(u8, arg, "ghost")) {
+            shell.opt_autosuggestion = enabled;
             if (i + 1 < args.len) i += 1;
         } else {
             try shell.stdout().print("set: unknown option: {s}\n", .{arg});
@@ -2414,6 +2420,18 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
         }
         try out.print("max_tokens: {d}\n", .{cfg.max_tokens});
         try out.print("max_iters:  {d}\n", .{cfg.max_tool_iterations});
+        // Router config
+        try out.print("\n\x1b[1mRouter:\x1b[0m\n", .{});
+        try out.print("  enabled:  {}\n", .{cfg.router_enabled});
+        if (cfg.router_enabled) {
+            if (cfg.router_provider.len > 0) try out.print("  provider: {s}\n", .{cfg.router_provider});
+            try out.print("  model:    {s}\n", .{cfg.router_model});
+            if (cfg.router_base_url.len > 0) try out.print("  base_url: {s}\n", .{cfg.router_base_url});
+            try out.print("  local_only: {}\n", .{cfg.router_local_only});
+            try out.print("  haiku:    {s}\n", .{cfg.haiku_model});
+            try out.print("  sonnet:   {s}\n", .{cfg.sonnet_model});
+            try out.print("  opus:     {s}\n", .{cfg.opus_model});
+        }
         try out.flush();
         return 0;
     }
@@ -2558,6 +2576,7 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
                         _ = shell.agent.queues.request.push(.confirm_response, "n");
                     },
                     .usage_info => {},
+                    .router_info => {},
                     .confirm_response => {},
                     .done => {
                         done = true;
@@ -2592,6 +2611,450 @@ fn getTermCols() u16 {
     return 80;
 }
 
+// ── TUI Layout ──
+// Row 1..N         Scrollable output area (ANSI scroll region)
+// Row N+1          Separator ── (with scroll indicator when not at bottom)
+// Row N+2..N+1+H   Input area (1-5 rows, grows with content)
+// Row term_rows    Status bar: model │ $cost │ Ctrl+D:exit │ /help
+
+/// Message history ring buffer for scrollback — no allocator needed.
+const MessageHistory = struct {
+    buf: [512 * 1024]u8 = undefined, // flat byte ring for rendered text
+    buf_pos: u32 = 0, // write position in buf (wraps)
+    buf_used: u32 = 0, // total bytes used (capped at buf size)
+    line_starts: [8192]u32 = undefined, // offset into buf per line
+    line_lens: [8192]u16 = undefined, // length per line
+    line_count: u32 = 0,
+    first_line: u32 = 0, // oldest line index (ring)
+    // accumulator for current line being built
+    cur_line_start: u32 = 0,
+    cur_line_len: u16 = 0,
+    in_line: bool = false,
+
+    const BUF_SIZE = 512 * 1024;
+    const MAX_LINES = 8192;
+
+    fn commitLine(self: *MessageHistory) void {
+        if (!self.in_line) return;
+        const idx = (self.first_line + self.line_count) % MAX_LINES;
+        self.line_starts[idx] = self.cur_line_start;
+        self.line_lens[idx] = self.cur_line_len;
+        if (self.line_count >= MAX_LINES) {
+            self.first_line = (self.first_line + 1) % MAX_LINES;
+        } else {
+            self.line_count += 1;
+        }
+        self.in_line = false;
+        self.cur_line_len = 0;
+    }
+
+    fn appendByte(self: *MessageHistory, b: u8) void {
+        if (!self.in_line) {
+            self.cur_line_start = self.buf_pos;
+            self.cur_line_len = 0;
+            self.in_line = true;
+        }
+        self.buf[self.buf_pos % BUF_SIZE] = b;
+        self.buf_pos +%= 1;
+        if (self.buf_used < BUF_SIZE) self.buf_used += 1;
+        if (self.cur_line_len < 65535) self.cur_line_len += 1;
+    }
+
+    fn appendSlice(self: *MessageHistory, data: []const u8) void {
+        for (data) |b| {
+            if (b == '\n') {
+                self.commitLine();
+            } else {
+                self.appendByte(b);
+            }
+        }
+    }
+
+    /// Get a line by index (0 = oldest visible line)
+    fn getLine(self: *const MessageHistory, idx: u32) ?[]const u8 {
+        if (idx >= self.line_count) return null;
+        const real_idx = (self.first_line + idx) % MAX_LINES;
+        const start = self.line_starts[real_idx];
+        const len = self.line_lens[real_idx];
+        // Check if this line's data is still in the ring buffer
+        if (len == 0) return "";
+        // Copy out from ring buffer (may wrap)
+        // We use a threadlocal scratch buffer for unwrapping
+        const S = struct {
+            threadlocal var scratch: [4096]u8 = undefined;
+        };
+        const copy_len: usize = @min(len, 4096);
+        for (0..copy_len) |i| {
+            S.scratch[i] = self.buf[(start +% @as(u32, @intCast(i))) % BUF_SIZE];
+        }
+        return S.scratch[0..copy_len];
+    }
+
+    /// Search backwards from a starting line for a pattern (case-insensitive)
+    /// Returns the line index if found, or null
+    fn searchBack(self: *const MessageHistory, pattern: []const u8, start_from: u32) ?u32 {
+        if (pattern.len == 0 or self.line_count == 0) return null;
+        // Lowercase the pattern into a small buf
+        var low_pat: [128]u8 = undefined;
+        const plen = @min(pattern.len, 128);
+        for (pattern[0..plen], 0..) |c, i| {
+            low_pat[i] = if (c >= 'A' and c <= 'Z') c + 32 else c;
+        }
+        const lp = low_pat[0..plen];
+
+        var idx: u32 = @min(start_from, self.line_count);
+        while (idx > 0) {
+            idx -= 1;
+            const line = self.getLine(idx) orelse continue;
+            if (line.len < plen) continue;
+            // Strip ANSI codes for search
+            var stripped: [4096]u8 = undefined;
+            var si: usize = 0;
+            var li: usize = 0;
+            while (li < line.len and si < stripped.len) {
+                if (line[li] == 0x1b) {
+                    // Skip ANSI sequence
+                    li += 1;
+                    if (li < line.len and line[li] == '[') {
+                        li += 1;
+                        while (li < line.len and line[li] != 'm' and line[li] != 'H' and line[li] != 'K' and line[li] != 'J')
+                            li += 1;
+                        if (li < line.len) li += 1;
+                    }
+                    continue;
+                }
+                stripped[si] = if (line[li] >= 'A' and line[li] <= 'Z') line[li] + 32 else line[li];
+                si += 1;
+                li += 1;
+            }
+            // Simple substring search on lowercased stripped text
+            if (si >= plen) {
+                var j: usize = 0;
+                while (j + plen <= si) : (j += 1) {
+                    if (std.mem.eql(u8, stripped[j..j + plen], lp)) return idx;
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Search forward from a starting line for a pattern (case-insensitive)
+    fn searchForward(self: *const MessageHistory, pattern: []const u8, start_from: u32) ?u32 {
+        if (pattern.len == 0 or self.line_count == 0) return null;
+        var low_pat: [128]u8 = undefined;
+        const plen = @min(pattern.len, 128);
+        for (pattern[0..plen], 0..) |c, i| {
+            low_pat[i] = if (c >= 'A' and c <= 'Z') c + 32 else c;
+        }
+        const lp = low_pat[0..plen];
+
+        var idx: u32 = start_from;
+        while (idx < self.line_count) : (idx += 1) {
+            const line = self.getLine(idx) orelse continue;
+            if (line.len < plen) continue;
+            var stripped: [4096]u8 = undefined;
+            var si: usize = 0;
+            var li: usize = 0;
+            while (li < line.len and si < stripped.len) {
+                if (line[li] == 0x1b) {
+                    li += 1;
+                    if (li < line.len and line[li] == '[') {
+                        li += 1;
+                        while (li < line.len and line[li] != 'm' and line[li] != 'H' and line[li] != 'K' and line[li] != 'J')
+                            li += 1;
+                        if (li < line.len) li += 1;
+                    }
+                    continue;
+                }
+                stripped[si] = if (line[li] >= 'A' and line[li] <= 'Z') line[li] + 32 else line[li];
+                si += 1;
+                li += 1;
+            }
+            if (si >= plen) {
+                var j: usize = 0;
+                while (j + plen <= si) : (j += 1) {
+                    if (std.mem.eql(u8, stripped[j..j + plen], lp)) return idx;
+                }
+            }
+        }
+        return null;
+    }
+};
+
+/// TeeWriter — wraps a real writer and also captures bytes into MessageHistory.
+fn TeeWriter(comptime W: type) type {
+    return struct {
+        inner: W,
+        hist: *MessageHistory,
+
+        const Self = @This();
+
+        pub fn writeAll(self: Self, data: []const u8) !void {
+            try self.inner.writeAll(data);
+            self.hist.appendSlice(data);
+        }
+
+        pub fn writeByte(self: Self, b: u8) !void {
+            try self.inner.writeByte(b);
+            if (b == '\n') {
+                self.hist.commitLine();
+            } else {
+                self.hist.appendByte(b);
+            }
+        }
+
+        pub fn print(self: Self, comptime fmt: []const u8, args: anytype) !void {
+            // Print to inner writer
+            try self.inner.print(fmt, args);
+            // Also format into history
+            var fmt_buf: [4096]u8 = undefined;
+            const formatted = std.fmt.bufPrint(&fmt_buf, fmt, args) catch return;
+            self.hist.appendSlice(formatted);
+        }
+
+        pub fn flush(self: Self) !void {
+            try self.inner.flush();
+        }
+    };
+}
+
+/// Escape sequence parse result
+/// Apply a BindableAction to an EditBuffer in the agent TUI context.
+/// Returns: .modified if buffer content changed (needs height recalc), .moved if only cursor moved, .none if nothing happened
+const TuiEditResult = enum { none, moved, modified, special };
+
+fn applyTuiBindableAction(
+    ba: BindableAction,
+    edit_buf: *editor.EditBuffer,
+    shell: *Shell,
+) TuiEditResult {
+    switch (ba) {
+        .move_line_start => { edit_buf.moveLineStart(); return .moved; },
+        .move_line_end => { edit_buf.moveLineEnd(); return .moved; },
+        .move_left => { _ = edit_buf.moveLeft(); return .moved; },
+        .move_right => { _ = edit_buf.moveRight(); return .moved; },
+        .move_word_forward => { edit_buf.wordForward(); return .moved; },
+        .move_word_backward => { edit_buf.wordBack(); return .moved; },
+        .move_up => { _ = edit_buf.moveUp(); return .moved; },
+        .move_down => { _ = edit_buf.moveDown(); return .moved; },
+        .backspace => { if (edit_buf.delete()) return .modified; return .none; },
+        .delete_char => { if (edit_buf.deleteForward()) return .modified; return .none; },
+        .delete_word_backward => {
+            const text = edit_buf.slice();
+            var pos: u16 = edit_buf.cursor;
+            while (pos > 0 and (text[pos - 1] == ' ' or text[pos - 1] == '\t')) pos -= 1;
+            while (pos > 0 and text[pos - 1] != ' ' and text[pos - 1] != '\t') pos -= 1;
+            const n = edit_buf.cursor - pos;
+            if (n == 0) return .none;
+            var i: usize = 0;
+            while (i < n) : (i += 1) _ = edit_buf.delete();
+            return .modified;
+        },
+        .kill_to_end => {
+            const start = edit_buf.cursor;
+            var end: u16 = start;
+            while (end < edit_buf.len and edit_buf.text[end] != '\n') end += 1;
+            if (end <= start) return .none;
+            const len = end - start;
+            @memcpy(shell.vi.yank_buf[0..len], edit_buf.text[start..end]);
+            shell.vi.yank_len = @intCast(len);
+            edit_buf.cursor = start;
+            var i: usize = 0;
+            while (i < len) : (i += 1) _ = edit_buf.deleteForward();
+            return .modified;
+        },
+        .kill_to_beginning => {
+            const pos = edit_buf.cursor;
+            if (pos == 0) return .none;
+            @memcpy(shell.vi.yank_buf[0..pos], edit_buf.text[0..pos]);
+            shell.vi.yank_len = @intCast(pos);
+            var i: usize = 0;
+            while (i < pos) : (i += 1) _ = edit_buf.delete();
+            return .modified;
+        },
+        .yank_killed => {
+            if (shell.vi.yank_len == 0) return .none;
+            _ = edit_buf.insertSlice(shell.vi.yank_buf[0..shell.vi.yank_len]);
+            return .modified;
+        },
+        .transpose_chars => {
+            if (edit_buf.cursor > 0 and edit_buf.cursor < edit_buf.len) {
+                const c1 = edit_buf.text[edit_buf.cursor - 1];
+                const c2 = edit_buf.text[edit_buf.cursor];
+                edit_buf.text[edit_buf.cursor - 1] = c2;
+                edit_buf.text[edit_buf.cursor] = c1;
+                edit_buf.cursor += 1;
+                return .moved;
+            } else if (edit_buf.cursor >= 2 and edit_buf.cursor == edit_buf.len) {
+                const p = edit_buf.cursor;
+                const c1 = edit_buf.text[p - 2];
+                const c2 = edit_buf.text[p - 1];
+                edit_buf.text[p - 2] = c2;
+                edit_buf.text[p - 1] = c1;
+                return .moved;
+            }
+            return .none;
+        },
+        .insert_last_arg => {
+            if (shell.history) |h| {
+                const items = h.entries.items;
+                if (items.len > 0) {
+                    const prev = h.getCommand(items[items.len - 1]);
+                    if (prev.len > 0) {
+                        var end: usize = prev.len;
+                        while (end > 0 and (prev[end - 1] == ' ' or prev[end - 1] == '\t')) end -= 1;
+                        var start: usize = end;
+                        while (start > 0 and prev[start - 1] != ' ' and prev[start - 1] != '\t') start -= 1;
+                        const last_arg = prev[start..end];
+                        if (last_arg.len > 0) {
+                            if (edit_buf.len > 0 and edit_buf.cursor > 0 and
+                                edit_buf.text[edit_buf.cursor - 1] != ' ')
+                            {
+                                _ = edit_buf.insert(' ');
+                            }
+                            _ = edit_buf.insertSlice(last_arg);
+                            return .modified;
+                        }
+                    }
+                }
+            }
+            return .none;
+        },
+        .undo => return .none, // no undo in TUI
+        .none => return .none,
+        // these are handled specially before reaching this function
+        .cancel, .cancel_agent, .clear_screen, .exit_shell,
+        .suspend_shell, .execute_command, .tab_complete,
+        .history_up, .history_down, .search_backward, .search_forward,
+        .enter_normal_mode,
+        => return .special,
+    }
+}
+
+/// Map a runtime Action back to BindableAction for TUI dispatch.
+fn actionToBindable(action: input_mod.Action) BindableAction {
+    return switch (action) {
+        .move_cursor => |m| switch (m) {
+            .to_line_start => .move_line_start,
+            .to_line_end => .move_line_end,
+            .relative => |r| if (r < 0) .move_left else .move_right,
+            .word_forward => .move_word_forward,
+            .word_backward => .move_word_backward,
+            .line_up => .move_up,
+            .line_down => .move_down,
+            else => .none,
+        },
+        .backspace => .backspace,
+        .delete => |d| switch (d) {
+            .char_under_cursor => .delete_char,
+            else => .none,
+        },
+        .delete_word_backward => .delete_word_backward,
+        .kill_to_end => .kill_to_end,
+        .kill_to_beginning => .kill_to_beginning,
+        .yank_killed => .yank_killed,
+        .transpose_chars => .transpose_chars,
+        .insert_last_arg => .insert_last_arg,
+        .undo => .undo,
+        .history_nav => |d| switch (d) {
+            .up => .history_up,
+            .down => .history_down,
+        },
+        .enter_search_mode => |d| switch (d) {
+            .backward => .search_backward,
+            .forward => .search_forward,
+        },
+        .cancel => .cancel,
+        .cancel_agent => .cancel_agent,
+        .clear_screen => .clear_screen,
+        .exit_shell => .exit_shell,
+        .suspend_shell => .suspend_shell,
+        .execute_command => .execute_command,
+        .tap_complete => .tab_complete,
+        .vim_mode => .enter_normal_mode,
+        else => .none,
+    };
+}
+
+const EscAction = union(enum) {
+    none,
+    enter,
+    arrow_up,
+    arrow_down,
+    arrow_left,
+    arrow_right,
+    page_up,
+    page_down,
+    home,
+    end,
+    alt_enter,
+    delete,
+    alt_key: u8, // Alt+<byte> — looked up in keybindings table by caller
+};
+
+fn parseEscSequence() EscAction {
+    const stdin = std.fs.File.stdin();
+    var esc_poll = [_]std.posix.pollfd{.{
+        .fd = std.posix.STDIN_FILENO,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
+    if ((std.posix.poll(&esc_poll, 10) catch 0) == 0) return .none;
+
+    var b: [1]u8 = undefined;
+    const n = stdin.read(&b) catch return .none;
+    if (n == 0) return .none;
+
+    // ESC followed by \r or \n — treat as plain enter (ignore the ESC).
+    // Don't return alt_enter here: too many terminals send spurious ESC before Enter.
+    if (b[0] == '\r' or b[0] == '\n') return .enter;
+
+    // Alt+key: ESC followed by a regular character (not '[')
+    if (b[0] != '[') {
+        if (b[0] >= 0x20 and b[0] < 0x7F) return .{ .alt_key = b[0] };
+        return .none;
+    }
+
+    // Read CSI parameter
+    if ((std.posix.poll(&esc_poll, 10) catch 0) == 0) return .none;
+    const n2 = stdin.read(&b) catch return .none;
+    if (n2 == 0) return .none;
+
+    return switch (b[0]) {
+        'A' => .arrow_up,
+        'B' => .arrow_down,
+        'C' => .arrow_right,
+        'D' => .arrow_left,
+        'H' => .home,
+        'F' => .end,
+        '5' => blk: {
+            // PageUp: ESC [ 5 ~
+            var discard: [1]u8 = undefined;
+            _ = stdin.read(&discard) catch {};
+            break :blk .page_up;
+        },
+        '6' => blk: {
+            // PageDown: ESC [ 6 ~
+            var discard: [1]u8 = undefined;
+            _ = stdin.read(&discard) catch {};
+            break :blk .page_down;
+        },
+        '3' => blk: {
+            // Delete: ESC [ 3 ~
+            var discard: [1]u8 = undefined;
+            _ = stdin.read(&discard) catch {};
+            break :blk .delete;
+        },
+        else => blk: {
+            // Consume remaining bytes of unknown sequence
+            while ((std.posix.poll(&esc_poll, 5) catch 0) > 0) {
+                _ = stdin.read(&b) catch break;
+            }
+            break :blk .none;
+        },
+    };
+}
+
 fn agentInteractive(shell: *Shell) !u8 {
     const out = shell.stdout();
     const agent_queue = @import("agent_queue.zig");
@@ -2608,210 +3071,507 @@ fn agentInteractive(shell: *Shell) !u8 {
     var cfg = agent_log.AgentConfig.load(shell.allocator);
     var model_buf: [64]u8 = undefined;
     const model_src = shell.agent.getModelOverride() orelse cfg.model;
-    const model_name = model_buf[0..model_src.len];
+    var model_name: []u8 = model_buf[0..model_src.len];
     @memcpy(model_name, model_src);
     cfg.deinit();
 
-    // Get terminal dimensions
-    const term_rows = getTermRows();
-    const term_cols = getTermCols();
-    const output_bottom = term_rows - 2; // last row of scroll region
+    // ── TUI State ──
+    var term_rows = getTermRows();
+    var term_cols = getTermCols();
+    var input_height: u16 = 1; // dynamic: min(editbuf.lineCount(), 5)
+    const fixed_rows: u16 = 2; // separator + status bar
 
-    // --- Setup bottom-anchored TUI layout ---
-    // Layout:
-    //   Rows 1..output_bottom: scroll region (output area)
-    //   Row output_bottom+1:   separator ────
-    //   Row term_rows:         input bar ╰─>
-    //
-    // We position cursor at output_bottom so output starts just above
-    // the separator (like Claude Code) and scrolls upward.
+    // Layout computation
+    var out_last = term_rows -| (fixed_rows + input_height); // last row of output scroll region
+    if (out_last < 2) out_last = 2;
+    var sep_row = out_last + 1;
+    var input_first_row = sep_row + 1;
+    var status_row = term_rows;
 
-    // Set scroll region
-    try out.print("\x1b[1;{d}r", .{output_bottom});
-
-    // Position cursor at bottom of scroll region
-    try out.print("\x1b[{d};1H", .{output_bottom});
-
-    // Draw separator (fixed, outside scroll region)
-    try out.print("\x1b[{d};1H\x1b[90m", .{output_bottom + 1});
-    {
-        var ci: u16 = 0;
-        while (ci < term_cols) : (ci += 1) try out.writeAll("\xe2\x94\x80");
-    }
-    try out.writeAll("\x1b[0m");
-
-    // Draw input bar (fixed, outside scroll region)
-    try out.print("\x1b[{d};1H\x1b[2K\x1b[1;34m\xe2\x95\xb0\xe2\x94\x80>\x1b[0m ", .{term_rows});
-
-    // Show header in output area (at bottom of scroll region, will scroll up)
-    try out.print("\x1b[{d};1H", .{output_bottom});
-    if (was_running) {
-        try out.print("\x1b[1;34m\xe2\x95\xad\xe2\x94\x80 Agent Mode \x1b[0m\x1b[90m({s} \xe2\x80\x94 continuing)\x1b[0m\n", .{model_name});
-    } else {
-        try out.print("\x1b[1;34m\xe2\x95\xad\xe2\x94\x80 Agent Mode \x1b[0m\x1b[90m({s} \xe2\x80\x94 /help for commands)\x1b[0m\n", .{model_name});
-    }
-    try out.flush();
-
-    // State
-    var line_buf: [4096]u8 = undefined;
-    var line_len: usize = 0;
+    var edit_buf: editor.EditBuffer = .{};
     var md: agent_mod.MarkdownRenderer = .{};
     var last_was_text = false;
     var agent_active = false;
     var in_confirm = false;
-    // Track output cursor row explicitly (no DEC save/restore — only one slot, fragile)
-    var output_row: u16 = output_bottom;
-    var output_col: u16 = 1;
     var cursor_at: enum { output, input } = .output;
 
-    // Helper: redraw input bar
-    const InputBar = struct {
-        fn draw(w: anytype, rows: u16, buf: []const u8, len: usize) void {
-            w.print("\x1b[{d};1H\x1b[2K\x1b[1;34m\xe2\x95\xb0\xe2\x94\x80>\x1b[0m ", .{rows}) catch {};
-            if (len > 0) w.writeAll(buf[0..len]) catch {};
-        }
-    };
+    // ? translation mode — captures response to pre-fill input
+    var translate_mode = false;
+    var translate_buf: [512]u8 = undefined;
+    var translate_len: usize = 0;
 
-    // Helper: move cursor to output area (tracked position)
-    const goOutput = struct {
-        fn f(w: anytype, row: u16, col: u16) void {
-            w.print("\x1b[{d};{d}H", .{ row, col }) catch {};
-        }
-    };
+    // Status bar state
+    var cost_buf: [32]u8 = undefined;
+    var cost_len: usize = 0;
+    var status_text: [64]u8 = undefined;
+    var status_len: usize = 0;
 
-    // Helper: restore terminal on exit
-    const exitRestore = struct {
-        fn f(w: anytype, rows: u16) void {
-            w.print("\x1b[1;{d}r", .{rows}) catch {}; // reset scroll region to full
-            w.print("\x1b[{d};1H", .{rows}) catch {}; // cursor to bottom
-            w.writeAll("\x1b[2K\n") catch {};
+    // Message history for scrollback
+    var msg_history: MessageHistory = .{};
+    var scroll_offset: u32 = 0; // 0 = at bottom (live), >0 = scrolled up N lines
+
+    // ── Layout helpers ──
+    // Count display width of a string (skip ANSI escapes, count UTF-8 chars as 1 col)
+    const displayWidth = struct {
+        fn f(s: []const u8) u16 {
+            var w: u16 = 0;
+            var i: usize = 0;
+            while (i < s.len) {
+                if (s[i] == 0x1b) {
+                    // Skip ESC sequence
+                    i += 1;
+                    if (i < s.len and s[i] == '[') {
+                        i += 1;
+                        while (i < s.len and s[i] != 'm' and s[i] != 'H' and s[i] != 'K' and s[i] != 'J') : (i += 1) {}
+                        if (i < s.len) i += 1;
+                    }
+                } else if (s[i] >= 0x80) {
+                    // UTF-8 multibyte: count as 1 display column, skip continuation bytes
+                    w += 1;
+                    i += 1;
+                    while (i < s.len and (s[i] & 0xC0) == 0x80) : (i += 1) {}
+                } else {
+                    w += 1;
+                    i += 1;
+                }
+            }
+            return w;
+        }
+    }.f;
+
+    const Layout = struct {
+        fn drawSeparator(w: anytype, row: u16, cols: u16, scroll_off: u32) void {
+            w.print("\x1b[{d};1H\x1b[2K\x1b[90m", .{row}) catch {};
+            if (scroll_off > 0) {
+                var indicator_buf: [64]u8 = undefined;
+                const indicator = std.fmt.bufPrint(&indicator_buf, " ^ {d} lines ", .{scroll_off}) catch "";
+                const ind_cols = displayWidth(indicator);
+                const pad_left = (cols -| ind_cols) / 2;
+                var ci: u16 = 0;
+                while (ci < pad_left) : (ci += 1) w.writeByte('-') catch {};
+                w.writeAll(indicator) catch {};
+                ci += ind_cols;
+                while (ci < cols) : (ci += 1) w.writeByte('-') catch {};
+            } else {
+                var ci: u16 = 0;
+                while (ci < cols) : (ci += 1) w.writeByte('-') catch {};
+            }
+            w.writeAll("\x1b[0m") catch {};
+        }
+
+        fn drawInput(w: anytype, first_row: u16, rows: u16, ebuf: *const editor.EditBuffer) void {
+            const line_count = ebuf.lineCount();
+            const visible_lines: u16 = @min(line_count, rows);
+            var line_i: u16 = 0;
+            while (line_i < rows) : (line_i += 1) {
+                w.print("\x1b[{d};1H\x1b[2K", .{first_row + line_i}) catch {};
+                if (line_i < visible_lines) {
+                    const line_text = ebuf.getLine(line_i);
+                    if (line_i == 0) {
+                        if (ebuf.vi_mode == .normal) {
+                            w.writeAll("\x1b[33m ::\x1b[0m ") catch {}; // :: yellow
+                        } else {
+                            w.writeAll("\x1b[34m >>\x1b[0m ") catch {}; // >> blue
+                        }
+                    } else {
+                        w.writeAll("    ") catch {};
+                    }
+                    w.writeAll(line_text) catch {};
+                }
+            }
+            // Position cursor at the right spot
+            const cur_line = blk: {
+                var cl: u16 = 0;
+                for (ebuf.text[0..ebuf.cursor]) |c| {
+                    if (c == '\n') cl += 1;
+                }
+                break :blk cl;
+            };
+            const cur_col = ebuf.currentCol();
+            // "╰─> " / "[N] " = 4 display cols, "    " = 4
+            const prefix_width: u16 = 4;
+            w.print("\x1b[{d};{d}H", .{ first_row + cur_line, prefix_width + cur_col + 1 }) catch {};
+            // Cursor shape: block for normal mode, bar for insert
+            if (ebuf.vi_mode == .normal) {
+                w.writeAll("\x1b[2 q") catch {}; // steady block
+            } else {
+                w.writeAll("\x1b[6 q") catch {}; // steady bar
+            }
+        }
+
+        fn drawStatusBar(w: anytype, row: u16, cols: u16, mdl: []const u8, cost: []const u8, status: []const u8) void {
+            w.print("\x1b[{d};1H\x1b[2K\x1b[90;7m ", .{row}) catch {};
+            var display_cols: u16 = 1; // leading space
+            // Model name
+            w.writeAll(mdl) catch {};
+            display_cols += displayWidth(mdl);
+            // Activity status (thinking, tool use, etc.)
+            if (status.len > 0) {
+                w.writeAll(" | ") catch {};
+                display_cols += 3;
+                w.writeAll("\x1b[0;93;7m") catch {}; // bright yellow on reverse
+                w.writeAll(status) catch {};
+                w.writeAll("\x1b[90;7m") catch {}; // back to dim reverse
+                display_cols += displayWidth(status);
+            }
+            // Cost
+            if (cost.len > 0) {
+                w.writeAll(" | ") catch {};
+                display_cols += 3;
+                w.writeAll(cost) catch {};
+                display_cols += displayWidth(cost);
+            }
+            // Key hints
+            w.writeAll(" | ^D:exit | /help ") catch {};
+            display_cols += 19;
+            // Pad remaining width
+            while (display_cols < cols) : (display_cols += 1) w.writeByte(' ') catch {};
+            w.writeAll("\x1b[0m") catch {};
+        }
+
+        /// Draw input area, preserving cursor position if streaming.
+        /// Expands scroll region temporarily so cursor moves outside output area work.
+        fn drawInputSafe(w: anytype, first_row: u16, rows: u16, ebuf: *const editor.EditBuffer, streaming: bool) void {
+            if (streaming) {
+                w.writeAll("\x1b[s") catch {};
+                drawInput(w, first_row, rows, ebuf);
+                w.writeAll("\x1b[u") catch {};
+            } else {
+                drawInput(w, first_row, rows, ebuf);
+            }
+        }
+
+        /// Draw status bar mid-stream: save cursor, expand scroll region, draw, restore.
+        fn drawStatusBarSafe(w: anytype, stat_row: u16, t_rows: u16, scroll_last: u16, cols: u16, mdl: []const u8, cost: []const u8, status: []const u8) void {
+            w.print("\x1b[1;{d}r", .{t_rows}) catch {}; // expand to full terminal
+            w.writeAll("\x1b[s") catch {};
+            drawStatusBar(w, stat_row, cols, mdl, cost, status);
+            w.writeAll("\x1b[u") catch {};
+            w.print("\x1b[1;{d}r", .{scroll_last}) catch {}; // restore output scroll region
+        }
+
+        fn goOutput(w: anytype, row: u16) void {
+            w.print("\x1b[{d};1H", .{row}) catch {};
+        }
+
+        fn doExit(w: anytype, rows: u16, in_h: u16) void {
+            w.writeAll("\x1b[0 q") catch {}; // reset cursor shape to default
+            w.print("\x1b[1;{d}r", .{rows}) catch {}; // reset scroll region
+            // Clear fixed rows: status bar, input area, separator
+            w.print("\x1b[{d};1H\x1b[2K", .{rows}) catch {}; // status bar
+            var ri: u16 = 0;
+            while (ri < in_h) : (ri += 1) {
+                w.print("\x1b[{d};1H\x1b[2K", .{rows -| (1 + ri)}) catch {}; // input rows
+            }
+            w.print("\x1b[{d};1H\x1b[2K", .{rows -| (1 + in_h)}) catch {}; // separator
+            w.print("\x1b[{d};1H\n", .{rows}) catch {}; // move to bottom
             w.flush() catch {};
         }
+
+        /// Repaint output area from history (for scroll)
+        fn repaintFromHistory(w: anytype, hist: *const MessageHistory, out_rows: u16, scroll_off: u32) void {
+            if (hist.line_count == 0) return;
+            // Calculate which lines to show
+            const total = hist.line_count;
+            const visible: u32 = @min(out_rows, total);
+            const bottom_line = if (total > scroll_off) total - scroll_off else 0;
+            const top_line = if (bottom_line > visible) bottom_line - visible else 0;
+
+            // Clear and repaint output area
+            var row: u16 = 1;
+            var line_idx = top_line;
+            while (row <= out_rows and line_idx < bottom_line) : ({
+                row += 1;
+                line_idx += 1;
+            }) {
+                w.print("\x1b[{d};1H\x1b[2K", .{row}) catch {};
+                if (hist.getLine(line_idx)) |line_data| {
+                    w.writeAll(line_data) catch {};
+                }
+            }
+            // Clear remaining rows
+            while (row <= out_rows) : (row += 1) {
+                w.print("\x1b[{d};1H\x1b[2K", .{row}) catch {};
+            }
+        }
     };
 
-    // Main event loop
+    // Recalculate layout from current state
+    const recalcLayout = struct {
+        fn f(
+            w: anytype,
+            t_rows: u16,
+            t_cols: u16,
+            in_h: u16,
+            o_last: *u16,
+            s_row: *u16,
+            in_first: *u16,
+            stat_row: *u16,
+            ebuf: *const editor.EditBuffer,
+            mdl: []const u8,
+            cost: []const u8,
+            scroll_off: u32,
+            status: []const u8,
+        ) void {
+            const fr: u16 = 2; // separator + status
+            o_last.* = t_rows -| (fr + in_h);
+            if (o_last.* < 2) o_last.* = 2;
+            s_row.* = o_last.* + 1;
+            in_first.* = s_row.* + 1;
+            stat_row.* = t_rows;
+
+            // Reset scroll region to full terminal for drawing fixed elements
+            w.print("\x1b[1;{d}r", .{t_rows}) catch {};
+            // Draw fixed elements (outside the output scroll region)
+            Layout.drawSeparator(w, s_row.*, t_cols, scroll_off);
+            Layout.drawInput(w, in_first.*, in_h, ebuf);
+            Layout.drawStatusBar(w, stat_row.*, t_cols, mdl, cost, status);
+            // Now set scroll region to output area only
+            w.print("\x1b[1;{d}r", .{o_last.*}) catch {};
+        }
+    };
+
+    // ── Setup: push content up, configure layout ──
+    {
+        var i: u16 = 0;
+        while (i < term_rows) : (i += 1) try out.writeByte('\n');
+    }
+
+    // Initial layout
+    recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
+
+    // Print header in scroll region
+    Layout.goOutput(out, out_last);
+    if (was_running) {
+        try out.print("\x1b[1;34m-- agent \x1b[0m\x1b[90m{s} (continuing)\x1b[0m\n", .{model_name});
+    } else {
+        try out.print("\x1b[1;34m-- agent \x1b[0m\x1b[90m{s}\x1b[0m\n", .{model_name});
+    }
+    // Capture header in history
+    {
+        var hdr_buf: [128]u8 = undefined;
+        const hdr = if (was_running)
+            std.fmt.bufPrint(&hdr_buf, "\x1b[1;34m-- agent \x1b[0m\x1b[90m{s} (continuing)\x1b[0m", .{model_name}) catch ""
+        else
+            std.fmt.bufPrint(&hdr_buf, "\x1b[1;34m-- agent \x1b[0m\x1b[90m{s}\x1b[0m", .{model_name}) catch "";
+        msg_history.appendSlice(hdr);
+        msg_history.commitLine();
+    }
+    try out.flush();
+
+    // Create TeeWriter for capturing output to history
+    const TW = TeeWriter(@TypeOf(out));
+
+    // ── Main event loop ──
     while (true) {
-        // When idle, ensure cursor is in input bar
+        // Check terminal resize
+        if (@atomicLoad(bool, &shell.terminal_resized, .acquire)) {
+            @atomicStore(bool, &shell.terminal_resized, false, .release);
+            term_rows = getTermRows();
+            term_cols = getTermCols();
+            // Full redraw: reset scroll region, clear entire screen, recalc layout, repaint
+            out.print("\x1b[1;{d}r", .{term_rows}) catch {}; // full scroll region first
+            out.writeAll("\x1b[2J") catch {}; // clear screen
+            recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
+            // Always repaint output from history
+            Layout.repaintFromHistory(out, &msg_history, out_last, scroll_offset);
+            Layout.drawSeparator(out, sep_row, term_cols, scroll_offset);
+            Layout.drawInput(out, input_first_row, input_height, &edit_buf);
+            Layout.drawStatusBar(out, status_row, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len]);
+            if (!agent_active) cursor_at = .input;
+            try out.flush();
+        }
+
+        // When idle, move cursor to input area
         if (!agent_active and !in_confirm and cursor_at == .output) {
-            InputBar.draw(out, term_rows, &line_buf, line_len);
+            Layout.drawInput(out, input_first_row, input_height, &edit_buf);
             cursor_at = .input;
             try out.flush();
         }
 
-        // Poll stdin
+        // Poll stdin with timeout (fast when streaming, slow when idle)
         var poll_fds = [_]std.posix.pollfd{.{
             .fd = std.posix.STDIN_FILENO,
             .events = std.posix.POLL.IN,
             .revents = 0,
         }};
-        const poll_timeout: i32 = if (agent_active) 20 else 100;
-        const poll_n = std.posix.poll(&poll_fds, poll_timeout) catch 0;
+        const poll_n = std.posix.poll(&poll_fds, if (agent_active) @as(i32, 20) else @as(i32, 100)) catch 0;
 
-        // --- Drain agent output ---
+        // ── Drain agent output queue ──
         var got_output = false;
         var msg: agent_queue.Msg = undefined;
         while (shell.agent.queues.output.pop(&msg)) {
             got_output = true;
-
-            if (!agent_active and msg.kind != .done and msg.kind != .usage_info and msg.kind != .confirm_response) {
+            if (!agent_active and msg.kind != .done and msg.kind != .usage_info and msg.kind != .router_info and msg.kind != .confirm_response) {
                 agent_active = true;
             }
 
-            // Move to output area if needed
+            // Auto-scroll to bottom on new output
+            if (scroll_offset > 0 and msg.kind != .confirm_request) {
+                scroll_offset = 0;
+                Layout.drawSeparator(out, sep_row, term_cols, 0);
+            }
+
+            // Ensure cursor is in scroll region for output
             if (cursor_at != .output and msg.kind != .confirm_request) {
-                goOutput.f(out, output_row, output_col);
+                Layout.goOutput(out, out_last);
                 cursor_at = .output;
             }
 
+            // Create tee writer for this message processing
+            var tee = TW{ .inner = out, .hist = &msg_history };
+
             switch (msg.kind) {
                 .text_delta => {
-                    try md.render(out, msg.slice());
+                    // Update status to "responding" on first text
+                    if (!last_was_text and status_len != 0) {
+                        const resp = "responding";
+                        @memcpy(status_text[0..resp.len], resp);
+                        status_len = resp.len;
+                        Layout.drawStatusBarSafe(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len]);
+                    }
+                    try md.render(tee, msg.slice());
                     last_was_text = true;
-                    // Track that cursor is at bottom of scroll region
-                    // (scroll region keeps cursor at output_bottom when scrolling)
-                    output_row = output_bottom;
-                    output_col = 1; // approximate — exact tracking would need parsing output
+                    // capture text for ? translation
+                    if (translate_mode) {
+                        const s = msg.slice();
+                        const avail = translate_buf.len - translate_len;
+                        const n = @min(s.len, avail);
+                        if (n > 0) {
+                            @memcpy(translate_buf[translate_len..][0..n], s[0..n]);
+                            translate_len += n;
+                        }
+                    }
                 },
                 .tool_call => {
-                    if (last_was_text) try out.writeAll("\x1b[0m\n");
+                    if (last_was_text) {
+                        try tee.writeAll("\x1b[0m\n");
+                    }
                     last_was_text = false;
-                    try out.writeAll("\x1b[90m");
-                    try out.writeAll(msg.slice());
-                    try out.writeAll("\x1b[0m\n");
-                    output_row = output_bottom;
-                    output_col = 1;
+                    // Compact tool rendering: ⚡ ToolName args...
+                    const tool_text = msg.slice();
+                    // Update status bar with tool name
+                    {
+                        // Extract tool name (format: "Tool: Name")
+                        const tool_prefix = "Tool: ";
+                        const tname = if (std.mem.startsWith(u8, tool_text, tool_prefix))
+                            tool_text[tool_prefix.len..]
+                        else
+                            tool_text;
+                        // Find end of tool name (space or end)
+                        const name_end = std.mem.indexOfScalar(u8, tname, ' ') orelse tname.len;
+                        const slen = @min(name_end, status_text.len);
+                        @memcpy(status_text[0..slen], tname[0..slen]);
+                        status_len = slen;
+                        Layout.drawStatusBarSafe(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len]);
+                    }
+                    try tee.writeAll("\x1b[90m>");
+                    // Truncate to terminal width
+                    const max_w: usize = if (term_cols > 4) term_cols - 4 else term_cols;
+                    if (tool_text.len > max_w) {
+                        try tee.writeAll(tool_text[0..max_w]);
+                        try tee.writeAll("\xe2\x80\xa6");
+                    } else {
+                        try tee.writeAll(tool_text);
+                    }
+                    try tee.writeAll("\x1b[0m\n");
                 },
                 .tool_done => {
                     last_was_text = false;
+                    try tee.writeAll("\x1b[90m\xe2\x9c\x93\x1b[0m\n");
+                    // Back to thinking after tool completes
+                    const thinking = "thinking...";
+                    @memcpy(status_text[0..thinking.len], thinking);
+                    status_len = thinking.len;
+                    Layout.drawStatusBarSafe(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len]);
                 },
                 .error_msg => {
-                    if (last_was_text) try out.writeAll("\x1b[0m\n");
+                    if (last_was_text) try tee.writeAll("\x1b[0m\n");
                     last_was_text = false;
-                    try out.writeAll("\x1b[31m");
-                    try out.writeAll(msg.slice());
-                    try out.writeAll("\x1b[0m\n");
-                    output_row = output_bottom;
-                    output_col = 1;
+                    try tee.print("\x1b[31m{s}\x1b[0m\n", .{msg.slice()});
                 },
                 .usage_info => {
-                    if (last_was_text) try out.writeAll("\x1b[0m\n");
+                    // Parse cost/free from usage_info for status bar
+                    const usage_text = msg.slice();
+                    if (std.mem.indexOf(u8, usage_text, "(free)") != null) {
+                        const free = "free";
+                        @memcpy(cost_buf[0..free.len], free);
+                        cost_len = free.len;
+                    } else if (std.mem.indexOf(u8, usage_text, "($")) |dollar_pos| {
+                        const cost_start = dollar_pos + 1; // skip '('
+                        if (std.mem.indexOfScalarPos(u8, usage_text, cost_start, ')')) |paren_end| {
+                            const cost_str = usage_text[cost_start..paren_end];
+                            cost_len = @min(cost_str.len, cost_buf.len);
+                            @memcpy(cost_buf[0..cost_len], cost_str[0..cost_len]);
+                        }
+                    }
+                    // Update status bar with new cost
+                    Layout.drawStatusBarSafe(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len]);
+                    if (last_was_text) {
+                        try tee.writeAll("\x1b[0m\n");
+                        last_was_text = false;
+                    }
+                },
+                .router_info => {
                     last_was_text = false;
-                    try out.writeAll("\x1b[90m");
-                    try out.writeAll(msg.slice());
-                    try out.writeAll("\x1b[0m\n");
-                    output_row = output_bottom;
-                    output_col = 1;
+                    try tee.print("\x1b[90m[{s}]\x1b[0m\n", .{msg.slice()});
                 },
                 .done => {
-                    if (last_was_text) try out.writeAll("\x1b[0m\n");
+                    if (last_was_text) try tee.writeAll("\x1b[0m\n");
                     last_was_text = false;
                     md.reset();
                     agent_active = false;
-                    output_row = output_bottom;
-                    output_col = 1;
-                    cursor_at = .output; // will jump to input on next iteration
+                    // Clear status indicator
+                    status_len = 0;
+                    Layout.drawStatusBarSafe(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], "");
+                    msg_history.commitLine(); // flush any partial line
+                    // ? translation done — pre-fill input with !<command>
+                    if (translate_mode and translate_len > 0) {
+                        translate_mode = false;
+                        // extract first line (the command)
+                        const ttext = translate_buf[0..translate_len];
+                        const first_nl = std.mem.indexOfScalar(u8, ttext, '\n') orelse ttext.len;
+                        const cmd_line = std.mem.trim(u8, ttext[0..first_nl], " \t\r");
+                        if (cmd_line.len > 0) {
+                            edit_buf.clear();
+                            _ = edit_buf.insertSlice("!");
+                            _ = edit_buf.insertSlice(cmd_line);
+                        }
+                    }
+                    translate_mode = false;
+                    cursor_at = .output; // will switch to input next iteration
                 },
                 .confirm_request => {
                     if (last_was_text) try out.writeByte('\n');
                     last_was_text = false;
                     in_confirm = true;
-                    // Show in input bar area
-                    try out.print("\x1b[{d};1H\x1b[2K", .{term_rows});
-                    try out.writeAll("\x1b[33m");
-                    try out.writeAll(msg.slice());
-                    try out.writeAll(" [y/n/a] \x1b[0m");
+                    // Render confirm prompt in input area
+                    try out.print("\x1b[{d};1H\x1b[2K\x1b[33m{s} [y/n/a] \x1b[0m", .{ input_first_row, msg.slice() });
                     cursor_at = .input;
                 },
                 .confirm_response => {},
                 .cancel => {
                     agent_active = false;
-                    output_row = output_bottom;
-                    output_col = 1;
+                    translate_mode = false;
+                    status_len = 0;
                     cursor_at = .output;
                 },
             }
         }
         if (got_output) {
-            // After writing output, refresh input bar
+            // Refresh input area while keeping output cursor position
             if (cursor_at == .output) {
-                // Jump to input bar, draw it, jump back to output
-                InputBar.draw(out, term_rows, &line_buf, line_len);
-                goOutput.f(out, output_row, output_col);
-                cursor_at = .output;
+                Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, true);
             }
             try out.flush();
         }
 
-        // --- Handle stdin ---
+        // ── Handle stdin ──
         if (poll_n > 0 and (poll_fds[0].revents & std.posix.POLL.IN) != 0) {
             var byte: [1]u8 = undefined;
             const n = std.fs.File.stdin().read(&byte) catch break;
-            if (n == 0) {
-                exitRestore.f(out, term_rows);
-                return 0;
-            }
+            if (n == 0) { Layout.doExit(out, term_rows, input_height); return 0; }
 
-            // Confirmation mode
             if (in_confirm) {
                 if (byte[0] == 'y' or byte[0] == 'Y') {
                     _ = shell.agent.queues.request.push(.confirm_response, "y");
@@ -2821,7 +3581,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                     _ = shell.agent.queues.request.push(.confirm_response, "n");
                 }
                 in_confirm = false;
-                InputBar.draw(out, term_rows, &line_buf, line_len);
+                Layout.drawInput(out, input_first_row, input_height, &edit_buf);
                 cursor_at = .input;
                 try out.flush();
                 continue;
@@ -2831,20 +3591,28 @@ fn agentInteractive(shell: *Shell) !u8 {
             if (byte[0] == 3 or byte[0] == 7) {
                 if (agent_active) {
                     shell.agent.cancel();
-                    goOutput.f(out, output_row, output_col);
-                    try out.writeAll("\x1b[0m\n\x1b[33m\xe2\x9a\xa1 cancelled\x1b[0m\n");
+                    Layout.goOutput(out, out_last);
+                    try out.writeAll("\x1b[0m\n\x1b[33m>cancelled\x1b[0m\n");
+                    msg_history.appendSlice("\x1b[33m>cancelled\x1b[0m");
+                    msg_history.commitLine();
                     md.reset();
                     agent_active = false;
+                    status_len = 0;
                     last_was_text = false;
-                    output_row = output_bottom;
-                    output_col = 1;
                     cursor_at = .output;
-                } else if (line_len > 0) {
-                    line_len = 0;
-                    InputBar.draw(out, term_rows, &line_buf, 0);
+                    Layout.drawStatusBarSafe(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], "");
+                } else if (edit_buf.len > 0) {
+                    edit_buf.clear();
+                    // Recalc input height
+                    const new_h: u16 = 1;
+                    if (new_h != input_height) {
+                        input_height = new_h;
+                        recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
+                    }
+                    Layout.drawInput(out, input_first_row, input_height, &edit_buf);
                     cursor_at = .input;
                 } else {
-                    exitRestore.f(out, term_rows);
+                    Layout.doExit(out, term_rows, input_height);
                     return 0;
                 }
                 try out.flush();
@@ -2853,139 +3621,780 @@ fn agentInteractive(shell: *Shell) !u8 {
 
             // Ctrl+D — exit on empty line
             if (byte[0] == 4) {
-                if (line_len == 0) {
-                    exitRestore.f(out, term_rows);
-                    return 0;
+                if (edit_buf.len == 0) { Layout.doExit(out, term_rows, input_height); return 0; }
+                continue;
+            }
+
+            // Ctrl+K — jump to previous user message in scrollback
+            // Ctrl+N — jump to next user message in scrollback
+            if (byte[0] == 11 or byte[0] == 14) {
+                if (msg_history.line_count > 0) {
+                    // Find lines starting with user prompt marker (green "> ")
+                    const user_marker = "\x1b[1;32m> ";
+                    if (byte[0] == 11) {
+                        // Ctrl+K — search backwards
+                        const current_top = if (msg_history.line_count > scroll_offset)
+                            msg_history.line_count - scroll_offset
+                        else 0;
+                        if (msg_history.searchBack("> ", if (current_top > 1) current_top - 1 else 0)) |found| {
+                            // Also check it's actually a user prompt line (has the ANSI marker)
+                            _ = user_marker;
+                            const from_bottom = msg_history.line_count - found;
+                            scroll_offset = if (from_bottom > out_last / 3) from_bottom - out_last / 3 else 0;
+                            Layout.repaintFromHistory(out, &msg_history, out_last, scroll_offset);
+                            Layout.drawSeparator(out, sep_row, term_cols, scroll_offset);
+                            try out.flush();
+                        }
+                    } else {
+                        // Ctrl+N — search forwards
+                        if (scroll_offset > 0) {
+                            const current_top = msg_history.line_count - scroll_offset;
+                            const search_from = current_top + out_last / 3 + 1;
+                            if (msg_history.searchForward("> ", search_from)) |found| {
+                                const from_bottom = msg_history.line_count - found;
+                                scroll_offset = if (from_bottom > out_last / 3) from_bottom - out_last / 3 else 0;
+                            } else {
+                                scroll_offset = 0; // no more messages, go to bottom
+                            }
+                            Layout.repaintFromHistory(out, &msg_history, out_last, scroll_offset);
+                            Layout.drawSeparator(out, sep_row, term_cols, scroll_offset);
+                            try out.flush();
+                        }
+                    }
                 }
                 continue;
             }
 
-            // Escape sequence — discard
+            // Escape sequence — parse arrows, PageUp/Down, etc.
             if (byte[0] == 27) {
-                var esc_buf: [8]u8 = undefined;
-                var esc_poll = [_]std.posix.pollfd{.{
-                    .fd = std.posix.STDIN_FILENO,
-                    .events = std.posix.POLL.IN,
-                    .revents = 0,
-                }};
-                if ((std.posix.poll(&esc_poll, 10) catch 0) > 0) {
-                    _ = std.fs.File.stdin().read(&esc_buf) catch {};
+                const action = parseEscSequence();
+                if (action == .enter) {
+                    byte[0] = '\r'; // fall through to Enter handler below
+                } else {
+                switch (action) {
+                    .arrow_left => {
+                        _ = edit_buf.moveLeft();
+                        Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                        if (!agent_active) cursor_at = .input;
+                        try out.flush();
+                    },
+                    .arrow_right => {
+                        _ = edit_buf.moveRight();
+                        Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                        if (!agent_active) cursor_at = .input;
+                        try out.flush();
+                    },
+                    .arrow_up => {
+                        _ = edit_buf.moveUp();
+                        Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                        if (!agent_active) cursor_at = .input;
+                        try out.flush();
+                    },
+                    .arrow_down => {
+                        _ = edit_buf.moveDown();
+                        Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                        if (!agent_active) cursor_at = .input;
+                        try out.flush();
+                    },
+                    .home => {
+                        edit_buf.moveLineStart();
+                        Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                        if (!agent_active) cursor_at = .input;
+                        try out.flush();
+                    },
+                    .end => {
+                        edit_buf.moveLineEnd();
+                        Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                        if (!agent_active) cursor_at = .input;
+                        try out.flush();
+                    },
+                    .page_up => {
+                        if (msg_history.line_count > 0) {
+                            const page = out_last / 2;
+                            scroll_offset += page;
+                            if (scroll_offset > msg_history.line_count) scroll_offset = msg_history.line_count;
+                            Layout.repaintFromHistory(out, &msg_history, out_last, scroll_offset);
+                            Layout.drawSeparator(out, sep_row, term_cols, scroll_offset);
+                            try out.flush();
+                        }
+                    },
+                    .page_down => {
+                        if (scroll_offset > 0) {
+                            const page = out_last / 2;
+                            if (scroll_offset > page) {
+                                scroll_offset -= page;
+                            } else {
+                                scroll_offset = 0;
+                            }
+                            Layout.repaintFromHistory(out, &msg_history, out_last, scroll_offset);
+                            Layout.drawSeparator(out, sep_row, term_cols, scroll_offset);
+                            try out.flush();
+                        }
+                    },
+                    .alt_enter => {
+                        if (edit_buf.insert('\n')) {
+                            const new_h: u16 = @min(edit_buf.lineCount(), 5);
+                            if (new_h != input_height) {
+                                input_height = new_h;
+                                recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
+                            }
+                            Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                            if (!agent_active) cursor_at = .input;
+                            try out.flush();
+                        }
+                    },
+                    .delete => {
+                        if (edit_buf.deleteForward()) {
+                            const new_h: u16 = @min(edit_buf.lineCount(), 5);
+                            if (new_h != input_height) {
+                                input_height = new_h;
+                                recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
+                            }
+                            Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                            if (!agent_active) cursor_at = .input;
+                            try out.flush();
+                        }
+                    },
+                    .alt_key => |alt_byte| {
+                        // Look up Alt+key in configurable keybindings table
+                        if (shell.keybindings.lookupAlt(alt_byte)) |act| {
+                            const ba = actionToBindable(act);
+                            const result = applyTuiBindableAction(ba, &edit_buf, shell);
+                            if (result != .none) {
+                                if (result == .modified) {
+                                    const new_h: u16 = @min(edit_buf.lineCount(), 5);
+                                    if (new_h != input_height) {
+                                        input_height = new_h;
+                                        recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
+                                    }
+                                }
+                                Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                                if (!agent_active) cursor_at = .input;
+                                try out.flush();
+                            }
+                        }
+                    },
+                    .none => {
+                        // Bare Escape — switch to vi normal mode
+                        if (edit_buf.vi_mode == .insert) {
+                            edit_buf.vi_mode = .normal;
+                            if (edit_buf.cursor > 0) edit_buf.cursor -= 1; // vi convention
+                            Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                            if (!agent_active) cursor_at = .input;
+                            try out.flush();
+                        }
+                    },
+                    .enter => {}, // handled above, won't reach here
+                }
+                continue;
+                } // end else
+            }
+
+            // ── Vi normal mode key handling ──
+            if (edit_buf.vi_mode == .normal and byte[0] >= 0x20) {
+                const vi_c = byte[0];
+                var need_redraw = true;
+                var vi_pending: u8 = 0; // for two-key commands (dd, dw, cc, etc.)
+                _ = &vi_pending;
+                switch (vi_c) {
+                    // Mode switches
+                    'i' => { edit_buf.vi_mode = .insert; need_redraw = false; },
+                    'a' => {
+                        if (edit_buf.cursor < edit_buf.len) edit_buf.cursor += 1;
+                        edit_buf.vi_mode = .insert;
+                    },
+                    'A' => { edit_buf.moveLineEnd(); edit_buf.vi_mode = .insert; },
+                    'I' => { edit_buf.moveFirstNonBlank(); edit_buf.vi_mode = .insert; },
+                    'o' => {
+                        edit_buf.moveLineEnd();
+                        _ = edit_buf.insert('\n');
+                        edit_buf.vi_mode = .insert;
+                    },
+                    'O' => {
+                        edit_buf.moveLineStart();
+                        _ = edit_buf.insert('\n');
+                        if (edit_buf.cursor > 0) edit_buf.cursor -= 1;
+                        edit_buf.vi_mode = .insert;
+                    },
+                    // Movement
+                    'h' => { _ = edit_buf.moveLeft(); },
+                    'l' => { _ = edit_buf.moveRight(); },
+                    'j' => { _ = edit_buf.moveDown(); },
+                    'k' => { _ = edit_buf.moveUp(); },
+                    'w' => { edit_buf.wordForward(); },
+                    'b' => { edit_buf.wordBack(); },
+                    'e' => { edit_buf.wordEnd(); },
+                    '0' => { edit_buf.moveLineStart(); },
+                    '^' => { edit_buf.moveFirstNonBlank(); },
+                    '$' => { edit_buf.moveLineEnd(); },
+                    // Delete operations
+                    'x' => { _ = edit_buf.deleteAt(); },
+                    'X' => { _ = edit_buf.delete(); },
+                    'D' => { edit_buf.deleteToEnd(); },
+                    'C' => { edit_buf.deleteToEnd(); edit_buf.vi_mode = .insert; },
+                    'S' => { edit_buf.deleteLine(); edit_buf.vi_mode = .insert; },
+                    // Two-key commands: read next key
+                    'd', 'c' => {
+                        // Read next key for motion
+                        var esc_poll2 = [_]std.posix.pollfd{.{
+                            .fd = std.posix.STDIN_FILENO,
+                            .events = std.posix.POLL.IN,
+                            .revents = 0,
+                        }};
+                        if ((std.posix.poll(&esc_poll2, 500) catch 0) > 0) {
+                            var b2: [1]u8 = undefined;
+                            const n2 = std.fs.File.stdin().read(&b2) catch 0;
+                            if (n2 > 0) {
+                                if (b2[0] == vi_c) {
+                                    // dd or cc — delete/change entire line
+                                    if (vi_c == 'c') {
+                                        edit_buf.deleteLine();
+                                        edit_buf.vi_mode = .insert;
+                                    } else {
+                                        edit_buf.deleteLine();
+                                    }
+                                } else if (b2[0] == 'w') {
+                                    // dw or cw
+                                    edit_buf.deleteWord();
+                                    if (vi_c == 'c') edit_buf.vi_mode = .insert;
+                                } else if (b2[0] == '$') {
+                                    // d$ or c$
+                                    edit_buf.deleteToEnd();
+                                    if (vi_c == 'c') edit_buf.vi_mode = .insert;
+                                } else if (b2[0] == '0') {
+                                    // d0 or c0 — delete to start of line
+                                    const start_pos = edit_buf.cursor;
+                                    edit_buf.moveLineStart();
+                                    const end = start_pos;
+                                    const begin = edit_buf.cursor;
+                                    if (end > begin) {
+                                        const remaining = edit_buf.len - end;
+                                        if (remaining > 0)
+                                            std.mem.copyForwards(u8, edit_buf.text[begin..begin + remaining], edit_buf.text[end..edit_buf.len]);
+                                        edit_buf.len -= @intCast(end - begin);
+                                    }
+                                    if (vi_c == 'c') edit_buf.vi_mode = .insert;
+                                } else {
+                                    need_redraw = false; // unknown motion, ignore
+                                }
+                            }
+                        } else {
+                            need_redraw = false;
+                        }
+                    },
+                    'r' => {
+                        // Replace char: read next key
+                        var esc_poll2 = [_]std.posix.pollfd{.{
+                            .fd = std.posix.STDIN_FILENO,
+                            .events = std.posix.POLL.IN,
+                            .revents = 0,
+                        }};
+                        if ((std.posix.poll(&esc_poll2, 500) catch 0) > 0) {
+                            var b2: [1]u8 = undefined;
+                            const n2 = std.fs.File.stdin().read(&b2) catch 0;
+                            if (n2 > 0 and b2[0] >= 0x20) {
+                                edit_buf.replaceChar(b2[0]);
+                            }
+                        } else {
+                            need_redraw = false;
+                        }
+                    },
+                    // Paste / put not implemented, treat 'p' as no-op
+                    else => { need_redraw = false; },
+                }
+                if (need_redraw) {
+                    const new_h: u16 = @min(edit_buf.lineCount(), 5);
+                    if (new_h != input_height) {
+                        input_height = new_h;
+                        recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
+                    }
+                    Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                    if (!agent_active) cursor_at = .input;
+                    try out.flush();
                 }
                 continue;
             }
 
-            // Enter — submit
-            if (byte[0] == '\n' or byte[0] == '\r') {
-                const query = std.mem.trim(u8, line_buf[0..line_len], " \t");
-                line_len = 0;
+            // Enter (0x0D CR or 0x0A LF) — submit query
+            if (byte[0] == '\r' or byte[0] == '\n') {
+                const query = std.mem.trim(u8, edit_buf.slice(), " \t\n\r");
+                edit_buf.clear();
+                edit_buf.vi_mode = .insert;
+
+                // Reset input height
+                if (input_height != 1) {
+                    input_height = 1;
+                    recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
+                }
 
                 if (query.len == 0) {
-                    InputBar.draw(out, term_rows, &line_buf, 0);
+                    Layout.drawInput(out, input_first_row, input_height, &edit_buf);
                     cursor_at = .input;
                     try out.flush();
                     continue;
                 }
 
-                // Show user message in output area
-                goOutput.f(out, output_row, output_col);
+                // Scroll to bottom if scrolled up
+                if (scroll_offset > 0) {
+                    scroll_offset = 0;
+                    Layout.drawSeparator(out, sep_row, term_cols, 0);
+                }
+
+                // Echo user message in output scroll region
+                Layout.goOutput(out, out_last);
                 cursor_at = .output;
-                try out.writeAll("\n\x1b[1;32m\xe2\x9d\xaf \x1b[0m"); // ❯
+                try out.writeAll("\n\x1b[1;32m> \x1b[0m");
                 try out.writeAll(query);
                 try out.writeByte('\n');
-                output_row = output_bottom;
-                output_col = 1;
+                // Capture to history
+                msg_history.appendSlice("\x1b[1;32m> \x1b[0m");
+                msg_history.appendSlice(query);
+                msg_history.commitLine();
 
-                // Clear input bar
-                InputBar.draw(out, term_rows, &line_buf, 0);
+                Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, true);
                 try out.flush();
 
                 // Local commands
+
+                // ! — shell escape. Bare "!" drops to full zish shell (with autocomplete, etc).
+                // !command — run command through zish directly (pipelines, builtins, aliases).
+                if (query[0] == '!') {
+                    // Tear down agent TUI temporarily
+                    try out.print("\x1b[1;{d}r", .{term_rows}); // reset scroll region
+                    Layout.doExit(out, term_rows, input_height);
+                    try out.flush();
+
+                    const cmd = std.mem.trim(u8, query[1..], " ");
+                    if (cmd.len > 0) {
+                        // Single command — execute and return
+                        try out.print("\x1b[90m$ {s}\x1b[0m\n", .{cmd});
+                        msg_history.appendSlice("\x1b[90m$ ");
+                        msg_history.appendSlice(cmd);
+                        msg_history.appendSlice("\x1b[0m");
+                        msg_history.commitLine();
+                        try out.flush();
+                        shell.disableRawMode();
+                        const exit_code = shell.executeCommand(cmd) catch 1;
+                        _ = exit_code;
+                        shell.enableRawMode() catch {};
+                    } else {
+                        // Bare "!" — drop to interactive shell until they run `agent` or `agent c`
+                        try out.writeAll("\x1b[90m-- shell (type 'agent' to return)\x1b[0m\n");
+                        msg_history.appendSlice("\x1b[90m-- shell escape\x1b[0m");
+                        msg_history.commitLine();
+                        try out.flush();
+                        // Yield to main shell loop — it will return here when user runs `agent`
+                        // We signal this by returning a special code
+                        return 2; // 2 = "dropped to shell, agent still running"
+                    }
+
+                    // Rebuild agent TUI layout
+                    term_rows = getTermRows();
+                    term_cols = getTermCols();
+                    recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
+                    Layout.drawInput(out, input_first_row, input_height, &edit_buf);
+                    cursor_at = .input;
+                    try out.flush();
+                    continue;
+                }
+
+                // ?query — natural language → shell command translation
+                // Asks agent to translate intent to command, then offers to run it
+                if (query.len > 1 and query[0] == '?') {
+                    const intent = std.mem.trim(u8, query[1..], " ");
+                    if (intent.len > 0) {
+                        var prompt_buf: [2048]u8 = undefined;
+                        const prompt = std.fmt.bufPrint(&prompt_buf,
+                            \\Translate this intent to a shell command. Reply with ONLY the command on the first line, nothing else.
+                            \\No explanation, no markdown, just the raw command.
+                            \\
+                            \\Intent: {s}
+                        , .{intent}) catch intent;
+                        if (shell.agent.query(prompt)) {
+                            agent_active = true;
+                            translate_mode = true;
+                            translate_len = 0;
+                            const thinking = "translating...";
+                            @memcpy(status_text[0..thinking.len], thinking);
+                            status_len = thinking.len;
+                            Layout.drawStatusBar(out, status_row, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len]);
+                        }
+                    }
+                    cursor_at = .output;
+                    try out.flush();
+                    continue;
+                }
+
                 if (std.mem.eql(u8, query, "exit") or std.mem.eql(u8, query, "quit")) {
-                    exitRestore.f(out, term_rows);
+                    Layout.doExit(out, term_rows, input_height);
                     return 0;
                 }
                 if (std.mem.eql(u8, query, "clear")) {
                     shell.agent.stop();
                     shell.agent.start() catch {};
-                    // Clear scroll region
-                    try out.print("\x1b[{d};1H", .{output_bottom});
+                    Layout.goOutput(out, out_last);
                     try out.writeAll("\x1b[90mconversation cleared\x1b[0m\n");
-                    output_row = output_bottom;
-                    output_col = 1;
+                    msg_history = .{}; // reset history
+                    msg_history.appendSlice("\x1b[90mconversation cleared\x1b[0m");
+                    msg_history.commitLine();
                     cursor_at = .output;
                     try out.flush();
                     continue;
                 }
                 if (std.mem.eql(u8, query, "/compact") or std.mem.eql(u8, query, "compact")) {
                     if (shell.agent.query("Please provide a brief summary of our conversation so far in 2-3 sentences, focusing on what was accomplished and any important context. Start with 'Summary:' and be concise.")) {
+                        Layout.goOutput(out, out_last);
                         try out.writeAll("\x1b[90mCompacting...\x1b[0m\n");
-                        try out.flush();
+                        msg_history.appendSlice("\x1b[90mCompacting...\x1b[0m");
+                        msg_history.commitLine();
                         agent_active = true;
                     }
+                    cursor_at = .output;
+                    try out.flush();
                     continue;
                 }
+                // /cost — show session cost breakdown
+                if (std.mem.eql(u8, query, "/cost")) {
+                    Layout.goOutput(out, out_last);
+                    cursor_at = .output;
+                    try out.print("\x1b[1mSession Cost:\x1b[0m {s}\n", .{if (cost_len > 0) cost_buf[0..cost_len] else "n/a"});
+                    try out.print("\x1b[1mModel:\x1b[0m        {s}\n", .{model_name});
+                    msg_history.appendSlice("Session cost displayed");
+                    msg_history.commitLine();
+                    try out.flush();
+                    continue;
+                }
+                // /model [name] — switch model
+                if (std.mem.eql(u8, query, "/model") or std.mem.startsWith(u8, query, "/model ")) {
+                    Layout.goOutput(out, out_last);
+                    cursor_at = .output;
+                    if (query.len > 7) {
+                        const new_model = std.mem.trim(u8, query[7..], " ");
+                        shell.agent.setModel(new_model);
+                        // Update model_name display
+                        const src = shell.agent.getModelOverride() orelse new_model;
+                        const clen = @min(src.len, model_buf.len);
+                        @memcpy(model_buf[0..clen], src[0..clen]);
+                        model_name = model_buf[0..clen];
+                        try out.print("\x1b[90mModel switched to \x1b[33m{s}\x1b[0m\n", .{model_name});
+                        msg_history.appendSlice("Model switched");
+                        msg_history.commitLine();
+                        // Redraw status bar with new model
+                        Layout.drawStatusBarSafe(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len]);
+                    } else {
+                        try out.print("\x1b[1mCurrent model:\x1b[0m {s}\n", .{model_name});
+                        try out.writeAll("\x1b[90mUsage: /model <opus|sonnet|haiku|model-id>\x1b[0m\n");
+                        msg_history.appendSlice("Model info displayed");
+                        msg_history.commitLine();
+                    }
+                    try out.flush();
+                    continue;
+                }
+                // /diff — show current git changes
+                if (std.mem.eql(u8, query, "/diff")) {
+                    Layout.goOutput(out, out_last);
+                    cursor_at = .output;
+                    if (shell.agent.query("Run `git diff --stat && git diff` to show current changes. Show the output directly, don't summarize.")) {
+                        agent_active = true;
+                        const thinking = "running diff...";
+                        @memcpy(status_text[0..thinking.len], thinking);
+                        status_len = thinking.len;
+                    }
+                    try out.flush();
+                    continue;
+                }
+                // /commit [message] — commit with AI-generated message
+                if (std.mem.eql(u8, query, "/commit") or std.mem.startsWith(u8, query, "/commit ")) {
+                    Layout.goOutput(out, out_last);
+                    cursor_at = .output;
+                    if (query.len > 8) {
+                        const commit_msg = std.mem.trim(u8, query[8..], " ");
+                        var commit_prompt_buf: [4096]u8 = undefined;
+                        const commit_prompt = std.fmt.bufPrint(&commit_prompt_buf, "Run `git add -A && git commit -m '{s}'`. Show the result.", .{commit_msg}) catch "Run git commit";
+                        if (shell.agent.query(commit_prompt)) {
+                            agent_active = true;
+                        }
+                    } else {
+                        if (shell.agent.query("Look at `git diff --cached` and `git diff` and `git status`, then create a good commit. Stage relevant files with `git add` (not -A, be selective), write a concise commit message focused on the 'why', and run `git commit`. Show the result.")) {
+                            agent_active = true;
+                            const thinking = "committing...";
+                            @memcpy(status_text[0..thinking.len], thinking);
+                            status_len = thinking.len;
+                        }
+                    }
+                    try out.flush();
+                    continue;
+                }
+                // /review — review changes made this session
+                if (std.mem.eql(u8, query, "/review")) {
+                    Layout.goOutput(out, out_last);
+                    cursor_at = .output;
+                    if (shell.agent.query("Review all changes made in this session. Run `git diff` and provide a concise code review: what changed, potential issues, and suggestions.")) {
+                        agent_active = true;
+                        const thinking = "reviewing...";
+                        @memcpy(status_text[0..thinking.len], thinking);
+                        status_len = thinking.len;
+                    }
+                    try out.flush();
+                    continue;
+                }
+                // /undo — undo last file change
+                if (std.mem.eql(u8, query, "/undo")) {
+                    Layout.goOutput(out, out_last);
+                    cursor_at = .output;
+                    if (shell.agent.query("Undo the last file change. Run `git diff --name-only` to see what changed, then `git checkout -- <file>` for the most recently modified file. If there are staged changes, use `git checkout HEAD -- <file>`. Show what was undone.")) {
+                        agent_active = true;
+                        const thinking = "undoing...";
+                        @memcpy(status_text[0..thinking.len], thinking);
+                        status_len = thinking.len;
+                    }
+                    try out.flush();
+                    continue;
+                }
+                // /plan — enter planning mode (ask agent to plan without executing)
+                if (std.mem.eql(u8, query, "/plan") or std.mem.startsWith(u8, query, "/plan ")) {
+                    Layout.goOutput(out, out_last);
+                    cursor_at = .output;
+                    if (query.len > 6) {
+                        const plan_query = std.mem.trim(u8, query[6..], " ");
+                        var plan_buf: [4096]u8 = undefined;
+                        const plan_prompt = std.fmt.bufPrint(&plan_buf, "PLANNING MODE — do NOT execute any tools. Only use Read/Glob/Grep to understand the codebase, then provide a detailed implementation plan with:\n1. Files to modify\n2. Changes needed in each file\n3. Order of operations\n4. Potential risks\n\nTask: {s}", .{plan_query}) catch plan_query;
+                        if (shell.agent.query(plan_prompt)) {
+                            agent_active = true;
+                            const thinking = "planning...";
+                            @memcpy(status_text[0..thinking.len], thinking);
+                            status_len = thinking.len;
+                        }
+                    } else {
+                        try out.writeAll("\x1b[90mUsage: /plan <description of what you want to implement>\x1b[0m\n");
+                        msg_history.appendSlice("Plan usage displayed");
+                        msg_history.commitLine();
+                    }
+                    try out.flush();
+                    continue;
+                }
+                // /agents or /tasks — show subagent info
+                if (std.mem.eql(u8, query, "/agents") or std.mem.eql(u8, query, "/tasks")) {
+                    Layout.goOutput(out, out_last);
+                    cursor_at = .output;
+                    if (shell.agent.isBusy()) {
+                        try out.writeAll("\x1b[33mAgent is busy\x1b[0m (may have subagents running)\n");
+                    } else {
+                        try out.writeAll("\x1b[90mAgent idle, no active tasks.\x1b[0m\n");
+                    }
+                    try out.writeAll("\x1b[90mUse `agent tasks` from shell for detailed subagent log.\x1b[0m\n");
+                    msg_history.appendSlice("Task status displayed");
+                    msg_history.commitLine();
+                    try out.flush();
+                    continue;
+                }
+                // /sessions — list recent sessions
+                if (std.mem.eql(u8, query, "/sessions")) {
+                    Layout.goOutput(out, out_last);
+                    cursor_at = .output;
+                    var sessions_list: std.ArrayList(agent_log.SessionInfo) = .{};
+                    defer sessions_list.deinit(shell.allocator);
+                    agent_log.listSessions(shell.allocator, &sessions_list) catch {};
+                    if (sessions_list.items.len == 0) {
+                        try out.writeAll("\x1b[90mNo saved sessions.\x1b[0m\n");
+                    } else {
+                        const start = if (sessions_list.items.len > 10) sessions_list.items.len - 10 else 0;
+                        for (sessions_list.items[start..]) |*info| {
+                            const epoch_secs: u64 = if (info.created > 0) @intCast(info.created) else 0;
+                            const es = std.time.epoch.EpochSeconds{ .secs = epoch_secs };
+                            const eday = es.getEpochDay();
+                            const eyd = eday.calculateYearDay();
+                            const emd = eyd.calculateMonthDay();
+                            const eds = es.getDaySeconds();
+                            try out.print("  \x1b[33m{s}\x1b[0m  {d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}  {s}\n", .{
+                                @as([]const u8, &info.id),
+                                eyd.year,
+                                @intFromEnum(emd.month),
+                                emd.day_index + 1,
+                                eds.getHoursIntoDay(),
+                                eds.getMinutesIntoHour(),
+                                info.cwd(),
+                            });
+                        }
+                    }
+                    msg_history.appendSlice("Sessions listed");
+                    msg_history.commitLine();
+                    try out.flush();
+                    continue;
+                }
+                // /config — show current configuration
+                if (std.mem.eql(u8, query, "/config")) {
+                    Layout.goOutput(out, out_last);
+                    cursor_at = .output;
+                    try out.print("\x1b[1mModel:\x1b[0m    {s}\n", .{model_name});
+                    try out.print("\x1b[1mCost:\x1b[0m     {s}\n", .{if (cost_len > 0) cost_buf[0..cost_len] else "n/a"});
+                    {
+                        var conf = agent_log.AgentConfig.load(shell.allocator);
+                        defer conf.deinit();
+                        try out.print("\x1b[1mProvider:\x1b[0m {s}\n", .{conf.provider});
+                        if (conf.api_key.len > 8) {
+                            try out.print("\x1b[1mAPI Key:\x1b[0m  {s}...{s}\n", .{ conf.api_key[0..4], conf.api_key[conf.api_key.len - 4 ..] });
+                        }
+                    }
+                    msg_history.appendSlice("Config displayed");
+                    msg_history.commitLine();
+                    try out.flush();
+                    continue;
+                }
+                // /search <pattern> — search history backwards
+                if (std.mem.startsWith(u8, query, "/search ") or std.mem.startsWith(u8, query, "/s ")) {
+                    const pattern = if (std.mem.startsWith(u8, query, "/search "))
+                        std.mem.trim(u8, query[8..], " ")
+                    else
+                        std.mem.trim(u8, query[3..], " ");
+                    if (pattern.len > 0) {
+                        // Search backwards from current view position
+                        const search_start = if (msg_history.line_count > scroll_offset)
+                            msg_history.line_count - scroll_offset
+                        else
+                            msg_history.line_count;
+                        if (msg_history.searchBack(pattern, search_start)) |found_line| {
+                            // Scroll to show the found line in the middle of the output area
+                            const lines_from_bottom = msg_history.line_count - found_line;
+                            scroll_offset = if (lines_from_bottom > out_last / 2)
+                                lines_from_bottom - out_last / 2
+                            else
+                                0;
+                            Layout.repaintFromHistory(out, &msg_history, out_last, scroll_offset);
+                            Layout.drawSeparator(out, sep_row, term_cols, scroll_offset);
+                        } else {
+                            Layout.goOutput(out, out_last);
+                            cursor_at = .output;
+                            try out.print("\x1b[90mPattern not found: {s}\x1b[0m\n", .{pattern});
+                        }
+                    }
+                    try out.flush();
+                    continue;
+                }
+                // /n — search forward (next match) using last search
+                // /N — search backward (prev match)
                 if (std.mem.eql(u8, query, "/help") or std.mem.eql(u8, query, "help")) {
-                    goOutput.f(out, output_row, output_col);
-                    try out.writeAll(
+                    Layout.goOutput(out, out_last);
+                    const help_text =
                         \\\x1b[1mAgent Mode Commands:\x1b[0m
                         \\  \x1b[33mexit\x1b[0m / \x1b[33mquit\x1b[0m / \x1b[33mCtrl+D\x1b[0m  — leave agent mode
                         \\  \x1b[33mclear\x1b[0m                — reset conversation
                         \\  \x1b[33m/compact\x1b[0m             — summarize conversation
+                        \\  \x1b[33m/cost\x1b[0m                — show session cost
+                        \\  \x1b[33m/model\x1b[0m [name]        — show/switch model
+                        \\  \x1b[33m/diff\x1b[0m                — show git changes
+                        \\  \x1b[33m/commit\x1b[0m [msg]        — commit (AI message if no msg)
+                        \\  \x1b[33m/review\x1b[0m              — review session changes
+                        \\  \x1b[33m/undo\x1b[0m                — undo last file change
+                        \\  \x1b[33m/plan\x1b[0m <task>          — plan without executing
+                        \\  \x1b[33m/agents\x1b[0m              — list active subagents
+                        \\  \x1b[33m/sessions\x1b[0m            — list recent sessions
+                        \\  \x1b[33m/config\x1b[0m              — show configuration
+                        \\  \x1b[33m/search\x1b[0m <pattern>    — search history (also /s)
                         \\  \x1b[33m/help\x1b[0m                — show this help
                         \\
-                        \\  Type while the agent responds — messages queue up.
-                        \\  \x1b[33mCtrl+C\x1b[0m cancels when busy, clears/exits when idle.
                         \\
-                    );
-                    output_row = output_bottom;
-                    output_col = 1;
+                        \\  \x1b[33m!command\x1b[0m             — run shell command (zish engine)
+                        \\  \x1b[33m!\x1b[0m                    — drop to full zish shell
+                        \\  \x1b[33m?intent\x1b[0m              — translate to shell command
+                        \\
+                        \\  \x1b[33mEnter\x1b[0m submits, \x1b[33mAlt+Enter\x1b[0m inserts newline.
+                        \\  \x1b[33mPageUp/Down\x1b[0m scrolls through history.
+                        \\  \x1b[33m^K/^N\x1b[0m jumps between messages.
+                        \\  \x1b[33mCtrl+C\x1b[0m cancels when busy, clears/exits when idle.
+                        \\  \x1b[33mEsc\x1b[0m enters vi normal mode (\x1b[33mi\x1b[0m to return to insert).
+                        \\  \x1b[33mRight/End\x1b[0m accepts ghost text, \x1b[33mCtrl+Right\x1b[0m one word.
+                        \\
+                    ;
+                    try out.writeAll(help_text);
+                    // Capture to history line by line
+                    var help_iter = std.mem.splitScalar(u8, help_text, '\n');
+                    while (help_iter.next()) |hl| {
+                        if (hl.len > 0) msg_history.appendSlice(hl);
+                        msg_history.commitLine();
+                    }
                     cursor_at = .output;
                     try out.flush();
                     continue;
                 }
 
-                // Send query
+                // Send to agent — always queues, never blocks
                 if (!shell.agent.query(query)) {
-                    goOutput.f(out, output_row, output_col);
+                    Layout.goOutput(out, out_last);
                     try out.writeAll("\x1b[31mqueue full, try again\x1b[0m\n");
-                    output_row = output_bottom;
+                    msg_history.appendSlice("\x1b[31mqueue full, try again\x1b[0m");
+                    msg_history.commitLine();
                     cursor_at = .output;
-                    try out.flush();
                 } else {
                     agent_active = true;
                     cursor_at = .output;
+                    // Show "thinking..." in status bar
+                    const thinking = "thinking...";
+                    @memcpy(status_text[0..thinking.len], thinking);
+                    status_len = thinking.len;
+                    Layout.drawStatusBarSafe(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len]);
                 }
+                try out.flush();
                 continue;
             }
 
-            // Backspace
+            // Backspace (in normal mode, just move left)
             if (byte[0] == 127 or byte[0] == 8) {
-                if (line_len > 0) {
-                    line_len -= 1;
-                    InputBar.draw(out, term_rows, &line_buf, line_len);
-                    if (agent_active) {
-                        goOutput.f(out, output_row, output_col);
-                        cursor_at = .output;
-                    } else {
-                        cursor_at = .input;
+                if (edit_buf.vi_mode == .normal) {
+                    if (edit_buf.moveLeft()) {
+                        Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                        if (!agent_active) cursor_at = .input;
+                        try out.flush();
                     }
+                    continue;
+                }
+                if (edit_buf.delete()) {
+                    const new_h: u16 = @min(edit_buf.lineCount(), 5);
+                    if (new_h != input_height) {
+                        input_height = new_h;
+                        recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
+                    }
+                    Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                    if (!agent_active) cursor_at = .input;
                     try out.flush();
                 }
                 continue;
             }
 
-            // Regular character
-            if (byte[0] >= 0x20 or byte[0] == '\t') {
-                if (line_len < line_buf.len - 1) {
-                    line_buf[line_len] = byte[0];
-                    line_len += 1;
-                    InputBar.draw(out, term_rows, &line_buf, line_len);
-                    if (agent_active) {
-                        goOutput.f(out, output_row, output_col);
-                        cursor_at = .output;
-                    } else {
-                        cursor_at = .input;
+            // Configurable Ctrl key bindings (from ~/.zish/keybindings.json)
+            // Skip keys handled above: 0x03 (Ctrl+C), 0x04 (Ctrl+D), 0x07 (Ctrl+G),
+            // 0x0B (Ctrl+K=scroll up), 0x0E (Ctrl+N=scroll down)
+            if (byte[0] >= 0x01 and byte[0] <= 0x1A and
+                byte[0] != 0x03 and byte[0] != 0x04 and byte[0] != 0x07 and
+                byte[0] != 0x0B and byte[0] != 0x0E and
+                byte[0] != 0x08 and byte[0] != 0x09 and byte[0] != 0x0A and byte[0] != 0x0D)
+            {
+                if (shell.keybindings.lookupCtrl(byte[0])) |action| {
+                    // Map Action back to BindableAction for TUI application
+                    const ba = actionToBindable(action);
+                    const result = applyTuiBindableAction(ba, &edit_buf, shell);
+                    if (result != .none) {
+                        if (result == .modified) {
+                            const new_h: u16 = @min(edit_buf.lineCount(), 5);
+                            if (new_h != input_height) {
+                                input_height = new_h;
+                                recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
+                            }
+                        }
+                        Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                        if (!agent_active) cursor_at = .input;
+                        try out.flush();
                     }
+                    continue;
+                }
+                continue; // unknown ctrl key, ignore
+            }
+
+            // Regular character — always typeable, even during streaming
+            if (byte[0] >= 0x20 or byte[0] == '\t') {
+                if (edit_buf.insert(byte[0])) {
+                    Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                    if (!agent_active) cursor_at = .input;
                     try out.flush();
                 }
             }
@@ -3169,19 +4578,19 @@ fn agentAttach(shell: *Shell, args: []const []const u8) !u8 {
     try out.print("\x1b[{d};1H\x1b[90m", .{output_bottom + 1});
     {
         var ci: u16 = 0;
-        while (ci < term_cols) : (ci += 1) try out.writeAll("\xe2\x94\x80");
+        while (ci < term_cols) : (ci += 1) try out.writeByte('-');
     }
     try out.writeAll("\x1b[0m");
 
     // Input bar
-    try out.print("\x1b[{d};1H\x1b[2K\x1b[1;35m\xe2\x95\xb0\xe2\x94\x80>\x1b[0m ", .{term_rows});
+    try out.print("\x1b[{d};1H\x1b[2K\x1b[1;35m>>\x1b[0m ", .{term_rows});
 
     // Header
     try out.print("\x1b[{d};1H", .{output_bottom});
     if (has_ctl) {
-        try out.print("\x1b[1;35m\xe2\x95\xad\xe2\x94\x80 Attached \x1b[0m\x1b[90m({s} \xe2\x80\x94 live)\x1b[0m\n", .{session_id});
+        try out.print("\x1b[1;35m-- attached \x1b[0m\x1b[90m{s} (live)\x1b[0m\n", .{session_id});
     } else {
-        try out.print("\x1b[1;35m\xe2\x95\xad\xe2\x94\x80 Replay \x1b[0m\x1b[90m({s} \xe2\x80\x94 session ended)\x1b[0m\n", .{session_id});
+        try out.print("\x1b[1;35m-- replay \x1b[0m\x1b[90m{s} (ended)\x1b[0m\n", .{session_id});
     }
     try out.flush();
 
@@ -3211,7 +4620,7 @@ fn agentAttach(shell: *Shell, args: []const []const u8) !u8 {
 
     const InputBar = struct {
         fn draw(w: anytype, rows: u16, buf: []const u8, len: usize) void {
-            w.print("\x1b[{d};1H\x1b[2K\x1b[1;35m\xe2\x95\xb0\xe2\x94\x80>\x1b[0m ", .{rows}) catch {};
+            w.print("\x1b[{d};1H\x1b[2K\x1b[1;35m>>\x1b[0m ", .{rows}) catch {};
             if (len > 0) w.writeAll(buf[0..len]) catch {};
         }
     };
@@ -3319,7 +4728,7 @@ fn agentAttach(shell: *Shell, args: []const []const u8) !u8 {
                     _ = std.posix.write(fd, "\n") catch {};
                     // Echo in output area
                     try out.print("\x1b[{d};1H", .{output_bottom});
-                    try out.writeAll("\n\x1b[1;35m\xe2\x9d\xaf \x1b[0m");
+                    try out.writeAll("\n\x1b[1;35m> \x1b[0m");
                     try out.writeAll(input);
                     try out.writeByte('\n');
                 } else {

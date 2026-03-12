@@ -1,0 +1,55 @@
+{
+    // ~/.zish/keybindings.json — Custom keybindings for zish
+    //
+    // Format: "key": "action"
+    // Keys:   ctrl+a through ctrl+z, alt+a through alt+z, alt+.
+    // Note:   ctrl+h (backspace), ctrl+i (tab), ctrl+j/ctrl+m (enter) cannot be rebound
+    //
+    // Available actions:
+    //   Cursor:    move_line_start, move_line_end, move_left, move_right
+    //              move_word_forward, move_word_backward, move_up, move_down
+    //   Editing:   backspace, delete_char, delete_word_backward
+    //              kill_to_end, kill_to_beginning, yank_killed
+    //              transpose_chars, insert_last_arg, undo
+    //   History:   history_up, history_down, search_backward, search_forward
+    //   Control:   cancel, cancel_agent, clear_screen, exit_shell
+    //              suspend_shell, execute_command, tab_complete
+    //   Vi:        enter_normal_mode
+    //   Disable:   none
+
+    // ── Defaults (uncomment to override) ──
+
+    // "ctrl+a": "move_line_start",
+    // "ctrl+b": "move_left",
+    // "ctrl+c": "cancel",
+    // "ctrl+d": "exit_shell",
+    // "ctrl+e": "move_line_end",
+    // "ctrl+f": "move_right",
+    // "ctrl+g": "cancel_agent",
+    // "ctrl+k": "kill_to_end",
+    // "ctrl+l": "clear_screen",
+    // "ctrl+n": "history_down",
+    // "ctrl+p": "history_up",
+    // "ctrl+r": "search_backward",
+    // "ctrl+s": "search_forward",
+    // "ctrl+t": "transpose_chars",
+    // "ctrl+u": "kill_to_beginning",
+    // "ctrl+w": "delete_word_backward",
+    // "ctrl+y": "yank_killed",
+    // "ctrl+z": "suspend_shell",
+
+    // "alt+b": "move_word_backward",
+    // "alt+f": "move_word_forward",
+    // "alt+.": "insert_last_arg"
+
+    // ── Examples ──
+    // Swap Ctrl+K and Ctrl+U (Ctrl+K kills backward, Ctrl+U kills forward):
+    // "ctrl+k": "kill_to_beginning",
+    // "ctrl+u": "kill_to_end",
+
+    // Disable Ctrl+S (prevent terminal freeze):
+    // "ctrl+s": "none",
+
+    // Make Ctrl+O undo (like some editors):
+    // "ctrl+o": "undo"
+}

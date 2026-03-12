@@ -16,6 +16,7 @@ const jobs = @import("jobs.zig");
 const editor = @import("editor.zig");
 const vim = @import("vim.zig");
 const agent_mod = @import("agent.zig");
+const agent_log = @import("agent_log.zig");
 
 // Re-export from input module (for compatibility)
 const VimMode = input_mod.VimMode;
@@ -185,6 +186,7 @@ job_table: jobs.JobTable,
 edit_buf: editor.EditBuffer = .{},
 term_view: editor.TermView,
 vi: vim.Vim = .{},
+keybindings: input_mod.KeyBindings = .{},
 
 // vim clipboard for yank/paste operations (legacy, now in vi.yank_buf)
 clipboard: []u8,
@@ -207,6 +209,43 @@ completion_menu_lines: usize = 0,
 completion_displayed: bool = false,
 skip_next_slash: bool = false, // set after completion inserts / for directory
 ctrl_d_pending: bool = false, // double ctrl+d to exit
+
+// flag completion cache (one command at a time, TTL 5 min)
+flag_cache_cmd: [64]u8 = undefined,
+flag_cache_cmd_len: usize = 0,
+flag_cache_buf: [8192]u8 = undefined,
+flag_cache_offsets: [256]u16 = undefined,
+flag_cache_lens: [256]u8 = undefined,
+flag_cache_count: usize = 0,
+flag_cache_ts: i64 = 0, // timestamp when cache was populated
+// flag description cache (parallel to flag_cache)
+flag_desc_buf: [16384]u8 = undefined,
+flag_desc_offsets: [256]u16 = undefined,
+flag_desc_lens: [256]u8 = undefined,
+
+// subcommand completion cache (one command at a time, TTL 5 min)
+subcmd_cache_cmd: [32]u8 = undefined,
+subcmd_cache_cmd_len: usize = 0,
+subcmd_cache_buf: [4096]u8 = undefined,
+subcmd_cache_offsets: [128]u16 = undefined,
+subcmd_cache_lens: [128]u8 = undefined,
+subcmd_cache_count: usize = 0,
+subcmd_cache_ts: i64 = 0,
+
+// ghost text autosuggestion (fish-style)
+opt_autosuggestion: bool = true, // enabled by default, disable with `set autosuggestion off`
+ghost_buf: [512]u8 = undefined,
+ghost_len: usize = 0,
+ghost_from_ctm: bool = false, // true if ghost text came from CTM inference, false if history
+// CTM inference for ghost text (async — runs on background thread)
+ghost_infer_input: [512]u8 = undefined, // command line sent to inference
+ghost_infer_input_len: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+ghost_infer_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0), // increment on new request
+ghost_infer_result: [512]u8 = undefined, // inference result
+ghost_infer_result_len: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+ghost_infer_result_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0), // seq of completed result
+ghost_infer_thread: ?std.Thread = null,
+ghost_infer_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
 // git info display (set via .zishrc: set git_prompt on)
 show_git_info: bool = false,
@@ -298,6 +337,7 @@ fn initWithOptions(allocator: std.mem.Allocator, load_config: bool) !*Shell {
     // load config only for interactive mode
     if (load_config) {
         shell.loadConfig() catch {}; // don't fail if no config file
+        shell.loadKeybindings();
     }
 
     return shell;
@@ -367,6 +407,9 @@ pub fn deinit(self: *Shell) void {
     // cleanup traps
     self.traps.deinit();
 
+    // stop ghost inference thread
+    completion_mod.stopGhostInference(self);
+
     // stop agent thread so it can clean up
     self.agent.stop();
 
@@ -386,6 +429,9 @@ fn clearCommand(self: *Shell) void {
 
 /// Render using TermView
 pub fn renderLine(self: *Shell) !void {
+    // update ghost text suggestion before rendering
+    completion_mod.updateGhostText(self);
+    self.term_view.ghost_text = self.ghost_buf[0..self.ghost_len];
     var prompt_buf: [256]u8 = undefined;
     const prompt = self.buildPrompt(&prompt_buf);
     try self.term_view.render(&self.edit_buf, prompt.slice, prompt.visible_len);
@@ -460,13 +506,48 @@ fn buildPrompt(self: *Shell, buf: *[256]u8) PromptInfo {
     // color codes
     const green = "\x1b[32m"; // user@host
     const cyan = "\x1b[36m"; // path
+    const red = "\x1b[31m"; // error
+    const yellow = "\x1b[33m"; // git branch
     const reset = "\x1b[0m";
 
-    // format: [M] user@host path $
-    const len = std.fmt.bufPrint(buf, "{s} {s}{s}@{s}{s} {s}{s}{s} $ ", .{
+    // get git branch (fast — reads .git/HEAD directly)
+    var branch_buf: [64]u8 = undefined;
+    var branch_visible: u16 = 0;
+    const branch_str = blk: {
+        const head = std.fs.cwd().openFile(".git/HEAD", .{}) catch break :blk "";
+        defer head.close();
+        var hbuf: [256]u8 = undefined;
+        const n = head.read(&hbuf) catch break :blk "";
+        const content = std.mem.trim(u8, hbuf[0..n], " \t\r\n");
+        if (std.mem.startsWith(u8, content, "ref: refs/heads/")) {
+            const name = content[16..];
+            const blen = @min(name.len, 30); // truncate long branches
+            branch_visible = @intCast(blen + 3); // " (branch)"
+            break :blk std.fmt.bufPrint(&branch_buf, " {s}({s}){s}", .{ yellow, name[0..blen], reset }) catch "";
+        }
+        break :blk "";
+    };
+
+    // exit code indicator
+    var exit_buf: [32]u8 = undefined;
+    var exit_visible: u16 = 0;
+    const exit_str = if (self.last_exit_code != 0) blk: {
+        const s = std.fmt.bufPrint(&exit_buf, " {s}[{d}]{s}", .{ red, self.last_exit_code, reset }) catch "";
+        // visible: " [N]" = 3 + digits
+        var digits: u16 = 1;
+        var v = self.last_exit_code;
+        while (v >= 10) : (v /= 10) digits += 1;
+        exit_visible = digits + 3;
+        break :blk s;
+    } else "";
+
+    // format: [M] user@host path (branch) [exit] $
+    const len = std.fmt.bufPrint(buf, "{s} {s}{s}@{s}{s} {s}{s}{s}{s}{s} $ ", .{
         mode_str,
         green, user, hostname, reset,
         cyan, display_path, reset,
+        branch_str,
+        exit_str,
     }) catch return .{ .slice = "$ ", .visible_len = 2 };
 
     // calculate visible length (mode indicator is 3-4 chars visible)
@@ -475,7 +556,7 @@ fn buildPrompt(self: *Shell, buf: *[256]u8) PromptInfo {
 
     return .{
         .slice = buf[0..len.len],
-        .visible_len = mode_visible + 1 + rest_visible, // +1 for space after mode
+        .visible_len = mode_visible + 1 + rest_visible + branch_visible + exit_visible, // +1 for space after mode
     };
 }
 
@@ -581,6 +662,22 @@ pub fn run(self: *Shell) !void {
 
     // start agent background thread (optional - silently skip if thread fails)
     self.agent.start() catch {};
+
+    // start ghost text inference if completion_model is configured
+    {
+        var cfg = agent_log.AgentConfig.load(self.allocator);
+        defer cfg.deinit();
+        if (cfg.completion_model.len > 0) {
+            // expand ~ to home directory
+            var path_buf: [512]u8 = undefined;
+            const model_path = if (std.mem.startsWith(u8, cfg.completion_model, "~/")) blk: {
+                const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch break :blk cfg.completion_model;
+                defer self.allocator.free(home);
+                break :blk std.fmt.bufPrint(&path_buf, "{s}{s}", .{ home, cfg.completion_model[1..] }) catch cfg.completion_model;
+            } else cfg.completion_model;
+            completion_mod.startGhostInference(self, model_path);
+        }
+    }
 
     try self.renderLine();
 
@@ -726,23 +823,22 @@ fn handleResize(self: *Shell) !void {
     self.terminal_width = new_size.width;
     self.terminal_height = new_size.height;
 
-    if (self.completion_mode and self.completion_displayed) {
-        // clear everything from command start down, then redraw
-        // move to start of command area
-        if (self.term_view.term.row > 0) {
-            try self.stdout().print("\x1b[{d}A", .{self.term_view.term.row});
-        }
-        try self.stdout().writeAll("\r\x1b[J");
-        self.term_view.term.row = 0;
-        self.term_view.term.col = 0;
-        self.term_view.last_hash = 0;
+    // update term_view dimensions
+    self.term_view.term.width = @intCast(new_size.width);
+    self.term_view.term.height = @intCast(new_size.height);
 
-        // redraw command line and completion menu
-        try self.renderLine();
+    // Clear from prompt start down and redraw everything
+    if (self.term_view.term.row > 0) {
+        try self.stdout().print("\x1b[{d}A", .{self.term_view.term.row});
+    }
+    try self.stdout().writeAll("\r\x1b[J");
+    self.term_view.term.row = 0;
+    self.term_view.term.col = 0;
+    self.term_view.last_hash = 0;
+
+    try self.renderLine();
+    if (self.completion_mode and self.completion_displayed) {
         try completion_mod.displayCompletions(self);
-    } else {
-        // just redraw the current line
-        try self.renderLine();
     }
 }
 
@@ -786,6 +882,7 @@ fn handleAction(self: *Shell, action: Action) !void {
 
         .cancel => {
             completion_mod.exitCompletionMode(self);
+            self.ghost_len = 0;
             // print ^C like bash does
             try self.stdout().writeAll("^C\n");
             try self.stdout().flush();
@@ -936,6 +1033,100 @@ fn handleAction(self: *Shell, action: Action) !void {
             try self.renderLine();
         },
 
+        .kill_to_beginning => {
+            // Ctrl+U: kill from cursor to start of line, save to kill buffer
+            const pos = self.edit_buf.cursor;
+            if (pos > 0) {
+                // Save killed text to yank buffer
+                @memcpy(self.vi.yank_buf[0..pos], self.edit_buf.text[0..pos]);
+                self.vi.yank_len = @intCast(pos);
+                // Delete by repeated backspace
+                var i: usize = 0;
+                while (i < pos) : (i += 1) _ = self.edit_buf.delete();
+                if (self.history_index != -1) {
+                    self.history_search_prefix_len = self.edit_buf.len;
+                }
+                try self.renderLine();
+            }
+        },
+
+        .kill_to_end => {
+            // Ctrl+K: kill from cursor to end of line, save to kill buffer
+            const start = self.edit_buf.cursor;
+            var end: u16 = start;
+            while (end < self.edit_buf.len and self.edit_buf.text[end] != '\n') end += 1;
+            if (end > start) {
+                const len = end - start;
+                @memcpy(self.vi.yank_buf[0..len], self.edit_buf.text[start..end]);
+                self.vi.yank_len = @intCast(len);
+                self.edit_buf.cursor = start;
+                var i: usize = 0;
+                while (i < len) : (i += 1) _ = self.edit_buf.deleteForward();
+                if (self.history_index != -1) {
+                    self.history_search_prefix_len = self.edit_buf.len;
+                }
+                try self.renderLine();
+            }
+        },
+
+        .yank_killed => {
+            // Ctrl+Y: paste kill buffer at cursor
+            if (self.vi.yank_len > 0) {
+                _ = self.edit_buf.insertSlice(self.vi.yank_buf[0..self.vi.yank_len]);
+                if (self.history_index != -1) {
+                    self.history_search_prefix_len = self.edit_buf.len;
+                }
+                try self.renderLine();
+            }
+        },
+
+        .transpose_chars => {
+            // Ctrl+T: swap character before cursor with character at cursor
+            if (self.edit_buf.cursor > 0 and self.edit_buf.cursor < self.edit_buf.len) {
+                const c1 = self.edit_buf.text[self.edit_buf.cursor - 1];
+                const c2 = self.edit_buf.text[self.edit_buf.cursor];
+                self.edit_buf.text[self.edit_buf.cursor - 1] = c2;
+                self.edit_buf.text[self.edit_buf.cursor] = c1;
+                self.edit_buf.cursor += 1;
+                try self.renderLine();
+            } else if (self.edit_buf.cursor >= 2 and self.edit_buf.cursor == self.edit_buf.len) {
+                // at end of line: swap last two chars (bash behavior)
+                const pos = self.edit_buf.cursor;
+                const c1 = self.edit_buf.text[pos - 2];
+                const c2 = self.edit_buf.text[pos - 1];
+                self.edit_buf.text[pos - 2] = c2;
+                self.edit_buf.text[pos - 1] = c1;
+                try self.renderLine();
+            }
+        },
+
+        .insert_last_arg => {
+            // Alt+.: insert last argument from previous history command
+            if (self.history) |h| {
+                const items = h.entries.items;
+                if (items.len > 0) {
+                    const prev = h.getCommand(items[items.len - 1]);
+                    if (prev.len > 0) {
+                        // find last whitespace-separated argument
+                        var end: usize = prev.len;
+                        while (end > 0 and (prev[end - 1] == ' ' or prev[end - 1] == '\t')) end -= 1;
+                        var start: usize = end;
+                        while (start > 0 and prev[start - 1] != ' ' and prev[start - 1] != '\t') start -= 1;
+                        const last_arg = prev[start..end];
+                        if (last_arg.len > 0) {
+                            if (self.edit_buf.len > 0 and self.edit_buf.cursor > 0 and
+                                self.edit_buf.text[self.edit_buf.cursor - 1] != ' ')
+                            {
+                                _ = self.edit_buf.insert(' ');
+                            }
+                            _ = self.edit_buf.insertSlice(last_arg);
+                            try self.renderLine();
+                        }
+                    }
+                }
+            }
+        },
+
         .delete => |delete_action| {
             switch (delete_action) {
                 .char_under_cursor => {
@@ -987,6 +1178,7 @@ fn handleAction(self: *Shell, action: Action) !void {
                 try self.handleAction(.{ .exit_search_mode = true });
             } else {
                 completion_mod.exitCompletionMode(self);
+                self.ghost_len = 0;
 
                 const command = std.mem.trim(u8, self.edit_buf.slice(), " \t\n\r");
 
@@ -1016,6 +1208,23 @@ fn handleAction(self: *Shell, action: Action) !void {
                 try self.stdout().flush();
 
                 if (command.len > 0) {
+                    // ? translate mode: natural language -> shell command
+                    if (command[0] == '?' and command.len > 1) {
+                        const nl_query = std.mem.trimLeft(u8, command[1..], " \t");
+                        if (nl_query.len > 0) {
+                            try self.handleTranslateQuery(nl_query);
+                            self.clearCommand();
+                            self.history_index = -1;
+                            self.history_search_prefix_len = 0;
+                            self.vi.mode = .insert;
+                            self.vim_mode = .insert;
+                            self.term_view.finishLine();
+                            self.displayed_cmd_lines = 1;
+                            try self.renderLine();
+                            return;
+                        }
+                    }
+
                     // Preprocess heredoc: convert << DELIM ... DELIM to <<< "content"
                     const processed_cmd = if (findHeredocDelimiter(command)) |delim|
                         preprocessHeredoc(self.allocator, command, delim) catch command
@@ -1023,12 +1232,39 @@ fn handleAction(self: *Shell, action: Action) !void {
                         command;
                     defer if (processed_cmd.ptr != command.ptr) self.allocator.free(processed_cmd);
 
+                    const start_ts = std.time.timestamp();
                     self.last_exit_code = try self.executeCommand(processed_cmd);
+                    const elapsed = std.time.timestamp() - start_ts;
+
+                    // Show elapsed time for long-running commands (>1s)
+                    if (elapsed > 0) {
+                        var time_buf: [32]u8 = undefined;
+                        const time_str = if (elapsed >= 3600)
+                            std.fmt.bufPrint(&time_buf, "\x1b[90m {d}h{d}m{d}s\x1b[0m", .{
+                                @divFloor(elapsed, 3600),
+                                @divFloor(@mod(elapsed, 3600), 60),
+                                @mod(elapsed, 60),
+                            }) catch ""
+                        else if (elapsed >= 60)
+                            std.fmt.bufPrint(&time_buf, "\x1b[90m {d}m{d}s\x1b[0m", .{
+                                @divFloor(elapsed, 60),
+                                @mod(elapsed, 60),
+                            }) catch ""
+                        else
+                            std.fmt.bufPrint(&time_buf, "\x1b[90m {d}s\x1b[0m", .{elapsed}) catch "";
+                        if (time_str.len > 0) {
+                            try self.stdout().writeAll(time_str);
+                            try self.stdout().writeByte('\n');
+                        }
+                    }
 
                     // Add to history
                     if (self.history) |h| {
                         h.addCommand(command, self.last_exit_code) catch {};
                     }
+
+                    // Log command execution for training data
+                    logCommandExecution(command, self.last_exit_code, elapsed);
                 }
 
                 // flush any command output before rendering new prompt
@@ -1303,7 +1539,29 @@ fn handleCursorMovement(self: *Shell, move_action: MoveCursorAction) !void {
         .line_up, .line_down => unreachable,
     };
 
-    if (new_pos == old_pos) return;
+    if (new_pos == old_pos) {
+        // At end of line — accept ghost text if available
+        if (old_pos == max_pos and self.ghost_len > 0) {
+            switch (move_action) {
+                .relative => |steps| {
+                    if (steps > 0) {
+                        // Right arrow: accept all ghost text
+                        if (completion_mod.acceptGhostText(self)) try self.renderLine();
+                    }
+                },
+                .to_line_end => {
+                    // End key: accept all ghost text
+                    if (completion_mod.acceptGhostText(self)) try self.renderLine();
+                },
+                .word_forward => {
+                    // Ctrl+Right: accept one word from ghost text
+                    if (completion_mod.acceptGhostWord(self)) try self.renderLine();
+                },
+                else => {},
+            }
+        }
+        return;
+    }
 
     self.edit_buf.cursor = @intCast(new_pos);
 
@@ -1506,6 +1764,208 @@ fn isWhitespace(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\n';
 }
 
+/// Handle ? translate mode: send NL query to agent, collect response, populate edit buffer.
+fn handleTranslateQuery(self: *Shell, nl_query: []const u8) !void {
+    const agent_queue = @import("agent_queue.zig");
+
+    // Build translate prompt
+    var prompt_buf: [2048]u8 = undefined;
+    const prompt = std.fmt.bufPrint(&prompt_buf, "Translate this to a shell command. Reply with ONLY the command, nothing else — no explanation, no markdown, no backticks:\n{s}", .{nl_query}) catch return;
+
+    // Send to agent
+    if (!self.agent.query(prompt)) {
+        try self.stdout().writeAll("\x1b[31m? agent queue full\x1b[0m\n");
+        return;
+    }
+
+    // Show thinking indicator
+    const writer = self.stdout();
+    try writer.writeAll("\x1b[90m? translating...\x1b[0m");
+    try writer.flush();
+
+    // Collect response (blocking wait with timeout)
+    var result_buf: [2048]u8 = undefined;
+    var result_len: usize = 0;
+    var done = false;
+    var ticks: u32 = 0;
+    const max_ticks: u32 = 1500; // 30s timeout at 20ms poll
+
+    while (!done and ticks < max_ticks) : (ticks += 1) {
+        var msg: agent_queue.Msg = undefined;
+        while (self.agent.queues.output.pop(&msg)) {
+            switch (msg.kind) {
+                .text_delta => {
+                    const text = msg.slice();
+                    const remaining = result_buf.len - result_len;
+                    const n = @min(text.len, remaining);
+                    @memcpy(result_buf[result_len..][0..n], text[0..n]);
+                    result_len += n;
+                },
+                .done => {
+                    done = true;
+                },
+                .error_msg => {
+                    try writer.writeAll("\r\x1b[2K\x1b[31m? ");
+                    try writer.writeAll(msg.slice());
+                    try writer.writeAll("\x1b[0m\n");
+                    return;
+                },
+                else => {},
+            }
+        }
+        if (!done) std.Thread.sleep(20 * std.time.ns_per_ms);
+    }
+
+    // Clear thinking indicator
+    try writer.writeAll("\r\x1b[2K");
+
+    if (result_len == 0) {
+        try writer.writeAll("\x1b[31m? no response\x1b[0m\n");
+        return;
+    }
+
+    // Strip any leading/trailing whitespace and backticks from response
+    var result = std.mem.trim(u8, result_buf[0..result_len], " \t\n\r");
+    // Strip ```sh ... ``` or ``` ... ``` wrapping
+    if (std.mem.startsWith(u8, result, "```")) {
+        if (std.mem.indexOfScalar(u8, result[3..], '\n')) |nl| {
+            result = result[3 + nl + 1 ..];
+        } else {
+            result = result[3..];
+        }
+        if (std.mem.endsWith(u8, result, "```")) {
+            result = result[0 .. result.len - 3];
+        }
+        result = std.mem.trim(u8, result, " \t\n\r");
+    }
+    // Strip single backtick wrapping
+    if (result.len > 2 and result[0] == '`' and result[result.len - 1] == '`') {
+        result = result[1 .. result.len - 1];
+    }
+
+    if (result.len == 0) {
+        try writer.writeAll("\x1b[31m? empty response\x1b[0m\n");
+        return;
+    }
+
+    // Log translation for training data
+    logTranslation(nl_query, result);
+
+    // Show suggested command and populate edit buffer
+    try writer.writeAll("\x1b[90m? \x1b[0m\x1b[1m");
+    try writer.writeAll(result);
+    try writer.writeAll("\x1b[0m\n");
+    try writer.flush();
+
+    // Put command in edit buffer so user can review and press Enter to run
+    self.edit_buf.clear();
+    _ = self.edit_buf.insertSlice(result);
+}
+
+/// Log a ? translate query and result for training data.
+fn logTranslation(query: []const u8, result: []const u8) void {
+    var path_buf: [512]u8 = undefined;
+    const home = std.process.getEnvVarOwned(std.heap.page_allocator, "HOME") catch return;
+    defer std.heap.page_allocator.free(home);
+    const path = std.fmt.bufPrint(&path_buf, "{s}/.zish/translate_log.jsonl", .{home}) catch return;
+
+    const file = std.fs.cwd().openFile(path, .{ .mode = .write_only }) catch |e| switch (e) {
+        error.FileNotFound => std.fs.cwd().createFile(path, .{}) catch return,
+        else => return,
+    };
+    defer file.close();
+    file.seekFromEnd(0) catch return;
+
+    const ts: u64 = @bitCast(std.time.timestamp());
+    var buf: [4096]u8 = undefined;
+    var pos: usize = 0;
+    pos += logCopy(&buf, pos, "{\"query\":\"");
+    pos = logEscape(&buf, pos, query);
+    pos += logCopy(&buf, pos, "\",\"cmd\":\"");
+    pos = logEscape(&buf, pos, result);
+    pos += logCopy(&buf, pos, "\",\"ts\":");
+    pos += (std.fmt.bufPrint(buf[pos..], "{d}", .{ts}) catch return).len;
+    pos += logCopy(&buf, pos, "}\n");
+    _ = file.write(buf[0..pos]) catch {};
+}
+
+/// Log every executed command with exit code and duration for training data.
+fn logCommandExecution(command: []const u8, exit_code: u8, elapsed: i64) void {
+    if (command.len == 0 or command.len > 2048) return;
+
+    var path_buf: [512]u8 = undefined;
+    const home = std.process.getEnvVarOwned(std.heap.page_allocator, "HOME") catch return;
+    defer std.heap.page_allocator.free(home);
+    const path = std.fmt.bufPrint(&path_buf, "{s}/.zish/command_log.jsonl", .{home}) catch return;
+
+    const file = std.fs.cwd().openFile(path, .{ .mode = .write_only }) catch |e| switch (e) {
+        error.FileNotFound => std.fs.cwd().createFile(path, .{}) catch return,
+        else => return,
+    };
+    defer file.close();
+    file.seekFromEnd(0) catch return;
+
+    var cwd_buf: [256]u8 = undefined;
+    const cwd = std.posix.getcwd(&cwd_buf) catch "?";
+
+    const ts: u64 = @bitCast(std.time.timestamp());
+    var buf: [4096]u8 = undefined;
+    var pos: usize = 0;
+    pos += logCopy(&buf, pos, "{\"cmd\":\"");
+    pos = logEscape(&buf, pos, command);
+    pos += logCopy(&buf, pos, "\",\"cwd\":\"");
+    pos = logEscape(&buf, pos, cwd);
+    pos += logCopy(&buf, pos, "\",\"exit\":");
+    pos += (std.fmt.bufPrint(buf[pos..], "{d}", .{exit_code}) catch return).len;
+    pos += logCopy(&buf, pos, ",\"dur\":");
+    pos += (std.fmt.bufPrint(buf[pos..], "{d}", .{elapsed}) catch return).len;
+    pos += logCopy(&buf, pos, ",\"ts\":");
+    pos += (std.fmt.bufPrint(buf[pos..], "{d}", .{ts}) catch return).len;
+    pos += logCopy(&buf, pos, "}\n");
+    _ = file.write(buf[0..pos]) catch {};
+}
+
+/// Shared helpers for JSON log writing.
+fn logCopy(buf: *[4096]u8, pos: usize, s: []const u8) usize {
+    if (pos + s.len > buf.len) return 0;
+    @memcpy(buf[pos..][0..s.len], s);
+    return s.len;
+}
+
+fn logEscape(buf: *[4096]u8, start: usize, s: []const u8) usize {
+    var pos = start;
+    for (s) |c| {
+        if (pos + 6 > buf.len) break;
+        switch (c) {
+            '"' => {
+                pos += logCopy(buf, pos, "\\\"");
+            },
+            '\\' => {
+                pos += logCopy(buf, pos, "\\\\");
+            },
+            '\n' => {
+                pos += logCopy(buf, pos, "\\n");
+            },
+            '\r' => {
+                pos += logCopy(buf, pos, "\\r");
+            },
+            '\t' => {
+                pos += logCopy(buf, pos, "\\t");
+            },
+            else => {
+                if (c < 0x20) {
+                    // control characters as \u00XX
+                    pos += (std.fmt.bufPrint(buf[pos..], "\\u00{x:0>2}", .{c}) catch break).len;
+                } else {
+                    buf[pos] = c;
+                    pos += 1;
+                }
+            },
+        }
+    }
+    return pos;
+}
+
 /// Drain agent output with proper terminal coordination.
 /// Clears the current prompt on first output, then streams directly.
 /// Re-renders prompt only when agent is done.
@@ -1593,6 +2053,12 @@ fn drainAgentOutput(self: *Shell) !void {
                 try writer.writeAll(msg.slice());
                 try writer.writeAll("\x1b[0m\n");
             },
+            .router_info => {
+                last_was_text = false;
+                try writer.writeAll("\x1b[90m[");
+                try writer.writeAll(msg.slice());
+                try writer.writeAll("]\x1b[0m\n");
+            },
             .confirm_response => {}, // handled on agent side
             .cancel => {
                 last_was_text = false;
@@ -1633,7 +2099,7 @@ fn readNextAction(self: *Shell) !Action {
 
     // Always check for escape sequences (arrow keys, Ctrl+arrows, paste end, etc.)
     if (char == '\x1b') {
-        return escapeSequenceAction();
+        return self.escapeSequenceAction();
     }
 
     // In paste mode (and insert mode), buffer content for editing
@@ -1660,22 +2126,19 @@ fn readNextAction(self: *Shell) !Action {
     // dispatch based on vim mode
     return switch (self.vim_mode) {
         .normal => normalModeAction(char),
-        .insert => insertModeAction(char),
+        .insert => self.resolveInsertAction(char),
     };
 }
 
-fn insertModeAction(char: u8) Action {
+fn resolveInsertAction(self: *Shell, char: u8) Action {
+    // Structural keys that cannot be rebound
     return switch (char) {
-        '\n' => .execute_command,
-        CTRL_C => .cancel,
-        CTRL_G => .cancel_agent,
-        CTRL_L => .clear_screen,
-        CTRL_D => .exit_shell,
-        CTRL_Z => .suspend_shell,
-        '\t' => .tap_complete,
-        8, 127 => .backspace,
-        23 => .delete_word_backward, // CTRL_W
+        '\n', '\r' => .execute_command, // Enter (ctrl+j / ctrl+m)
+        '\t' => .tap_complete, // Tab (ctrl+i)
+        0x08, 127 => .backspace, // Backspace (ctrl+h / DEL)
         32...126 => .{ .input_char = char },
+        // Ctrl keys — look up in configurable keybindings table
+        0x01...0x07, 0x0B...0x0C, 0x0E...0x1A => self.keybindings.lookupCtrl(char) orelse .none,
         else => .none,
     };
 }
@@ -1732,7 +2195,7 @@ fn normalModeAction(char: u8) Action {
     };
 }
 
-fn escapeSequenceAction() !Action {
+fn escapeSequenceAction(self: *Shell) !Action {
     const stdin_fd = std.posix.STDIN_FILENO;
     var temp_buf: [2]u8 = undefined;
 
@@ -1754,6 +2217,8 @@ fn escapeSequenceAction() !Action {
     const bytes_read: usize = @intCast(result);
 
     if (temp_buf[0] != '[') {
+        // Alt+key: look up in keybindings table
+        if (self.keybindings.lookupAlt(temp_buf[0])) |action| return action;
         return .{ .vim_mode = .{ .set_mode = .normal } };
     }
 
@@ -2002,6 +2467,14 @@ fn loadHistoryEntry(self: *Shell, h: *hist.History) !void {
     // Set edit buffer to history command
     self.edit_buf.set(history_cmd);
     }
+
+fn loadKeybindings(self: *Shell) void {
+    var path_buf: [512]u8 = undefined;
+    const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch return;
+    defer self.allocator.free(home);
+    const path = std.fmt.bufPrint(&path_buf, "{s}/.zish/keybindings.json", .{home}) catch return;
+    self.keybindings = input_mod.KeyBindings.loadFromFile(path);
+}
 
 fn loadConfig(self: *Shell) !void {
     // get home directory

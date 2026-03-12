@@ -5,6 +5,7 @@
 const std = @import("std");
 const q = @import("agent_queue.zig");
 const log_mod = @import("agent_log.zig");
+const router_mod = @import("agent_router.zig");
 
 pub const AgentQueues = q.AgentQueues;
 pub const SessionLog = log_mod.SessionLog;
@@ -55,6 +56,39 @@ pub const Config = struct {
         }
 
         return cfg;
+    }
+
+    pub fn buildRouterConfig(ac: log_mod.AgentConfig) router_mod.RouterConfig {
+        var rc = router_mod.RouterConfig.init();
+        rc.enabled = ac.router_enabled;
+        rc.api_enabled = !ac.router_local_only; // local_only disables API calls to router model
+        if (ac.router_model.len > 0) {
+            router_mod.RouterConfig.setField(&rc.model, &rc.model_len, ac.router_model);
+        }
+        if (ac.router_base_url.len > 0) {
+            const n = @min(ac.router_base_url.len, 256);
+            @memcpy(rc.base_url[0..n], ac.router_base_url[0..n]);
+            rc.base_url_len = @intCast(n);
+        }
+        // Provider
+        if (ac.router_provider.len > 0) {
+            if (std.mem.eql(u8, ac.router_provider, "ollama")) {
+                rc.provider = .ollama;
+            } else if (std.mem.eql(u8, ac.router_provider, "openai")) {
+                rc.provider = .openai_compat;
+            } else {
+                rc.provider = .anthropic;
+            }
+        }
+        // Model tier names
+        if (ac.haiku_model.len > 0) router_mod.RouterConfig.setField(&rc.haiku_model, &rc.haiku_len, ac.haiku_model);
+        if (ac.sonnet_model.len > 0) router_mod.RouterConfig.setField(&rc.sonnet_model, &rc.sonnet_len, ac.sonnet_model);
+        if (ac.opus_model.len > 0) router_mod.RouterConfig.setField(&rc.opus_model, &rc.opus_len, ac.opus_model);
+        // Local GGUF model path for pure-Zig inference
+        if (ac.router_local_model.len > 0) {
+            router_mod.RouterConfig.setFieldLong(&rc.local_model_path, &rc.local_model_len, ac.router_local_model);
+        }
+        return rc;
     }
 
     pub fn fromEnv(allocator: std.mem.Allocator) Config {
@@ -493,7 +527,9 @@ const TOOLS_JSON =
     \\{"name":"Write","description":"Create a new file or completely overwrite an existing one. For modifying existing files, prefer Edit.","input_schema":{"type":"object","properties":{"file_path":{"type":"string","description":"Absolute path"},"content":{"type":"string","description":"Complete file content"}},"required":["file_path","content"]}},
     \\{"name":"Glob","description":"Find files matching a glob pattern. Returns matching file paths.","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern (e.g. **/*.zig, src/*.rs)"},"path":{"type":"string","description":"Directory to search in (default: cwd)"}},"required":["pattern"]}},
     \\{"name":"Grep","description":"Search file contents with regex. Returns matching lines with file:line format.","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern to search for"},"path":{"type":"string","description":"File or directory to search"},"glob":{"type":"string","description":"Filter files by glob (e.g. *.zig)"}},"required":["pattern"]}},
-    \\{"name":"Agent","description":"Spawn a subagent to handle a task autonomously in the background. Use for research, exploration, or parallel work. The subagent has Read/Glob/Grep/Bash tools. Launch multiple agents concurrently for independent tasks.","input_schema":{"type":"object","properties":{"prompt":{"type":"string","description":"Detailed task description for the subagent"},"description":{"type":"string","description":"Short 3-5 word summary of the task"}},"required":["prompt","description"]}}
+    \\{"name":"Agent","description":"Spawn a subagent to handle a task autonomously in the background. Use for research, exploration, or parallel work. The subagent has Read/Glob/Grep/Bash tools. Launch multiple agents concurrently for independent tasks.","input_schema":{"type":"object","properties":{"prompt":{"type":"string","description":"Detailed task description for the subagent"},"description":{"type":"string","description":"Short 3-5 word summary of the task"}},"required":["prompt","description"]}},
+    \\{"name":"WebFetch","description":"Fetch a URL and return its content. HTML is converted to plain text. Use for reading web pages, APIs, documentation.","input_schema":{"type":"object","properties":{"url":{"type":"string","description":"URL to fetch"},"max_bytes":{"type":"integer","description":"Max bytes to return (default: 32768)"}},"required":["url"]}},
+    \\{"name":"WebSearch","description":"Search the web using DuckDuckGo. Returns titles, URLs and snippets. Use when you need current information.","input_schema":{"type":"object","properties":{"query":{"type":"string","description":"Search query"},"max_results":{"type":"integer","description":"Max results to return (default: 8)"}},"required":["query"]}}
     \\]
 ;
 
@@ -586,6 +622,7 @@ const AgentThread = struct {
     // Token usage tracking (cumulative for session)
     total_input_tokens: u32 = 0,
     total_output_tokens: u32 = 0,
+    compact_in_progress: bool = false,
     plugin_tools: [MAX_PLUGIN_TOOLS]PluginTool,
     plugin_count: u8,
     all_tools_json: [16384]u8,
@@ -595,12 +632,14 @@ const AgentThread = struct {
     allow_edit: bool = false,
     allow_write: bool = false,
     allow_plugins: u16 = 0, // bitmask for plugin tools
+    // Router for query classification
+    router_config: router_mod.RouterConfig = router_mod.RouterConfig.init(),
     // Subagent pool
     subagents: [MAX_SUBAGENTS]SubAgent = [_]SubAgent{.{}} ** MAX_SUBAGENTS,
     subagent_count: u8 = 0,
     next_subagent_id: u16 = 1,
 
-    fn init(allocator: std.mem.Allocator, queues: *AgentQueues, config: Config) AgentThread {
+    fn init(allocator: std.mem.Allocator, queues: *AgentQueues, config: Config, rc: router_mod.RouterConfig) AgentThread {
         var self = AgentThread{
             .allocator = allocator,
             .queues = queues,
@@ -617,6 +656,7 @@ const AgentThread = struct {
             .plugin_count = 0,
             .all_tools_json = undefined,
             .all_tools_json_len = 0,
+            .router_config = rc,
         };
 
         // get cwd
@@ -754,6 +794,12 @@ const AgentThread = struct {
                 t.join();
                 sa.thread = null;
             }
+        }
+        // Shut down fork-based inference server if running
+        if (self.router_config.fork_server) |srv| {
+            srv.shutdown();
+            self.allocator.destroy(srv);
+            self.router_config.fork_server = null;
         }
         if (self.session_log) |*sl| sl.close();
         self.history.deinit();
@@ -939,7 +985,100 @@ const AgentThread = struct {
         }
     }
 
+    fn buildContextSummary(self: *AgentThread, buf: *[256]u8) []const u8 {
+        if (self.history.count == 0) return "";
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+        w.print("{d} messages", .{self.history.count}) catch {};
+        // Include first user message as topic hint
+        if (self.history.count > 0 and self.history.messages[0].role == .user) {
+            const first = self.history.messages[0].content[0..self.history.messages[0].content_len];
+            const preview_len = @min(first.len, 80);
+            w.print(", topic: {s}", .{first[0..preview_len]}) catch {};
+        }
+        return buf[0..fbs.pos];
+    }
+
     fn processQuery(self: *AgentThread, query: []const u8) !void {
+        // Save original model so we can restore after routing override
+        const saved_model = self.config.model;
+        defer self.config.model = saved_model;
+
+        // Fast path: translate queries always use haiku (cheap + fast)
+        const is_translate = std.mem.startsWith(u8, query, "Translate this to a shell command");
+        if (is_translate) {
+            const haiku = self.router_config.resolveModel(.haiku);
+            self.config.model = haiku;
+        }
+
+        // ── ROUTING PHASE ──
+        var route: ?router_mod.RouteDecision = null;
+        if (self.router_config.enabled and !is_translate) {
+            // Try local classification first (zero cost)
+            route = router_mod.classifyLocal(query);
+
+            // If ambiguous, try local GGUF inference first (pure Zig, no external deps)
+            if (route == null and self.router_config.local_model_len > 0) {
+                route = router_mod.classifyWithLocalModel(
+                    self.allocator,
+                    query,
+                    &self.router_config,
+                );
+            }
+
+            // If still ambiguous, call the router model via API (unless API is disabled)
+            if (route == null and self.router_config.api_enabled) {
+                var ctx_buf: [256]u8 = undefined;
+                const ctx = self.buildContextSummary(&ctx_buf);
+                route = router_mod.classifyWithModel(
+                    self.allocator,
+                    query,
+                    ctx,
+                    &self.router_config,
+                    self.config.api_key,
+                );
+            }
+
+            // Apply routing decision
+            if (route) |*rd| {
+                // Resolve model name from tier
+                const model_name = self.router_config.resolveModel(rd.model_tier);
+                rd.setModel(model_name);
+
+                // Notify user about routing decision
+                var summary_buf: [256]u8 = undefined;
+                const summary = rd.summary(&summary_buf);
+                _ = self.queues.output.push(.router_info, summary);
+
+                // Log routing decision for training data
+                logRouterDecision(query, rd.*);
+
+                // Handle shell action — bypass LLM entirely, run as shell command
+                if (rd.action == .shell) {
+                    const result = std.process.Child.run(.{
+                        .allocator = self.allocator,
+                        .argv = &[_][]const u8{ "/bin/sh", "-c", query },
+                        .max_output_bytes = 65536,
+                    }) catch |err| {
+                        var errbuf: [256]u8 = undefined;
+                        const msg = std.fmt.bufPrint(&errbuf, "shell error: {}", .{err}) catch "shell error";
+                        _ = self.queues.output.push(.error_msg, msg);
+                        return;
+                    };
+                    defer self.allocator.free(result.stderr);
+                    defer self.allocator.free(result.stdout);
+                    if (result.stdout.len > 0)
+                        _ = self.queues.output.push(.text_delta, result.stdout);
+                    if (result.stderr.len > 0)
+                        _ = self.queues.output.push(.error_msg, result.stderr);
+                    return;
+                }
+
+                // Override model for this query
+                self.config.model = rd.modelName();
+            }
+        }
+
         // add user message to history
         try self.history.add(.user, query);
         if (self.session_log) |*sl| sl.logUser(query) catch {};
@@ -966,6 +1105,8 @@ const AgentThread = struct {
                 if (response.text.len > 0) {
                     try self.history.add(.assistant, response.text);
                     if (self.session_log) |*sl| sl.logAssistant(response.text) catch {};
+                } else {
+                    _ = self.queues.output.push(.error_msg, "empty response from API (check credentials/model)");
                 }
                 break;
             }
@@ -1056,19 +1197,143 @@ const AgentThread = struct {
         self.total_output_tokens += query_output_tokens;
         if (query_input_tokens > 0 or query_output_tokens > 0) {
             var usage_buf: [256]u8 = undefined;
-            // Estimate cost: Sonnet 4.6 is $3/MTok input, $15/MTok output
-            const input_cost = @as(f64, @floatFromInt(self.total_input_tokens)) * 3.0 / 1_000_000.0;
-            const output_cost = @as(f64, @floatFromInt(self.total_output_tokens)) * 15.0 / 1_000_000.0;
-            const total_cost = input_cost + output_cost;
-            const usage_msg = std.fmt.bufPrint(&usage_buf, "tokens: {d}↑ {d}↓ | session: {d}↑ {d}↓ (${d:.4})", .{
-                query_input_tokens, query_output_tokens,
-                self.total_input_tokens, self.total_output_tokens,
-                total_cost,
-            }) catch "usage unavailable";
+            const is_free = std.mem.startsWith(u8, self.config.api_key, "sk-ant-oat");
+            const usage_msg = if (is_free)
+                // OAuth/Max subscription — show tokens with "free" indicator
+                std.fmt.bufPrint(&usage_buf, "tokens: {d}\xe2\x86\x91 {d}\xe2\x86\x93 | total: {d}\xe2\x86\x91 {d}\xe2\x86\x93 (free)", .{
+                    query_input_tokens, query_output_tokens,
+                    self.total_input_tokens, self.total_output_tokens,
+                }) catch "usage unavailable"
+            else blk: {
+                // API key — show estimated cost
+                const input_cost = @as(f64, @floatFromInt(self.total_input_tokens)) * 3.0 / 1_000_000.0;
+                const output_cost = @as(f64, @floatFromInt(self.total_output_tokens)) * 15.0 / 1_000_000.0;
+                const total_cost = input_cost + output_cost;
+                break :blk std.fmt.bufPrint(&usage_buf, "tokens: {d}\xe2\x86\x91 {d}\xe2\x86\x93 | total: {d}\xe2\x86\x91 {d}\xe2\x86\x93 (${d:.4})", .{
+                    query_input_tokens, query_output_tokens,
+                    self.total_input_tokens, self.total_output_tokens,
+                    total_cost,
+                }) catch "usage unavailable";
+            };
             _ = self.queues.output.push(.usage_info, usage_msg);
         }
 
         if (self.session_log) |*sl| sl.logDone() catch {};
+
+        // Auto-compact: if cumulative input tokens exceed threshold, summarize history
+        // This prevents context overflow on long conversations
+        const AUTO_COMPACT_THRESHOLD: u32 = 120_000;
+        if (self.total_input_tokens > AUTO_COMPACT_THRESHOLD and self.history.count > 4 and !self.compact_in_progress) {
+            self.autoCompact();
+        }
+    }
+
+    fn autoCompact(self: *AgentThread) void {
+        self.compact_in_progress = true;
+        defer self.compact_in_progress = false;
+
+        _ = self.queues.output.push(.tool_call, "Auto-compacting conversation (context getting large)...");
+
+        // Build a summary request using the current history
+        const compact_query =
+            \\Summarize our conversation so far in a concise way that preserves:
+            \\1. Key decisions and their rationale
+            \\2. Important code changes made (files, what changed, why)
+            \\3. Current task/goal and next steps
+            \\4. Any constraints or requirements mentioned
+            \\Be thorough but concise. This summary replaces the conversation history.
+        ;
+
+        // Drop oldest messages to free context, keeping last 4 messages (recent context)
+        const saved_count = self.history.count;
+        if (saved_count < 6) return;
+
+        // Add the compact query as a user message
+        self.history.add(.user, compact_query) catch return;
+
+        // Call API to get summary
+        const response = self.callAPI() catch {
+            // Remove the compact query we added
+            if (self.history.count > saved_count) {
+                self.allocator.free(self.history.messages[self.history.count - 1].content[0..self.history.messages[self.history.count - 1].alloc_len]);
+                self.history.count -= 1;
+            }
+            return;
+        };
+        defer self.allocator.free(response.text_alloc);
+
+        if (response.text.len == 0) return;
+
+        // Keep summary + last 2 messages from before compact query
+        // Strategy: free old messages, shift recent ones, prepend summary
+        const summary = self.allocator.dupe(u8, response.text) catch return;
+
+        // Remove the compact query + response from history (they were added by callAPI flow)
+        // The compact query is at saved_count, remove it
+        if (self.history.count > saved_count) {
+            // Remove messages from saved_count onwards (compact query + any response)
+            var ri = self.history.count;
+            while (ri > saved_count) {
+                ri -= 1;
+                self.allocator.free(self.history.messages[ri].content[0..self.history.messages[ri].alloc_len]);
+            }
+            self.history.count = saved_count;
+        }
+
+        // Free all but the last 4 messages
+        const keep = @min(saved_count, 4);
+        const drop = saved_count - keep;
+        for (0..drop) |i| {
+            self.allocator.free(self.history.messages[i].content[0..self.history.messages[i].alloc_len]);
+        }
+        // Shift kept messages to make room for summary at front
+        if (drop > 0) {
+            std.mem.copyForwards(Message, self.history.messages[2..2 + keep], self.history.messages[drop..drop + keep]);
+            self.history.count = 2 + keep;
+        } else {
+            // Need to make room — shift everything right by 2
+            if (self.history.count + 2 <= MAX_HISTORY) {
+                var si = self.history.count;
+                while (si > 0) {
+                    si -= 1;
+                    self.history.messages[si + 2] = self.history.messages[si];
+                }
+                self.history.count += 2;
+            } else {
+                // Drop oldest 2 to make room
+                self.allocator.free(self.history.messages[0].content[0..self.history.messages[0].alloc_len]);
+                self.allocator.free(self.history.messages[1].content[0..self.history.messages[1].alloc_len]);
+                std.mem.copyForwards(Message, self.history.messages[2..self.history.count], self.history.messages[2..self.history.count]);
+                // Shift is a no-op here, just overwrite [0] and [1]
+            }
+        }
+
+        // Insert summary as first two messages (user context + assistant summary)
+        const ctx_msg = "Here is a summary of our conversation so far. Continue from where we left off.";
+        const ctx_buf = self.allocator.dupe(u8, ctx_msg) catch {
+            self.allocator.free(summary);
+            return;
+        };
+        self.history.messages[0] = .{
+            .role = .user,
+            .kind = .text,
+            .content = ctx_buf,
+            .content_len = ctx_msg.len,
+            .alloc_len = ctx_msg.len,
+        };
+        self.history.messages[1] = .{
+            .role = .assistant,
+            .kind = .text,
+            .content = summary,
+            .content_len = summary.len,
+            .alloc_len = summary.len,
+        };
+
+        // Reset token counter so we don't immediately re-compact
+        self.total_input_tokens = 0;
+        self.total_output_tokens = 0;
+
+        _ = self.queues.output.push(.tool_done, "Conversation compacted");
     }
 
     fn confirmTool(self: *AgentThread, tool_name: []const u8, detail: []const u8, allowed: *bool) bool {
@@ -1159,6 +1424,18 @@ const AgentThread = struct {
             // Wait for result (timeout 120s)
             const result = self.collectSubAgent(agent_id, 120_000);
             return self.allocator.dupe(u8, result);
+        }
+        if (std.mem.eql(u8, tool_name, "WebFetch")) {
+            const url = extractJsonField(tool_input, "url") orelse return error.MissingURL;
+            const max_str = extractJsonField(tool_input, "max_bytes");
+            const max_bytes: usize = if (max_str) |s| std.fmt.parseInt(usize, s, 10) catch 32768 else 32768;
+            return self.executeWebFetch(url, max_bytes);
+        }
+        if (std.mem.eql(u8, tool_name, "WebSearch")) {
+            const query = extractJsonField(tool_input, "query") orelse return error.MissingQuery;
+            const max_str = extractJsonField(tool_input, "max_results");
+            const max_results: usize = if (max_str) |s| std.fmt.parseInt(usize, s, 10) catch 8 else 8;
+            return self.executeWebSearch(query, max_results);
         }
         // Check plugin tools
         for (self.plugin_tools[0..self.plugin_count], 0..) |*pt, pi| {
@@ -1819,6 +2096,337 @@ const AgentThread = struct {
         return diff_result.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
     }
 
+    fn executeWebFetch(self: *AgentThread, url: []const u8, max_bytes: usize) ![]u8 {
+        var url_buf: [2048]u8 = undefined;
+        const real_url = unescapeJSON(url, &url_buf) orelse url;
+
+        var notif_buf: [512]u8 = undefined;
+        const notif = std.fmt.bufPrint(&notif_buf, "Fetch {s}", .{real_url}) catch real_url;
+        _ = self.queues.output.push(.tool_call, notif);
+
+        // Use curl to fetch URL content
+        const result = std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = &[_][]const u8{
+                "curl", "-sS", "-L", "--max-time", "30",
+                "-H", "User-Agent: Mozilla/5.0 (compatible; zish/1.0)",
+                "-H", "Accept: text/html,application/json,text/plain",
+                real_url,
+            },
+            .max_output_bytes = 256 * 1024,
+        }) catch |err| {
+            var errbuf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&errbuf, "fetch failed: {}", .{err}) catch "fetch failed";
+            return self.allocator.dupe(u8, msg);
+        };
+        defer self.allocator.free(result.stderr);
+
+        if (result.stdout.len == 0) {
+            self.allocator.free(result.stdout);
+            if (result.stderr.len > 0) {
+                return self.allocator.dupe(u8, result.stderr);
+            }
+            return self.allocator.dupe(u8, "empty response");
+        }
+
+        // Check if content looks like HTML — strip tags if so
+        const is_html = if (result.stdout.len > 50) blk: {
+            var low: [64]u8 = undefined;
+            for (result.stdout[0..@min(result.stdout.len, 64)], 0..) |c, j| {
+                low[j] = if (c >= 'A' and c <= 'Z') c + 32 else c;
+            }
+            const check = low[0..@min(result.stdout.len, 64)];
+            break :blk std.mem.indexOf(u8, check, "<!doctype") != null or
+                std.mem.indexOf(u8, check, "<html") != null;
+        } else false;
+
+        if (is_html) {
+            // Strip HTML tags and decode basic entities
+            var text: std.ArrayList(u8) = .{};
+            const src = result.stdout;
+            var si: usize = 0;
+            var in_tag = false;
+            var in_script = false;
+            var in_style = false;
+            var last_was_space = false;
+            const cap = @min(max_bytes * 2, src.len); // process more than max to account for compression
+
+            while (si < cap) {
+                if (src[si] == '<') {
+                    // Check for script/style start/end
+                    if (si + 7 < src.len) {
+                        var tag_buf: [10]u8 = undefined;
+                        const tlen = @min(10, src.len - si - 1);
+                        for (src[si + 1 ..][0..tlen], 0..) |c, j| {
+                            tag_buf[j] = if (c >= 'A' and c <= 'Z') c + 32 else c;
+                        }
+                        const tag = tag_buf[0..tlen];
+                        if (std.mem.startsWith(u8, tag, "script")) in_script = true;
+                        if (std.mem.startsWith(u8, tag, "/script")) in_script = false;
+                        if (std.mem.startsWith(u8, tag, "style")) in_style = true;
+                        if (std.mem.startsWith(u8, tag, "/style")) in_style = false;
+                    }
+                    in_tag = true;
+                    si += 1;
+                    continue;
+                }
+                if (src[si] == '>') {
+                    in_tag = false;
+                    si += 1;
+                    continue;
+                }
+                if (in_tag or in_script or in_style) {
+                    si += 1;
+                    continue;
+                }
+                // Handle HTML entities
+                if (src[si] == '&') {
+                    if (si + 4 < src.len and std.mem.startsWith(u8, src[si..], "&amp;")) {
+                        text.append(self.allocator, '&') catch break;
+                        si += 5;
+                        last_was_space = false;
+                        continue;
+                    }
+                    if (si + 3 < src.len and std.mem.startsWith(u8, src[si..], "&lt;")) {
+                        text.append(self.allocator, '<') catch break;
+                        si += 4;
+                        last_was_space = false;
+                        continue;
+                    }
+                    if (si + 3 < src.len and std.mem.startsWith(u8, src[si..], "&gt;")) {
+                        text.append(self.allocator, '>') catch break;
+                        si += 4;
+                        last_was_space = false;
+                        continue;
+                    }
+                    if (si + 5 < src.len and std.mem.startsWith(u8, src[si..], "&quot;")) {
+                        text.append(self.allocator, '"') catch break;
+                        si += 6;
+                        last_was_space = false;
+                        continue;
+                    }
+                    if (si + 5 < src.len and std.mem.startsWith(u8, src[si..], "&nbsp;")) {
+                        text.append(self.allocator, ' ') catch break;
+                        si += 6;
+                        last_was_space = true;
+                        continue;
+                    }
+                    // Skip unknown entities
+                    if (std.mem.indexOfScalarPos(u8, src, si + 1, ';')) |end| {
+                        if (end - si < 10) {
+                            si = end + 1;
+                            continue;
+                        }
+                    }
+                }
+                // Collapse whitespace
+                if (src[si] == ' ' or src[si] == '\t') {
+                    if (!last_was_space) {
+                        text.append(self.allocator, ' ') catch break;
+                        last_was_space = true;
+                    }
+                    si += 1;
+                    continue;
+                }
+                if (src[si] == '\n' or src[si] == '\r') {
+                    if (!last_was_space) {
+                        text.append(self.allocator, '\n') catch break;
+                        last_was_space = true;
+                    }
+                    si += 1;
+                    continue;
+                }
+                text.append(self.allocator, src[si]) catch break;
+                last_was_space = false;
+                si += 1;
+
+                if (text.items.len >= max_bytes) break;
+            }
+
+            self.allocator.free(result.stdout);
+
+            // Collapse multiple newlines
+            const raw = text.items;
+            var clean: std.ArrayList(u8) = .{};
+            var ci: usize = 0;
+            var consecutive_nl: u8 = 0;
+            while (ci < raw.len) {
+                if (raw[ci] == '\n') {
+                    consecutive_nl += 1;
+                    if (consecutive_nl <= 2)
+                        clean.append(self.allocator, '\n') catch break;
+                } else {
+                    consecutive_nl = 0;
+                    clean.append(self.allocator, raw[ci]) catch break;
+                }
+                ci += 1;
+            }
+            text.deinit(self.allocator);
+
+            const final = clean.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
+            _ = self.queues.output.push(.tool_done, final);
+            return final;
+        }
+
+        // Non-HTML: return raw content truncated
+        if (result.stdout.len > max_bytes) {
+            const truncated = try self.allocator.alloc(u8, max_bytes + 20);
+            @memcpy(truncated[0..max_bytes], result.stdout[0..max_bytes]);
+            const suffix = "\n... [truncated]";
+            @memcpy(truncated[max_bytes..max_bytes + suffix.len], suffix);
+            self.allocator.free(result.stdout);
+            const final_len = max_bytes + suffix.len;
+            _ = self.queues.output.push(.tool_done, truncated[0..final_len]);
+            return self.allocator.realloc(truncated, final_len) catch truncated;
+        }
+
+        _ = self.queues.output.push(.tool_done, result.stdout);
+        return result.stdout;
+    }
+
+    fn executeWebSearch(self: *AgentThread, query: []const u8, max_results: usize) ![]u8 {
+        var query_buf: [1024]u8 = undefined;
+        const real_query = unescapeJSON(query, &query_buf) orelse query;
+
+        var notif_buf: [512]u8 = undefined;
+        const notif = std.fmt.bufPrint(&notif_buf, "Search: {s}", .{real_query}) catch real_query;
+        _ = self.queues.output.push(.tool_call, notif);
+
+        // URL-encode the query
+        var encoded_buf: [2048]u8 = undefined;
+        var ei: usize = 0;
+        for (real_query) |c| {
+            if (ei + 3 >= encoded_buf.len) break;
+            if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '-' or c == '_' or c == '.') {
+                encoded_buf[ei] = c;
+                ei += 1;
+            } else if (c == ' ') {
+                encoded_buf[ei] = '+';
+                ei += 1;
+            } else {
+                const hex = "0123456789ABCDEF";
+                encoded_buf[ei] = '%';
+                encoded_buf[ei + 1] = hex[c >> 4];
+                encoded_buf[ei + 2] = hex[c & 0x0f];
+                ei += 3;
+            }
+        }
+        const encoded_query = encoded_buf[0..ei];
+
+        // Use DuckDuckGo HTML lite
+        var url_buf2: [2200]u8 = undefined;
+        const search_url = std.fmt.bufPrint(&url_buf2, "https://html.duckduckgo.com/html/?q={s}", .{encoded_query}) catch return error.URLTooLong;
+
+        const result = std.process.Child.run(.{
+            .allocator = self.allocator,
+            .argv = &[_][]const u8{
+                "curl", "-sS", "-L", "--max-time", "15",
+                "-H", "User-Agent: Mozilla/5.0 (compatible; zish/1.0)",
+                search_url,
+            },
+            .max_output_bytes = 256 * 1024,
+        }) catch |err| {
+            var errbuf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&errbuf, "search failed: {}", .{err}) catch "search failed";
+            return self.allocator.dupe(u8, msg);
+        };
+        defer self.allocator.free(result.stdout);
+        defer self.allocator.free(result.stderr);
+
+        if (result.stdout.len == 0) {
+            return self.allocator.dupe(u8, "no search results");
+        }
+
+        // Parse DuckDuckGo HTML results
+        // Results are in <a class="result__a" href="...">title</a> and <a class="result__snippet">...</a>
+        var output: std.ArrayList(u8) = .{};
+        const w = output.writer(self.allocator);
+        var count: usize = 0;
+        const src = result.stdout;
+        var si: usize = 0;
+        const cap = @min(max_results, 20);
+
+        while (si < src.len and count < cap) {
+            // Find result link: class="result__a"
+            const marker = "class=\"result__a\"";
+            const pos = std.mem.indexOfPos(u8, src, si, marker) orelse break;
+            si = pos + marker.len;
+
+            // Extract href
+            // Go back to find href="..."
+            const href_start = if (std.mem.lastIndexOf(u8, src[0..pos], "href=\"")) |h| h + 6 else {
+                continue;
+            };
+            const href_end = std.mem.indexOfScalarPos(u8, src, href_start, '"') orelse continue;
+            var href = src[href_start..href_end];
+
+            // DuckDuckGo wraps URLs in redirect — extract actual URL
+            if (std.mem.indexOf(u8, href, "uddg=")) |uddg| {
+                const url_start = uddg + 5;
+                const url_end = std.mem.indexOfScalarPos(u8, href, url_start, '&') orelse href.len;
+                href = href[url_start..url_end];
+            }
+
+            // Extract title (text between > and </a>)
+            const title_start = std.mem.indexOfScalarPos(u8, src, si, '>') orelse continue;
+            const title_end = std.mem.indexOfPos(u8, src, title_start, "</a>") orelse continue;
+            si = title_end + 4;
+
+            // Strip HTML from title
+            var title_buf2: [512]u8 = undefined;
+            var ti: usize = 0;
+            var in_tag = false;
+            for (src[title_start + 1 .. title_end]) |c| {
+                if (c == '<') { in_tag = true; continue; }
+                if (c == '>') { in_tag = false; continue; }
+                if (!in_tag and ti < title_buf2.len) {
+                    title_buf2[ti] = c;
+                    ti += 1;
+                }
+            }
+
+            // Find snippet: class="result__snippet"
+            var snippet_text: []const u8 = "";
+            var snippet_buf2: [1024]u8 = undefined;
+            const snippet_marker = "class=\"result__snippet\"";
+            if (std.mem.indexOfPos(u8, src, si, snippet_marker)) |sp| {
+                const sn_start = std.mem.indexOfScalarPos(u8, src, sp + snippet_marker.len, '>') orelse si;
+                const sn_end = std.mem.indexOfPos(u8, src, sn_start, "</a>") orelse
+                    (std.mem.indexOfPos(u8, src, sn_start, "</td>") orelse si);
+                // Strip HTML from snippet
+                var sni: usize = 0;
+                var s_tag = false;
+                for (src[sn_start + 1 .. @min(sn_end, src.len)]) |c| {
+                    if (c == '<') { s_tag = true; continue; }
+                    if (c == '>') { s_tag = false; continue; }
+                    if (!s_tag and sni < snippet_buf2.len) {
+                        snippet_buf2[sni] = c;
+                        sni += 1;
+                    }
+                }
+                snippet_text = snippet_buf2[0..sni];
+            }
+
+            count += 1;
+            w.print("{d}. {s}\n   {s}\n", .{
+                count, title_buf2[0..ti], href,
+            }) catch break;
+            if (snippet_text.len > 0) {
+                w.print("   {s}\n", .{snippet_text}) catch break;
+            }
+            w.writeByte('\n') catch break;
+        }
+
+        if (count == 0) {
+            output.deinit(self.allocator);
+            return self.allocator.dupe(u8, "no results found");
+        }
+
+        const final = output.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
+        _ = self.queues.output.push(.tool_done, final);
+        return final;
+    }
+
     fn executeGlob(self: *AgentThread, pattern: []const u8, search_path: ?[]const u8) ![]u8 {
         var pattern_buf: [256]u8 = undefined;
         const real_pattern = unescapeJSON(pattern, &pattern_buf) orelse pattern;
@@ -1983,6 +2591,8 @@ fn parseAnthropicDelta(
             }
             return;
         }
+        // thinking delta — ignore (internal reasoning)
+        if (std.mem.indexOf(u8, data, "\"thinking_delta\"") != null) return;
         // input_json_delta (tool arguments)
         if (std.mem.indexOf(u8, data, "\"input_json_delta\"") != null) {
             if (jsonGetStr(data, "partial_json")) |chunk| {
@@ -2329,6 +2939,11 @@ pub const AgentContext = struct {
                     try writer.writeAll(msg.slice());
                     try writer.writeAll("\x1b[0m\n");
                 },
+                .router_info => {
+                    try writer.writeAll("\x1b[90m[");
+                    try writer.writeAll(msg.slice());
+                    try writer.writeAll("]\x1b[0m\n");
+                },
                 .done => {
                     try writer.writeByte('\n');
                 },
@@ -2510,11 +3125,77 @@ fn subAgentThreadFn(
     sa.setResult(if (final_text.len > 0) final_text else "No response from subagent", if (final_text.len > 0) .done else .failed);
 }
 
+/// Log router decision to ~/.zish/router_log.jsonl for training data.
+/// Format: {"q":"query","action":"shell|agent|fan_out","tier":"haiku|sonnet|opus","reason":"...","ts":N}
+fn logRouterDecision(query: []const u8, rd: router_mod.RouteDecision) void {
+    if (query.len == 0 or query.len > 2048) return;
+
+    var path_buf: [512]u8 = undefined;
+    const home = std.process.getEnvVarOwned(std.heap.page_allocator, "HOME") catch return;
+    defer std.heap.page_allocator.free(home);
+    const path = std.fmt.bufPrint(&path_buf, "{s}/.zish/router_log.jsonl", .{home}) catch return;
+
+    const file = std.fs.cwd().openFile(path, .{ .mode = .write_only }) catch |e| switch (e) {
+        error.FileNotFound => std.fs.cwd().createFile(path, .{}) catch return,
+        else => return,
+    };
+    defer file.close();
+    file.seekFromEnd(0) catch return;
+
+    const action_str = switch (rd.action) {
+        .shell => "shell",
+        .agent => "agent",
+        .fan_out => "fan_out",
+    };
+    const tier_str = switch (rd.model_tier) {
+        .haiku => "haiku",
+        .sonnet => "sonnet",
+        .opus => "opus",
+    };
+    const ts: u64 = @bitCast(std.time.timestamp());
+    var buf: [4096]u8 = undefined;
+    var pos: usize = 0;
+
+    // Manual JSON building (zero-alloc, same pattern as other log functions)
+    const prefix = "{\"q\":\"";
+    if (pos + prefix.len < buf.len) { @memcpy(buf[pos..][0..prefix.len], prefix); pos += prefix.len; }
+    // escape query
+    for (query) |c| {
+        if (pos + 6 >= buf.len) break;
+        switch (c) {
+            '"' => { @memcpy(buf[pos..][0..2], "\\\""); pos += 2; },
+            '\\' => { @memcpy(buf[pos..][0..2], "\\\\"); pos += 2; },
+            '\n' => { @memcpy(buf[pos..][0..2], "\\n"); pos += 2; },
+            '\r' => { @memcpy(buf[pos..][0..2], "\\r"); pos += 2; },
+            '\t' => { @memcpy(buf[pos..][0..2], "\\t"); pos += 2; },
+            else => if (c < 0x20) {
+                const hex = std.fmt.bufPrint(buf[pos..], "\\u{x:0>4}", .{c}) catch break;
+                pos += hex.len;
+            } else { buf[pos] = c; pos += 1; },
+        }
+    }
+    const mid = std.fmt.bufPrint(buf[pos..], "\",\"action\":\"{s}\",\"tier\":\"{s}\",\"reason\":\"", .{ action_str, tier_str }) catch return;
+    pos += mid.len;
+    // escape reason
+    for (rd.reason_buf[0..rd.reason_len]) |c| {
+        if (pos + 6 >= buf.len) break;
+        switch (c) {
+            '"' => { @memcpy(buf[pos..][0..2], "\\\""); pos += 2; },
+            '\\' => { @memcpy(buf[pos..][0..2], "\\\\"); pos += 2; },
+            else => { buf[pos] = c; pos += 1; },
+        }
+    }
+    const suffix = std.fmt.bufPrint(buf[pos..], "\",\"ts\":{d}}}\n", .{ts}) catch return;
+    pos += suffix.len;
+    _ = file.write(buf[0..pos]) catch {};
+}
+
 fn agentThreadFn(allocator: std.mem.Allocator, queues: *AgentQueues, model_override: ?[]const u8) void {
     var ac = log_mod.AgentConfig.load(allocator);
     var config = Config.fromAgentConfig(ac);
     if (model_override) |m| config.model = m;
-    var agent = AgentThread.init(allocator, queues, config);
+    const rc = Config.buildRouterConfig(ac);
+    var agent = AgentThread.init(allocator, queues, config, rc);
     // Config slices now point into ac's tracked buffers — must keep ac alive
     // until agent is done, then free both
     defer {
