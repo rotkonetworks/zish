@@ -6,6 +6,7 @@ const git = @import("git.zig");
 const editor = @import("editor.zig");
 const input_mod = @import("input.zig");
 const keywords = @import("keywords.zig");
+const hist = @import("history.zig");
 
 pub const WordResult = struct {
     word: []const u8,
@@ -15,7 +16,9 @@ pub const WordResult = struct {
 
 pub const CycleDirection = input_mod.CycleDirection;
 
-/// Extract word at cursor position from command string
+/// Extract word at cursor position from command string.
+/// Recognizes redirect operators (>, >>, <, 2>, 2>>, &>, &>>) at word boundaries
+/// and strips them so the word contains only the filename part.
 pub fn extractWordAtCursor(cmd: []const u8, cursor: usize) ?WordResult {
     if (cmd.len == 0) return null;
 
@@ -25,7 +28,24 @@ pub fn extractWordAtCursor(cmd: []const u8, cursor: usize) ?WordResult {
     while (start > 0 and cmd[start - 1] != ' ') start -= 1;
     while (end < cmd.len and cmd[end] != ' ') end += 1;
 
-    return WordResult{ .word = cmd[start..end], .start = start, .end = end };
+    // Strip leading redirect operators: &>>, &>, 2>>, 2>, >>, >
+    var s = start;
+    if (s < end) {
+        if (s + 1 < end and cmd[s] == '&' and cmd[s + 1] == '>') {
+            s += 2;
+            if (s < end and cmd[s] == '>') s += 1; // &>>
+        } else if (s + 1 < end and cmd[s] == '2' and cmd[s + 1] == '>') {
+            s += 2;
+            if (s < end and cmd[s] == '>') s += 1; // 2>>
+        } else if (cmd[s] == '>') {
+            s += 1;
+            if (s < end and cmd[s] == '>') s += 1; // >>
+        } else if (cmd[s] == '<') {
+            s += 1;
+        }
+    }
+
+    return WordResult{ .word = cmd[s..end], .start = s, .end = end };
 }
 
 /// Escape shell special characters in a filename for safe insertion
@@ -90,13 +110,71 @@ pub fn handleTabCompletion(self: *Shell) !void {
         if (i > 1 and cmd[i - 2] == '&' and cmd[i - 1] == '&') break :blk true;
         break :blk false;
     };
+    // detect if we're specifically after a pipe for pipe-aware suggestions
+    const is_after_pipe = blk: {
+        var i = word_result.start;
+        while (i > 0 and (cmd[i - 1] == ' ' or cmd[i - 1] == '\t')) i -= 1;
+        break :blk (i > 0 and cmd[i - 1] == '|');
+    };
+
     if (is_command_position and word.len > 0) {
         if (try tryCommandCompletion(self, word_result)) return;
+    }
+
+    // pipe completion: suggest common pipe targets when typing after |
+    if (is_after_pipe and word.len <= 3) {
+        if (try tryPipeCompletion(self, word_result)) return;
     }
 
     // check for variable completion ($VAR)
     if (word.len > 0 and word[0] == '$') {
         if (try tryVariableCompletion(self, word_result)) return;
+    }
+
+    // check for subcommand completion (e.g., docker run, cargo build)
+    if (word.len > 0 and word[0] != '-' and !is_command_position) {
+        if (try trySubcommandCompletion(self, cmd, word_result)) return;
+    }
+
+    // check for flag completion (--flag or -f)
+    if (word.len > 0 and word[0] == '-' and !is_command_position) {
+        if (try tryFlagCompletion(self, cmd, word_result)) return;
+    }
+
+    // check for SSH host completion (ssh/scp/rsync + non-flag argument)
+    if (!is_command_position and word.len > 0 and word[0] != '-' and word[0] != '/' and word[0] != '.') {
+        if (try tryHostCompletion(self, cmd, word_result)) return;
+    }
+
+    // check for kill process/signal completion
+    if (!is_command_position) {
+        if (try tryKillCompletion(self, cmd, word_result)) return;
+    }
+
+    // check for make/just target completion
+    if (!is_command_position and word.len > 0 and word[0] != '-') {
+        if (try tryMakeCompletion(self, cmd, word_result)) return;
+        if (try tryJustCompletion(self, cmd, word_result)) return;
+    }
+
+    // check for systemctl unit completion
+    if (!is_command_position and word.len > 0 and word[0] != '-') {
+        if (try trySystemctlCompletion(self, cmd, word_result)) return;
+    }
+
+    // check for docker container/image completion
+    if (!is_command_position and word.len > 0 and word[0] != '-') {
+        if (try tryDockerCompletion(self, cmd, word_result)) return;
+    }
+
+    // project-aware completions: zig build targets, cargo bins, npm scripts
+    if (!is_command_position and word.len > 0 and word[0] != '-') {
+        if (try tryProjectCompletion(self, cmd, word_result)) return;
+    }
+
+    // check for history-based completion (full command line prefix match)
+    if (is_command_position and word.len >= 2) {
+        if (try tryHistoryCompletion(self, cmd)) return;
     }
 
     // determine base directory and search pattern
@@ -212,6 +290,15 @@ pub fn handleTabCompletion(self: *Shell) !void {
         existing_args.append(self.allocator, cmd[arg_start..self.edit_buf.len]) catch {};
     }
 
+    // detect if we're completing for cd/pushd (dirs only)
+    const dirs_only = blk: {
+        const t = std.mem.trimLeft(u8, cmd, " \t");
+        if (std.mem.startsWith(u8, t, "cd ") or std.mem.startsWith(u8, t, "pushd ") or
+            std.mem.startsWith(u8, t, "mkdir ") or std.mem.startsWith(u8, t, "rmdir "))
+            break :blk true;
+        break :blk false;
+    };
+
     const dir = std.fs.cwd().openDir(search_dir, .{ .iterate = true }) catch return;
     var iter = dir.iterate();
     const show_hidden = pattern.len > 0 and pattern[0] == '.';
@@ -252,6 +339,9 @@ pub fn handleTabCompletion(self: *Shell) !void {
                     d.close();
                     break :blk true;
                 } else false;
+
+                // skip non-directories for cd/pushd/mkdir/rmdir
+                if (dirs_only and !is_dir) continue;
 
                 const full_name = if (is_dir)
                     try std.fmt.allocPrint(self.allocator, "{s}/", .{entry.name})
@@ -341,12 +431,37 @@ fn tryVariableCompletion(self: *Shell, word_result: WordResult) !bool {
         matches.deinit(self.allocator);
     }
 
+    var seen = std.StringHashMap(void).init(self.allocator);
+    defer seen.deinit();
+
     // get shell variables
     var var_iter = self.variables.iterator();
     while (var_iter.next()) |entry| {
         const name = entry.key_ptr.*;
         if (std.mem.startsWith(u8, name, pattern)) {
             const full = std.fmt.allocPrint(self.allocator, "${s}", .{name}) catch continue;
+            seen.put(name, {}) catch {};
+            matches.append(self.allocator, full) catch {
+                self.allocator.free(full);
+                continue;
+            };
+        }
+    }
+
+    // get environment variables
+    const environ = std.os.environ;
+    for (environ) |env_ptr| {
+        const env: [*:0]const u8 = env_ptr;
+        var len: usize = 0;
+        while (env[len] != 0) : (len += 1) {}
+        const env_str = env[0..len];
+        const eq_pos = std.mem.indexOfScalar(u8, env_str, '=') orelse continue;
+        const name = env_str[0..eq_pos];
+        if (name.len == 0) continue;
+        if (seen.contains(name)) continue;
+        if (std.mem.startsWith(u8, name, pattern)) {
+            const full = std.fmt.allocPrint(self.allocator, "${s}", .{name}) catch continue;
+            seen.put(name, {}) catch {};
             matches.append(self.allocator, full) catch {
                 self.allocator.free(full);
                 continue;
@@ -374,6 +489,537 @@ fn tryVariableCompletion(self: *Shell, word_result: WordResult) !bool {
     }
 }
 
+fn tryHostCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bool {
+    // only complete hosts for ssh/scp/rsync/sftp commands
+    const trimmed = std.mem.trimLeft(u8, cmd, " \t");
+    const cmd_end = std.mem.indexOfAny(u8, trimmed, " \t") orelse return false;
+    const base_cmd = trimmed[0..cmd_end];
+    const is_ssh_cmd = for ([_][]const u8{ "ssh", "scp", "rsync", "sftp", "sshfs", "mosh" }) |tool| {
+        if (std.mem.eql(u8, base_cmd, tool)) break true;
+    } else false;
+    if (!is_ssh_cmd) return false;
+
+    const pattern = word_result.word;
+
+    var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 32);
+    defer {
+        for (matches.items) |m| self.allocator.free(m);
+        matches.deinit(self.allocator);
+    }
+
+    var seen = std.StringHashMap(void).init(self.allocator);
+    defer seen.deinit();
+
+    // Parse ~/.ssh/config for Host entries
+    if (std.process.getEnvVarOwned(self.allocator, "HOME")) |home| {
+        defer self.allocator.free(home);
+        var path_buf: [512]u8 = undefined;
+
+        // SSH config: Host lines
+        const config_path = std.fmt.bufPrint(&path_buf, "{s}/.ssh/config", .{home}) catch "";
+        if (config_path.len > 0) {
+            if (std.fs.cwd().openFile(config_path, .{})) |file| {
+                defer file.close();
+                var read_buf: [8192]u8 = undefined;
+                const n = file.read(&read_buf) catch 0;
+                const text = read_buf[0..n];
+                var line_start: usize = 0;
+                while (line_start < text.len) {
+                    const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
+                    const line = std.mem.trimLeft(u8, text[line_start..line_end], " \t");
+                    line_start = line_end + 1;
+                    // Match "Host " (case-insensitive)
+                    if (line.len > 5 and (line[0] == 'H' or line[0] == 'h') and
+                        (std.mem.startsWith(u8, line, "Host ") or std.mem.startsWith(u8, line, "host ")))
+                    {
+                        // Can have multiple hosts on one line
+                        var rest = std.mem.trimLeft(u8, line[5..], " \t");
+                        while (rest.len > 0) {
+                            const host_end = std.mem.indexOfAny(u8, rest, " \t") orelse rest.len;
+                            const host = rest[0..host_end];
+                            rest = if (host_end < rest.len) std.mem.trimLeft(u8, rest[host_end..], " \t") else "";
+                            // Skip wildcard patterns
+                            if (std.mem.indexOf(u8, host, "*") != null) continue;
+                            if (std.mem.indexOf(u8, host, "?") != null) continue;
+                            if (host.len == 0) continue;
+                            if (std.mem.startsWith(u8, host, pattern) and !seen.contains(host)) {
+                                const owned = self.allocator.dupe(u8, host) catch continue;
+                                seen.put(owned, {}) catch {};
+                                matches.append(self.allocator, owned) catch {
+                                    self.allocator.free(owned);
+                                    continue;
+                                };
+                            }
+                        }
+                    }
+                }
+            } else |_| {}
+        }
+
+        // SSH known_hosts: hostname entries
+        const known_path = std.fmt.bufPrint(&path_buf, "{s}/.ssh/known_hosts", .{home}) catch "";
+        if (known_path.len > 0) {
+            if (std.fs.cwd().openFile(known_path, .{})) |file| {
+                defer file.close();
+                var read_buf: [32768]u8 = undefined;
+                const n = file.read(&read_buf) catch 0;
+                const text = read_buf[0..n];
+                var line_start: usize = 0;
+                while (line_start < text.len) {
+                    const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
+                    const line = text[line_start..line_end];
+                    line_start = line_end + 1;
+                    if (line.len == 0 or line[0] == '#' or line[0] == '|') continue; // skip comments and hashed
+                    // First field is comma-separated hostnames (may have [host]:port)
+                    const field_end = std.mem.indexOfAny(u8, line, " \t") orelse continue;
+                    const hosts_field = line[0..field_end];
+                    var host_start: usize = 0;
+                    while (host_start < hosts_field.len) {
+                        const comma = std.mem.indexOfScalarPos(u8, hosts_field, host_start, ',') orelse hosts_field.len;
+                        var host = hosts_field[host_start..comma];
+                        host_start = comma + 1;
+                        // Strip []:port notation
+                        if (host.len > 0 and host[0] == '[') {
+                            if (std.mem.indexOfScalar(u8, host, ']')) |close| {
+                                host = host[1..close];
+                            }
+                        }
+                        if (host.len == 0) continue;
+                        if (std.mem.startsWith(u8, host, pattern) and !seen.contains(host)) {
+                            const owned = self.allocator.dupe(u8, host) catch continue;
+                            seen.put(owned, {}) catch {};
+                            matches.append(self.allocator, owned) catch {
+                                self.allocator.free(owned);
+                                continue;
+                            };
+                        }
+                    }
+                }
+            } else |_| {}
+        }
+    } else |_| {}
+
+    if (matches.items.len == 0) return false;
+    if (matches.items.len == 1) {
+        return try applySingleCompletion(self, matches.items[0], word_result);
+    } else {
+        return try showCompletionMatches(self, &matches, word_result, pattern);
+    }
+}
+
+fn tryKillCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bool {
+    const trimmed = std.mem.trimLeft(u8, cmd, " \t");
+    const cmd_end = std.mem.indexOfAny(u8, trimmed, " \t") orelse return false;
+    const base_cmd = trimmed[0..cmd_end];
+    if (!std.mem.eql(u8, base_cmd, "kill") and !std.mem.eql(u8, base_cmd, "killall")) return false;
+
+    const word = word_result.word;
+
+    // Signal completion: kill -<tab>
+    if (word.len > 0 and word[0] == '-' and std.mem.eql(u8, base_cmd, "kill")) {
+        const pattern = word[1..]; // strip leading -
+        const signals = [_][]const u8{
+            "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "BUS", "FPE",
+            "KILL", "USR1", "SEGV", "USR2", "PIPE", "ALRM", "TERM",
+            "STKFLT", "CHLD", "CONT", "STOP", "TSTP", "TTIN", "TTOU",
+        };
+        var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 16);
+        defer {
+            for (matches.items) |m| self.allocator.free(m);
+            matches.deinit(self.allocator);
+        }
+        for (&signals) |sig| {
+            if (pattern.len == 0 or std.mem.startsWith(u8, sig, pattern)) {
+                const full = std.fmt.allocPrint(self.allocator, "-{s}", .{sig}) catch continue;
+                matches.append(self.allocator, full) catch {
+                    self.allocator.free(full);
+                    continue;
+                };
+            }
+        }
+        if (matches.items.len == 0) return false;
+        if (matches.items.len == 1) {
+            return try applySingleCompletion(self, matches.items[0], word_result);
+        }
+        return try showCompletionMatches(self, &matches, word_result, word);
+    }
+
+    // Process name completion for killall
+    if (std.mem.eql(u8, base_cmd, "killall") and word.len > 0) {
+        // Use ps to get running process names
+        var child = std.process.Child.init(
+            &.{ "/bin/sh", "-c", "ps -eo comm= 2>/dev/null | sort -u" },
+            self.allocator,
+        );
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Ignore;
+        child.spawn() catch return false;
+
+        const stdout = child.stdout.?;
+        var read_buf: [8192]u8 = undefined;
+        var total: usize = 0;
+        while (total < read_buf.len) {
+            const n = stdout.read(read_buf[total..]) catch break;
+            if (n == 0) break;
+            total += n;
+        }
+        _ = child.wait() catch {};
+
+        var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 32);
+        defer {
+            for (matches.items) |m| self.allocator.free(m);
+            matches.deinit(self.allocator);
+        }
+
+        const text = read_buf[0..total];
+        var line_start: usize = 0;
+        while (line_start < text.len) {
+            const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
+            const proc = std.mem.trim(u8, text[line_start..line_end], " \t\r");
+            line_start = line_end + 1;
+            if (proc.len == 0) continue;
+            if (std.mem.startsWith(u8, proc, word)) {
+                const owned = self.allocator.dupe(u8, proc) catch continue;
+                matches.append(self.allocator, owned) catch {
+                    self.allocator.free(owned);
+                    continue;
+                };
+            }
+        }
+
+        if (matches.items.len == 0) return false;
+        if (matches.items.len == 1) {
+            return try applySingleCompletion(self, matches.items[0], word_result);
+        }
+        return try showCompletionMatches(self, &matches, word_result, word);
+    }
+
+    return false;
+}
+
+fn tryMakeCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bool {
+    // only complete targets for make/gmake
+    const trimmed = std.mem.trimLeft(u8, cmd, " \t");
+    const cmd_end = std.mem.indexOfAny(u8, trimmed, " \t") orelse return false;
+    const base_cmd = trimmed[0..cmd_end];
+    if (!std.mem.eql(u8, base_cmd, "make") and !std.mem.eql(u8, base_cmd, "gmake")) return false;
+
+    const pattern = word_result.word;
+
+    // Check for -f flag to determine which makefile to parse
+    var makefile_name: []const u8 = "Makefile";
+    {
+        var i: usize = cmd_end;
+        while (i < cmd.len) {
+            while (i < cmd.len and (cmd[i] == ' ' or cmd[i] == '\t')) i += 1;
+            if (i + 1 < cmd.len and cmd[i] == '-' and cmd[i + 1] == 'f') {
+                i += 2;
+                while (i < cmd.len and (cmd[i] == ' ' or cmd[i] == '\t')) i += 1;
+                const arg_start = i;
+                while (i < cmd.len and cmd[i] != ' ' and cmd[i] != '\t') i += 1;
+                if (i > arg_start) makefile_name = cmd[arg_start..i];
+                break;
+            }
+            while (i < cmd.len and cmd[i] != ' ' and cmd[i] != '\t') i += 1;
+        }
+    }
+
+    // Try Makefile, then makefile
+    const file = std.fs.cwd().openFile(makefile_name, .{}) catch blk: {
+        if (std.mem.eql(u8, makefile_name, "Makefile")) {
+            break :blk std.fs.cwd().openFile("makefile", .{}) catch return false;
+        }
+        return false;
+    };
+    defer file.close();
+
+    var read_buf: [32768]u8 = undefined;
+    const n = file.read(&read_buf) catch return false;
+    const text = read_buf[0..n];
+
+    var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 32);
+    defer {
+        for (matches.items) |m| self.allocator.free(m);
+        matches.deinit(self.allocator);
+    }
+
+    var seen = std.StringHashMap(void).init(self.allocator);
+    defer seen.deinit();
+
+    // Parse target: lines — "target: deps" where target starts at column 0
+    var line_start: usize = 0;
+    while (line_start < text.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
+        const line = text[line_start..line_end];
+        line_start = line_end + 1;
+
+        // Skip empty, comments, tabs (recipe lines), variable assignments
+        if (line.len == 0 or line[0] == '#' or line[0] == '\t' or line[0] == ' ') continue;
+        if (line[0] == '.') continue; // skip .PHONY, .DEFAULT, etc
+
+        // Find colon (but not ::= which is assignment)
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (colon == 0) continue;
+        if (colon + 1 < line.len and line[colon + 1] == '=') continue; // := assignment
+        if (colon > 0 and line[colon - 1] == '?') continue; // ?= through other path
+
+        // Check for variable references in target name — skip those
+        const target_part = line[0..colon];
+        if (std.mem.indexOf(u8, target_part, "$") != null) continue;
+        if (std.mem.indexOf(u8, target_part, "%") != null) continue; // pattern rules
+
+        // Can have multiple targets: "foo bar: deps"
+        var tstart: usize = 0;
+        while (tstart < target_part.len) {
+            while (tstart < target_part.len and (target_part[tstart] == ' ' or target_part[tstart] == '\t')) tstart += 1;
+            const tend = std.mem.indexOfAnyPos(u8, target_part, tstart, " \t") orelse target_part.len;
+            if (tend > tstart) {
+                const target = target_part[tstart..tend];
+                if (std.mem.startsWith(u8, target, pattern) and !seen.contains(target)) {
+                    const owned = self.allocator.dupe(u8, target) catch continue;
+                    seen.put(owned, {}) catch {};
+                    matches.append(self.allocator, owned) catch {
+                        self.allocator.free(owned);
+                        continue;
+                    };
+                }
+            }
+            tstart = tend;
+        }
+    }
+
+    if (matches.items.len == 0) return false;
+    if (matches.items.len == 1) {
+        return try applySingleCompletion(self, matches.items[0], word_result);
+    }
+    return try showCompletionMatches(self, &matches, word_result, pattern);
+}
+
+/// Complete `just` recipes from justfile
+fn tryJustCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bool {
+    const trimmed = std.mem.trimLeft(u8, cmd, " \t");
+    if (!std.mem.startsWith(u8, trimmed, "just ") and !std.mem.eql(u8, trimmed, "just")) return false;
+    const pattern = word_result.word;
+
+    // Try justfile, then Justfile
+    const file = std.fs.cwd().openFile("justfile", .{}) catch
+        std.fs.cwd().openFile("Justfile", .{}) catch return false;
+    defer file.close();
+
+    var read_buf: [16384]u8 = undefined;
+    const n = file.read(&read_buf) catch return false;
+    const text = read_buf[0..n];
+
+    var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 16);
+    defer {
+        for (matches.items) |m| self.allocator.free(m);
+        matches.deinit(self.allocator);
+    }
+
+    // Parse recipes: lines starting with alpha at column 0, followed by ':'
+    // justfile format: recipe_name arg1 arg2: deps
+    var line_start: usize = 0;
+    while (line_start < text.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
+        const line = text[line_start..line_end];
+        line_start = line_end + 1;
+
+        if (line.len == 0) continue;
+        // recipes start at column 0 with alpha or @
+        if (line[0] == ' ' or line[0] == '\t' or line[0] == '#') continue;
+
+        // find recipe name (first word before space or colon)
+        const name_start: usize = if (line[0] == '@') 1 else 0; // @ prefix for quiet
+        var name_end = name_start;
+        while (name_end < line.len and line[name_end] != ' ' and line[name_end] != ':' and line[name_end] != '(') : (name_end += 1) {}
+        if (name_end <= name_start) continue;
+
+        // verify there's a colon somewhere on this line (it's a recipe, not an assignment)
+        if (std.mem.indexOfScalar(u8, line, ':') == null) continue;
+
+        const name = line[name_start..name_end];
+        // skip if it looks like a variable assignment
+        if (std.mem.indexOf(u8, name, ":=") != null or std.mem.indexOf(u8, name, "=") != null) continue;
+
+        if (std.mem.startsWith(u8, name, pattern)) {
+            var dup = false;
+            for (matches.items) |m| {
+                if (std.mem.eql(u8, m, name)) { dup = true; break; }
+            }
+            if (!dup) {
+                const owned = try self.allocator.dupe(u8, name);
+                try matches.append(self.allocator, owned);
+            }
+        }
+    }
+
+    if (matches.items.len == 0) return false;
+    if (matches.items.len == 1) return try applySingleCompletion(self, matches.items[0], word_result);
+    return try showCompletionMatches(self, &matches, word_result, pattern);
+}
+
+fn trySystemctlCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bool {
+    // only for systemctl (+ journalctl -u) commands
+    const trimmed = std.mem.trimLeft(u8, cmd, " \t");
+    const cmd_end = std.mem.indexOfAny(u8, trimmed, " \t") orelse return false;
+    const base_cmd = trimmed[0..cmd_end];
+
+    const is_systemctl = std.mem.eql(u8, base_cmd, "systemctl");
+    const is_journalctl = std.mem.eql(u8, base_cmd, "journalctl");
+    if (!is_systemctl and !is_journalctl) return false;
+
+    // For journalctl, only complete after -u flag
+    if (is_journalctl) {
+        const rest = std.mem.trimLeft(u8, trimmed[cmd_end..], " \t");
+        // Check if the previous arg is -u
+        var prev_is_u = false;
+        var i: usize = 0;
+        while (i < rest.len) {
+            while (i < rest.len and (rest[i] == ' ' or rest[i] == '\t')) i += 1;
+            const arg_start = i;
+            while (i < rest.len and rest[i] != ' ' and rest[i] != '\t') i += 1;
+            const arg = rest[arg_start..i];
+            if (arg.ptr == word_result.word.ptr) break;
+            prev_is_u = std.mem.eql(u8, arg, "-u") or std.mem.eql(u8, arg, "--unit");
+        }
+        if (!prev_is_u) return false;
+    }
+
+    const pattern = word_result.word;
+
+    var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 32);
+    defer {
+        for (matches.items) |m| self.allocator.free(m);
+        matches.deinit(self.allocator);
+    }
+
+    var seen = std.StringHashMap(void).init(self.allocator);
+    defer seen.deinit();
+
+    // Scan systemd unit directories
+    const dirs = [_][]const u8{
+        "/usr/lib/systemd/system",
+        "/etc/systemd/system",
+        "/run/systemd/system",
+    };
+    for (&dirs) |dir_path| {
+        var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch continue;
+        defer dir.close();
+        var iter = dir.iterate();
+        while (try iter.next()) |entry| {
+            const name = entry.name;
+            // Only .service, .timer, .socket, .mount, .target, .path, .slice, .scope
+            const is_unit = std.mem.endsWith(u8, name, ".service") or
+                std.mem.endsWith(u8, name, ".timer") or
+                std.mem.endsWith(u8, name, ".socket") or
+                std.mem.endsWith(u8, name, ".mount") or
+                std.mem.endsWith(u8, name, ".target") or
+                std.mem.endsWith(u8, name, ".path") or
+                std.mem.endsWith(u8, name, ".slice") or
+                std.mem.endsWith(u8, name, ".scope");
+            if (!is_unit) continue;
+            if (!std.mem.startsWith(u8, name, pattern)) continue;
+            if (seen.contains(name)) continue;
+            const owned = self.allocator.dupe(u8, name) catch continue;
+            seen.put(owned, {}) catch {};
+            matches.append(self.allocator, owned) catch {
+                self.allocator.free(owned);
+                continue;
+            };
+        }
+    }
+
+    if (matches.items.len == 0) return false;
+    if (matches.items.len == 1) {
+        return try applySingleCompletion(self, matches.items[0], word_result);
+    }
+    return try showCompletionMatches(self, &matches, word_result, pattern);
+}
+
+fn tryDockerCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bool {
+    const trimmed = std.mem.trimLeft(u8, cmd, " \t");
+    const cmd_end = std.mem.indexOfAny(u8, trimmed, " \t") orelse return false;
+    const base_cmd = trimmed[0..cmd_end];
+    if (!std.mem.eql(u8, base_cmd, "docker") and !std.mem.eql(u8, base_cmd, "podman")) return false;
+
+    // Find subcommand
+    const rest = std.mem.trimLeft(u8, trimmed[cmd_end..], " \t");
+    const sub_end = std.mem.indexOfAny(u8, rest, " \t") orelse return false;
+    const subcmd = rest[0..sub_end];
+
+    // Determine what to complete
+    const needs_container = for ([_][]const u8{
+        "start", "stop", "restart", "rm", "logs", "exec", "attach", "inspect",
+        "kill", "pause", "unpause", "top", "stats", "cp", "diff", "export",
+        "port", "rename", "update", "wait",
+    }) |s| {
+        if (std.mem.eql(u8, subcmd, s)) break true;
+    } else false;
+
+    const needs_image = for ([_][]const u8{
+        "run", "create", "rmi", "tag", "push", "save", "history",
+    }) |s| {
+        if (std.mem.eql(u8, subcmd, s)) break true;
+    } else false;
+
+    if (!needs_container and !needs_image) return false;
+
+    const pattern = word_result.word;
+    const list_cmd = if (needs_container)
+        &[_][]const u8{ "/bin/sh", "-c", "docker ps -a --format '{{.Names}}' 2>/dev/null" }
+    else
+        &[_][]const u8{ "/bin/sh", "-c", "docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null" };
+
+    var child = std.process.Child.init(list_cmd, self.allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch return false;
+
+    const stdout = child.stdout.?;
+    var read_buf: [8192]u8 = undefined;
+    var total: usize = 0;
+    while (total < read_buf.len) {
+        const n = stdout.read(read_buf[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    _ = child.wait() catch {};
+
+    var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 32);
+    defer {
+        for (matches.items) |m| self.allocator.free(m);
+        matches.deinit(self.allocator);
+    }
+
+    var seen = std.StringHashMap(void).init(self.allocator);
+    defer seen.deinit();
+
+    const text = read_buf[0..total];
+    var line_start: usize = 0;
+    while (line_start < text.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
+        const name = std.mem.trim(u8, text[line_start..line_end], " \t\r'");
+        line_start = line_end + 1;
+        if (name.len == 0) continue;
+        if (std.mem.startsWith(u8, name, pattern) and !seen.contains(name)) {
+            const owned = self.allocator.dupe(u8, name) catch continue;
+            seen.put(owned, {}) catch {};
+            matches.append(self.allocator, owned) catch {
+                self.allocator.free(owned);
+                continue;
+            };
+        }
+    }
+
+    if (matches.items.len == 0) return false;
+    if (matches.items.len == 1) {
+        return try applySingleCompletion(self, matches.items[0], word_result);
+    }
+    return try showCompletionMatches(self, &matches, word_result, pattern);
+}
+
 // use centralized builtins list from keywords.zig
 const builtins = keywords.shell_builtins;
 
@@ -393,6 +1039,22 @@ fn tryCommandCompletion(self: *Shell, word_result: WordResult) !bool {
     for (builtins) |builtin| {
         if (std.mem.startsWith(u8, builtin, pattern)) {
             const name = self.allocator.dupe(u8, builtin) catch continue;
+            seen.put(name, {}) catch {
+                self.allocator.free(name);
+                continue;
+            };
+            matches.append(self.allocator, name) catch {
+                self.allocator.free(name);
+                continue;
+            };
+        }
+    }
+
+    // add matching aliases
+    var alias_iter = self.aliases.iterator();
+    while (alias_iter.next()) |entry| {
+        if (std.mem.startsWith(u8, entry.key_ptr.*, pattern) and !seen.contains(entry.key_ptr.*)) {
+            const name = self.allocator.dupe(u8, entry.key_ptr.*) catch continue;
             seen.put(name, {}) catch {
                 self.allocator.free(name);
                 continue;
@@ -462,6 +1124,244 @@ fn tryCommandCompletion(self: *Shell, word_result: WordResult) !bool {
     }
 }
 
+/// Project-aware completions: zig build targets, cargo bins/examples, npm scripts
+fn tryProjectCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bool {
+    const trimmed = std.mem.trimLeft(u8, cmd, " \t");
+    const pattern = word_result.word;
+
+    // zig build <target> — parse build.zig for addExecutable/addTest/step names
+    if (std.mem.startsWith(u8, trimmed, "zig build ")) {
+        return try tryZigBuildTargetCompletion(self, pattern, word_result);
+    }
+
+    // cargo run --bin <name> / cargo run --example <name>
+    if (std.mem.startsWith(u8, trimmed, "cargo run ") or
+        std.mem.startsWith(u8, trimmed, "cargo test ") or
+        std.mem.startsWith(u8, trimmed, "cargo bench "))
+    {
+        // check if previous arg was --bin or --example
+        const rest = trimmed[std.mem.indexOfScalar(u8, trimmed, ' ').? + 1 ..];
+        if (std.mem.indexOf(u8, rest, "--bin ") != null or
+            std.mem.indexOf(u8, rest, "--example ") != null)
+        {
+            return try tryCargoBinCompletion(self, trimmed, pattern, word_result);
+        }
+    }
+
+    // npm run <script> / yarn <script> / pnpm run <script>
+    if (std.mem.startsWith(u8, trimmed, "npm run ") or
+        std.mem.startsWith(u8, trimmed, "pnpm run ") or
+        std.mem.startsWith(u8, trimmed, "yarn "))
+    {
+        return try tryNpmScriptCompletion(self, pattern, word_result);
+    }
+
+    return false;
+}
+
+/// Complete zig build targets by parsing build.zig for step/exe names
+fn tryZigBuildTargetCompletion(self: *Shell, pattern: []const u8, word_result: WordResult) !bool {
+    const file = std.fs.cwd().openFile("build.zig", .{}) catch return false;
+    defer file.close();
+
+    var read_buf: [32768]u8 = undefined;
+    const n = file.read(&read_buf) catch return false;
+    const text = read_buf[0..n];
+
+    var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 16);
+    defer {
+        for (matches.items) |m| self.allocator.free(m);
+        matches.deinit(self.allocator);
+    }
+
+    // Parse: b.step("name", ...) patterns
+    var i: usize = 0;
+    while (i < text.len) {
+        // Look for .step(" or addExecutable(.{ .name = "
+        const step_marker = std.mem.indexOfPos(u8, text, i, ".step(\"") orelse break;
+        const name_start = step_marker + 7; // skip .step("
+        const name_end = std.mem.indexOfScalarPos(u8, text, name_start, '"') orelse break;
+        const name = text[name_start..name_end];
+        i = name_end + 1;
+
+        if (name.len > 0 and std.mem.startsWith(u8, name, pattern)) {
+            // deduplicate
+            var dup = false;
+            for (matches.items) |m| {
+                if (std.mem.eql(u8, m, name)) { dup = true; break; }
+            }
+            if (!dup) {
+                const owned = try self.allocator.dupe(u8, name);
+                try matches.append(self.allocator, owned);
+            }
+        }
+    }
+
+    // Also parse addExecutable(.{ .name = "xxx" patterns
+    i = 0;
+    while (i < text.len) {
+        const marker = std.mem.indexOfPos(u8, text, i, "addExecutable(") orelse break;
+        // find .name = " after this
+        const search_end = @min(marker + 200, text.len);
+        const name_key = std.mem.indexOfPos(u8, text, marker, ".name = \"") orelse {
+            i = marker + 14;
+            continue;
+        };
+        if (name_key >= search_end) { i = marker + 14; continue; }
+        const name_start = name_key + 9;
+        const name_end = std.mem.indexOfScalarPos(u8, text, name_start, '"') orelse { i = name_start; continue; };
+        const name = text[name_start..name_end];
+        i = name_end + 1;
+
+        if (name.len > 0 and std.mem.startsWith(u8, name, pattern)) {
+            var dup = false;
+            for (matches.items) |m| {
+                if (std.mem.eql(u8, m, name)) { dup = true; break; }
+            }
+            if (!dup) {
+                const owned = try self.allocator.dupe(u8, name);
+                try matches.append(self.allocator, owned);
+            }
+        }
+    }
+
+    if (matches.items.len == 0) return false;
+    if (matches.items.len == 1) return try applySingleCompletion(self, matches.items[0], word_result);
+    return try showCompletionMatches(self, &matches, word_result, pattern);
+}
+
+/// Complete cargo --bin and --example names from Cargo.toml + directory scan
+fn tryCargoBinCompletion(self: *Shell, cmd: []const u8, pattern: []const u8, word_result: WordResult) !bool {
+    _ = cmd;
+    var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 16);
+    defer {
+        for (matches.items) |m| self.allocator.free(m);
+        matches.deinit(self.allocator);
+    }
+
+    // Scan src/bin/ for binary names
+    if (std.fs.cwd().openDir("src/bin", .{ .iterate = true })) |dir_handle| {
+        var dir = dir_handle;
+        defer dir.close();
+        var iter = dir.iterate();
+        while (try iter.next()) |entry| {
+            if (entry.kind != .file) continue;
+            // strip .rs extension
+            const name = if (std.mem.endsWith(u8, entry.name, ".rs"))
+                entry.name[0 .. entry.name.len - 3]
+            else
+                entry.name;
+            if (name.len > 0 and std.mem.startsWith(u8, name, pattern)) {
+                const owned = try self.allocator.dupe(u8, name);
+                try matches.append(self.allocator, owned);
+            }
+        }
+    } else |_| {}
+
+    // Scan examples/ for example names
+    if (std.fs.cwd().openDir("examples", .{ .iterate = true })) |dir_handle| {
+        var dir = dir_handle;
+        defer dir.close();
+        var iter = dir.iterate();
+        while (try iter.next()) |entry| {
+            if (entry.kind != .file) continue;
+            const name = if (std.mem.endsWith(u8, entry.name, ".rs"))
+                entry.name[0 .. entry.name.len - 3]
+            else
+                entry.name;
+            if (name.len > 0 and std.mem.startsWith(u8, name, pattern)) {
+                const owned = try self.allocator.dupe(u8, name);
+                try matches.append(self.allocator, owned);
+            }
+        }
+    } else |_| {}
+
+    // Also parse Cargo.toml for [[bin]] names
+    if (std.fs.cwd().openFile("Cargo.toml", .{})) |file| {
+        defer file.close();
+        var read_buf: [8192]u8 = undefined;
+        const n = file.read(&read_buf) catch 0;
+        const text = read_buf[0..n];
+        // Simple parse: look for name = "xxx" after [[bin]] or [[example]]
+        var pos: usize = 0;
+        while (pos < text.len) {
+            const name_key = std.mem.indexOfPos(u8, text, pos, "name = \"") orelse break;
+            const name_start = name_key + 8;
+            const name_end = std.mem.indexOfScalarPos(u8, text, name_start, '"') orelse break;
+            const name = text[name_start..name_end];
+            pos = name_end + 1;
+            if (name.len > 0 and std.mem.startsWith(u8, name, pattern)) {
+                var dup = false;
+                for (matches.items) |m| {
+                    if (std.mem.eql(u8, m, name)) { dup = true; break; }
+                }
+                if (!dup) {
+                    const owned = try self.allocator.dupe(u8, name);
+                    try matches.append(self.allocator, owned);
+                }
+            }
+        }
+    } else |_| {}
+
+    if (matches.items.len == 0) return false;
+    if (matches.items.len == 1) return try applySingleCompletion(self, matches.items[0], word_result);
+    return try showCompletionMatches(self, &matches, word_result, pattern);
+}
+
+/// Complete npm/yarn/pnpm script names from package.json
+fn tryNpmScriptCompletion(self: *Shell, pattern: []const u8, word_result: WordResult) !bool {
+    const file = std.fs.cwd().openFile("package.json", .{}) catch return false;
+    defer file.close();
+
+    var read_buf: [16384]u8 = undefined;
+    const n = file.read(&read_buf) catch return false;
+    const text = read_buf[0..n];
+
+    // Find "scripts": { ... } section and extract keys
+    const scripts_key = std.mem.indexOf(u8, text, "\"scripts\"") orelse return false;
+    const brace_start = std.mem.indexOfScalarPos(u8, text, scripts_key, '{') orelse return false;
+
+    var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 16);
+    defer {
+        for (matches.items) |m| self.allocator.free(m);
+        matches.deinit(self.allocator);
+    }
+
+    // Parse keys within the scripts object
+    var pos = brace_start + 1;
+    var depth: i32 = 1;
+    while (pos < text.len and depth > 0) {
+        if (text[pos] == '{') {
+            depth += 1;
+            pos += 1;
+        } else if (text[pos] == '}') {
+            depth -= 1;
+            pos += 1;
+        } else if (text[pos] == '"' and depth == 1) {
+            // this should be a key
+            const key_start = pos + 1;
+            const key_end = std.mem.indexOfScalarPos(u8, text, key_start, '"') orelse break;
+            const key = text[key_start..key_end];
+            pos = key_end + 1;
+
+            // skip past ": "value"
+            const colon = std.mem.indexOfScalarPos(u8, text, pos, ':') orelse break;
+            pos = colon + 1;
+
+            if (key.len > 0 and std.mem.startsWith(u8, key, pattern)) {
+                const owned = try self.allocator.dupe(u8, key);
+                try matches.append(self.allocator, owned);
+            }
+        } else {
+            pos += 1;
+        }
+    }
+
+    if (matches.items.len == 0) return false;
+    if (matches.items.len == 1) return try applySingleCompletion(self, matches.items[0], word_result);
+    return try showCompletionMatches(self, &matches, word_result, pattern);
+}
+
 fn tryGitCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bool {
     if (!std.mem.startsWith(u8, cmd, "git ")) return false;
     if (!git.isRepo()) return false;
@@ -477,6 +1377,32 @@ fn tryGitCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !boo
     }
 
     const pattern = word_result.word;
+
+    // check if cursor is on the subcommand word itself (completing git sub<tab>)
+    const is_subcommand_pos = parts.next() == null and std.mem.eql(u8, subcommand, pattern);
+    if (is_subcommand_pos) {
+        const git_subcommands = [_][]const u8{
+            "add",      "bisect",   "blame",    "branch",   "checkout",
+            "cherry-pick", "clean", "clone",    "commit",   "config",
+            "diff",     "fetch",    "grep",     "init",     "log",
+            "merge",    "mv",       "pull",     "push",     "rebase",
+            "remote",   "reset",    "restore",  "revert",   "rm",
+            "show",     "stash",    "status",   "switch",   "tag",
+            "worktree",
+        };
+        for (&git_subcommands) |sc| {
+            if (std.mem.startsWith(u8, sc, pattern)) {
+                const owned = try self.allocator.dupe(u8, sc);
+                try matches.append(self.allocator, owned);
+            }
+        }
+        if (matches.items.len == 0) return false;
+        if (matches.items.len == 1) {
+            return try applySingleCompletion(self, matches.items[0], word_result);
+        } else {
+            return try showCompletionMatches(self, &matches, word_result, pattern);
+        }
+    }
 
     if (std.mem.eql(u8, subcommand, "add") or
         std.mem.eql(u8, subcommand, "restore") or
@@ -505,7 +1431,9 @@ fn tryGitCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !boo
     } else if (std.mem.eql(u8, subcommand, "checkout") or
         std.mem.eql(u8, subcommand, "switch") or
         std.mem.eql(u8, subcommand, "merge") or
-        std.mem.eql(u8, subcommand, "rebase"))
+        std.mem.eql(u8, subcommand, "rebase") or
+        std.mem.eql(u8, subcommand, "log") or
+        std.mem.eql(u8, subcommand, "show"))
     {
         try getGitBranches(self, &matches, pattern);
     } else if (std.mem.eql(u8, subcommand, "branch")) {
@@ -521,6 +1449,27 @@ fn tryGitCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !boo
         if (has_delete) {
             try getGitBranches(self, &matches, pattern);
         }
+    } else if (std.mem.eql(u8, subcommand, "tag")) {
+        // git tag completion — complete existing tags for -d, otherwise show tags for reference
+        try getGitTags(self, &matches, pattern);
+    } else if (std.mem.eql(u8, subcommand, "stash")) {
+        // git stash subcommands
+        const stash_cmds = [_][]const u8{ "apply", "drop", "list", "pop", "push", "show", "clear" };
+        for (stash_cmds) |sc| {
+            if (std.mem.startsWith(u8, sc, pattern)) {
+                const owned = try self.allocator.dupe(u8, sc);
+                try matches.append(self.allocator, owned);
+            }
+        }
+    } else if (std.mem.eql(u8, subcommand, "remote")) {
+        // git remote subcommands
+        const remote_cmds = [_][]const u8{ "add", "remove", "rename", "show", "prune", "get-url", "set-url" };
+        for (remote_cmds) |rc| {
+            if (std.mem.startsWith(u8, rc, pattern)) {
+                const owned = try self.allocator.dupe(u8, rc);
+                try matches.append(self.allocator, owned);
+            }
+        }
     } else {
         return false;
     }
@@ -534,18 +1483,809 @@ fn tryGitCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !boo
     }
 }
 
+/// Suggest full commands from history matching the current input prefix.
+/// Shows unique matching commands, most recent first.
+/// Pipe completion: suggest common pipe targets (grep, sort, head, jq, etc.)
+/// Triggers when user types `| <tab>` or `| gr<tab>` with short prefix.
+fn tryPipeCompletion(self: *Shell, word_result: WordResult) !bool {
+    const pipe_targets = [_][]const u8{
+        "grep", "sort", "head", "tail", "wc", "uniq", "cut", "tr",
+        "awk", "sed", "jq", "tee", "xargs", "less", "more",
+        "cat", "rev", "column", "paste", "fold", "fmt",
+        "base64", "md5sum", "sha256sum",
+    };
+
+    const pattern = word_result.word;
+    var matches = std.ArrayList([]const u8){};
+    defer matches.deinit(self.allocator);
+
+    for (&pipe_targets) |target| {
+        if (pattern.len == 0 or std.mem.startsWith(u8, target, pattern)) {
+            matches.append(self.allocator, target) catch continue;
+        }
+    }
+
+    if (matches.items.len == 0) return false;
+
+    if (matches.items.len == 1) {
+        _ = try applySingleCompletion(self, matches.items[0], word_result);
+        return true;
+    }
+
+    // show multi-column menu
+    _ = try showCompletionMatches(self, &matches, word_result, pattern);
+    return true;
+}
+
+fn tryHistoryCompletion(self: *Shell, current_input: []const u8) !bool {
+    const h = self.history orelse return false;
+    const prefix = std.mem.trimLeft(u8, current_input, " \t");
+    if (prefix.len < 2) return false;
+
+    var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 32);
+    defer {
+        for (matches.items) |m| self.allocator.free(m);
+        matches.deinit(self.allocator);
+    }
+
+    // scan history in reverse (most recent first), collect unique prefix matches
+    var seen_buf: [8192]u8 = undefined;
+    var seen_pos: usize = 0;
+    var seen_offsets: [64]u16 = undefined;
+    var seen_lens: [64]u16 = undefined;
+    var seen_count: usize = 0;
+
+    const items = h.entries.items;
+    var idx: usize = items.len;
+    while (idx > 0) {
+        idx -= 1;
+        const entry = items[idx];
+        const cmd_text = h.getCommand(entry);
+        if (cmd_text.len <= prefix.len) continue;
+        if (!std.mem.startsWith(u8, cmd_text, prefix)) continue;
+        // skip exact match
+        if (cmd_text.len == prefix.len) continue;
+
+        // deduplicate
+        var is_dup = false;
+        for (0..seen_count) |si| {
+            const seen_cmd = seen_buf[seen_offsets[si] .. seen_offsets[si] + seen_lens[si]];
+            if (std.mem.eql(u8, seen_cmd, cmd_text)) {
+                is_dup = true;
+                break;
+            }
+        }
+        if (is_dup) continue;
+
+        // track in seen buffer
+        if (seen_count < 64 and seen_pos + cmd_text.len <= seen_buf.len) {
+            @memcpy(seen_buf[seen_pos .. seen_pos + cmd_text.len], cmd_text);
+            seen_offsets[seen_count] = @intCast(seen_pos);
+            seen_lens[seen_count] = @intCast(cmd_text.len);
+            seen_pos += cmd_text.len;
+            seen_count += 1;
+        }
+
+        const owned = try self.allocator.dupe(u8, cmd_text);
+        try matches.append(self.allocator, owned);
+
+        if (matches.items.len >= 20) break; // cap at 20 suggestions
+    }
+
+    if (matches.items.len == 0) return false;
+
+    if (matches.items.len == 1) {
+        // replace entire input with the history match
+        self.edit_buf.clear();
+        _ = self.edit_buf.insertSlice(matches.items[0]);
+        logCompletionWith(self.edit_buf.slice(), 0, prefix, matches.items[0], .history_menu);
+        try self.renderLine();
+        return true;
+    }
+
+    // show as completion menu — use full command as match
+    self.completion_matches.deinit(self.allocator);
+    self.completion_matches = .{};
+    for (matches.items) |m| {
+        const owned = try self.allocator.dupe(u8, m);
+        try self.completion_matches.append(self.allocator, owned);
+    }
+    self.completion_index = 0;
+    self.completion_word_start = 0;
+    self.completion_word_end = @intCast(self.edit_buf.len);
+    self.completion_pattern_len = @intCast(prefix.len);
+
+    try displayCompletions(self);
+    return true;
+}
+
+fn trySubcommandCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bool {
+    // only complete subcommands when cursor is on the second word
+    const trimmed = std.mem.trimLeft(u8, cmd, " \t");
+    const cmd_end = std.mem.indexOfAny(u8, trimmed, " \t") orelse return false;
+    const base_cmd = trimmed[0..cmd_end];
+
+    // check this is a tool that uses subcommands
+    const subcmd_tools = [_][]const u8{ "docker", "cargo", "npm", "kubectl", "zig", "go", "rustup", "apt", "systemctl", "ip", "gh", "podman", "helm", "terraform", "yarn", "pnpm", "pipx", "uv" };
+    var is_subcmd_tool = false;
+    for (&subcmd_tools) |tool| {
+        if (std.mem.eql(u8, base_cmd, tool)) {
+            is_subcmd_tool = true;
+            break;
+        }
+    }
+    if (!is_subcmd_tool) return false;
+
+    // check we're on the subcommand position (second word, cursor at/within it)
+    const rest = std.mem.trimLeft(u8, trimmed[cmd_end..], " \t");
+    const sub_end = std.mem.indexOfAny(u8, rest, " \t") orelse rest.len;
+    // if there's more text after the subcommand word, we're past subcommand position
+    if (sub_end < rest.len) {
+        const after_sub = std.mem.trimLeft(u8, rest[sub_end..], " \t");
+        if (after_sub.len > 0) return false;
+    }
+
+    const pattern = word_result.word;
+
+    // check cache (TTL 5 minutes)
+    const now = std.time.timestamp();
+    const cache_ttl: i64 = 300;
+    const cached = self.subcmd_cache_cmd_len > 0 and
+        self.subcmd_cache_cmd_len == base_cmd.len and
+        base_cmd.len <= self.subcmd_cache_cmd.len and
+        std.mem.eql(u8, self.subcmd_cache_cmd[0..self.subcmd_cache_cmd_len], base_cmd) and
+        (now - self.subcmd_cache_ts) < cache_ttl;
+
+    if (!cached) {
+        parseSubcmdsFromHelp(self, base_cmd) catch {
+            self.subcmd_cache_count = 0;
+        };
+        self.subcmd_cache_ts = now;
+    }
+
+    if (self.subcmd_cache_count == 0) return false;
+
+    var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 32);
+    defer {
+        for (matches.items) |m| self.allocator.free(m);
+        matches.deinit(self.allocator);
+    }
+
+    for (0..self.subcmd_cache_count) |i| {
+        const off = self.subcmd_cache_offsets[i];
+        const len = self.subcmd_cache_lens[i];
+        const subcmd = self.subcmd_cache_buf[off .. off + len];
+        if (std.mem.startsWith(u8, subcmd, pattern)) {
+            const owned = try self.allocator.dupe(u8, subcmd);
+            try matches.append(self.allocator, owned);
+        }
+    }
+
+    if (matches.items.len == 0) return false;
+    if (matches.items.len == 1) {
+        return try applySingleCompletion(self, matches.items[0], word_result);
+    } else {
+        return try showCompletionMatches(self, &matches, word_result, pattern);
+    }
+}
+
+fn parseSubcmdsFromHelp(self: *Shell, base_cmd: []const u8) !void {
+    self.subcmd_cache_count = 0;
+    if (base_cmd.len > self.subcmd_cache_cmd.len) return;
+    @memcpy(self.subcmd_cache_cmd[0..base_cmd.len], base_cmd);
+    self.subcmd_cache_cmd_len = base_cmd.len;
+
+    var argv_buf: [128]u8 = undefined;
+    var child = std.process.Child.init(
+        &.{ "/bin/sh", "-c", std.fmt.bufPrint(&argv_buf, "{s} --help 2>&1", .{base_cmd}) catch return },
+        self.allocator,
+    );
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+
+    const stdout = child.stdout.?;
+    var read_buf: [16384]u8 = undefined;
+    var total_read: usize = 0;
+    while (total_read < read_buf.len) {
+        const n = stdout.read(read_buf[total_read..]) catch break;
+        if (n == 0) break;
+        total_read += n;
+    }
+    _ = child.wait() catch {};
+
+    // parse subcommands: lines starting with 2+ spaces followed by a word (no dash prefix)
+    const text = read_buf[0..total_read];
+    var line_start: usize = 0;
+    var buf_pos: usize = 0;
+    var count: usize = 0;
+
+    while (line_start < text.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
+        const line = text[line_start..line_end];
+        line_start = line_end + 1;
+
+        if (line.len < 3) continue;
+        var indent: usize = 0;
+        while (indent < line.len and (line[indent] == ' ' or line[indent] == '\t')) : (indent += 1) {}
+        if (indent < 2 or indent >= line.len) continue;
+        if (!std.ascii.isAlphabetic(line[indent])) continue;
+
+        var wend = indent;
+        while (wend < line.len and (std.ascii.isAlphanumeric(line[wend]) or line[wend] == '-' or line[wend] == '_')) : (wend += 1) {}
+        const subcmd = line[indent..wend];
+        if (subcmd.len < 2 or subcmd.len > 30) continue;
+        if (count >= 128) break;
+
+        // deduplicate
+        var dup = false;
+        for (0..count) |j| {
+            const existing = self.subcmd_cache_buf[self.subcmd_cache_offsets[j] .. self.subcmd_cache_offsets[j] + self.subcmd_cache_lens[j]];
+            if (std.mem.eql(u8, existing, subcmd)) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+
+        if (buf_pos + subcmd.len > self.subcmd_cache_buf.len) break;
+        @memcpy(self.subcmd_cache_buf[buf_pos .. buf_pos + subcmd.len], subcmd);
+        self.subcmd_cache_offsets[count] = @intCast(buf_pos);
+        self.subcmd_cache_lens[count] = @intCast(subcmd.len);
+        buf_pos += subcmd.len;
+        count += 1;
+    }
+
+    self.subcmd_cache_count = count;
+}
+
+fn tryFlagCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bool {
+    // extract command + subcommand for tools that use subcommands
+    const trimmed = std.mem.trimLeft(u8, cmd, " \t");
+    const cmd_end = std.mem.indexOfAny(u8, trimmed, " \t") orelse return false;
+    const base_cmd = trimmed[0..cmd_end];
+    if (base_cmd.len == 0 or base_cmd.len > 32) return false;
+
+    // for git/docker/cargo/npm/kubectl/zig etc, include subcommand in --help
+    const has_subcmds = for ([_][]const u8{ "git", "docker", "cargo", "npm", "kubectl", "zig", "go", "rustup", "apt", "systemctl", "ip", "gh" }) |tool| {
+        if (std.mem.eql(u8, base_cmd, tool)) break true;
+    } else false;
+
+    var full_cmd_buf: [64]u8 = undefined;
+    const command = blk: {
+        if (has_subcmds) {
+            const rest = std.mem.trimLeft(u8, trimmed[cmd_end..], " \t");
+            if (rest.len > 0) {
+                const sub_end = std.mem.indexOfAny(u8, rest, " \t") orelse rest.len;
+                const sub = rest[0..sub_end];
+                // only include if subcommand doesn't start with - (it's a flag not a subcmd)
+                if (sub.len > 0 and sub[0] != '-') {
+                    break :blk std.fmt.bufPrint(&full_cmd_buf, "{s} {s}", .{ base_cmd, sub }) catch base_cmd;
+                }
+            }
+        }
+        break :blk base_cmd;
+    };
+    if (command.len > 64) return false;
+
+    const pattern = word_result.word;
+
+    // check cache (TTL 5 minutes)
+    const now = std.time.timestamp();
+    const cache_ttl: i64 = 300; // 5 minutes
+    const cached = self.flag_cache_cmd_len > 0 and
+        self.flag_cache_cmd_len == command.len and
+        std.mem.eql(u8, self.flag_cache_cmd[0..self.flag_cache_cmd_len], command) and
+        (now - self.flag_cache_ts) < cache_ttl;
+
+    if (!cached) {
+        // run command --help and parse flags
+        parseFlagsFromHelp(self, command) catch {
+            self.flag_cache_count = 0;
+        };
+        self.flag_cache_ts = now;
+    }
+
+    if (self.flag_cache_count == 0) return false;
+
+    var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 32);
+    defer {
+        for (matches.items) |m| self.allocator.free(m);
+        matches.deinit(self.allocator);
+    }
+
+    // collect matching flag indices for description lookup
+    var match_indices: [256]usize = undefined;
+    var match_count: usize = 0;
+
+    for (0..self.flag_cache_count) |i| {
+        const off = self.flag_cache_offsets[i];
+        const len = self.flag_cache_lens[i];
+        const flag = self.flag_cache_buf[off .. off + len];
+        if (std.mem.startsWith(u8, flag, pattern)) {
+            const owned = try self.allocator.dupe(u8, flag);
+            try matches.append(self.allocator, owned);
+            if (match_count < 256) {
+                match_indices[match_count] = i;
+                match_count += 1;
+            }
+        }
+    }
+
+    if (matches.items.len == 0) return false;
+    if (matches.items.len == 1) {
+        return try applySingleCompletion(self, matches.items[0], word_result);
+    } else {
+        // check if any match has a description
+        var has_descs = false;
+        for (0..match_count) |mi| {
+            if (self.flag_desc_lens[match_indices[mi]] > 0) {
+                has_descs = true;
+                break;
+            }
+        }
+        if (has_descs) {
+            return try showFlagCompletionsWithDesc(self, &matches, match_indices[0..match_count], word_result, pattern);
+        }
+        return try showCompletionMatches(self, &matches, word_result, pattern);
+    }
+}
+
+fn parseFlagsFromHelp(self: *Shell, command: []const u8) !void {
+    self.flag_cache_count = 0;
+    @memcpy(self.flag_cache_cmd[0..command.len], command);
+    self.flag_cache_cmd_len = command.len;
+
+    var argv_buf: [128]u8 = undefined;
+    var child = std.process.Child.init(
+        &.{ "/bin/sh", "-c", std.fmt.bufPrint(&argv_buf, "{s} --help 2>&1", .{command}) catch return },
+        self.allocator,
+    );
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+
+    const stdout = child.stdout.?;
+    var buf_pos: usize = 0;
+    var desc_pos: usize = 0;
+    var count: usize = 0;
+
+    // read help output and parse flags
+    var read_buf: [16384]u8 = undefined;
+    var total_read: usize = 0;
+    while (total_read < read_buf.len) {
+        const n = stdout.read(read_buf[total_read..]) catch break;
+        if (n == 0) break;
+        total_read += n;
+    }
+
+    _ = child.wait() catch {};
+
+    // parse flags from help text — extract flag + description
+    const text = read_buf[0..total_read];
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '-' and i + 1 < text.len and
+            (i == 0 or text[i - 1] == ' ' or text[i - 1] == '\t' or text[i - 1] == '\n' or text[i - 1] == ',' or text[i - 1] == '['))
+        {
+            const flag_start = i;
+            i += 1;
+            if (i < text.len and text[i] == '-') i += 1; // --
+            // require at least one alpha char
+            if (i >= text.len or !std.ascii.isAlphabetic(text[i])) {
+                continue;
+            }
+            while (i < text.len and (std.ascii.isAlphanumeric(text[i]) or text[i] == '-' or text[i] == '_')) : (i += 1) {}
+            const flag = text[flag_start..i];
+            // skip single dash alone, require -X or --word (min 2 chars)
+            if (flag.len > 1 and flag.len < 255 and count < 256) {
+                // deduplicate
+                var dup = false;
+                for (0..count) |j| {
+                    const existing = self.flag_cache_buf[self.flag_cache_offsets[j] .. self.flag_cache_offsets[j] + self.flag_cache_lens[j]];
+                    if (std.mem.eql(u8, existing, flag)) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup and buf_pos + flag.len <= self.flag_cache_buf.len) {
+                    @memcpy(self.flag_cache_buf[buf_pos .. buf_pos + flag.len], flag);
+                    self.flag_cache_offsets[count] = @intCast(buf_pos);
+                    self.flag_cache_lens[count] = @intCast(flag.len);
+                    buf_pos += flag.len;
+
+                    // extract description: skip to end of flag group, then grab description text
+                    const desc = extractFlagDescription(text, i);
+                    const desc_len = @min(desc.len, 60); // cap at 60 chars
+                    if (desc_len > 0 and desc_pos + desc_len <= self.flag_desc_buf.len) {
+                        @memcpy(self.flag_desc_buf[desc_pos .. desc_pos + desc_len], desc[0..desc_len]);
+                        self.flag_desc_offsets[count] = @intCast(desc_pos);
+                        self.flag_desc_lens[count] = @intCast(desc_len);
+                        desc_pos += desc_len;
+                    } else {
+                        self.flag_desc_offsets[count] = 0;
+                        self.flag_desc_lens[count] = 0;
+                    }
+
+                    count += 1;
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    self.flag_cache_count = count;
+
+    // If most flags lack descriptions, try man page as fallback
+    if (count > 0) {
+        var desc_count: usize = 0;
+        for (0..count) |j| {
+            if (self.flag_desc_lens[j] > 0) desc_count += 1;
+        }
+        // Only try man page if less than 30% have descriptions
+        if (desc_count * 100 / count < 30) {
+            augmentFlagsFromMan(self, command, count, &desc_pos);
+        }
+    }
+}
+
+/// Parse man page output to fill in missing flag descriptions.
+/// Only augments flags that already exist in the cache but lack descriptions.
+fn augmentFlagsFromMan(self: *Shell, command: []const u8, count: usize, desc_pos: *usize) void {
+    // Extract base command (strip subcommands for man page lookup)
+    const base_cmd = if (std.mem.indexOfScalar(u8, command, ' ')) |sp| command[0..sp] else command;
+
+    var argv_buf: [128]u8 = undefined;
+    const man_cmd = std.fmt.bufPrint(&argv_buf, "COLUMNS=200 man {s} 2>/dev/null | col -bx", .{base_cmd}) catch return;
+
+    var child = std.process.Child.init(
+        &.{ "/bin/sh", "-c", man_cmd },
+        self.allocator,
+    );
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch return;
+
+    const stdout = child.stdout.?;
+    var read_buf: [32768]u8 = undefined;
+    var total_read: usize = 0;
+    while (total_read < read_buf.len) {
+        const n = stdout.read(read_buf[total_read..]) catch break;
+        if (n == 0) break;
+        total_read += n;
+    }
+    _ = child.wait() catch {};
+
+    if (total_read == 0) return;
+    const text = read_buf[0..total_read];
+
+    // For each cached flag without a description, search man page text
+    for (0..count) |j| {
+        if (self.flag_desc_lens[j] > 0) continue; // already has description
+        const flag = self.flag_cache_buf[self.flag_cache_offsets[j] .. self.flag_cache_offsets[j] + self.flag_cache_lens[j]];
+
+        // Search for the flag in man page text
+        var pos: usize = 0;
+        while (std.mem.indexOfPos(u8, text, pos, flag)) |found| {
+            // Verify it's a word boundary (preceded by whitespace/newline, followed by space/comma/=)
+            if (found > 0 and text[found - 1] != ' ' and text[found - 1] != '\t' and text[found - 1] != '\n') {
+                pos = found + 1;
+                continue;
+            }
+            const after = found + flag.len;
+            if (after < text.len and text[after] != ' ' and text[after] != '\t' and
+                text[after] != ',' and text[after] != '=' and text[after] != '\n' and
+                text[after] != '[' and text[after] != '<')
+            {
+                pos = found + 1;
+                continue;
+            }
+
+            // Try to extract description from this position
+            const desc = extractFlagDescription(text, after);
+            const desc_len = @min(desc.len, 60);
+            if (desc_len > 0 and desc_pos.* + desc_len <= self.flag_desc_buf.len) {
+                @memcpy(self.flag_desc_buf[desc_pos.* .. desc_pos.* + desc_len], desc[0..desc_len]);
+                self.flag_desc_offsets[j] = @intCast(desc_pos.*);
+                self.flag_desc_lens[j] = @intCast(desc_len);
+                desc_pos.* += desc_len;
+                break;
+            }
+            pos = found + 1;
+        }
+    }
+}
+
+/// Extract description text after a flag from help output.
+/// Handles common formats:
+///   -f, --flag          Description text here
+///   -f, --flag=VALUE    Description text here
+///   --flag              Description text here
+///       Description continues on next indented line
+fn extractFlagDescription(text: []const u8, flag_end: usize) []const u8 {
+    var i = flag_end;
+
+    // skip past any =VALUE, [VALUE], <VALUE>, or comma-separated short/long variants
+    while (i < text.len and text[i] != '\n') {
+        if (text[i] == ',' and i + 1 < text.len and text[i + 1] == ' ') {
+            // skip ", -x" or ", --long" (another flag variant)
+            i += 2;
+            while (i < text.len and text[i] != ' ' and text[i] != '\t' and text[i] != '\n') : (i += 1) {}
+        } else if (text[i] == '=' or text[i] == '[' or text[i] == '<') {
+            // skip value placeholder
+            while (i < text.len and text[i] != ' ' and text[i] != '\t' and text[i] != '\n') : (i += 1) {}
+        } else if (text[i] == ' ' or text[i] == '\t') {
+            break;
+        } else {
+            i += 1;
+        }
+    }
+
+    // skip whitespace between flag and description (often 2+ spaces or tab)
+    var spaces: usize = 0;
+    while (i < text.len and (text[i] == ' ' or text[i] == '\t')) {
+        if (text[i] == '\t') spaces += 4 else spaces += 1;
+        i += 1;
+    }
+
+    // need at least 2 spaces gap to be a description (not a continuation flag)
+    if (spaces < 2 or i >= text.len or text[i] == '\n') return "";
+
+    // capture until end of line
+    const desc_start = i;
+    while (i < text.len and text[i] != '\n') : (i += 1) {}
+
+    // trim trailing whitespace
+    var end = i;
+    while (end > desc_start and (text[end - 1] == ' ' or text[end - 1] == '\t')) end -= 1;
+
+    if (end <= desc_start) return "";
+    return text[desc_start..end];
+}
+
+/// Show flag completions with descriptions in single-column layout
+fn showFlagCompletionsWithDesc(self: *Shell, matches: *std.ArrayList([]const u8), match_indices: []const usize, word_result: WordResult, pattern: []const u8) !bool {
+    if (matches.items.len == 0) return false;
+
+    // store matches for cycling
+    self.completion_matches.deinit(self.allocator);
+    self.completion_matches = .{};
+    for (matches.items) |m| {
+        const owned = try self.allocator.dupe(u8, m);
+        try self.completion_matches.append(self.allocator, owned);
+    }
+    self.completion_index = 0;
+    self.completion_word_start = word_result.start;
+    self.completion_word_end = word_result.end;
+    self.completion_pattern_len = pattern.len;
+
+    // display with descriptions
+    const term_width = self.terminal_width;
+    const term_height = self.terminal_height;
+    const max_menu_height = if (term_height > 3) term_height - 3 else 1;
+
+    try self.stdout().writeAll("\x1b[s");
+    const cmd_rows = self.term_view.term.rows_owned;
+    const cursor_row = self.term_view.term.row;
+    const rows_below_cursor = if (cmd_rows > cursor_row + 1) cmd_rows - cursor_row - 1 else 0;
+    if (rows_below_cursor > 0) {
+        try self.stdout().print("\x1b[{d}B", .{rows_below_cursor});
+    }
+    try self.stdout().writeByte('\n');
+
+    // find max flag length for alignment
+    var max_flag_len: usize = 0;
+    for (matches.items) |m| {
+        if (m.len > max_flag_len) max_flag_len = m.len;
+    }
+    max_flag_len = @min(max_flag_len, 25);
+
+    const items_to_show = @min(matches.items.len, max_menu_height);
+    const start_idx: usize = if (matches.items.len > items_to_show) blk: {
+        const half = items_to_show / 2;
+        if (self.completion_index < half) break :blk 0;
+        if (self.completion_index + half >= matches.items.len) break :blk matches.items.len - items_to_show;
+        break :blk self.completion_index - half;
+    } else 0;
+    const end_idx = @min(start_idx + items_to_show, matches.items.len);
+
+    for (start_idx..end_idx) |idx| {
+        const flag = matches.items[idx];
+        const cache_idx = if (idx < match_indices.len) match_indices[idx] else 0;
+        const desc_len = self.flag_desc_lens[cache_idx];
+        const desc = if (desc_len > 0) self.flag_desc_buf[self.flag_desc_offsets[cache_idx] .. self.flag_desc_offsets[cache_idx] + desc_len] else "";
+
+        const display_flag = if (flag.len > 25) flag[0..24] else flag;
+        const is_selected = idx == self.completion_index;
+
+        if (is_selected) {
+            try self.stdout().print("{f}", .{tty.Style.reverse});
+        }
+        try self.stdout().print("{s}", .{display_flag});
+        if (flag.len > 25) try self.stdout().writeByte('~');
+        if (is_selected) {
+            try self.stdout().print("{f}", .{tty.Style.reset});
+        }
+
+        // pad to alignment column
+        const actual_len = if (flag.len > 25) @as(usize, 25) else flag.len;
+        const padding = if (max_flag_len + 2 > actual_len) max_flag_len + 2 - actual_len else 1;
+        var p: usize = 0;
+        while (p < padding) : (p += 1) try self.stdout().writeByte(' ');
+
+        // description in dim
+        if (desc.len > 0) {
+            const max_desc = if (term_width > max_flag_len + 4) term_width - max_flag_len - 4 else 20;
+            const show_desc = if (desc.len > max_desc) desc[0..max_desc] else desc;
+            try self.stdout().print("\x1b[2m{s}\x1b[22m", .{show_desc});
+        }
+        try self.stdout().writeByte('\n');
+    }
+
+    if (end_idx < matches.items.len) {
+        try self.stdout().print("... ({} more)\n", .{matches.items.len - end_idx});
+        self.completion_menu_lines = items_to_show + 1;
+    } else if (start_idx > 0) {
+        try self.stdout().print("... ({} hidden above)\n", .{start_idx});
+        self.completion_menu_lines = items_to_show + 1;
+    } else {
+        self.completion_menu_lines = items_to_show;
+    }
+
+    try self.stdout().writeAll("\x1b[u");
+    try self.stdout().flush();
+    self.completion_displayed = true;
+    return true;
+}
+
 fn getGitBranches(self: *Shell, matches: *std.ArrayList([]const u8), pattern: []const u8) !void {
+    // local branches from .git/refs/heads/
     const refs_dir = std.fs.cwd().openDir(".git/refs/heads", .{ .iterate = true }) catch return;
     var dir = refs_dir;
     defer dir.close();
+
+    var local_set: [64][64]u8 = undefined;
+    var local_lens: [64]usize = undefined;
+    var local_count: usize = 0;
 
     var iter = dir.iterate();
     while (try iter.next()) |entry| {
         if (entry.kind == .file and std.mem.startsWith(u8, entry.name, pattern)) {
             const branch = try self.allocator.dupe(u8, entry.name);
             try matches.append(self.allocator, branch);
+            // track local branch names to avoid duplicating as remote
+            if (local_count < 64 and entry.name.len < 64) {
+                @memcpy(local_set[local_count][0..entry.name.len], entry.name);
+                local_lens[local_count] = entry.name.len;
+                local_count += 1;
+            }
         }
     }
+
+    // remote branches from .git/refs/remotes/*/
+    const remotes_dir = std.fs.cwd().openDir(".git/refs/remotes", .{ .iterate = true }) catch return;
+    var rdir = remotes_dir;
+    defer rdir.close();
+
+    var remote_iter = rdir.iterate();
+    while (try remote_iter.next()) |remote_entry| {
+        if (remote_entry.kind != .directory) continue;
+        const remote_name = remote_entry.name;
+
+        var remote_branch_dir = rdir.openDir(remote_name, .{ .iterate = true }) catch continue;
+        defer remote_branch_dir.close();
+
+        var branch_iter = remote_branch_dir.iterate();
+        while (try branch_iter.next()) |branch_entry| {
+            if (branch_entry.kind != .file) continue;
+            if (std.mem.eql(u8, branch_entry.name, "HEAD")) continue;
+            if (!std.mem.startsWith(u8, branch_entry.name, pattern)) continue;
+
+            // skip if already in local branches
+            var is_local = false;
+            for (0..local_count) |li| {
+                if (local_lens[li] == branch_entry.name.len and
+                    std.mem.eql(u8, local_set[li][0..local_lens[li]], branch_entry.name))
+                {
+                    is_local = true;
+                    break;
+                }
+            }
+            if (is_local) continue;
+
+            const branch = try self.allocator.dupe(u8, branch_entry.name);
+            try matches.append(self.allocator, branch);
+        }
+    }
+
+    // also read packed-refs for branches that have been packed by git gc
+    readPackedRefs(self, matches, "refs/heads/", pattern, local_set[0..local_count], local_lens[0..local_count]) catch {};
+}
+
+/// Parse .git/packed-refs for refs matching a prefix (e.g. "refs/heads/", "refs/tags/")
+fn readPackedRefs(self: *Shell, matches: *std.ArrayList([]const u8), ref_prefix: []const u8, pattern: []const u8, existing: [][64]u8, existing_lens: []usize) !void {
+    const file = std.fs.cwd().openFile(".git/packed-refs", .{}) catch return;
+    defer file.close();
+
+    var buf: [8192]u8 = undefined;
+    const n = file.read(&buf) catch return;
+    const text = buf[0..n];
+
+    var line_start: usize = 0;
+    while (line_start < text.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
+        const line = text[line_start..line_end];
+        line_start = line_end + 1;
+
+        // skip comments and peeled refs (^)
+        if (line.len == 0 or line[0] == '#' or line[0] == '^') continue;
+
+        // format: <hash> <ref>
+        const space = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+        const ref = line[space + 1 ..];
+
+        if (!std.mem.startsWith(u8, ref, ref_prefix)) continue;
+        const branch_name = ref[ref_prefix.len..];
+        if (!std.mem.startsWith(u8, branch_name, pattern)) continue;
+
+        // deduplicate against existing matches
+        var is_dup = false;
+        for (0..existing.len) |ei| {
+            if (existing_lens[ei] == branch_name.len and
+                std.mem.eql(u8, existing[ei][0..existing_lens[ei]], branch_name))
+            {
+                is_dup = true;
+                break;
+            }
+        }
+        if (is_dup) continue;
+
+        // also check already-added matches
+        for (matches.items) |m| {
+            if (std.mem.eql(u8, m, branch_name)) {
+                is_dup = true;
+                break;
+            }
+        }
+        if (is_dup) continue;
+
+        const owned = try self.allocator.dupe(u8, branch_name);
+        try matches.append(self.allocator, owned);
+    }
+}
+
+fn getGitTags(self: *Shell, matches: *std.ArrayList([]const u8), pattern: []const u8) !void {
+    var existing_set: [64][64]u8 = undefined;
+    var existing_lens: [64]usize = undefined;
+    var existing_count: usize = 0;
+
+    const tags_dir = std.fs.cwd().openDir(".git/refs/tags", .{ .iterate = true }) catch {
+        // no refs/tags dir — try packed-refs only
+        readPackedRefs(self, matches, "refs/tags/", pattern, &.{}, &.{}) catch {};
+        return;
+    };
+    var dir = tags_dir;
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind == .file and std.mem.startsWith(u8, entry.name, pattern)) {
+            const tag = try self.allocator.dupe(u8, entry.name);
+            try matches.append(self.allocator, tag);
+            if (existing_count < 64 and entry.name.len < 64) {
+                @memcpy(existing_set[existing_count][0..entry.name.len], entry.name);
+                existing_lens[existing_count] = entry.name.len;
+                existing_count += 1;
+            }
+        }
+    }
+
+    // also check packed-refs
+    readPackedRefs(self, matches, "refs/tags/", pattern, existing_set[0..existing_count], existing_lens[0..existing_count]) catch {};
 }
 
 fn applySingleCompletion(self: *Shell, match: []const u8, word_result: WordResult) !bool {
@@ -559,6 +2299,10 @@ fn applySingleCompletion(self: *Shell, match: []const u8, word_result: WordResul
 
     self.edit_buf.cursor = @intCast(word_end);
     _ = self.edit_buf.insertSlice(escaped);
+
+    // log accepted completion for training data
+    logCompletion(self.edit_buf.slice(), word_result.start, pattern, match);
+
     try self.renderLine();
     return true;
 }
@@ -708,6 +2452,10 @@ fn applyCompletion(self: *Shell, pattern_len: usize) !void {
     self.edit_buf.len = @intCast(self.completion_original_len);
     self.edit_buf.cursor = @intCast(self.completion_word_end);
     _ = self.edit_buf.insertSlice(escaped);
+
+    // log accepted completion for training data
+    const pattern = match[0..pattern_len];
+    logCompletion(self.edit_buf.slice(), self.completion_word_start, pattern, match);
 }
 
 pub fn displayCompletions(self: *Shell) !void {
@@ -824,6 +2572,101 @@ pub fn displayCompletions(self: *Shell) !void {
     self.completion_displayed = true;
 }
 
+// Log accepted completion pairs to ~/.zish/completion_log.jsonl for CTM training data.
+// Format: {"ctx":"command text before cursor","pfx":"typed prefix","cmp":"full completion","ts":unix_timestamp}
+const CompletionSource = enum { tab, ghost_history, ghost_ctm, history_menu };
+
+fn logCompletionWith(cmd: []const u8, word_start: usize, prefix: []const u8, completion: []const u8, source: CompletionSource) void {
+    logCompletionImpl(cmd, word_start, prefix, completion, source);
+}
+
+fn logCompletion(cmd: []const u8, word_start: usize, prefix: []const u8, completion: []const u8) void {
+    logCompletionImpl(cmd, word_start, prefix, completion, .tab);
+}
+
+fn logCompletionImpl(cmd: []const u8, word_start: usize, prefix: []const u8, completion: []const u8, source: CompletionSource) void {
+    var path_buf: [512]u8 = undefined;
+    const home = std.process.getEnvVarOwned(std.heap.page_allocator, "HOME") catch return;
+    defer std.heap.page_allocator.free(home);
+    const path = std.fmt.bufPrint(&path_buf, "{s}/.zish/completion_log.jsonl", .{home}) catch return;
+
+    const file = std.fs.cwd().openFile(path, .{ .mode = .write_only }) catch |e| switch (e) {
+        error.FileNotFound => std.fs.cwd().createFile(path, .{}) catch return,
+        else => return,
+    };
+    defer file.close();
+    file.seekFromEnd(0) catch return;
+
+    const ctx = cmd[0..@min(word_start, cmd.len)];
+    const ts: u64 = @bitCast(std.time.timestamp());
+
+    // write JSON with manual escaping
+    var buf: [4096]u8 = undefined;
+    var pos: usize = 0;
+    pos += copySlice(&buf, pos, "{\"ctx\":\"");
+    pos = writeJsonEscaped(&buf, pos, ctx);
+    pos += copySlice(&buf, pos, "\",\"pfx\":\"");
+    pos = writeJsonEscaped(&buf, pos, prefix);
+    pos += copySlice(&buf, pos, "\",\"cmp\":\"");
+    pos = writeJsonEscaped(&buf, pos, completion);
+    pos += copySlice(&buf, pos, "\",\"src\":\"");
+    pos += copySlice(&buf, pos, switch (source) {
+        .tab => "tab",
+        .ghost_history => "ghost_h",
+        .ghost_ctm => "ghost_ctm",
+        .history_menu => "hist",
+    });
+    pos += copySlice(&buf, pos, "\",\"ts\":");
+    pos += (std.fmt.bufPrint(buf[pos..], "{d}", .{ts}) catch return).len;
+    pos += copySlice(&buf, pos, "}\n");
+
+    _ = file.write(buf[0..pos]) catch {};
+}
+
+fn copySlice(buf: *[4096]u8, pos: usize, s: []const u8) usize {
+    if (pos + s.len > buf.len) return 0;
+    @memcpy(buf[pos..][0..s.len], s);
+    return s.len;
+}
+
+fn writeJsonEscaped(buf: *[4096]u8, start: usize, s: []const u8) usize {
+    var pos = start;
+    for (s) |c| {
+        if (pos + 6 > buf.len) break;
+        switch (c) {
+            '"' => {
+                pos += copySlice(buf, pos, "\\\"");
+            },
+            '\\' => {
+                pos += copySlice(buf, pos, "\\\\");
+            },
+            '\n' => {
+                pos += copySlice(buf, pos, "\\n");
+            },
+            '\r' => {
+                pos += copySlice(buf, pos, "\\r");
+            },
+            '\t' => {
+                pos += copySlice(buf, pos, "\\t");
+            },
+            else => if (c < 0x20) {
+                const hex = "0123456789abcdef";
+                buf[pos] = '\\';
+                buf[pos + 1] = 'u';
+                buf[pos + 2] = '0';
+                buf[pos + 3] = '0';
+                buf[pos + 4] = hex[c >> 4];
+                buf[pos + 5] = hex[c & 0xf];
+                pos += 6;
+            } else {
+                buf[pos] = c;
+                pos += 1;
+            },
+        }
+    }
+    return pos;
+}
+
 pub fn updateCompletionHighlight(self: *Shell, old_index: usize) !void {
     const term_width = self.terminal_width;
 
@@ -902,4 +2745,254 @@ pub fn updateCompletionHighlight(self: *Shell, old_index: usize) !void {
     // restore cursor to command line
     try self.stdout().writeAll("\x1b[u");
     try self.stdout().flush();
+}
+
+// ============================================================
+// Ghost text autosuggestion (fish-style)
+// ============================================================
+
+/// Update ghost text suggestion based on current input.
+/// Searches history for a prefix match and stores the suffix in ghost_buf.
+pub fn updateGhostText(self: *Shell) void {
+    self.ghost_len = 0;
+
+    if (!self.opt_autosuggestion) return;
+
+    // only suggest when cursor is at end and we have content
+    const cmd = self.edit_buf.slice();
+    if (cmd.len < 2 or self.edit_buf.cursor != self.edit_buf.len) return;
+    if (self.completion_mode) return;
+
+    // check for CTM inference result (non-blocking)
+    const cur_seq = self.ghost_infer_seq.load(.monotonic);
+    const res_seq = self.ghost_infer_result_seq.load(.monotonic);
+    if (res_seq == cur_seq and res_seq > 0) {
+        const rlen = self.ghost_infer_result_len.load(.monotonic);
+        if (rlen > 0) {
+            const n = @min(rlen, self.ghost_buf.len);
+            @memcpy(self.ghost_buf[0..n], self.ghost_infer_result[0..n]);
+            self.ghost_len = n;
+            self.ghost_from_ctm = true;
+            return; // CTM result takes priority
+        }
+    }
+
+    // submit new CTM inference request if model configured
+    // thread checks staleness — discards result if user typed more during inference
+    if (self.ghost_infer_thread != null and cmd.len <= self.ghost_infer_input.len) {
+        const new_seq = cur_seq +% 1;
+        const len: u32 = @intCast(cmd.len);
+        @memcpy(self.ghost_infer_input[0..cmd.len], cmd);
+        self.ghost_infer_input_len.store(len, .monotonic);
+        self.ghost_infer_seq.store(new_seq, .release);
+    }
+
+    // fast path: history-based suggestion
+    const h = self.history orelse return;
+    const items = h.entries.items;
+
+    // Strategy 1: full prefix match (strongest signal)
+    var best_idx: ?usize = null;
+    var best_freq: u16 = 0;
+    var best_ts: u32 = 0;
+    for (0..items.len) |i| {
+        const idx = items.len - 1 - i;
+        const entry = items[idx];
+        const command = h.getCommand(entry);
+        if (command.len > cmd.len and std.mem.startsWith(u8, command, cmd)) {
+            if (best_idx == null or entry.frequency > best_freq or
+                (entry.frequency == best_freq and entry.timestamp > best_ts))
+            {
+                best_idx = idx;
+                best_freq = entry.frequency;
+                best_ts = entry.timestamp;
+            }
+            if (i > 500) break;
+        }
+    }
+
+    if (best_idx) |idx| {
+        const command = h.getCommand(items[idx]);
+        const suffix = command[cmd.len..];
+        const n = @min(suffix.len, self.ghost_buf.len);
+        @memcpy(self.ghost_buf[0..n], suffix[0..n]);
+        self.ghost_len = n;
+        self.ghost_from_ctm = false;
+        return;
+    }
+
+    // Strategy 2: match last segment after pipe/semicolon
+    // e.g. "git log | grep fo" matches history "grep foo --color" → suggests "o --color"
+    const last_seg = blk: {
+        var pos = cmd.len;
+        while (pos > 0) : (pos -= 1) {
+            if (cmd[pos - 1] == '|' or cmd[pos - 1] == ';') {
+                break :blk std.mem.trimLeft(u8, cmd[pos..], " \t");
+            }
+        }
+        break :blk @as([]const u8, "");
+    };
+    if (last_seg.len >= 2) {
+        var seg_best_idx: ?usize = null;
+        var seg_best_freq: u16 = 0;
+        var seg_best_ts: u32 = 0;
+        for (0..items.len) |i| {
+            const idx = items.len - 1 - i;
+            const entry = items[idx];
+            const command = h.getCommand(entry);
+            if (command.len > last_seg.len and std.mem.startsWith(u8, command, last_seg)) {
+                if (seg_best_idx == null or entry.frequency > seg_best_freq or
+                    (entry.frequency == seg_best_freq and entry.timestamp > seg_best_ts))
+                {
+                    seg_best_idx = idx;
+                    seg_best_freq = entry.frequency;
+                    seg_best_ts = entry.timestamp;
+                }
+                if (i > 500) break;
+            }
+        }
+        if (seg_best_idx) |idx| {
+            const command = h.getCommand(items[idx]);
+            const suffix = command[last_seg.len..];
+            const n = @min(suffix.len, self.ghost_buf.len);
+            @memcpy(self.ghost_buf[0..n], suffix[0..n]);
+            self.ghost_len = n;
+            self.ghost_from_ctm = false;
+        }
+    }
+}
+
+/// Start the ghost inference background thread (called when completion_model is configured).
+pub fn startGhostInference(self: *Shell, model_path: []const u8) void {
+    if (self.ghost_infer_thread != null) return;
+    if (model_path.len == 0) return;
+
+    // Copy model path to a stable location (self is heap-allocated, fields are stable)
+    var path_buf: [256]u8 = undefined;
+    if (model_path.len > path_buf.len) return;
+    @memcpy(path_buf[0..model_path.len], model_path);
+
+    const GhostInferCtx = struct {
+        shell: *Shell,
+        path: [256]u8,
+        path_len: usize,
+    };
+
+    // Allocate context on heap so thread can reference it
+    const ctx = self.allocator.create(GhostInferCtx) catch return;
+    ctx.* = .{ .shell = self, .path = path_buf, .path_len = model_path.len };
+
+    self.ghost_infer_thread = std.Thread.spawn(.{}, ghostInferThread, .{ctx}) catch {
+        self.allocator.destroy(ctx);
+        return;
+    };
+}
+
+fn ghostInferThread(ctx: anytype) void {
+    const shell = ctx.shell;
+    const model_path = ctx.path[0..ctx.path_len];
+    const alloc = shell.allocator;
+
+    // Spawn ForkServer for inference
+    const inference = @import("inference/root.zig");
+    var server = inference.ForkServer.spawn(model_path) catch {
+        alloc.destroy(ctx);
+        return;
+    };
+    defer server.shutdown();
+    alloc.destroy(ctx);
+
+    var last_seq: u32 = 0;
+
+    while (!shell.ghost_infer_stop.load(.monotonic)) {
+        // wait for new request
+        const seq = shell.ghost_infer_seq.load(.acquire);
+        if (seq == last_seq) {
+            std.Thread.sleep(20 * std.time.ns_per_ms); // 20ms poll
+            continue;
+        }
+        last_seq = seq;
+
+        // debounce: wait 100ms for input to stabilize before expensive inference
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+        if (shell.ghost_infer_seq.load(.monotonic) != seq) continue;
+
+        // read input
+        const ilen = shell.ghost_infer_input_len.load(.monotonic);
+        if (ilen == 0 or ilen > 512) continue;
+        var input_buf: [512]u8 = undefined;
+        @memcpy(input_buf[0..ilen], shell.ghost_infer_input[0..ilen]);
+
+        // run inference (short: max 32 tokens, low temp for deterministic)
+        if (!server.isAlive()) {
+            server = inference.ForkServer.spawn(model_path) catch break;
+        }
+        const result = server.generate(input_buf[0..ilen], 32, 0.1, alloc) catch continue;
+        defer alloc.free(result);
+
+        // check if still current
+        if (shell.ghost_infer_seq.load(.monotonic) != seq) continue;
+
+        // write result
+        const rlen: u32 = @intCast(@min(result.len, 512));
+        if (rlen > 0) {
+            @memcpy(shell.ghost_infer_result[0..rlen], result[0..rlen]);
+        }
+        shell.ghost_infer_result_len.store(rlen, .monotonic);
+        shell.ghost_infer_result_seq.store(seq, .release);
+    }
+}
+
+/// Stop the ghost inference thread.
+pub fn stopGhostInference(self: *Shell) void {
+    self.ghost_infer_stop.store(true, .monotonic);
+    if (self.ghost_infer_thread) |t| {
+        t.join();
+        self.ghost_infer_thread = null;
+    }
+}
+
+/// Accept ghost text — append it to the edit buffer.
+/// Returns true if ghost text was accepted.
+pub fn acceptGhostText(self: *Shell) bool {
+    if (self.ghost_len == 0) return false;
+    if (self.edit_buf.cursor != self.edit_buf.len) return false;
+
+    const ghost = self.ghost_buf[0..self.ghost_len];
+    _ = self.edit_buf.insertSlice(ghost);
+    self.ghost_len = 0;
+
+    // log accepted ghost suggestion with source tracking
+    logCompletionWith(self.edit_buf.slice(), 0, "", self.edit_buf.slice(),
+        if (self.ghost_from_ctm) .ghost_ctm else .ghost_history);
+
+    return true;
+}
+
+/// Accept one word from ghost text (Ctrl+Right).
+/// Returns true if a word was accepted.
+pub fn acceptGhostWord(self: *Shell) bool {
+    if (self.ghost_len == 0) return false;
+    if (self.edit_buf.cursor != self.edit_buf.len) return false;
+
+    const ghost = self.ghost_buf[0..self.ghost_len];
+
+    // find end of first word: skip leading spaces, then skip non-spaces
+    var i: usize = 0;
+    while (i < ghost.len and ghost[i] == ' ') : (i += 1) {}
+    while (i < ghost.len and ghost[i] != ' ') : (i += 1) {}
+
+    if (i == 0) return false;
+
+    // insert the word
+    _ = self.edit_buf.insertSlice(ghost[0..i]);
+
+    // shift remaining ghost text
+    const remaining = self.ghost_len - i;
+    if (remaining > 0) {
+        std.mem.copyForwards(u8, &self.ghost_buf, self.ghost_buf[i..self.ghost_len]);
+    }
+    self.ghost_len = remaining;
+
+    return true;
 }
