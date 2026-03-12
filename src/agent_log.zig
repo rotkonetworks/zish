@@ -440,6 +440,17 @@ pub const AgentConfig = struct {
     max_tool_iterations: u32,
     max_agents: u8,
     auto_allow: bool,
+    // Router config
+    router_enabled: bool = false,
+    router_provider: []const u8 = "",
+    router_model: []const u8 = "claude-haiku-4-5-20251001",
+    router_base_url: []const u8 = "",
+    router_local_only: bool = false, // true = never call router API, only use local patterns
+    router_local_model: []const u8 = "", // path to local GGUF model for pure-Zig inference
+    completion_model: []const u8 = "", // path to GGUF model for shell completion (ghost text)
+    haiku_model: []const u8 = "claude-haiku-4-5-20251001",
+    sonnet_model: []const u8 = "claude-sonnet-4-6",
+    opus_model: []const u8 = "claude-opus-4-6",
 
     // Allocation tracking for proper cleanup
     // Max 7 possible: file content, creds content, 4 env vars, api_key_cmd stdout
@@ -522,6 +533,25 @@ pub const AgentConfig = struct {
             const trimmed = std.mem.trimLeft(u8, after, " \t\n\r:");
             self.auto_allow = std.mem.startsWith(u8, trimmed, "true");
         }
+        // Router config
+        if (std.mem.indexOf(u8, content, "\"router_enabled\"")) |idx| {
+            const after = content[@min(idx + 16, content.len)..];
+            const trimmed = std.mem.trimLeft(u8, after, " \t\n\r:");
+            self.router_enabled = std.mem.startsWith(u8, trimmed, "true");
+        }
+        if (jsonExtractStr(content, "router_model")) |v| self.router_model = v;
+        if (jsonExtractStr(content, "router_provider")) |v| self.router_provider = v;
+        if (jsonExtractStr(content, "router_base_url")) |v| self.router_base_url = v;
+        if (std.mem.indexOf(u8, content, "\"router_local_only\"")) |idx| {
+            const after = content[@min(idx + 19, content.len)..];
+            const trimmed = std.mem.trimLeft(u8, after, " \t\n\r:");
+            self.router_local_only = std.mem.startsWith(u8, trimmed, "true");
+        }
+        if (jsonExtractStr(content, "router_local_model")) |v| self.router_local_model = v;
+        if (jsonExtractStr(content, "completion_model")) |v| self.completion_model = v;
+        if (jsonExtractStr(content, "haiku_model")) |v| self.haiku_model = v;
+        if (jsonExtractStr(content, "sonnet_model")) |v| self.sonnet_model = v;
+        if (jsonExtractStr(content, "opus_model")) |v| self.opus_model = v;
     }
 
     fn loadFromEnv(self: *AgentConfig, allocator: std.mem.Allocator) void {

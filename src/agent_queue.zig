@@ -17,6 +17,7 @@ pub const MsgKind = enum(u8) {
     confirm_request,  // agent -> main: "Run this command? [y/N]"
     confirm_response, // main -> agent: "y" or "n"
     usage_info,       // agent -> main: token usage "input:N output:N cost:$X.XX"
+    router_info,      // agent -> main: routing decision "agent -> sonnet (med cost)"
 };
 
 pub const Msg = struct {
