@@ -120,6 +120,12 @@ pub const Action = union(enum) {
     exit_paste_mode,
     suspend_shell,
     cancel_agent, // Ctrl+G: cancel agent work
+    // readline bindings
+    kill_to_beginning, // Ctrl+U: kill from cursor to start of line
+    kill_to_end, // Ctrl+K: kill from cursor to end of line
+    yank_killed, // Ctrl+Y: paste kill buffer
+    transpose_chars, // Ctrl+T: swap char before cursor with char at cursor
+    insert_last_arg, // Alt+.: insert last argument from previous command
 };
 
 const CTRL_W = 23;
@@ -260,3 +266,253 @@ pub fn isWordChar(c: u8) bool {
 pub fn isWhitespace(c: u8) bool {
     return c == ' ' or c == '\t';
 }
+
+// ── Configurable Keybindings ──
+
+/// Bindable actions — the subset of Action that can be configured via keybindings.
+/// Each maps to a concrete Action value (no payload needed from the binding itself).
+pub const BindableAction = enum(u8) {
+    none = 0,
+    // cursor movement
+    move_line_start,
+    move_line_end,
+    move_left,
+    move_right,
+    move_word_forward,
+    move_word_backward,
+    move_up,
+    move_down,
+    // editing
+    backspace,
+    delete_char,
+    delete_word_backward,
+    kill_to_end,
+    kill_to_beginning,
+    yank_killed,
+    transpose_chars,
+    insert_last_arg,
+    undo,
+    // history
+    history_up,
+    history_down,
+    search_backward,
+    search_forward,
+    // shell control
+    cancel,
+    cancel_agent,
+    clear_screen,
+    exit_shell,
+    suspend_shell,
+    execute_command,
+    tab_complete,
+    // vi
+    enter_normal_mode,
+
+    /// Convert to runtime Action
+    pub fn toAction(self: BindableAction) Action {
+        return switch (self) {
+            .none => .none,
+            .move_line_start => .{ .move_cursor = .to_line_start },
+            .move_line_end => .{ .move_cursor = .to_line_end },
+            .move_left => .{ .move_cursor = .{ .relative = -1 } },
+            .move_right => .{ .move_cursor = .{ .relative = 1 } },
+            .move_word_forward => .{ .move_cursor = .{ .word_forward = .word } },
+            .move_word_backward => .{ .move_cursor = .{ .word_backward = .word } },
+            .move_up => .{ .move_cursor = .line_up },
+            .move_down => .{ .move_cursor = .line_down },
+            .backspace => .backspace,
+            .delete_char => .{ .delete = .char_under_cursor },
+            .delete_word_backward => .delete_word_backward,
+            .kill_to_end => .kill_to_end,
+            .kill_to_beginning => .kill_to_beginning,
+            .yank_killed => .yank_killed,
+            .transpose_chars => .transpose_chars,
+            .insert_last_arg => .insert_last_arg,
+            .undo => .undo,
+            .history_up => .{ .history_nav = .up },
+            .history_down => .{ .history_nav = .down },
+            .search_backward => .{ .enter_search_mode = .backward },
+            .search_forward => .{ .enter_search_mode = .forward },
+            .cancel => .cancel,
+            .cancel_agent => .cancel_agent,
+            .clear_screen => .clear_screen,
+            .exit_shell => .exit_shell,
+            .suspend_shell => .suspend_shell,
+            .execute_command => .execute_command,
+            .tab_complete => .tap_complete,
+            .enter_normal_mode => .{ .vim_mode = .{ .set_mode = .normal } },
+        };
+    }
+
+    /// Parse from string name (used by JSON config loader)
+    pub fn fromName(name: []const u8) ?BindableAction {
+        inline for (std.meta.fields(BindableAction)) |field| {
+            if (std.mem.eql(u8, name, field.name)) {
+                return @enumFromInt(field.value);
+            }
+        }
+        return null;
+    }
+};
+
+/// Key identifier for binding lookup
+pub const KeyId = struct {
+    /// Ctrl+key index (0=a, 1=b, ..., 25=z)
+    pub fn ctrl(comptime c: u8) u8 {
+        return (c & 0x1F) - 1; // ctrl+a=0, ctrl+b=1, ..., ctrl+z=25
+    }
+    // Alt+key: use the raw ASCII byte as index into the alt table
+};
+
+/// Keybinding configuration — fixed-size tables for Ctrl and Alt bindings.
+/// Loaded from ~/.zish/keybindings.json at shell startup.
+pub const KeyBindings = struct {
+    /// Ctrl+a (index 0) through Ctrl+z (index 25)
+    ctrl: [26]BindableAction = default_ctrl,
+    /// Alt+<ascii byte> — 128 entries for all ASCII chars
+    alt: [128]BindableAction = default_alt,
+
+    /// Default Ctrl bindings (readline-compatible)
+    /// Index = byte_value - 1, so ctrl+a (0x01) = index 0, ctrl+z (0x1A) = index 25
+    const default_ctrl: [26]BindableAction = blk: {
+        var t = [_]BindableAction{.none} ** 26;
+        t[0] = .move_line_start;       // ctrl+a (0x01)
+        t[1] = .move_left;             // ctrl+b (0x02)
+        t[2] = .cancel;                // ctrl+c (0x03)
+        t[3] = .exit_shell;            // ctrl+d (0x04)
+        t[4] = .move_line_end;         // ctrl+e (0x05)
+        t[5] = .move_right;            // ctrl+f (0x06)
+        t[6] = .cancel_agent;          // ctrl+g (0x07)
+        // t[7] = backspace (ctrl+h=0x08) — handled structurally, not here
+        // t[8] = tab (ctrl+i=0x09) — handled structurally, not here
+        // t[9] = enter (ctrl+j=0x0A) — handled structurally, not here
+        t[10] = .kill_to_end;          // ctrl+k (0x0B)
+        t[11] = .clear_screen;         // ctrl+l (0x0C)
+        // t[12] = enter (ctrl+m=0x0D) — handled structurally
+        t[13] = .history_down;          // ctrl+n (0x0E)
+        t[15] = .history_up;            // ctrl+p (0x10)
+        t[17] = .search_backward;       // ctrl+r (0x12)
+        t[18] = .search_forward;        // ctrl+s (0x13)
+        t[19] = .transpose_chars;       // ctrl+t (0x14)
+        t[20] = .kill_to_beginning;     // ctrl+u (0x15)
+        t[22] = .delete_word_backward;  // ctrl+w (0x17)
+        t[24] = .yank_killed;           // ctrl+y (0x19)
+        t[25] = .suspend_shell;         // ctrl+z (0x1A)
+        break :blk t;
+    };
+
+    /// Default Alt bindings
+    const default_alt: [128]BindableAction = blk: {
+        var t = [_]BindableAction{.none} ** 128;
+        t['b'] = .move_word_backward;
+        t['f'] = .move_word_forward;
+        t['.'] = .insert_last_arg;
+        break :blk t;
+    };
+
+    /// Look up Ctrl+key binding. `byte` is the raw control character (0x01-0x1A).
+    pub fn lookupCtrl(self: *const KeyBindings, byte: u8) ?Action {
+        if (byte < 1 or byte > 26) return null;
+        const ba = self.ctrl[byte - 1];
+        if (ba == .none) return null;
+        return ba.toAction();
+    }
+
+    /// Look up Alt+key binding. `byte` is the ASCII char after ESC.
+    pub fn lookupAlt(self: *const KeyBindings, byte: u8) ?Action {
+        if (byte >= 128) return null;
+        const ba = self.alt[byte];
+        if (ba == .none) return null;
+        return ba.toAction();
+    }
+
+    /// Load keybindings from a JSON file, overriding defaults.
+    /// Format: {"ctrl+a": "move_line_start", "alt+b": "move_word_backward", ...}
+    pub fn loadFromFile(path: []const u8) KeyBindings {
+        var kb = KeyBindings{}; // start with defaults
+        const file = std.fs.cwd().openFile(path, .{}) catch return kb;
+        defer file.close();
+        var buf: [8192]u8 = undefined;
+        const len = file.readAll(&buf) catch return kb;
+        kb.parseJson(buf[0..len]);
+        return kb;
+    }
+
+    /// Parse JSON keybindings. Minimal parser for {"key": "action", ...} format.
+    fn parseJson(self: *KeyBindings, json: []const u8) void {
+        var i: usize = 0;
+        // skip to first '{'
+        while (i < json.len and json[i] != '{') i += 1;
+        if (i >= json.len) return;
+        i += 1;
+
+        while (i < json.len) {
+            // skip whitespace and commas
+            while (i < json.len and (json[i] == ' ' or json[i] == '\t' or json[i] == '\n' or json[i] == '\r' or json[i] == ',')) i += 1;
+            if (i >= json.len or json[i] == '}') break;
+
+            // skip comments (// to end of line)
+            if (i + 1 < json.len and json[i] == '/' and json[i + 1] == '/') {
+                while (i < json.len and json[i] != '\n') i += 1;
+                continue;
+            }
+
+            // parse key string
+            if (json[i] != '"') { i += 1; continue; }
+            i += 1;
+            const key_start = i;
+            while (i < json.len and json[i] != '"') i += 1;
+            if (i >= json.len) break;
+            const key_name = json[key_start..i];
+            i += 1; // skip closing "
+
+            // skip : and whitespace
+            while (i < json.len and (json[i] == ' ' or json[i] == '\t' or json[i] == ':')) i += 1;
+
+            // parse value string
+            if (i >= json.len or json[i] != '"') { i += 1; continue; }
+            i += 1;
+            const val_start = i;
+            while (i < json.len and json[i] != '"') i += 1;
+            if (i >= json.len) break;
+            const action_name = json[val_start..i];
+            i += 1; // skip closing "
+
+            // resolve action
+            const action = BindableAction.fromName(action_name) orelse continue;
+
+            // resolve key
+            if (parseKeyName(key_name)) |key| {
+                switch (key.kind) {
+                    .ctrl => self.ctrl[key.index] = action,
+                    .alt => if (key.index < 128) { self.alt[key.index] = action; },
+                }
+            }
+        }
+    }
+
+    const KeyKind = enum { ctrl, alt };
+    const ParsedKey = struct { kind: KeyKind, index: u8 };
+
+    fn parseKeyName(name: []const u8) ?ParsedKey {
+        // "ctrl+x" format
+        if (name.len >= 6 and std.mem.eql(u8, name[0..5], "ctrl+")) {
+            const ch = name[5];
+            if (ch >= 'a' and ch <= 'z') {
+                return .{ .kind = .ctrl, .index = ch - 'a' };
+            }
+        }
+        // "alt+x" format
+        if (name.len >= 5 and std.mem.eql(u8, name[0..4], "alt+")) {
+            const rest = name[4..];
+            if (rest.len == 1 and rest[0] < 128) {
+                return .{ .kind = .alt, .index = rest[0] };
+            }
+            // special names
+            if (std.mem.eql(u8, rest, "dot") or std.mem.eql(u8, rest, ".")) {
+                return .{ .kind = .alt, .index = '.' };
+            }
+        }
+        return null;
+    }
+};

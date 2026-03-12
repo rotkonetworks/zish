@@ -20,11 +20,14 @@ pub const Color = struct {
 pub const LINE_BUF_SIZE = 4096;
 pub const RENDER_BUF_SIZE = 65536; // 64KB for large multiline content
 
+pub const ViMode = enum { insert, normal };
+
 /// pure text buffer - no rendering logic
 pub const EditBuffer = struct {
     text: [LINE_BUF_SIZE]u8 = undefined,
     len: u16 = 0,
     cursor: u16 = 0,
+    vi_mode: ViMode = .insert,
 
     const Self = @This();
 
@@ -138,6 +141,159 @@ pub const EditBuffer = struct {
         }
         return count;
     }
+
+    /// column offset within current line (chars since last \n or start)
+    pub fn currentCol(self: *const Self) u16 {
+        var col: u16 = 0;
+        var i = self.cursor;
+        while (i > 0 and self.text[i - 1] != '\n') {
+            i -= 1;
+            col += 1;
+        }
+        return col;
+    }
+
+    /// move cursor up one line, preserving column where possible
+    pub fn moveUp(self: *Self) bool {
+        const col = self.currentCol();
+        // find start of current line
+        const line_start = self.cursor - col;
+        if (line_start == 0) return false; // already on first line
+        // go to end of previous line (before the \n)
+        const prev_end = line_start - 1;
+        // find start of previous line
+        var prev_start = prev_end;
+        while (prev_start > 0 and self.text[prev_start - 1] != '\n') {
+            prev_start -= 1;
+        }
+        const prev_len = prev_end - prev_start;
+        self.cursor = @intCast(prev_start + @min(col, prev_len));
+        return true;
+    }
+
+    /// move cursor down one line, preserving column where possible
+    pub fn moveDown(self: *Self) bool {
+        const col = self.currentCol();
+        // find end of current line
+        var pos: u16 = self.cursor;
+        while (pos < self.len and self.text[pos] != '\n') {
+            pos += 1;
+        }
+        if (pos >= self.len) return false; // already on last line
+        // skip the \n to get to next line start
+        const next_start = pos + 1;
+        // find end of next line
+        var next_end = next_start;
+        while (next_end < self.len and self.text[next_end] != '\n') {
+            next_end += 1;
+        }
+        const next_len = next_end - next_start;
+        self.cursor = @intCast(next_start + @min(col, next_len));
+        return true;
+    }
+
+    // ── Vi-mode motions ──
+
+    fn isWordChar(c: u8) bool {
+        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
+    }
+
+    /// move forward to start of next word (vi 'w')
+    pub fn wordForward(self: *Self) void {
+        // skip current word chars
+        while (self.cursor < self.len and isWordChar(self.text[self.cursor])) self.cursor += 1;
+        // skip non-word chars (punctuation/spaces)
+        while (self.cursor < self.len and !isWordChar(self.text[self.cursor]) and self.text[self.cursor] != '\n')
+            self.cursor += 1;
+    }
+
+    /// move backward to start of previous word (vi 'b')
+    pub fn wordBack(self: *Self) void {
+        if (self.cursor == 0) return;
+        self.cursor -= 1;
+        // skip non-word chars
+        while (self.cursor > 0 and !isWordChar(self.text[self.cursor])) self.cursor -= 1;
+        // skip word chars to find start
+        while (self.cursor > 0 and isWordChar(self.text[self.cursor - 1])) self.cursor -= 1;
+    }
+
+    /// move forward to end of word (vi 'e')
+    pub fn wordEnd(self: *Self) void {
+        if (self.cursor >= self.len) return;
+        self.cursor += 1;
+        // skip non-word chars
+        while (self.cursor < self.len and !isWordChar(self.text[self.cursor])) self.cursor += 1;
+        // skip to end of word
+        while (self.cursor < self.len and isWordChar(self.text[self.cursor])) self.cursor += 1;
+        if (self.cursor > 0) self.cursor -= 1;
+    }
+
+    /// delete from cursor to end of line (vi 'D' / 'd$')
+    pub fn deleteToEnd(self: *Self) void {
+        var end = self.cursor;
+        while (end < self.len and self.text[end] != '\n') end += 1;
+        if (end > self.cursor) {
+            // shift remaining text
+            const remaining = self.len - end;
+            if (remaining > 0)
+                std.mem.copyForwards(u8, self.text[self.cursor..self.cursor + remaining], self.text[end..self.len]);
+            self.len -= @intCast(end - self.cursor);
+        }
+    }
+
+    /// delete word under/after cursor (vi 'dw')
+    pub fn deleteWord(self: *Self) void {
+        const start = self.cursor;
+        self.wordForward();
+        const end = self.cursor;
+        self.cursor = @intCast(start);
+        if (end > start) {
+            const remaining = self.len - end;
+            if (remaining > 0)
+                std.mem.copyForwards(u8, self.text[start..start + remaining], self.text[end..self.len]);
+            self.len -= @intCast(end - start);
+        }
+    }
+
+    /// delete entire current line content (vi 'dd')
+    pub fn deleteLine(self: *Self) void {
+        self.moveLineStart();
+        self.deleteToEnd();
+    }
+
+    /// replace character under cursor (vi 'r')
+    pub fn replaceChar(self: *Self, c: u8) void {
+        if (self.cursor < self.len) {
+            self.text[self.cursor] = c;
+        }
+    }
+
+    /// delete character under cursor in normal mode (vi 'x')
+    pub fn deleteAt(self: *Self) bool {
+        return self.deleteForward();
+    }
+
+    /// put cursor at first non-blank of line (vi '^')
+    pub fn moveFirstNonBlank(self: *Self) void {
+        self.moveLineStart();
+        while (self.cursor < self.len and (self.text[self.cursor] == ' ' or self.text[self.cursor] == '\t'))
+            self.cursor += 1;
+    }
+
+    /// get the text of a specific line (0-indexed)
+    pub fn getLine(self: *const Self, line_idx: u16) []const u8 {
+        var current_line: u16 = 0;
+        var start: usize = 0;
+        for (self.text[0..self.len], 0..) |c, i| {
+            if (c == '\n') {
+                if (current_line == line_idx) return self.text[start..i];
+                current_line += 1;
+                start = i + 1;
+            }
+        }
+        if (current_line == line_idx) return self.text[start..self.len];
+        return "";
+    }
 };
 
 /// terminal output state
@@ -221,8 +377,15 @@ pub const SyntaxHighlighter = struct {
                 if (!self.at_line_start) self.first_word = false;
             },
             ';', '|', '&' => {
+                _ = out.emit(Color.magenta);
                 _ = out.emitByte(c);
+                _ = out.emit(Color.reset);
                 self.first_word = true; // next word is a command
+            },
+            '>', '<' => {
+                _ = out.emit(Color.magenta);
+                _ = out.emitByte(c);
+                _ = out.emit(Color.reset);
             },
             else => {
                 _ = out.emitByte(c);
@@ -306,6 +469,12 @@ pub const SyntaxHighlighter = struct {
             } else if (keywords.isBuiltin(word)) {
                 _ = out.emit(Color.blue);
             }
+        } else if (word.len > 1 and word[0] == '-') {
+            // flags: --verbose, -f (dim white)
+            _ = out.emit(Color.gray);
+        } else if (word.len > 0 and word[0] >= '0' and word[0] <= '9') {
+            // numbers
+            _ = out.emit(Color.yellow);
         }
 
         _ = out.emit(word);
@@ -324,6 +493,8 @@ pub const TermView = struct {
     last_cursor: u16 = 0,
     last_width: u16 = 0,
     fd: std.posix.fd_t,
+    // ghost text suggestion (set by Shell, rendered after content in dim)
+    ghost_text: []const u8 = "",
 
     const Self = @This();
 
@@ -430,7 +601,8 @@ pub const TermView = struct {
         self.updateSize();
 
         const text = buf.slice();
-        const hash = std.hash.Wyhash.hash(0, text);
+        var hash = std.hash.Wyhash.hash(0, text);
+        if (self.ghost_text.len > 0) hash ^= std.hash.Wyhash.hash(1, self.ghost_text);
 
         // detect size change - force redraw when width changes
         const size_changed = self.term.width != self.last_width;
@@ -513,6 +685,22 @@ pub const TermView = struct {
         }
         hl.flushWord(self);
         _ = self.emit(Color.reset);
+
+        // render ghost text suggestion (dim, after content, only when cursor at end)
+        if (self.ghost_text.len > 0 and buf.cursor == buf.len) {
+            _ = self.emit("\x1b[90m"); // dim gray
+            for (self.ghost_text) |c| {
+                if (self.out_len > RENDER_BUF_SIZE - 64) break;
+                if (c == '\n') break; // only show first line of ghost
+                _ = self.emitByte(c);
+                render_col += 1;
+                if (w > 0 and render_col >= w) {
+                    render_row += 1;
+                    render_col = 0;
+                }
+            }
+            _ = self.emit("\x1b[0m");
+        }
 
         // clear any leftover content after our text
         _ = self.emit("\x1b[J");
