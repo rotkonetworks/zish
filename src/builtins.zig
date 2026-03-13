@@ -3646,7 +3646,13 @@ fn agentInteractive(shell: *Shell) !u8 {
 
             // Enter (0x0D CR) — submit query
             if (byte[0] == '\r') {
-                const query = std.mem.trim(u8, edit_buf.slice(), " \t\n\r");
+                // Copy query to stack buffer before clearing edit_buf
+                // (query is a slice into edit_buf.text which clear() invalidates)
+                var query_buf: [editor.LINE_BUF_SIZE]u8 = undefined;
+                const raw_query = std.mem.trim(u8, edit_buf.slice(), " \t\n\r");
+                const qlen = @min(raw_query.len, query_buf.len);
+                @memcpy(query_buf[0..qlen], raw_query[0..qlen]);
+                const query = query_buf[0..qlen];
                 edit_buf.clear();
                 edit_buf.vi_mode = .insert;
 
