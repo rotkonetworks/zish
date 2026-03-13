@@ -9,6 +9,7 @@ const router_mod = @import("agent_router.zig");
 const tools_mod = @import("agent_tools.zig");
 const svc = @import("agent_service.zig");
 const filters = @import("agent_filters.zig");
+const inference = @import("inference/root.zig");
 
 pub const AgentQueues = q.AgentQueues;
 pub const SessionLog = log_mod.SessionLog;
@@ -18,7 +19,7 @@ pub const AgentConfig = log_mod.AgentConfig;
 // Configuration
 // ============================================================
 
-pub const Provider = enum { anthropic, ollama, openai_compat };
+pub const Provider = enum { anthropic, ollama, openai_compat, local };
 
 pub const Config = struct {
     provider: Provider = .anthropic,
@@ -28,6 +29,7 @@ pub const Config = struct {
     max_tokens: u32 = 8192,
     max_tool_iterations: u32 = 10,
     auto_allow: bool = false,
+    local_model: []const u8 = "", // path to GGUF for local provider
 
     pub fn fromAgentConfig(ac: log_mod.AgentConfig) Config {
         var cfg = Config{
@@ -44,8 +46,14 @@ pub const Config = struct {
             cfg.provider = .ollama;
         } else if (std.mem.eql(u8, ac.provider, "openai")) {
             cfg.provider = .openai_compat;
+        } else if (std.mem.eql(u8, ac.provider, "local")) {
+            cfg.provider = .local;
         } else {
             cfg.provider = .anthropic;
+        }
+        // Local model path (shared with router config field)
+        if (ac.router_local_model.len > 0) {
+            cfg.local_model = ac.router_local_model;
         }
 
         // ollama defaults
@@ -105,6 +113,7 @@ pub const Config = struct {
             .anthropic => "anthropic",
             .ollama => "ollama",
             .openai_compat => "openai",
+            .local => "local",
         };
     }
 };
@@ -409,6 +418,8 @@ const AgentThread = struct {
     allow_plugins: u16 = 0, // bitmask for plugin tools
     // Router for query classification
     router_config: router_mod.RouterConfig = router_mod.RouterConfig.init(),
+    // Local inference server (for provider = .local)
+    local_server: ?*inference.ForkServer = null,
     // Subagent pool
     subagents: [MAX_SUBAGENTS]SubAgent = [_]SubAgent{.{}} ** MAX_SUBAGENTS,
     subagent_count: u8 = 0,
@@ -681,7 +692,13 @@ const AgentThread = struct {
             }
             if (sa.has_worktree) self.cleanupWorktree(sa);
         }
-        // Shut down fork-based inference server if running
+        // Shut down local inference server if running
+        if (self.local_server) |srv| {
+            srv.shutdown();
+            self.allocator.destroy(srv);
+            self.local_server = null;
+        }
+        // Shut down fork-based router inference server if running
         if (self.router_config.fork_server) |srv| {
             srv.shutdown();
             self.allocator.destroy(srv);
@@ -1604,6 +1621,7 @@ const AgentThread = struct {
             const result = switch (self.config.provider) {
                 .anthropic => self.callAnthropic(),
                 .ollama, .openai_compat => self.callOpenAICompat(),
+                .local => self.callLocal(),
             };
             if (result) |resp| {
                 return resp;
@@ -1693,6 +1711,97 @@ const AgentThread = struct {
             catch return error.URLTooLong;
 
         return self.doStreamRequest(url, body, .openai_compat);
+    }
+
+    fn callLocal(self: *AgentThread) !APIResponse {
+        // Lazy-spawn the ForkServer
+        if (self.local_server == null) {
+            if (self.config.local_model.len == 0)
+                return error.NoLocalModel;
+            const srv = self.allocator.create(inference.ForkServer) catch return error.OutOfMemory;
+            srv.* = inference.ForkServer.spawn(self.config.local_model) catch {
+                self.allocator.destroy(srv);
+                _ = self.queues.output.push(.error_msg, "Failed to load local model");
+                return error.InferenceError;
+            };
+            self.local_server = srv;
+        }
+        const srv = self.local_server.?;
+
+        // Build a chat-style text prompt from conversation history
+        var prompt_buf = try self.allocator.alloc(u8, MAX_CONTENT_LEN * 2);
+        defer self.allocator.free(prompt_buf);
+        var fbs = std.io.fixedBufferStream(prompt_buf);
+        const w = fbs.writer();
+
+        // System prompt
+        w.writeAll("System: ") catch {};
+        w.writeAll(self.systemPrompt()) catch {};
+        w.writeAll("\n\nAvailable tools: Bash, Read, Edit, Write, Glob, Grep\n") catch {};
+        w.writeAll("To use a tool, write: <tool>ToolName</tool><input>{\"param\":\"value\"}</input>\n\n") catch {};
+
+        // Conversation history
+        for (0..self.history.count) |i| {
+            const msg = &self.history.messages[i];
+            const role_str = if (msg.role == .user) "User" else "Assistant";
+            const content = msg.content[0..msg.content_len];
+            w.print("{s}: {s}\n", .{ role_str, content }) catch {};
+        }
+        w.writeAll("Assistant:") catch {};
+        const prompt = prompt_buf[0..fbs.pos];
+
+        // Call ForkServer
+        const max_tokens: u16 = @intCast(@min(self.config.max_tokens, 4096));
+        const response = srv.generate(prompt, max_tokens, 0.7, self.allocator) catch {
+            _ = self.queues.output.push(.error_msg, "Local inference failed");
+            return error.InferenceError;
+        };
+
+        // Stream the text to the user
+        if (response.len > 0) {
+            _ = self.queues.output.push(.text_delta, response);
+        }
+
+        // Parse for tool calls: <tool>Name</tool><input>JSON</input>
+        var resp = APIResponse{
+            .text = response,
+            .text_alloc = response,
+            .has_tool_call = false,
+            .input_tokens = @intCast(prompt.len / 4), // rough estimate
+            .output_tokens = @intCast(response.len / 4),
+        };
+
+        if (std.mem.indexOf(u8, response, "<tool>")) |tool_start| {
+            const name_start = tool_start + 6;
+            if (std.mem.indexOfPos(u8, response, name_start, "</tool>")) |name_end| {
+                const tool_name = response[name_start..name_end];
+                const tn = @min(tool_name.len, 64);
+                @memcpy(resp.tool_name_buf[0..tn], tool_name[0..tn]);
+                resp.tool_name_len = @intCast(tn);
+
+                if (std.mem.indexOfPos(u8, response, name_end, "<input>")) |input_start| {
+                    const json_start = input_start + 7;
+                    if (std.mem.indexOfPos(u8, response, json_start, "</input>")) |input_end| {
+                        const tool_input = response[json_start..input_end];
+                        const ti = @min(tool_input.len, 4096);
+                        @memcpy(resp.tool_cmd_buf[0..ti], tool_input[0..ti]);
+                        resp.tool_cmd_len = @intCast(ti);
+                        resp.has_tool_call = true;
+                    }
+                }
+
+                // Generate a tool_use id
+                const id = std.fmt.bufPrint(&resp.tool_id_buf, "local_{d}", .{
+                    @as(u64, @bitCast(std.time.milliTimestamp())),
+                }) catch "local_0";
+                resp.tool_id_len = @intCast(id.len);
+
+                // Trim tool markup from displayed text
+                resp.text = response[0..tool_start];
+            }
+        }
+
+        return resp;
     }
 
     fn doStreamRequest(self: *AgentThread, url: []const u8, body: []const u8, provider: Provider) !APIResponse {
@@ -1810,6 +1919,7 @@ const AgentThread = struct {
                 argv_buf[argc] = "X-Stainless-Helper-Method: stream";
                 argc += 1;
             },
+            .local => unreachable, // local provider never calls doStreamRequest
             .ollama, .openai_compat => {
                 if (self.config.api_key.len > 0) {
                     const h0 = std.fmt.bufPrint(&header_bufs[hdr_idx], "Authorization: Bearer {s}", .{self.config.api_key}) catch "";
@@ -1883,6 +1993,7 @@ const AgentThread = struct {
                             &has_tool_call, self.queues,
                             &resp_input_tokens, &resp_output_tokens);
                     },
+                    .local => unreachable,
                     .ollama, .openai_compat => {
                         parseOpenAIDelta(data, &text_buf, &text_len, self.queues);
                     },

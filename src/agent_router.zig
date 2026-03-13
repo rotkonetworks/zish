@@ -488,6 +488,7 @@ pub fn classifyWithModel(
         .anthropic => std.fmt.bufPrint(&url_buf, "{s}/v1/messages", .{config.routerBaseUrl()}) catch return null,
         .ollama => std.fmt.bufPrint(&url_buf, "{s}/api/chat", .{config.routerBaseUrl()}) catch return null,
         .openai_compat => std.fmt.bufPrint(&url_buf, "{s}/v1/chat/completions", .{config.routerBaseUrl()}) catch return null,
+        .local => return null, // local models use ForkServer, not HTTP
     };
 
     // Call curl (non-streaming, small response)
@@ -535,6 +536,7 @@ pub fn classifyWithModel(
                 argc += 1;
             }
         },
+        .local => return null, // handled by ForkServer
         .ollama => {}, // no auth needed
         .openai_compat => {
             if (api_key.len > 0) {
