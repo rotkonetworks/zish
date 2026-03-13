@@ -262,23 +262,18 @@ pub fn classifyLocal(query: []const u8) ?RouteDecision {
     const trimmed = std.mem.trim(u8, query, " \t\r\n");
     if (trimmed.len == 0) return null;
 
-    // Check for shell command patterns
-    if (isShellCommand(trimmed)) {
-        var rd = RouteDecision{
-            .action = .shell,
-            .model_tier = .haiku,
-            .cost = .low,
-        };
-        rd.setReason("local: shell command");
-        return rd;
-    }
-
-    // Check for agent keywords (case-insensitive prefix match)
+    // Check for agent keywords (case-insensitive)
     var lower_buf: [512]u8 = undefined;
     const lower = toLower(trimmed, &lower_buf);
 
+    // If first word is a known shell command, only match agent keywords at START of query
+    // This prevents "sha256sum build.zig" from matching agent keyword "build"
+    const first_word_is_shell = isShellCommand(trimmed);
+
     for (AGENT_KEYWORDS) |kw| {
-        if (std.mem.startsWith(u8, lower, kw.word) or containsWord(lower, kw.word)) {
+        if (std.mem.startsWith(u8, lower, kw.word) or
+            (!first_word_is_shell and containsWord(lower, kw.word)))
+        {
             var rd = RouteDecision{
                 .action = .agent,
                 .model_tier = kw.tier,
@@ -307,6 +302,18 @@ pub fn classifyLocal(query: []const u8) ?RouteDecision {
             .tools = READ_ONLY,
         };
         rd.setReason("local: short question");
+        return rd;
+    }
+
+    // Check for shell command patterns — AFTER agent keywords so natural language
+    // queries like "find any TODO comments" don't get misrouted as shell "find"
+    if (isShellCommand(trimmed) and !looksLikeNaturalLanguage(lower)) {
+        var rd = RouteDecision{
+            .action = .shell,
+            .model_tier = .haiku,
+            .cost = .low,
+        };
+        rd.setReason("local: shell command");
         return rd;
     }
 
@@ -358,6 +365,25 @@ fn isShellCommand(query: []const u8) bool {
         }
     }
 
+    return false;
+}
+
+/// Detect natural language queries that start with shell command names.
+/// E.g. "find any TODO comments in the codebase" vs "find . -name '*.zig'"
+fn looksLikeNaturalLanguage(lower_query: []const u8) bool {
+    // Natural language indicators — articles, pronouns, prepositions common in queries
+    const nl_words = [_][]const u8{
+        " any ", " the ", " all ", " every ", " each ",
+        " my ", " our ", " this ", " that ", " these ",
+        " please ", " can you ", " could you ",
+        " where ", " which ", " who ", " what ", " how ",
+        " about ", " from the ", " in the ", " of the ",
+        " comments", " functions", " files ", " errors",
+        " code ", " codebase", " project", " repository",
+    };
+    for (nl_words) |w| {
+        if (std.mem.indexOf(u8, lower_query, w) != null) return true;
+    }
     return false;
 }
 
@@ -507,7 +533,12 @@ pub fn classifyWithModel(
     var auth_buf: [512]u8 = undefined;
     switch (config.provider) {
         .anthropic => {
-            const auth = std.fmt.bufPrint(&auth_buf, "x-api-key: {s}", .{api_key}) catch return null;
+            // OAuth tokens (sk-ant-oat01-) use Bearer auth; API keys use X-Api-Key
+            const is_oauth = std.mem.startsWith(u8, api_key, "sk-ant-oat01-");
+            const auth = if (is_oauth)
+                std.fmt.bufPrint(&auth_buf, "Authorization: Bearer {s}", .{api_key}) catch return null
+            else
+                std.fmt.bufPrint(&auth_buf, "x-api-key: {s}", .{api_key}) catch return null;
             argv[argc] = "-H";
             argc += 1;
             argv[argc] = auth;
@@ -516,6 +547,13 @@ pub fn classifyWithModel(
             argc += 1;
             argv[argc] = "anthropic-version: 2023-06-01";
             argc += 1;
+            // OAuth requires the beta flag
+            if (is_oauth) {
+                argv[argc] = "-H";
+                argc += 1;
+                argv[argc] = "anthropic-beta: oauth-2025-04-20";
+                argc += 1;
+            }
         },
         .ollama => {}, // no auth needed
         .openai_compat => {
