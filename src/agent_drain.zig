@@ -88,8 +88,19 @@ pub fn drain(comptime Handler: type, handler: *Handler, queues: *AgentQueues) !b
                     try handler.onAgentStatus(data);
                 }
             },
+            .agent_tree_node => {
+                if (comptime hasMethod(Handler, "onTreeNode")) {
+                    try handler.onTreeNode(data);
+                }
+            },
+            .agent_result => {
+                if (comptime hasMethod(Handler, "onAgentResult")) {
+                    try handler.onAgentResult(data);
+                }
+            },
             // Request-side messages — not expected on output queue
-            .confirm_response, .add_task, .spawn_worker, .agent_status_req => {},
+            .confirm_response, .add_task, .spawn_worker, .agent_status_req,
+            .agent_tree_req, .agent_result_req => {},
         }
     }
 

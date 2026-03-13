@@ -1,0 +1,20 @@
+[
+  {
+    "name": "KubePods",
+    "description": "List Kubernetes pods in a namespace",
+    "command": "kubectl get pods -n {namespace} -o wide",
+    "parameters": {
+      "namespace": { "type": "string", "description": "Kubernetes namespace (default: default)" }
+    }
+  },
+  {
+    "name": "KubeLogs",
+    "description": "Get logs from a Kubernetes pod",
+    "command": "kubectl logs {pod} -n {namespace} --tail=100",
+    "confirm": true,
+    "parameters": {
+      "pod": { "type": "string", "description": "Pod name" },
+      "namespace": { "type": "string", "description": "Namespace" }
+    }
+  }
+]

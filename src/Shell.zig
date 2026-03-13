@@ -272,6 +272,7 @@ path_cache: std.StringHashMap([]const u8),
 agent: agent_mod.AgentContext,
 agent_output_active: bool = false,
 agent_md: agent_mod.MarkdownRenderer = .{},
+bulletin_cursor: usize = 0,
 
 pub fn init(allocator: std.mem.Allocator) !*Shell {
     return initWithOptions(allocator, true);
@@ -2068,7 +2069,9 @@ fn drainAgentOutput(self: *Shell) !void {
                 try writer.writeAll(msg.slice());
                 try writer.writeAll("]\x1b[0m\n");
             },
-            .confirm_response, .add_task, .spawn_worker, .agent_status_req => {}, // handled on agent side
+            .confirm_response, .add_task, .spawn_worker, .agent_status_req,
+            .agent_tree_req, .agent_result_req => {}, // handled on agent side
+            .agent_tree_node, .agent_result => {}, // only used in interactive tree view
             .agent_status => {
                 last_was_text = false;
                 if (msg.len > 0) {
@@ -2086,6 +2089,39 @@ fn drainAgentOutput(self: *Shell) !void {
     if (wrote) {
         try writer.flush();
     }
+
+    // ── Bulletin: show escalations and discoveries to the user ──
+    self.drainBulletin(writer) catch {};
+}
+
+fn drainBulletin(self: *Shell, writer: anytype) !void {
+    const aq = @import("agent_queue.zig");
+    var posts: [8]aq.Post = undefined;
+    const br = self.agent.queues.bulletin.read(self.bulletin_cursor, &posts);
+    self.bulletin_cursor = br.new_cursor;
+    if (br.count == 0) return;
+
+    for (posts[0..br.count]) |*p| {
+        // Only surface escalations and discoveries to the user
+        switch (p.kind) {
+            .escalate => {
+                try writer.writeAll("\x1b[33m⚠ [");
+                try writer.writeAll(p.authorSlice());
+                try writer.writeAll("] ");
+                try writer.writeAll(p.slice());
+                try writer.writeAll("\x1b[0m\n");
+            },
+            .discovery => {
+                try writer.writeAll("\x1b[36m● [");
+                try writer.writeAll(p.authorSlice());
+                try writer.writeAll("] ");
+                try writer.writeAll(p.slice());
+                try writer.writeAll("\x1b[0m\n");
+            },
+            else => {},
+        }
+    }
+    try writer.flush();
 }
 
 /// Non-blocking input read using poll. Returns .none if no input available within timeout.

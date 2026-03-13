@@ -1,0 +1,18 @@
+# devops shell commands — contributed by community
+# these get added to the router's shell detection
+type: shell
+terraform
+ansible
+ansible-playbook
+packer
+vault
+consul
+nomad
+k9s
+stern
+kubectx
+kubens
+kustomize
+skaffold
+argocd
+flux

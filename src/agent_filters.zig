@@ -171,13 +171,13 @@ pub fn RouterFilter(comptime Inner: type) type {
             // Fast path: translate queries always use haiku
             if (std.mem.startsWith(u8, req.query, "Translate this to a shell command")) {
                 req.is_translate = true;
-                ctx.config.model = ctx.router_config.resolveModel(.haiku);
+                ctx.config.model = ctx.router_config.resolveModel(.small);
             }
 
             // Routing phase
             if (ctx.router_config.enabled and !req.is_translate) {
                 // Try local classification first (zero cost)
-                req.route = router_mod.classifyLocal(req.query);
+                req.route = router_mod.classifyLocalWithConfig(req.query, ctx.router_config);
 
                 // If ambiguous, try local GGUF inference
                 if (req.route == null and ctx.router_config.local_model_len > 0) {
@@ -202,39 +202,21 @@ pub fn RouterFilter(comptime Inner: type) type {
                 // Handle routing decision
                 if (req.route) |*rd| {
                     logRouterDecision(req.query, rd.*);
-
-                    // Shell action — bypass LLM entirely
-                    if (rd.action == .shell) {
-                        const result = std.process.Child.run(.{
-                            .allocator = ctx.allocator,
-                            .argv = &[_][]const u8{ "/bin/sh", "-c", req.query },
-                            .max_output_bytes = 65536,
-                        }) catch |err| {
-                            var errbuf: [256]u8 = undefined;
-                            const msg = std.fmt.bufPrint(&errbuf, "shell error: {}", .{err}) catch "shell error";
-                            _ = ctx.queues.output.push(.error_msg, msg);
-                            req.handled = true;
-                            return .{ .status = .error_msg };
-                        };
-                        defer ctx.allocator.free(result.stderr);
-                        defer ctx.allocator.free(result.stdout);
-                        if (result.stdout.len > 0)
-                            _ = ctx.queues.output.push(.text_delta, result.stdout);
-                        if (result.stderr.len > 0)
-                            _ = ctx.queues.output.push(.error_msg, result.stderr);
-                        req.handled = true;
-                        return .{ .status = .ok };
-                    }
+                    // Apply: set model based on routed tier
+                    ctx.config.model = ctx.router_config.resolveModel(rd.model_tier);
+                    // Push route info to display
+                    var sum_buf: [256]u8 = undefined;
+                    _ = ctx.queues.output.push(.router_info, rd.summary(&sum_buf));
                 }
 
                 // Log unclassified queries
                 if (req.route == null) {
                     var default_rd = router_mod.RouteDecision{
                         .action = .agent,
-                        .model_tier = .opus,
+                        .model_tier = .large,
                         .cost = .high,
                     };
-                    default_rd.setReason("default: opus");
+                    default_rd.setReason("default: large");
                     logRouterDecision(req.query, default_rd);
                 }
             }
@@ -243,36 +225,55 @@ pub fn RouterFilter(comptime Inner: type) type {
             return self.inner.serve(ctx, req);
         }
 
-        /// Log routing decision to ~/.zish/router.log for training data.
-        /// Mirror of the free function in agent.zig — will be deduplicated on integration.
+        /// Log routing decision to ~/.zish/router_log.jsonl for training data.
         fn logRouterDecision(query: []const u8, rd: router_mod.RouteDecision) void {
             if (query.len == 0 or query.len > 2048) return;
 
+            const alloc = std.heap.page_allocator;
             var path_buf: [512]u8 = undefined;
-            const home = std.process.getEnvVarOwned(std.heap.page_allocator, "HOME") catch return;
-            defer std.heap.page_allocator.free(home);
+            const home = std.process.getEnvVarOwned(alloc, "HOME") catch return;
+            defer alloc.free(home);
 
-            const path = std.fmt.bufPrint(&path_buf, "{s}/.zish/router.log", .{home}) catch return;
-            const file = std.fs.cwd().openFile(path, .{ .mode = .write_only }) catch return;
+            const path = std.fmt.bufPrint(&path_buf, "{s}/.zish/router_log.jsonl", .{home}) catch return;
+            const file = std.fs.cwd().openFile(path, .{ .mode = .write_only }) catch |e| switch (e) {
+                error.FileNotFound => std.fs.cwd().createFile(path, .{}) catch return,
+                else => return,
+            };
             defer file.close();
             file.seekFromEnd(0) catch return;
 
             const action_str: []const u8 = switch (rd.action) {
-                .shell => "shell",
                 .agent => "agent",
                 .fan_out => "fan_out",
             };
             const tier_str: []const u8 = switch (rd.model_tier) {
-                .haiku => "haiku",
-                .sonnet => "sonnet",
-                .opus => "opus",
+                .small => "small",
+                .medium => "medium",
+                .large => "large",
             };
 
-            var log_buf: [4096]u8 = undefined;
-            const line = std.fmt.bufPrint(&log_buf, "{s}\t{s}\t{s}\t{s}\n", .{
-                query, action_str, tier_str, rd.reason(),
+            const ts: u64 = @bitCast(std.time.timestamp());
+            var buf: [4096]u8 = undefined;
+            var pos: usize = 0;
+            const prefix = "{\"q\":\"";
+            @memcpy(buf[pos..][0..prefix.len], prefix);
+            pos += prefix.len;
+            for (query) |c| {
+                if (pos + 6 >= buf.len) break;
+                switch (c) {
+                    '"' => { @memcpy(buf[pos..][0..2], "\\\""); pos += 2; },
+                    '\\' => { @memcpy(buf[pos..][0..2], "\\\\"); pos += 2; },
+                    '\n' => { @memcpy(buf[pos..][0..2], "\\n"); pos += 2; },
+                    '\r' => {},
+                    '\t' => { @memcpy(buf[pos..][0..2], "\\t"); pos += 2; },
+                    else => { buf[pos] = c; pos += 1; },
+                }
+            }
+            const mid = std.fmt.bufPrint(buf[pos..], "\",\"action\":\"{s}\",\"tier\":\"{s}\",\"reason\":\"{s}\",\"ts\":{d}}}\n", .{
+                action_str, tier_str, rd.reason(), ts,
             }) catch return;
-            file.writeAll(line) catch {};
+            pos += mid.len;
+            file.writeAll(buf[0..pos]) catch {};
         }
     };
 }

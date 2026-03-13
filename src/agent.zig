@@ -91,6 +91,8 @@ pub const Config = struct {
         if (ac.router_local_model.len > 0) {
             router_mod.RouterConfig.setFieldLong(&rc.local_model_path, &rc.local_model_len, ac.router_local_model);
         }
+        // Load user-contributed patterns from ~/.zish/patterns/
+        rc.loadPlugins();
         return rc;
     }
 
@@ -166,7 +168,7 @@ fn buildToolsJson(plugins: []const PluginTool, count: u8, buf: []u8) u16 {
 // Conversation history
 // ============================================================
 
-const MAX_MSGS = 20;
+const MAX_MSGS = 64;
 const MAX_CONTENT_LEN = 65536;
 
 const Role = enum { user, assistant };
@@ -201,10 +203,21 @@ const ConversationHistory = struct {
 
     fn addKind(self: *ConversationHistory, role: Role, kind: MsgKindH, content: []const u8) !void {
         if (self.count >= MAX_MSGS) {
-            // drop oldest two (user+assistant pair)
-            const n = 2;
-            self.allocator.free(self.messages[0].content[0..self.messages[0].alloc_len]);
-            self.allocator.free(self.messages[1].content[0..self.messages[1].alloc_len]);
+            // Drop oldest messages until we reach a clean boundary
+            // (first remaining message must be user .text, not tool_result)
+            var n: usize = 2;
+            while (n < self.count -| 2) {
+                // Ensure the new first message is a user text message
+                if (self.messages[n].kind == .tool_result or
+                    (self.messages[n].role == .assistant and self.messages[n].kind == .tool_use_response))
+                {
+                    n += 1;
+                } else break;
+            }
+            n = @min(n, self.count -| 2); // keep at least 2 messages
+            for (0..n) |i| {
+                self.allocator.free(self.messages[i].content[0..self.messages[i].alloc_len]);
+            }
             std.mem.copyForwards(Message, self.messages[0..self.count - n], self.messages[n..self.count]);
             self.count -= n;
         }
@@ -256,7 +269,8 @@ const TOOLS_JSON =
     \\{"name":"Grep","description":"Search file contents with regex. Returns matching lines with file:line format.","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern to search for"},"path":{"type":"string","description":"File or directory to search"},"glob":{"type":"string","description":"Filter files by glob (e.g. *.zig)"}},"required":["pattern"]}},
     \\{"name":"Agent","description":"Spawn a subagent to handle a task autonomously in the background. Use for research, exploration, or parallel work. The subagent has Read/Glob/Grep/Bash tools. Launch multiple agents concurrently for independent tasks.","input_schema":{"type":"object","properties":{"prompt":{"type":"string","description":"Detailed task description for the subagent"},"description":{"type":"string","description":"Short 3-5 word summary of the task"}},"required":["prompt","description"]}},
     \\{"name":"WebFetch","description":"Fetch a URL and return its content. HTML is converted to plain text. Use for reading web pages, APIs, documentation.","input_schema":{"type":"object","properties":{"url":{"type":"string","description":"URL to fetch"},"max_bytes":{"type":"integer","description":"Max bytes to return (default: 32768)"}},"required":["url"]}},
-    \\{"name":"WebSearch","description":"Search the web using DuckDuckGo. Returns titles, URLs and snippets. Use when you need current information.","input_schema":{"type":"object","properties":{"query":{"type":"string","description":"Search query"},"max_results":{"type":"integer","description":"Max results to return (default: 8)"}},"required":["query"]}}
+    \\{"name":"WebSearch","description":"Search the web using DuckDuckGo. Returns titles, URLs and snippets. Use when you need current information.","input_schema":{"type":"object","properties":{"query":{"type":"string","description":"Search query"},"max_results":{"type":"integer","description":"Max results to return (default: 8)"}},"required":["query"]}},
+    \\{"name":"Post","description":"Post to the shared bulletin board. All agents see all posts. Use to share discoveries, flag problems, request help, or vote (+1/-1) on other agents' posts. Types: discovery (share findings), escalate (urgent, override plans), request_peer (ask for help), vote (+1 or -1 on a claim/decision).","input_schema":{"type":"object","properties":{"type":{"type":"string","enum":["discovery","escalate","request_peer","vote"],"description":"Post type"},"message":{"type":"string","description":"Post content. For votes, prefix with +1 or -1"}},"required":["type","message"]}}
     \\]
 ;
 
@@ -391,6 +405,103 @@ const AgentThread = struct {
     task_queue: [MAX_TASKS]Task = undefined,
     task_count: u8 = 0,
     task_head: u8 = 0, // next task to process
+    // Agent identity (for bulletin posts)
+    agent_id: [16]u8 = undefined,
+    agent_id_len: u8 = 0,
+    // Bulletin read cursor — tracks what we've already seen
+    bulletin_cursor: usize = 0,
+    // Separate cursor for request_peer pickup (exhale phase)
+    peer_scan_cursor: usize = 0,
+
+    /// Post to the shared bulletin board — visible to all agents.
+    fn broadcast(self: *AgentThread, kind: q.PostKind, text: []const u8) void {
+        self.queues.bulletin.post(kind, self.agent_id[0..self.agent_id_len], self.depth, text);
+    }
+
+    /// Coffee pause: read the bulletin, format relevant peer activity.
+    /// Returns a slice into buf with bulletin context, or empty if nothing new.
+    /// Called between tool calls so the agent stays aware of peer activity.
+    ///
+    /// Every agent reads the bulletin — no hierarchy. Read-only agents that
+    /// can't act on what they see cast votes instead (upvote/downvote).
+    /// This is the commons: everyone has a voice.
+    fn coffeePause(self: *AgentThread, buf: []u8) []const u8 {
+        var posts: [16]q.Post = undefined;
+        const br = self.queues.bulletin.read(self.bulletin_cursor, &posts);
+        self.bulletin_cursor = br.new_cursor;
+        if (br.count == 0) return buf[0..0];
+
+        // Filter: skip own posts and vote echoes
+        var relevant: [16]usize = undefined;
+        var rel_count: usize = 0;
+        const my_id = self.agent_id[0..self.agent_id_len];
+        for (0..br.count) |i| {
+            if (std.mem.eql(u8, posts[i].authorSlice(), my_id)) continue;
+            if (posts[i].kind == .status_change) continue;
+            // Skip vote posts (they're signals, not conversation)
+            if (posts[i].kind == .vote) continue;
+            relevant[rel_count] = i;
+            rel_count += 1;
+            if (rel_count >= relevant.len) break;
+        }
+        if (rel_count == 0) return buf[0..0];
+
+        // Build context note for the model — LLM decides what to vote/comment on via Post tool
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+        w.writeAll("\n\n[bulletin — peer activity]\n") catch {};
+        for (relevant[0..rel_count]) |idx| {
+            const p = &posts[idx];
+            const kind_str: []const u8 = switch (p.kind) {
+                .discovery => "discovery",
+                .escalate => "ESCALATE",
+                .request_peer => "help wanted",
+                .claim => "claimed",
+                .release => "released",
+                .vote => "vote",
+                .status_change => "status",
+            };
+            w.print("- {s} ({s}): {s}\n", .{ p.authorSlice(), kind_str, p.slice() }) catch {};
+        }
+        // Tell the model what it can do based on its permissions
+        if (!self.allow_edit) {
+            w.writeAll("[you are read-only — respond with discoveries or escalate if urgent]\n") catch {};
+        }
+        return buf[0..fbs.pos];
+    }
+
+    /// Scan bulletin for unclaimed request_peer posts and spawn workers.
+    /// Only called by main agent (depth 0) during exhale phase.
+    fn pickUpPeerRequests(self: *AgentThread) void {
+        var posts: [32]q.Post = undefined;
+        const br = self.queues.bulletin.read(self.peer_scan_cursor, &posts);
+        self.peer_scan_cursor = br.new_cursor;
+        if (br.count == 0) return;
+
+        for (posts[0..br.count]) |*p| {
+            if (p.kind != .request_peer) continue;
+            // Don't pick up our own requests
+            const author = p.authorSlice();
+            const self_id = self.agent_id[0..self.agent_id_len];
+            if (std.mem.eql(u8, author, self_id)) continue;
+
+            // Check if we have capacity
+            if (self.subagent_count >= MAX_SUBAGENTS) break;
+
+            // Spawn a worker for this request
+            const task_text = p.slice();
+            if (task_text.len == 0) continue;
+
+            _ = self.spawnWorker(task_text, "peer-request") catch continue;
+
+            // Acknowledge on bulletin
+            var ack_buf: [128]u8 = undefined;
+            const ack = std.fmt.bufPrint(&ack_buf, "picked up: {s}", .{
+                task_text[0..@min(task_text.len, 80)],
+            }) catch continue;
+            self.broadcast(.status_change, ack);
+        }
+    }
 
     fn init(allocator: std.mem.Allocator, queues: *AgentQueues, config: Config, rc: router_mod.RouterConfig) AgentThread {
         var self = AgentThread{
@@ -411,6 +522,15 @@ const AgentThread = struct {
             .all_tools_json_len = 0,
             .router_config = rc,
         };
+
+        // main agent identity
+        const main_id = "main";
+        @memcpy(self.agent_id[0..main_id.len], main_id);
+        self.agent_id_len = main_id.len;
+
+        // Start reading bulletin from current position (don't replay old posts)
+        self.bulletin_cursor = queues.bulletin.position();
+        self.peer_scan_cursor = self.bulletin_cursor;
 
         // get cwd
         const cwd = std.process.getCwd(&self.cwd) catch "/";
@@ -626,7 +746,7 @@ const AgentThread = struct {
         // Spawn thread — pass depth+1 for recursion tracking
         const child_depth = self.depth + 1;
         sa.thread = std.Thread.spawn(.{}, subAgentThreadFn, .{
-            self.allocator, sa, prompt_copy, cfg, &self.system_prompt_buf, self.system_prompt_len, full_tools, child_depth,
+            self.allocator, sa, prompt_copy, cfg, &self.system_prompt_buf, self.system_prompt_len, full_tools, child_depth, self.queues.bulletin,
         }) catch {
             self.allocator.free(prompt_copy);
             sa.setResult("Failed to spawn subagent thread", .failed);
@@ -764,6 +884,14 @@ const AgentThread = struct {
                     _ = self.queues.output.push(.agent_status, "");
                     continue;
                 }
+                if (req_msg.kind == .agent_tree_req) {
+                    self.sendTreeNodes();
+                    continue;
+                }
+                if (req_msg.kind == .agent_result_req) {
+                    self.sendAgentResult(req_msg.slice());
+                    continue;
+                }
                 const query_text = req_msg.slice();
                 self.queues.clearCancel();
                 self.queues.setBusy(true);
@@ -835,6 +963,11 @@ const AgentThread = struct {
                 _ = self.queues.output.push(.done, "");
                 self.task_head += 1;
                 continue;
+            }
+
+            // ── EXHALE: pick up request_peer posts from bulletin ──
+            if (self.depth == 0) { // only main agent spawns workers for help requests
+                self.pickUpPeerRequests();
             }
 
             std.Thread.sleep(10 * std.time.ns_per_ms);
@@ -1003,7 +1136,17 @@ const AgentThread = struct {
             } else {
                 writeJSONString(rw, effective_output) catch {};
             }
-            rw.writeAll("}]") catch {};
+            // ☕ Coffee pause — check what peers are up to before next API call
+            var bulletin_buf: [2048]u8 = undefined;
+            const bulletin_note = self.coffeePause(&bulletin_buf);
+            if (bulletin_note.len > 0) {
+                // Append bulletin as a text block alongside the tool_result
+                rw.writeAll("},{\"type\":\"text\",\"text\":") catch {};
+                writeJSONString(rw, bulletin_note) catch {};
+                rw.writeAll("}]") catch {};
+            } else {
+                rw.writeAll("}]") catch {};
+            }
             try self.history.addKind(.user, .tool_result, result_json_buf[0..result_fbs.pos]);
         }
 
@@ -1012,6 +1155,104 @@ const AgentThread = struct {
             .input_tokens = query_input_tokens,
             .output_tokens = query_output_tokens,
         };
+    }
+
+    /// Send structured tree nodes for the tree view.
+    /// Binary format per node: [depth:u8][status:u8][type:u8][id_len:u8][id][desc_len:u8][desc][result_preview...]
+    /// Status: 0=running, 1=done, 2=failed, 3=pending
+    /// Type: 0=agent(main), 1=subagent(readonly), 2=worker(full), 3=task
+    fn sendTreeNodes(self: *AgentThread) void {
+        // Node 0: main agent
+        var buf: [q.MAX_MSG_LEN]u8 = undefined;
+        const main_status: u8 = if (self.queues.isBusy()) 0 else 1;
+        buf[0] = 0; // depth 0
+        buf[1] = main_status;
+        buf[2] = 0; // type: main agent
+        buf[3] = 4; // id_len
+        @memcpy(buf[4..8], "main");
+        const model = self.config.model;
+        const mlen: u8 = @intCast(@min(model.len, 200));
+        buf[8] = mlen;
+        @memcpy(buf[9..][0..mlen], model[0..mlen]);
+        _ = self.queues.output.push(.agent_tree_node, buf[0 .. 9 + mlen]);
+
+        // Subagents
+        for (&self.subagents) |*sa| {
+            if (sa.id_len == 0) continue;
+            var nbuf: [q.MAX_MSG_LEN]u8 = undefined;
+            nbuf[0] = 1; // depth 1
+            nbuf[1] = switch (@atomicLoad(SubAgentStatus, &sa.status, .acquire)) {
+                .running => 0,
+                .done => 1,
+                .failed => 2,
+            };
+            nbuf[2] = if (sa.full_tools) 2 else 1; // worker or read-only
+            nbuf[3] = sa.id_len;
+            @memcpy(nbuf[4..][0..sa.id_len], sa.id_buf[0..sa.id_len]);
+            const dlen = sa.desc_len;
+            nbuf[4 + sa.id_len] = dlen;
+            @memcpy(nbuf[5 + sa.id_len ..][0..dlen], sa.desc_buf[0..dlen]);
+            // Result preview (first 200 bytes if done)
+            const preview_start = @as(usize, 5) + sa.id_len + dlen;
+            if (sa.isDone() and sa.result_len > 0) {
+                const plen = @min(sa.result_len, @as(u32, @intCast(q.MAX_MSG_LEN - preview_start)));
+                @memcpy(nbuf[preview_start..][0..plen], sa.result_buf[0..plen]);
+                _ = self.queues.output.push(.agent_tree_node, nbuf[0 .. preview_start + plen]);
+            } else {
+                _ = self.queues.output.push(.agent_tree_node, nbuf[0..preview_start]);
+            }
+        }
+
+        // Tasks
+        for (self.task_queue[0..self.task_count], 0..) |*task, i| {
+            var tbuf: [q.MAX_MSG_LEN]u8 = undefined;
+            tbuf[0] = 1; // depth 1
+            tbuf[1] = switch (task.status) {
+                .pending => 3,
+                .running => 0,
+                .done => 1,
+                .failed => 2,
+            };
+            tbuf[2] = 3; // type: task
+            // ID = task index as string
+            var id_tmp: [4]u8 = undefined;
+            const id_str = std.fmt.bufPrint(&id_tmp, "t{d}", .{i}) catch "t?";
+            tbuf[3] = @intCast(id_str.len);
+            @memcpy(tbuf[4..][0..id_str.len], id_str);
+            const ttext = task.text();
+            const tlen: u8 = @intCast(@min(ttext.len, 200));
+            tbuf[4 + id_str.len] = tlen;
+            @memcpy(tbuf[5 + id_str.len ..][0..tlen], ttext[0..tlen]);
+            _ = self.queues.output.push(.agent_tree_node, tbuf[0 .. 5 + id_str.len + tlen]);
+        }
+
+        // End marker: empty node
+        _ = self.queues.output.push(.agent_tree_node, "");
+    }
+
+    /// Send full result for a subagent by ID
+    fn sendAgentResult(self: *AgentThread, id_text: []const u8) void {
+        for (&self.subagents) |*sa| {
+            if (sa.id_len == 0) continue;
+            if (std.mem.eql(u8, sa.id(), id_text)) {
+                if (sa.isDone()) {
+                    const res = sa.result();
+                    // Send in chunks since result can be up to 32KB
+                    var offset: usize = 0;
+                    while (offset < res.len) {
+                        const chunk_len = @min(res.len - offset, q.MAX_MSG_LEN);
+                        _ = self.queues.output.push(.agent_result, res[offset..][0..chunk_len]);
+                        offset += chunk_len;
+                    }
+                } else {
+                    _ = self.queues.output.push(.agent_result, "(running...)");
+                }
+                _ = self.queues.output.push(.agent_result, "");
+                return;
+            }
+        }
+        _ = self.queues.output.push(.agent_result, "(not found)");
+        _ = self.queues.output.push(.agent_result, "");
     }
 
     fn autoCompact(self: *AgentThread) void {
@@ -1068,14 +1309,16 @@ const AgentThread = struct {
             self.history.count = saved_count;
         }
 
-        // Free all but the last few messages, ensuring we start at a clean boundary
-        // (not a tool_result, which would reference a missing tool_use)
+        // Free all but the last few messages, ensuring we start at a clean boundary.
+        // The first kept message must be a user .text message (not tool_result,
+        // not following a tool_use_response that would create consecutive assistant msgs).
         var keep = @min(saved_count, 4);
-        // Walk backwards from the keep boundary to find a user text message
+        // Walk backwards until the boundary message is a user text message
         while (keep < saved_count) {
             const boundary_idx = saved_count - keep;
-            if (self.history.messages[boundary_idx].kind == .tool_result) {
-                keep += 1; // include the preceding tool_use_response too
+            const bmsg = self.history.messages[boundary_idx];
+            if (bmsg.kind != .text or bmsg.role != .user) {
+                keep += 1; // skip tool_result, tool_use_response, or misaligned messages
             } else break;
         }
         keep = @min(keep, saved_count); // don't exceed total
@@ -1147,6 +1390,8 @@ const AgentThread = struct {
             .plugin_count = self.plugin_count,
             .spawn_and_collect = &spawnAndCollectCallback,
             .spawn_ctx = @ptrCast(self),
+            .agent_id = self.agent_id[0..self.agent_id_len],
+            .agent_depth = self.depth,
         };
     }
 
@@ -2180,9 +2425,14 @@ pub const AgentContext = struct {
     allocator: std.mem.Allocator,
     model_override: [64]u8 = undefined,
     model_override_len: u8 = 0,
+    bulletin: *q.Bulletin,
 
     pub fn init(allocator: std.mem.Allocator) AgentContext {
-        return .{ .allocator = allocator };
+        const bulletin = allocator.create(q.Bulletin) catch @panic("OOM: bulletin");
+        bulletin.* = .{};
+        var ctx = AgentContext{ .allocator = allocator, .bulletin = bulletin };
+        ctx.queues.bulletin = bulletin;
+        return ctx;
     }
 
     /// Set a model override for the next agent thread start
@@ -2264,6 +2514,7 @@ pub const AgentContext = struct {
                     try writer.writeByte('\n');
                 },
                 .cancel => {},
+                else => {},
             }
         }
         return wrote;
@@ -2282,11 +2533,13 @@ fn subAgentThreadFn(
     sys_prompt_len: u16,
     full_tools: bool,
     depth: u8,
+    bulletin: *q.Bulletin,
 ) void {
     defer allocator.free(prompt_owned);
 
     // Create a minimal agent — no session log, no plugin tools, auto-allow all
     var dummy_queues: AgentQueues = .{};
+    dummy_queues.bulletin = bulletin;
     var agent = AgentThread{
         .allocator = allocator,
         .queues = &dummy_queues,
@@ -2309,6 +2562,15 @@ fn subAgentThreadFn(
         .allow_plugins = 0,
         .depth = depth,
     };
+    // Set agent identity from subagent ID
+    const sa_id = sa.id();
+    @memcpy(agent.agent_id[0..sa_id.len], sa_id);
+    agent.agent_id_len = @intCast(sa_id.len);
+    // Start reading bulletin from current position
+    agent.bulletin_cursor = bulletin.position();
+    // Announce arrival on the bulletin
+    agent.broadcast(.status_change, "spawned");
+
     // Set cwd
     const cwd = std.process.getCwd(&agent.cwd) catch "/";
     agent.cwd_len = @intCast(cwd.len);
@@ -2325,7 +2587,8 @@ fn subAgentThreadFn(
             \\{"name":"Bash","description":"Run a shell command.","input_schema":{"type":"object","properties":{"command":{"type":"string","description":"Shell command to run"}},"required":["command"]}},
             \\{"name":"Read","description":"Read a file. Returns contents with line numbers.","input_schema":{"type":"object","properties":{"file_path":{"type":"string","description":"Absolute path to the file"},"offset":{"type":"integer","description":"Line offset (optional)"},"limit":{"type":"integer","description":"Max lines (optional)"}},"required":["file_path"]}},
             \\{"name":"Glob","description":"Find files matching a glob pattern.","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern"},"path":{"type":"string","description":"Directory (default: cwd)"}},"required":["pattern"]}},
-            \\{"name":"Grep","description":"Search file contents with regex.","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern"},"path":{"type":"string","description":"File or directory"},"glob":{"type":"string","description":"Filter files by glob"}},"required":["pattern"]}}
+            \\{"name":"Grep","description":"Search file contents with regex.","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern"},"path":{"type":"string","description":"File or directory"},"glob":{"type":"string","description":"Filter files by glob"}},"required":["pattern"]}},
+            \\{"name":"Post","description":"Post to the shared bulletin board. All agents see all posts. Use to share discoveries, flag problems, or vote (+1/-1) on other agents' posts. Types: discovery (share findings), escalate (urgent), vote (+1 or -1).","input_schema":{"type":"object","properties":{"type":{"type":"string","enum":["discovery","escalate","vote"],"description":"Post type"},"message":{"type":"string","description":"Post content. For votes, prefix with +1 or -1"}},"required":["type","message"]}}
             \\]
         ;
         @memcpy(agent.all_tools_json[0..SUBAGENT_TOOLS.len], SUBAGENT_TOOLS);
@@ -2459,72 +2722,10 @@ fn subAgentThreadFn(
         }
     }
 
-    sa.setResult(if (final_text.len > 0) final_text else "No response from subagent", if (final_text.len > 0) .done else .failed);
-}
-
-/// Log router decision to ~/.zish/router_log.jsonl for training data.
-/// Format: {"q":"query","action":"shell|agent|fan_out","tier":"haiku|sonnet|opus","reason":"...","ts":N}
-fn logRouterDecision(query: []const u8, rd: router_mod.RouteDecision) void {
-    if (query.len == 0 or query.len > 2048) return;
-
-    var path_buf: [512]u8 = undefined;
-    const home = std.process.getEnvVarOwned(std.heap.page_allocator, "HOME") catch return;
-    defer std.heap.page_allocator.free(home);
-    const path = std.fmt.bufPrint(&path_buf, "{s}/.zish/router_log.jsonl", .{home}) catch return;
-
-    const file = std.fs.cwd().openFile(path, .{ .mode = .write_only }) catch |e| switch (e) {
-        error.FileNotFound => std.fs.cwd().createFile(path, .{}) catch return,
-        else => return,
-    };
-    defer file.close();
-    file.seekFromEnd(0) catch return;
-
-    const action_str = switch (rd.action) {
-        .shell => "shell",
-        .agent => "agent",
-        .fan_out => "fan_out",
-    };
-    const tier_str = switch (rd.model_tier) {
-        .haiku => "haiku",
-        .sonnet => "sonnet",
-        .opus => "opus",
-    };
-    const ts: u64 = @bitCast(std.time.timestamp());
-    var buf: [4096]u8 = undefined;
-    var pos: usize = 0;
-
-    // Manual JSON building (zero-alloc, same pattern as other log functions)
-    const prefix = "{\"q\":\"";
-    if (pos + prefix.len < buf.len) { @memcpy(buf[pos..][0..prefix.len], prefix); pos += prefix.len; }
-    // escape query
-    for (query) |c| {
-        if (pos + 6 >= buf.len) break;
-        switch (c) {
-            '"' => { @memcpy(buf[pos..][0..2], "\\\""); pos += 2; },
-            '\\' => { @memcpy(buf[pos..][0..2], "\\\\"); pos += 2; },
-            '\n' => { @memcpy(buf[pos..][0..2], "\\n"); pos += 2; },
-            '\r' => { @memcpy(buf[pos..][0..2], "\\r"); pos += 2; },
-            '\t' => { @memcpy(buf[pos..][0..2], "\\t"); pos += 2; },
-            else => if (c < 0x20) {
-                const hex = std.fmt.bufPrint(buf[pos..], "\\u{x:0>4}", .{c}) catch break;
-                pos += hex.len;
-            } else { buf[pos] = c; pos += 1; },
-        }
-    }
-    const mid = std.fmt.bufPrint(buf[pos..], "\",\"action\":\"{s}\",\"tier\":\"{s}\",\"reason\":\"", .{ action_str, tier_str }) catch return;
-    pos += mid.len;
-    // escape reason
-    for (rd.reason_buf[0..rd.reason_len]) |c| {
-        if (pos + 6 >= buf.len) break;
-        switch (c) {
-            '"' => { @memcpy(buf[pos..][0..2], "\\\""); pos += 2; },
-            '\\' => { @memcpy(buf[pos..][0..2], "\\\\"); pos += 2; },
-            else => { buf[pos] = c; pos += 1; },
-        }
-    }
-    const suffix = std.fmt.bufPrint(buf[pos..], "\",\"ts\":{d}}}\n", .{ts}) catch return;
-    pos += suffix.len;
-    _ = file.write(buf[0..pos]) catch {};
+    const status: SubAgentStatus = if (final_text.len > 0) .done else .failed;
+    sa.setResult(if (final_text.len > 0) final_text else "No response from subagent", status);
+    // Announce completion on the bulletin
+    agent.broadcast(if (status == .done) .discovery else .escalate, if (final_text.len > 0) final_text[0..@min(final_text.len, 256)] else "failed");
 }
 
 fn agentThreadFn(allocator: std.mem.Allocator, queues: *AgentQueues, model_override: ?[]const u8) void {
@@ -2532,6 +2733,10 @@ fn agentThreadFn(allocator: std.mem.Allocator, queues: *AgentQueues, model_overr
     var config = Config.fromAgentConfig(ac);
     if (model_override) |m| config.model = m;
     const rc = Config.buildRouterConfig(ac);
+
+    // Learn from past corrections before loading patterns
+    router_mod.learnPatterns();
+
     var agent = AgentThread.init(allocator, queues, config, rc);
     // Config slices now point into ac's tracked buffers — must keep ac alive
     // until agent is done, then free both

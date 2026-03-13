@@ -2321,11 +2321,11 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
     if (std.mem.eql(u8, subcmd, "-m") and args.len >= 3) {
         const model = args[2];
         // Resolve model aliases
-        const resolved = if (std.mem.eql(u8, model, "opus"))
+        const resolved = if (std.mem.eql(u8, model, "opus") or std.mem.eql(u8, model, "large"))
             "claude-opus-4-6"
-        else if (std.mem.eql(u8, model, "sonnet"))
+        else if (std.mem.eql(u8, model, "sonnet") or std.mem.eql(u8, model, "medium"))
             "claude-sonnet-4-6"
-        else if (std.mem.eql(u8, model, "haiku"))
+        else if (std.mem.eql(u8, model, "haiku") or std.mem.eql(u8, model, "small"))
             "claude-haiku-4-5-20251001"
         else
             model;
@@ -2430,9 +2430,9 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
             try out.print("  model:    {s}\n", .{cfg.router_model});
             if (cfg.router_base_url.len > 0) try out.print("  base_url: {s}\n", .{cfg.router_base_url});
             try out.print("  local_only: {}\n", .{cfg.router_local_only});
-            try out.print("  haiku:    {s}\n", .{cfg.haiku_model});
-            try out.print("  sonnet:   {s}\n", .{cfg.sonnet_model});
-            try out.print("  opus:     {s}\n", .{cfg.opus_model});
+            try out.print("  small:    {s}\n", .{cfg.haiku_model});
+            try out.print("  medium:   {s}\n", .{cfg.sonnet_model});
+            try out.print("  large:    {s}\n", .{cfg.opus_model});
         }
         try out.flush();
         return 0;
@@ -2546,13 +2546,15 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
         return 1;
     }
 
-    // in non-interactive mode (-c), wait for agent to finish and drain output
-    if (!std.posix.isatty(std.posix.STDIN_FILENO)) {
+    // One-shot mode: always wait for the agent to finish and drain output.
+    // This makes `zish -c 'agent <query>'` and `agent <query>` at the prompt
+    // both work synchronously — essential for scripting and recursive use.
+    {
         const agent_drain = @import("agent_drain.zig");
         var handler = agent_drain.SimpleHandler.init(out, &shell.agent.queues.request);
-        // wait up to 60 seconds
+        // wait up to 120 seconds
         var ticks: usize = 0;
-        while (!handler.isDone() and ticks < 1200) : (ticks += 1) {
+        while (!handler.isDone() and ticks < 2400) : (ticks += 1) {
             _ = try agent_drain.drain(agent_drain.SimpleHandler, &handler, &shell.agent.queues);
             try handler.flush();
             if (!handler.isDone()) std.Thread.sleep(50 * std.time.ns_per_ms);
@@ -2896,6 +2898,12 @@ fn agentInteractive(shell: *Shell) !u8 {
     var msg_history: MessageHistory = .{};
     var scroll_offset: u32 = 0; // 0 = at bottom (live), >0 = scrolled up N lines
 
+    // Router correction tracking
+    var last_query_buf: [512]u8 = undefined;
+    var last_query_len: usize = 0;
+    var last_routed_tier: [16]u8 = undefined;
+    var last_routed_tier_len: usize = 0;
+
     // ── Layout helpers (defined in agent_commands.zig) ──
 
     const TermWidth = agent_commands.TermWidth;
@@ -3124,7 +3132,11 @@ fn agentInteractive(shell: *Shell) !u8 {
                     Layout.drawStatusBarSafeElapsed(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0);
                 },
                 .error_msg => {
-                    if (last_was_text) try tee.writeAll("\x1b[0m\n");
+                    if (last_was_text) {
+                        try md.flush(tee);
+                        md.reset();
+                        try tee.writeAll("\x1b[0m\n");
+                    }
                     last_was_text = false;
                     try tee.print("\x1b[31m{s}\x1b[0m\n", .{msg.slice()});
                 },
@@ -3146,13 +3158,30 @@ fn agentInteractive(shell: *Shell) !u8 {
                     // Update status bar with new cost
                     Layout.drawStatusBarSafeElapsed(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0);
                     if (last_was_text) {
+                        try md.flush(tee);
+                        md.reset();
                         try tee.writeAll("\x1b[0m\n");
                         last_was_text = false;
                     }
                 },
                 .router_info => {
+                    if (last_was_text) {
+                        try md.flush(tee);
+                        md.reset();
+                        try tee.writeAll("\x1b[0m\n");
+                    }
                     last_was_text = false;
                     try tee.print("\x1b[90m[{s}]\x1b[0m\n", .{msg.slice()});
+                    // Extract tier from summary "agent -> small (low cost)"
+                    const info = msg.slice();
+                    if (std.mem.indexOf(u8, info, "-> ")) |arrow| {
+                        const after = info[arrow + 3..];
+                        const tier_end = std.mem.indexOfScalar(u8, after, ' ') orelse after.len;
+                        const tier_name = after[0..tier_end];
+                        const tlen = @min(tier_name.len, last_routed_tier.len);
+                        @memcpy(last_routed_tier[0..tlen], tier_name[0..tlen]);
+                        last_routed_tier_len = tlen;
+                    }
                 },
                 .done => {
                     if (last_was_text) {
@@ -3205,9 +3234,14 @@ fn agentInteractive(shell: *Shell) !u8 {
                     out.writeAll("\x1b[u") catch {};
                     cursor_at = .input;
                 },
-                .confirm_response, .add_task, .spawn_worker, .agent_status_req => {},
+                .confirm_response, .add_task, .spawn_worker, .agent_status_req,
+                .agent_tree_req, .agent_result_req => {},
                 .agent_status => {
-                    if (last_was_text) try tee.writeAll("\x1b[0m\n");
+                    if (last_was_text) {
+                        try md.flush(tee);
+                        md.reset();
+                        try tee.writeAll("\x1b[0m\n");
+                    }
                     last_was_text = false;
                     if (msg.len > 0) {
                         try tee.writeAll(msg.slice());
@@ -3223,6 +3257,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                     status_len = 0;
                     cursor_at = .output;
                 },
+                .agent_tree_node, .agent_result => {}, // handled by tree view modal
             }
         }
         if (got_output) {
@@ -3644,6 +3679,128 @@ fn agentInteractive(shell: *Shell) !u8 {
                 continue;
             }
 
+            // Tab — complete slash commands and file paths
+            if (byte[0] == '\t') {
+                const text = edit_buf.slice();
+                if (text.len > 0 and text[0] == '/') {
+                    // Slash command completion
+                    const slash_cmds = [_][]const u8{
+                        "/compact", "/cost",     "/model",    "/diff",    "/commit",
+                        "/review",  "/undo",     "/plan",     "/spawn",   "/queue",
+                        "/agents",  "/tasks",    "/tree",     "/sessions", "/config",
+                        "/search",  "/help",
+                    };
+                    var matches: [16][]const u8 = undefined;
+                    var match_count: u8 = 0;
+                    for (slash_cmds) |cmd| {
+                        if (std.mem.startsWith(u8, cmd, text)) {
+                            if (match_count < matches.len) {
+                                matches[match_count] = cmd;
+                                match_count += 1;
+                            }
+                        }
+                    }
+                    if (match_count == 1) {
+                        edit_buf.clear();
+                        _ = edit_buf.insertSlice(matches[0]);
+                        _ = edit_buf.insert(' ');
+                    } else if (match_count > 1) {
+                        // Find common prefix among matches and complete to it
+                        var common_len: usize = matches[0].len;
+                        for (matches[1..match_count]) |m| {
+                            common_len = @min(common_len, m.len);
+                            var j: usize = 0;
+                            while (j < common_len and matches[0][j] == m[j]) : (j += 1) {}
+                            common_len = j;
+                        }
+                        if (common_len > text.len) {
+                            edit_buf.clear();
+                            _ = edit_buf.insertSlice(matches[0][0..common_len]);
+                        } else {
+                            // Show matches in output area
+                            // Show matches in scroll region
+                            try out.print("\x1b[{d};1H\x1b[90m", .{out_last});
+                            for (matches[0..match_count]) |m| {
+                                try out.writeAll(m);
+                                try out.writeByte(' ');
+                            }
+                            try out.writeAll("\x1b[0m\n");
+                            msg_history.appendSlice("\x1b[90m");
+                            for (matches[0..match_count]) |m| {
+                                msg_history.appendSlice(m);
+                                msg_history.appendSlice(" ");
+                            }
+                            msg_history.appendSlice("\x1b[0m");
+                            msg_history.commitLine();
+                        }
+                    }
+                } else if (text.len > 0) {
+                    // File path completion — find the word under cursor
+                    const cur = edit_buf.cursor;
+                    var word_start: u16 = cur;
+                    while (word_start > 0 and text[word_start - 1] != ' ' and text[word_start - 1] != '\n') : (word_start -= 1) {}
+                    const prefix = text[word_start..cur];
+                    if (prefix.len > 0) {
+                        // Split into dir and file prefix
+                        const last_slash = std.mem.lastIndexOfScalar(u8, prefix, '/');
+                        const dir_path = if (last_slash) |s| prefix[0 .. s + 1] else "";
+                        const file_prefix = if (last_slash) |s| prefix[s + 1 ..] else prefix;
+
+                        const dir_to_open = if (dir_path.len > 0) dir_path else ".";
+                        var dir = std.fs.cwd().openDir(dir_to_open, .{ .iterate = true }) catch {
+                            continue;
+                        };
+                        defer dir.close();
+
+                        // Collect up to 32 matches
+                        var name_storage: [32][256]u8 = undefined;
+                        var name_lens: [32]u16 = undefined;
+                        var match_count: u16 = 0;
+                        var iter = dir.iterate();
+                        while (iter.next() catch null) |entry| {
+                            if (std.mem.startsWith(u8, entry.name, file_prefix)) {
+                                if (match_count < 32) {
+                                    const elen: u16 = @intCast(@min(entry.name.len, 256));
+                                    @memcpy(name_storage[match_count][0..elen], entry.name[0..elen]);
+                                    name_lens[match_count] = elen;
+                                    match_count += 1;
+                                }
+                            }
+                        }
+                        if (match_count == 1) {
+                            const suffix_start = file_prefix.len;
+                            const suffix = name_storage[0][suffix_start..name_lens[0]];
+                            _ = edit_buf.insertSlice(suffix);
+                        } else if (match_count > 1) {
+                            // Find common prefix among matches
+                            var common_len: u16 = name_lens[0];
+                            for (1..match_count) |i| {
+                                common_len = @min(common_len, name_lens[i]);
+                                var j: u16 = 0;
+                                while (j < common_len and name_storage[0][j] == name_storage[i][j]) : (j += 1) {}
+                                common_len = j;
+                            }
+                            if (common_len > file_prefix.len) {
+                                const suffix = name_storage[0][file_prefix.len..common_len];
+                                _ = edit_buf.insertSlice(suffix);
+                            } else {
+                                // Show matches in scroll region
+                                try out.print("\x1b[{d};1H\x1b[90m", .{out_last});
+                                for (0..match_count) |i| {
+                                    try out.writeAll(name_storage[i][0..name_lens[i]]);
+                                    try out.writeByte(' ');
+                                }
+                                try out.writeAll("\x1b[0m\n");
+                            }
+                        }
+                    }
+                }
+                Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                if (!agent_active) cursor_at = .input;
+                try out.flush();
+                continue;
+            }
+
             // Enter (0x0D CR) — submit query
             if (byte[0] == '\r') {
                 // Copy query to stack buffer before clearing edit_buf
@@ -3734,6 +3891,10 @@ fn agentInteractive(shell: *Shell) !u8 {
                         .input_height = &input_height,
                         .md = &md,
                         .last_was_text = &last_was_text,
+                        .last_query_buf = &last_query_buf,
+                        .last_query_len = &last_query_len,
+                        .last_routed_tier = &last_routed_tier,
+                        .last_routed_tier_len = &last_routed_tier_len,
                     };
                     const result = agent_commands.dispatch(&cmd_ctx, query);
                     // Sync back model_name (may have changed via /model)
@@ -3751,7 +3912,22 @@ fn agentInteractive(shell: *Shell) !u8 {
                             cursor_at = .output;
                             continue;
                         },
+                        .enter_tree => {
+                            // Enter modal tree view — takes over the screen
+                            const cmds = @import("agent_commands.zig");
+                            cmds.runTreeView(shell, out, term_rows, term_cols);
+                            // Restore scroll region and redraw layout
+                            recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
+                            cursor_at = .output;
+                            continue;
+                        },
                         .not_found => {
+                            // Track last query for router correction feedback
+                            const qcopy_len = @min(query.len, last_query_buf.len);
+                            @memcpy(last_query_buf[0..qcopy_len], query[0..qcopy_len]);
+                            last_query_len = qcopy_len;
+                            last_routed_tier_len = 0; // reset until router_info arrives
+
                             // Send to agent — always queues, never blocks
                             if (!shell.agent.query(query)) {
                                 Layout.goOutput(out, out_last);

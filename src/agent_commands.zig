@@ -4,6 +4,7 @@ const Shell = @import("Shell.zig");
 const editor = @import("editor.zig");
 const agent_log = @import("agent_log.zig");
 const agent_mod = @import("agent.zig");
+const router_mod = @import("agent_router.zig");
 
 /// Result of a command dispatch — tells the caller what to do next.
 pub const DispatchResult = enum {
@@ -17,6 +18,8 @@ pub const DispatchResult = enum {
     shell_escape,
     /// Enter ?-translation mode (caller sets translate state).
     translate,
+    /// Enter tree view modal (vim-navigable agent tree).
+    enter_tree,
 };
 
 // ── Terminal width helpers (moved from agentInteractive local TermWidth) ──
@@ -571,6 +574,11 @@ pub const CommandCtx = struct {
     // Markdown renderer
     md: *agent_mod.MarkdownRenderer,
     last_was_text: *bool,
+    // Router correction tracking
+    last_query_buf: *[512]u8,
+    last_query_len: *usize,
+    last_routed_tier: *[16]u8,
+    last_routed_tier_len: *usize,
 
     // ── Helper methods for common patterns ──
 
@@ -622,8 +630,9 @@ const commands = [_]Command{
     .{ .name = "/plan", .has_arg = true, .handler = cmdPlan },
     .{ .name = "/spawn", .has_arg = true, .handler = cmdSpawn },
     .{ .name = "/queue", .has_arg = true, .handler = cmdQueue },
-    .{ .name = "/agents", .has_arg = false, .handler = cmdAgents },
-    .{ .name = "/tasks", .has_arg = false, .handler = cmdAgents },
+    .{ .name = "/agents", .has_arg = false, .handler = cmdTree },
+    .{ .name = "/tasks", .has_arg = false, .handler = cmdTree },
+    .{ .name = "/tree", .has_arg = false, .handler = cmdTree },
     .{ .name = "/sessions", .has_arg = false, .handler = cmdSessions },
     .{ .name = "/config", .has_arg = false, .handler = cmdConfig },
     .{ .name = "/search", .has_arg = true, .handler = cmdSearch },
@@ -712,6 +721,26 @@ fn cmdCost(ctx: *CommandCtx, _: []const u8) DispatchResult {
 fn cmdModel(ctx: *CommandCtx, arg: []const u8) DispatchResult {
     Layout.goOutput(ctx.out, ctx.out_last.*);
     if (arg.len > 0) {
+        // Log correction if router had classified differently
+        if (ctx.last_query_len.* > 0 and ctx.last_routed_tier_len.* > 0) {
+            const corrected = if (std.mem.eql(u8, arg, "large") or std.mem.eql(u8, arg, "opus"))
+                "large"
+            else if (std.mem.eql(u8, arg, "small") or std.mem.eql(u8, arg, "haiku"))
+                "small"
+            else if (std.mem.eql(u8, arg, "medium") or std.mem.eql(u8, arg, "sonnet"))
+                "medium"
+            else
+                arg;
+            const routed = ctx.last_routed_tier[0..ctx.last_routed_tier_len.*];
+            if (!std.mem.eql(u8, routed, corrected)) {
+                router_mod.logCorrection(
+                    ctx.last_query_buf[0..ctx.last_query_len.*],
+                    routed,
+                    corrected,
+                );
+            }
+        }
+
         ctx.shell.agent.setModel(arg);
         const src = ctx.shell.agent.getModelOverride() orelse arg;
         const clen = @min(src.len, ctx.model_buf.len);
@@ -722,7 +751,7 @@ fn cmdModel(ctx: *CommandCtx, arg: []const u8) DispatchResult {
         ctx.drawStatusElapsed();
     } else {
         ctx.out.print("\x1b[1mCurrent model:\x1b[0m {s}\n", .{ctx.model_name}) catch {};
-        ctx.out.writeAll("\x1b[90mUsage: /model <opus|sonnet|haiku|model-id>\x1b[0m\n") catch {};
+        ctx.out.writeAll("\x1b[90mUsage: /model <large|medium|small|model-id>\x1b[0m\n") catch {};
         ctx.historyNote("Model info displayed");
     }
     ctx.out.flush() catch {};
@@ -837,18 +866,513 @@ fn cmdQueue(ctx: *CommandCtx, arg: []const u8) DispatchResult {
     return .handled;
 }
 
-fn cmdAgents(ctx: *CommandCtx, _: []const u8) DispatchResult {
-    Layout.goOutput(ctx.out, ctx.out_last.*);
-    if (ctx.shell.agent.isBusy()) {
-        ctx.out.writeAll("\x1b[33mAgent busy\x1b[0m\n") catch {};
-    } else {
-        ctx.out.writeAll("\x1b[90mAgent idle\x1b[0m\n") catch {};
+fn cmdTree(_: *CommandCtx, _: []const u8) DispatchResult {
+    return .enter_tree;
+}
+
+// ── Tree View ──────────────────────────────────────────────────────────
+
+/// A parsed tree node from the agent's binary protocol.
+pub const TreeNode = struct {
+    depth: u8,
+    status: u8, // 0=running, 1=done, 2=failed, 3=pending
+    kind: u8, // 0=main, 1=subagent(ro), 2=worker(full), 3=task
+    id: [16]u8 = undefined,
+    id_len: u8 = 0,
+    desc: [200]u8 = undefined,
+    desc_len: u8 = 0,
+    preview: [512]u8 = undefined,
+    preview_len: u16 = 0,
+
+    pub fn idSlice(self: *const TreeNode) []const u8 {
+        return self.id[0..self.id_len];
     }
-    _ = ctx.shell.agent.queues.request.push(.agent_status_req, "");
-    ctx.out.writeAll("\x1b[90mWorkers & tasks:\x1b[0m\n") catch {};
-    ctx.historyNote("Agent status requested");
-    ctx.out.flush() catch {};
-    return .handled;
+    pub fn descSlice(self: *const TreeNode) []const u8 {
+        return self.desc[0..self.desc_len];
+    }
+    pub fn previewSlice(self: *const TreeNode) []const u8 {
+        return self.preview[0..self.preview_len];
+    }
+
+    pub fn statusIcon(self: *const TreeNode) []const u8 {
+        return switch (self.status) {
+            0 => "\x1b[33m\xe2\x97\x8f\x1b[0m", // ● yellow (running)
+            1 => "\x1b[32m\xe2\x9c\x93\x1b[0m", // ✓ green (done)
+            2 => "\x1b[31m\xe2\x9c\x97\x1b[0m", // ✗ red (failed)
+            3 => "\x1b[90m\xe2\x97\x8b\x1b[0m", // ○ dim (pending)
+            else => "?",
+        };
+    }
+
+    pub fn kindLabel(self: *const TreeNode) []const u8 {
+        return switch (self.kind) {
+            0 => "\x1b[1magent\x1b[0m",
+            1 => "\x1b[36msubagent\x1b[0m",
+            2 => "\x1b[35mworker\x1b[0m",
+            3 => "\x1b[90mtask\x1b[0m",
+            else => "?",
+        };
+    }
+
+    /// Parse a binary tree node from the agent protocol.
+    pub fn parse(data: []const u8) ?TreeNode {
+        if (data.len < 5) return null;
+        var node: TreeNode = .{
+            .depth = data[0],
+            .status = data[1],
+            .kind = data[2],
+            .id_len = 0,
+            .desc_len = 0,
+        };
+        const id_len = data[3];
+        if (4 + id_len >= data.len) return null;
+        const il: u8 = @min(id_len, 16);
+        @memcpy(node.id[0..il], data[4..][0..il]);
+        node.id_len = il;
+        const desc_off: usize = 4 + id_len;
+        const dl = data[desc_off];
+        const desc_start = desc_off + 1;
+        if (desc_start + dl > data.len) return null;
+        const dll: u8 = @min(dl, 200);
+        @memcpy(node.desc[0..dll], data[desc_start..][0..dll]);
+        node.desc_len = dll;
+        // Preview is everything after desc
+        const prev_start = desc_start + dl;
+        if (prev_start < data.len) {
+            const plen: u16 = @intCast(@min(data.len - prev_start, 512));
+            @memcpy(node.preview[0..plen], data[prev_start..][0..plen]);
+            node.preview_len = plen;
+        }
+        return node;
+    }
+};
+
+/// Render the tree view. Called from the main input loop when in tree mode.
+/// Returns when user presses q/Esc to exit tree view.
+pub fn runTreeView(
+    shell: *Shell,
+    out: *std.Io.Writer,
+    term_rows: u16,
+    term_cols: u16,
+) void {
+    const q = @import("agent_queue.zig");
+
+    // Request tree data from agent
+    _ = shell.agent.queues.request.push(.agent_tree_req, "");
+
+    // Collect nodes (poll for up to 500ms)
+    var nodes: [64]TreeNode = undefined;
+    var node_count: u8 = 0;
+    var deadline: i64 = std.time.milliTimestamp() + 500;
+    var got_end = false;
+
+    while (std.time.milliTimestamp() < deadline and !got_end) {
+        var msg: q.Msg = undefined;
+        while (shell.agent.queues.output.pop(&msg)) {
+            if (msg.kind == .agent_tree_node) {
+                if (msg.len == 0) {
+                    got_end = true;
+                    break;
+                }
+                if (node_count < 64) {
+                    if (TreeNode.parse(msg.slice())) |parsed| {
+                        nodes[node_count] = parsed;
+                        node_count += 1;
+                    }
+                }
+            }
+            // Discard other messages during tree collection
+        }
+        if (!got_end) std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+
+    if (node_count == 0) {
+        // No nodes — show empty state in scroll region
+        out.writeAll("\x1b[90mNo agents or tasks.\x1b[0m\n") catch {};
+        out.flush() catch {};
+        return;
+    }
+
+    // Tree view state
+    var cursor: u8 = 0;
+    var scroll_top: u8 = 0;
+    var viewing_result = false;
+    var result_buf: [32768]u8 = undefined;
+    var result_len: usize = 0;
+    var result_scroll: u16 = 0;
+
+    // Bulletin state — read recent posts from the commons
+    var bulletin_cursor: usize = 0;
+    var bulletin_posts: [16]q.Post = undefined;
+    var bulletin_count: usize = 0;
+    // Start from recent history (last 16 posts)
+    const cur_pos = shell.agent.bulletin.position();
+    if (cur_pos > 16) {
+        bulletin_cursor = cur_pos - 16;
+    }
+    {
+        const br = shell.agent.bulletin.read(bulletin_cursor, &bulletin_posts);
+        bulletin_count = br.count;
+        bulletin_cursor = br.new_cursor;
+    }
+
+    // Layout: header(1) | tree(dynamic) | separator(1) | bulletin(4) | footer(1)
+    const header_rows: u16 = 1;
+    const footer_rows: u16 = 1;
+    const bulletin_rows: u16 = @min(4, term_rows / 4);
+    const sep_rows: u16 = 1;
+    const view_height = term_rows -| (header_rows + footer_rows + bulletin_rows + sep_rows);
+
+    // Save scroll region, use full screen
+    out.print("\x1b[1;{d}r", .{term_rows}) catch {};
+
+    // Main tree view loop
+    while (true) {
+        // Clear and render
+        out.writeAll("\x1b[?25l") catch {}; // hide cursor
+
+        // Poll bulletin for new posts
+        {
+            const br = shell.agent.bulletin.read(bulletin_cursor, bulletin_posts[bulletin_count..]);
+            if (br.count > 0) {
+                // Shift old posts out if full
+                if (bulletin_count + br.count > bulletin_posts.len) {
+                    const shift = bulletin_count + br.count - bulletin_posts.len;
+                    for (0..bulletin_posts.len - shift) |i| {
+                        bulletin_posts[i] = bulletin_posts[i + shift];
+                    }
+                    bulletin_count = bulletin_posts.len - br.count;
+                }
+                bulletin_count += br.count;
+            }
+            bulletin_cursor = br.new_cursor;
+        }
+
+        if (viewing_result) {
+            drawResultView(out, term_rows, term_cols, &nodes[cursor], result_buf[0..result_len], result_scroll, view_height);
+        } else {
+            drawTreeView(out, term_rows, term_cols, nodes[0..node_count], cursor, scroll_top, view_height);
+            // Draw bulletin separator + feed
+            const bsep_row = header_rows + 1 + view_height;
+            drawBulletin(out, bsep_row, term_rows, term_cols, bulletin_posts[0..bulletin_count], bulletin_rows);
+        }
+
+        out.flush() catch {};
+
+        // Read input
+        var byte: [1]u8 = undefined;
+        const nr = std.fs.File.stdin().read(&byte) catch break;
+        if (nr == 0) break;
+
+        if (viewing_result) {
+            switch (byte[0]) {
+                'q', 0x1B, 'h' => { // Esc, q, h = back to tree
+                    viewing_result = false;
+                    result_scroll = 0;
+                },
+                'j' => result_scroll +|= 1,
+                'k' => {
+                    result_scroll -|= 1;
+                },
+                'G' => {
+                    // Jump to end
+                    const lines = countLines(result_buf[0..result_len]);
+                    result_scroll = if (lines > view_height) lines - view_height else 0;
+                },
+                'g' => {
+                    result_scroll = 0;
+                },
+                'd' => { // Ctrl+D / half page down
+                    result_scroll +|= view_height / 2;
+                },
+                'u' => { // Ctrl+U / half page up
+                    const half = view_height / 2;
+                    result_scroll -|= half;
+                },
+                else => {},
+            }
+        } else {
+            switch (byte[0]) {
+                'q', 0x1B => break, // quit tree view
+                'j' => {
+                    if (cursor + 1 < node_count) {
+                        cursor += 1;
+                        { const vh: u8 = @intCast(@min(view_height, 255)); if (cursor >= scroll_top +| vh) scroll_top = cursor -| vh +| 1; }
+                    }
+                },
+                'k' => {
+                    if (cursor > 0) {
+                        cursor -= 1;
+                        if (cursor < scroll_top) scroll_top = cursor;
+                    }
+                },
+                'l', 0x0D => { // Enter or l = view result
+                    if (nodes[cursor].status == 1 or nodes[cursor].status == 2) {
+                        // Fetch result
+                        result_len = 0;
+                        _ = shell.agent.queues.request.push(.agent_result_req, nodes[cursor].idSlice());
+                        // Collect result chunks
+                        const rdl: i64 = std.time.milliTimestamp() + 1000;
+                        var got_res_end = false;
+                        while (std.time.milliTimestamp() < rdl and !got_res_end) {
+                            var rmsg: q.Msg = undefined;
+                            while (shell.agent.queues.output.pop(&rmsg)) {
+                                if (rmsg.kind == .agent_result) {
+                                    if (rmsg.len == 0) {
+                                        got_res_end = true;
+                                        break;
+                                    }
+                                    const chunk = rmsg.slice();
+                                    const space = result_buf.len - result_len;
+                                    const cn = @min(chunk.len, space);
+                                    @memcpy(result_buf[result_len..][0..cn], chunk[0..cn]);
+                                    result_len += cn;
+                                }
+                            }
+                            if (!got_res_end) std.Thread.sleep(10 * std.time.ns_per_ms);
+                        }
+                        viewing_result = true;
+                        result_scroll = 0;
+                    } else if (nodes[cursor].preview_len > 0) {
+                        // Use preview for running agents
+                        const pv = nodes[cursor].previewSlice();
+                        const cn = @min(pv.len, result_buf.len);
+                        @memcpy(result_buf[0..cn], pv[0..cn]);
+                        result_len = cn;
+                        viewing_result = true;
+                        result_scroll = 0;
+                    }
+                },
+                'r' => { // Refresh tree
+                    _ = shell.agent.queues.request.push(.agent_tree_req, "");
+                    node_count = 0;
+                    deadline = std.time.milliTimestamp() + 500;
+                    got_end = false;
+                    while (std.time.milliTimestamp() < deadline and !got_end) {
+                        var rmsg: q.Msg = undefined;
+                        while (shell.agent.queues.output.pop(&rmsg)) {
+                            if (rmsg.kind == .agent_tree_node) {
+                                if (rmsg.len == 0) {
+                                    got_end = true;
+                                    break;
+                                }
+                                if (node_count < 64) {
+                                    if (TreeNode.parse(rmsg.slice())) |parsed| {
+                                        nodes[node_count] = parsed;
+                                        node_count += 1;
+                                    }
+                                }
+                            }
+                        }
+                        if (!got_end) std.Thread.sleep(10 * std.time.ns_per_ms);
+                    }
+                    if (cursor >= node_count and node_count > 0) cursor = node_count - 1;
+                },
+                'G' => {
+                    if (node_count > 0) {
+                        cursor = node_count - 1;
+                        { const vh: u8 = @intCast(@min(view_height, 255)); if (cursor >= scroll_top +| vh) scroll_top = cursor -| vh +| 1; }
+                    }
+                },
+                'g' => {
+                    cursor = 0;
+                    scroll_top = 0;
+                },
+                else => {},
+            }
+        }
+    }
+
+    // Restore cursor and show
+    out.writeAll("\x1b[?25h") catch {}; // show cursor
+    out.flush() catch {};
+}
+
+fn drawTreeView(
+    w: *std.Io.Writer,
+    term_rows: u16,
+    term_cols: u16,
+    nodes: []const TreeNode,
+    cursor: u8,
+    scroll_top: u8,
+    view_height: u16,
+) void {
+    // Header
+    w.print("\x1b[1;1H\x1b[2K\x1b[1;7m Agent Tree \x1b[0m\x1b[90m  j/k:move  l/Enter:view  r:refresh  q:exit\x1b[0m", .{}) catch {};
+
+    // Tree nodes
+    const end = @min(@as(u16, scroll_top) + view_height, @as(u16, @intCast(nodes.len)));
+    for (scroll_top..@intCast(end)) |idx| {
+        const i: u8 = @intCast(idx);
+        const row: u16 = @as(u16, @intCast(idx - scroll_top)) + 2;
+        const node = &nodes[idx];
+
+        w.print("\x1b[{d};1H\x1b[2K", .{row}) catch {};
+
+        // Cursor indicator
+        if (i == cursor) {
+            w.writeAll("\x1b[7m") catch {}; // reverse video
+        }
+
+        // Tree connector lines
+        const indent = @as(u16, node.depth) * 3;
+        var pad: u16 = 0;
+        while (pad < indent) : (pad += 1) {
+            w.writeByte(' ') catch {};
+        }
+
+        // Tree branch characters
+        if (node.depth > 0) {
+            // Check if this is the last node at this depth
+            var is_last = true;
+            for (idx + 1..nodes.len) |j| {
+                if (nodes[j].depth <= node.depth) {
+                    if (nodes[j].depth == node.depth) is_last = false;
+                    break;
+                }
+            }
+            if (is_last) {
+                w.writeAll("\xe2\x94\x94\xe2\x94\x80 ") catch {}; // └─
+            } else {
+                w.writeAll("\xe2\x94\x9c\xe2\x94\x80 ") catch {}; // ├─
+            }
+        }
+
+        // Status icon + kind + id + description
+        w.writeAll(node.statusIcon()) catch {};
+        w.writeByte(' ') catch {};
+        w.writeAll(node.kindLabel()) catch {};
+        w.print(" \x1b[1m{s}\x1b[0m", .{node.idSlice()}) catch {};
+        if (i == cursor) w.writeAll("\x1b[7m") catch {};
+        w.writeByte(' ') catch {};
+
+        // Truncate description to fit
+        const used = indent + 3 + 20 + node.id_len; // approximate
+        const avail = if (term_cols > used) term_cols - used else 10;
+        const desc = node.descSlice();
+        if (desc.len > avail) {
+            w.writeAll(desc[0..avail -| 1]) catch {};
+            w.writeAll("\xe2\x80\xa6") catch {}; // …
+        } else {
+            w.writeAll(desc) catch {};
+        }
+
+        if (i == cursor) {
+            w.writeAll("\x1b[0m") catch {};
+        }
+    }
+
+    // Clear remaining rows
+    var r: u16 = @as(u16, @intCast(end - scroll_top)) + 2;
+    while (r < term_rows) : (r += 1) {
+        w.print("\x1b[{d};1H\x1b[2K", .{r}) catch {};
+    }
+
+    // Footer
+    w.print("\x1b[{d};1H\x1b[2K\x1b[90m {d}/{d} nodes\x1b[0m", .{
+        term_rows, @as(u16, cursor) + 1, @as(u16, @intCast(nodes.len)),
+    }) catch {};
+}
+
+fn drawResultView(
+    w: *std.Io.Writer,
+    term_rows: u16,
+    term_cols: u16,
+    node: *const TreeNode,
+    result: []const u8,
+    scroll: u16,
+    view_height: u16,
+) void {
+    _ = term_cols;
+    // Header
+    w.print("\x1b[1;1H\x1b[2K\x1b[1;7m {s} {s} \x1b[0m\x1b[90m  j/k:scroll  g/G:top/bottom  h/q:back\x1b[0m", .{
+        node.kindLabel(), node.idSlice(),
+    }) catch {};
+
+    // Render result text line by line with scroll
+    var line_start: usize = 0;
+    var line_num: u16 = 0;
+    var row: u16 = 2;
+
+    for (result, 0..) |c, ci| {
+        if (c == '\n' or ci == result.len - 1) {
+            const end = if (c == '\n') ci else ci + 1;
+            if (line_num >= scroll and row <= term_rows - 1) {
+                w.print("\x1b[{d};1H\x1b[2K", .{row}) catch {};
+                w.writeAll(result[line_start..end]) catch {};
+                row += 1;
+            }
+            line_num += 1;
+            line_start = ci + 1;
+        }
+    }
+
+    // Clear remaining rows
+    while (row < term_rows) : (row += 1) {
+        w.print("\x1b[{d};1H\x1b[2K", .{row}) catch {};
+    }
+
+    // Footer
+    w.print("\x1b[{d};1H\x1b[2K\x1b[90m line {d}  {s}\x1b[0m", .{
+        term_rows, scroll + 1, node.descSlice(),
+    }) catch {};
+    _ = view_height;
+}
+
+fn countLines(text: []const u8) u16 {
+    var count: u16 = 1;
+    for (text) |c| {
+        if (c == '\n') count +|= 1;
+    }
+    return count;
+}
+
+fn drawBulletin(
+    w: *std.Io.Writer,
+    start_row: u16,
+    term_rows: u16,
+    term_cols: u16,
+    posts: []const @import("agent_queue.zig").Post,
+    max_rows: u16,
+) void {
+    _ = term_cols;
+    // Separator
+    w.print("\x1b[{d};1H\x1b[2K\x1b[90m\xe2\x94\x80\xe2\x94\x80 bulletin ", .{start_row}) catch {};
+    var pad: u16 = 12;
+    while (pad < 40) : (pad += 1) w.writeAll("\xe2\x94\x80") catch {};
+    w.writeAll("\x1b[0m") catch {};
+
+    // Posts (most recent at bottom)
+    const avail = @min(max_rows, term_rows -| start_row -| 1);
+    const show_start = if (posts.len > avail) posts.len - avail else 0;
+    var row: u16 = start_row + 1;
+    for (posts[show_start..]) |*post| {
+        if (row >= term_rows) break;
+        w.print("\x1b[{d};1H\x1b[2K", .{row}) catch {};
+        // Post kind icon
+        const icon: []const u8 = switch (post.kind) {
+            .discovery => "\x1b[32m\xe2\x97\x86\x1b[0m", // ◆ green
+            .escalate => "\x1b[31m\xe2\x96\xb2\x1b[0m", // ▲ red
+            .request_peer => "\x1b[33m\xe2\x97\x8b\x1b[0m", // ○ yellow
+            .status_change => "\x1b[36m\xe2\x97\x8f\x1b[0m", // ● cyan
+            .claim => "\x1b[35m\xe2\x96\xa0\x1b[0m", // ■ magenta
+            .release => "\x1b[90m\xe2\x96\xa1\x1b[0m", // □ dim
+            .vote => "\x1b[34m\xe2\x9c\x93\x1b[0m", // ✓ blue
+        };
+        w.writeAll(icon) catch {};
+        w.print(" \x1b[1m{s}\x1b[0m \x1b[90m", .{post.authorSlice()}) catch {};
+        // Truncate message
+        const msg = post.slice();
+        const show_len = @min(msg.len, 80);
+        w.writeAll(msg[0..show_len]) catch {};
+        if (msg.len > 80) w.writeAll("\xe2\x80\xa6") catch {};
+        w.writeAll("\x1b[0m") catch {};
+        row += 1;
+    }
+    // Clear remaining
+    while (row < term_rows) : (row += 1) {
+        w.print("\x1b[{d};1H\x1b[2K", .{row}) catch {};
+    }
 }
 
 fn cmdSessions(ctx: *CommandCtx, _: []const u8) DispatchResult {
@@ -939,7 +1463,8 @@ fn cmdHelp(ctx: *CommandCtx, _: []const u8) DispatchResult {
         \\  \x1b[33m/plan\x1b[0m <task>          — plan without executing
         \\  \x1b[33m/spawn\x1b[0m <task>         — spawn worker (full tools)
         \\  \x1b[33m/queue\x1b[0m <task>         — queue autonomous task
-        \\  \x1b[33m/agents\x1b[0m              — list workers & tasks
+        \\  \x1b[33m/tree\x1b[0m                — agent tree view (vim nav)
+        \\  \x1b[33m/agents\x1b[0m              — agent tree view (alias)
         \\  \x1b[33m/sessions\x1b[0m            — list recent sessions
         \\  \x1b[33m/config\x1b[0m              — show configuration
         \\  \x1b[33m/search\x1b[0m <pattern>    — search history (also /s)

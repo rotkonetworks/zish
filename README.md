@@ -23,7 +23,7 @@ embedded LLM agent with tool use, recursive subagents, and local inference.
 ```
 agent                    # interactive mode
 agent <query>            # one-shot
-agent -m opus <query>    # model override (opus/sonnet/haiku)
+agent -m large <query>   # model override (small/medium/large)
 agent continue           # re-enter session
 agent attach [id]        # attach to running session (like screen)
 agent sessions           # list sessions
@@ -46,15 +46,36 @@ bottom-anchored TUI with scroll regions, markdown rendering, and vi mode input.
 | `Esc` | vi normal mode |
 | `Ctrl+D` | exit |
 
-commands: `/compact`, `/cost`, `/model`, `/diff`, `/commit`, `/review`, `/undo`, `/plan`, `/spawn`, `/queue`, `/agents`, `/tasks`, `/search`, `/help`
+commands: `/compact`, `/cost`, `/model`, `/diff`, `/commit`, `/review`, `/undo`, `/plan`, `/spawn`, `/queue`, `/tree`, `/agents`, `/tasks`, `/search`, `/help`
 
 ### subagents
 
 recursive spawning up to 3 levels deep, 8 per level. workers get full tools, read-only subagents get bash/read/glob/grep. autonomous task queue (16 slots) for background work.
 
+### tree view (`/tree`)
+
+vim-navigable agent tree with live bulletin feed. shows all agents, subagents, and tasks in a hierarchical view.
+
+| key | action |
+|-----|--------|
+| `j/k` | move cursor |
+| `l` / `Enter` | view agent output |
+| `h` / `Esc` | back / exit |
+| `g/G` | top / bottom |
+| `r` | refresh tree |
+| `q` | quit tree view |
+
+### bulletin board
+
+shared broadcast log — the commons. any agent (main, subagent, worker) can post. no hierarchy, no central authority. all agents see all posts.
+
+post types: discovery (findings), escalate (override parent), request_peer (ask for help), claim/release (resource locking), vote (consensus).
+
+agents automatically broadcast: spawn/completion events, file edit/write claims. visible in tree view bulletin feed.
+
 ### query router
 
-classifies queries before dispatch: local patterns (70% zero-cost) → local GGUF inference → haiku API call. routes to shell (bypass LLM), or selects model tier (haiku/sonnet/opus).
+classifies queries before dispatch: local patterns (70% zero-cost) → local GGUF inference → small-tier API call. selects model tier (small/medium/large). shell commands use `!` prefix for deterministic bypass.
 
 ### local GGUF inference engine
 
@@ -109,9 +130,57 @@ RouterFilter → LoggingFilter → TokenTrackingFilter → RetryFilter → ToolL
 | `agent_filters.zig` | router, logging, token tracking, retry filters |
 | `agent_tools.zig` | tool dispatch with `ToolContext` |
 | `agent_drain.zig` | comptime drain handler for message output |
-| `agent_commands.zig` | table-driven slash command dispatch |
+| `agent_commands.zig` | table-driven slash command dispatch, tree view |
 | `agent_router.zig` | query classification pipeline |
+| `agent_queue.zig` | SPSC ring buffer, MPSC bulletin board (the commons) |
 | `agent.zig` | agent thread, API calls, SSE parsing, markdown renderer |
+
+## plugins
+
+contribute without recompiling. drop files in `~/.zish/` directories.
+
+### tools (`~/.zish/tools/*.json`)
+
+one JSON file per tool (or array of tools). agent gets them as callable functions.
+
+```json
+{
+  "name": "GitBlame",
+  "description": "Show git blame for a file",
+  "command": "git blame --date=short {file_path}",
+  "parameters": {
+    "file_path": { "type": "string", "description": "Path to file" }
+  }
+}
+```
+
+also loads legacy `~/.zish/agent-tools.json`. see `contrib/tools/` for examples.
+
+### router patterns (`~/.zish/patterns/*.txt`)
+
+teach the router new keywords. zero-cost local classification. tiers: small (simple), medium (code), large (complex).
+
+```
+# agent keywords — route to LLM with tier selection
+type: agent
+tier: medium
+scaffold
+bootstrap
+
+type: agent
+tier: large
+threat model
+root cause
+```
+
+see `contrib/patterns/` for examples.
+
+### install from contrib
+
+```sh
+cp contrib/tools/kubectl.json ~/.zish/tools/
+cp contrib/patterns/devops.txt ~/.zish/patterns/
+```
 
 ## performance
 

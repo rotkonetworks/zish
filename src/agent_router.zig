@@ -1,5 +1,5 @@
 // agent_router.zig - lightweight query router for agent dispatch
-// Classifies user intent using local patterns or a cheap model (Haiku/0.5B).
+// Classifies user intent using local patterns or a cheap model (small tier/0.5B).
 // The router never speaks to the user — it only emits structured routing decisions.
 
 const std = @import("std");
@@ -7,15 +7,16 @@ const agent_mod = @import("agent.zig");
 const inference = @import("inference/root.zig");
 
 pub const RouteAction = enum(u8) {
-    shell, // run as plain shell command, skip LLM entirely
     agent, // route to a single agent with specified model
     fan_out, // spawn parallel subagents
 };
 
+/// Model size tier — maps to any provider's small/medium/large models.
+/// Names are labels, not tied to any vendor.
 pub const ModelTier = enum(u8) {
-    haiku, // simple: explanations, lookups, quick edits
-    sonnet, // medium: multi-file changes, debugging, code gen
-    opus, // hard: complex reasoning, large refactors, audits
+    small, // fast, cheap: lookups, simple questions, classification
+    medium, // balanced: code edits, debugging, multi-file changes
+    large, // heavyweight: complex reasoning, architecture, audits
 };
 
 pub const CostTier = enum(u8) { low, medium, high };
@@ -36,7 +37,7 @@ pub const READ_ONLY = ToolMask{ .bash = true, .read = true, .edit = false, .writ
 
 pub const RouteDecision = struct {
     action: RouteAction = .agent,
-    model_tier: ModelTier = .sonnet,
+    model_tier: ModelTier = .medium,
     cost: CostTier = .medium,
     tools: ToolMask = ALL_TOOLS,
     fan_out_count: u8 = 0,
@@ -69,14 +70,13 @@ pub const RouteDecision = struct {
 
     pub fn summary(self: *const RouteDecision, buf: *[256]u8) []const u8 {
         const action_str = switch (self.action) {
-            .shell => "shell",
             .agent => "agent",
             .fan_out => "fan_out",
         };
         const tier_str = switch (self.model_tier) {
-            .haiku => "haiku",
-            .sonnet => "sonnet",
-            .opus => "opus",
+            .small => "small",
+            .medium => "medium",
+            .large => "large",
         };
         const cost_str = switch (self.cost) {
             .low => "low",
@@ -113,6 +113,9 @@ pub const RouterConfig = struct {
     sonnet_len: u8 = 0,
     opus_model: [64]u8 = undefined,
     opus_len: u8 = 0,
+    // User-contributed keyword patterns loaded from ~/.zish/patterns/
+    extra_keywords: [64]struct { word: [48]u8 = undefined, word_len: u8 = 0, tier: ModelTier = .medium } = undefined,
+    extra_keyword_count: u8 = 0,
 
     pub fn routerModel(self: *const RouterConfig) []const u8 {
         if (self.model_len > 0) return self.model[0..self.model_len];
@@ -126,9 +129,9 @@ pub const RouterConfig = struct {
 
     pub fn resolveModel(self: *const RouterConfig, tier: ModelTier) []const u8 {
         return switch (tier) {
-            .haiku => if (self.haiku_len > 0) self.haiku_model[0..self.haiku_len] else "claude-haiku-4-5-20251001",
-            .sonnet => if (self.sonnet_len > 0) self.sonnet_model[0..self.sonnet_len] else "claude-sonnet-4-6",
-            .opus => if (self.opus_len > 0) self.opus_model[0..self.opus_len] else "claude-opus-4-6",
+            .small => if (self.haiku_len > 0) self.haiku_model[0..self.haiku_len] else "claude-haiku-4-5-20251001",
+            .medium => if (self.sonnet_len > 0) self.sonnet_model[0..self.sonnet_len] else "claude-sonnet-4-6",
+            .large => if (self.opus_len > 0) self.opus_model[0..self.opus_len] else "claude-opus-4-6",
         };
     }
 
@@ -157,106 +160,136 @@ pub const RouterConfig = struct {
         setField(&cfg.opus_model, &cfg.opus_len, "claude-opus-4-6");
         return cfg;
     }
+
+    /// Load user-contributed patterns at runtime. Call after init().
+    pub fn loadPlugins(self: *RouterConfig) void {
+        self.loadUserPatterns();
+    }
+
+    /// Load patterns from ~/.zish/patterns/ directory.
+    /// File format: lines of words, with optional header lines:
+    ///   # comment
+    ///   type: shell | agent
+    ///   tier: haiku | sonnet | opus  (for agent type)
+    ///   word1
+    ///   word2
+    fn loadUserPatterns(self: *RouterConfig) void {
+        const alloc = std.heap.page_allocator;
+        const home = std.process.getEnvVarOwned(alloc, "HOME") catch return;
+        defer alloc.free(home);
+        var dir_buf: [512]u8 = undefined;
+        const dir_path = std.fmt.bufPrint(&dir_buf, "{s}/.zish/patterns", .{home}) catch return;
+        var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+        defer dir.close();
+        var iter = dir.iterate();
+        while (iter.next() catch null) |entry| {
+            if (entry.kind != .file) continue;
+            const content = dir.readFileAlloc(alloc, entry.name, 8192) catch continue;
+            defer alloc.free(content);
+            self.parsePatternFile(content);
+        }
+    }
+
+    fn parsePatternFile(self: *RouterConfig, content: []const u8) void {
+        var tier: ModelTier = .medium;
+        var is_agent: bool = true;
+        var line_start: usize = 0;
+        for (content, 0..) |c, ci| {
+            if (c == '\n' or ci == content.len - 1) {
+                const end = if (c == '\n') ci else ci + 1;
+                const line = std.mem.trim(u8, content[line_start..end], " \t\r");
+                line_start = ci + 1;
+                if (line.len == 0 or line[0] == '#') continue;
+                if (std.mem.startsWith(u8, line, "type:")) {
+                    const val = std.mem.trim(u8, line[5..], " \t");
+                    is_agent = std.mem.eql(u8, val, "agent");
+                    continue;
+                }
+                if (std.mem.startsWith(u8, line, "tier:")) {
+                    const val = std.mem.trim(u8, line[5..], " \t");
+                    if (std.mem.eql(u8, val, "small") or std.mem.eql(u8, val, "haiku")) tier = .small
+                    else if (std.mem.eql(u8, val, "medium") or std.mem.eql(u8, val, "sonnet")) tier = .medium
+                    else if (std.mem.eql(u8, val, "large") or std.mem.eql(u8, val, "opus")) tier = .large;
+                    continue;
+                }
+                // Only load agent keywords (shell type is ignored — use ! prefix instead)
+                if (is_agent and self.extra_keyword_count < 64) {
+                    const n: u8 = @intCast(@min(line.len, 48));
+                    var kw = &self.extra_keywords[self.extra_keyword_count];
+                    @memcpy(kw.word[0..n], line[0..n]);
+                    kw.word_len = n;
+                    kw.tier = tier;
+                    self.extra_keyword_count += 1;
+                }
+            }
+        }
+    }
 };
 
 // ============================================================
 // Local pattern classification (zero-cost, no API call)
 // ============================================================
 
-/// Known shell commands that should bypass the agent entirely.
-/// These are commands that make no sense to route through an LLM.
-const SHELL_COMMANDS = [_][]const u8{
-    "ls",    "cd",     "pwd",    "cat",   "echo",  "mkdir",  "rm",
-    "cp",    "mv",     "touch",  "chmod", "chown", "find",   "grep",
-    "head",  "tail",   "wc",     "sort",  "uniq",  "cut",    "tr",
-    "sed",   "awk",    "diff",   "tar",   "gzip",  "gunzip", "zip",
-    "unzip", "curl",   "wget",   "ssh",   "scp",   "rsync",  "df",
-    "du",    "free",   "top",    "htop",  "ps",    "kill",   "man",
-    "which", "whoami", "date",   "cal",   "env",   "export", "source",
-    "make",  "cmake",  "cargo",  "npm",   "yarn",  "pip",    "python",
-    "python3", "node", "ruby",   "perl",  "go",    "zig",    "rustc",
-    "gcc",   "g++",    "clang",  "git",   "docker", "systemctl",
-    "journalctl", "mount", "umount", "ip", "ping", "dig", "nslookup",
-    "less",  "more",   "vi",     "vim",   "nano",  "emacs",
-    // package managers
-    "apt",   "apt-get", "dnf",  "yum",   "pacman", "brew",  "snap",
-    "flatpak", "pnpm", "uv",   "pipx",  "gem",   "cpan",
-    // containers & infra
-    "podman", "kubectl", "helm", "terraform", "ansible", "vagrant",
-    "docker-compose",
-    // network & system
-    "ss",    "netstat", "iptables", "nft",  "firewall-cmd",
-    "lsof",  "strace", "ltrace", "perf",  "valgrind",
-    "fdisk", "lsblk",  "blkid",  "mkfs",  "fsck",
-    // file & text
-    "xargs", "tee",    "file",   "stat",  "ln",    "readlink",
-    "basename", "dirname", "realpath", "md5sum", "sha256sum",
-    "jq",    "yq",     "rg",     "fd",    "bat",   "exa",
-    // process & job
-    "killall", "pkill", "pgrep", "nohup", "screen", "tmux",
-    "bg",    "fg",     "jobs",   "wait",  "nice",  "renice",
-    // misc
-    "sudo",  "su",     "dmesg",  "uname", "uptime", "id",
-    "groups", "passwd", "crontab", "at",   "watch",
-    "xdg-open", "open", "pbcopy", "pbpaste", "xclip",
-};
-
 /// Keywords that suggest the user wants an LLM agent, not a shell command
 const AGENT_KEYWORDS = [_]struct { word: []const u8, tier: ModelTier }{
-    // Haiku tier — simple questions
-    .{ .word = "explain", .tier = .haiku },
-    .{ .word = "what is", .tier = .haiku },
-    .{ .word = "what's", .tier = .haiku },
-    .{ .word = "how do", .tier = .haiku },
-    .{ .word = "how to", .tier = .haiku },
-    .{ .word = "tell me", .tier = .haiku },
-    .{ .word = "describe", .tier = .haiku },
-    .{ .word = "show me", .tier = .haiku },
-    .{ .word = "list the", .tier = .haiku },
-    .{ .word = "summarize", .tier = .haiku },
-    .{ .word = "translate", .tier = .haiku },
-    // Sonnet tier — code work
-    .{ .word = "fix", .tier = .sonnet },
-    .{ .word = "debug", .tier = .sonnet },
-    .{ .word = "implement", .tier = .sonnet },
-    .{ .word = "add a ", .tier = .sonnet },
-    .{ .word = "add the", .tier = .sonnet },
-    .{ .word = "create a", .tier = .sonnet },
-    .{ .word = "write a", .tier = .sonnet },
-    .{ .word = "modify", .tier = .sonnet },
-    .{ .word = "change", .tier = .sonnet },
-    .{ .word = "update", .tier = .sonnet },
-    .{ .word = "refactor", .tier = .sonnet },
-    .{ .word = "optimize", .tier = .sonnet },
-    .{ .word = "build", .tier = .sonnet },
-    .{ .word = "test", .tier = .sonnet },
-    .{ .word = "generate", .tier = .sonnet },
-    .{ .word = "convert", .tier = .sonnet },
-    .{ .word = "migrate", .tier = .sonnet },
-    .{ .word = "port", .tier = .sonnet },
-    .{ .word = "rename", .tier = .sonnet },
-    .{ .word = "extract", .tier = .sonnet },
-    .{ .word = "move the", .tier = .sonnet },
-    .{ .word = "split", .tier = .sonnet },
-    .{ .word = "merge", .tier = .sonnet },
-    .{ .word = "clean up", .tier = .sonnet },
-    // Opus tier — complex reasoning
-    .{ .word = "audit", .tier = .opus },
-    .{ .word = "review all", .tier = .opus },
-    .{ .word = "redesign", .tier = .opus },
-    .{ .word = "architect", .tier = .opus },
-    .{ .word = "security", .tier = .opus },
-    .{ .word = "analyze the entire", .tier = .opus },
-    .{ .word = "compare and contrast", .tier = .opus },
-    .{ .word = "deep dive", .tier = .opus },
-    .{ .word = "comprehensive", .tier = .opus },
-    .{ .word = "thoroughly", .tier = .opus },
-    .{ .word = "performance analysis", .tier = .opus },
-    .{ .word = "investigate", .tier = .opus },
+    // Small tier — simple questions
+    .{ .word = "explain", .tier = .small},
+    .{ .word = "what is", .tier = .small},
+    .{ .word = "what's", .tier = .small},
+    .{ .word = "how do", .tier = .small},
+    .{ .word = "how to", .tier = .small},
+    .{ .word = "tell me", .tier = .small},
+    .{ .word = "describe", .tier = .small},
+    .{ .word = "show me", .tier = .small},
+    .{ .word = "list the", .tier = .small},
+    .{ .word = "summarize", .tier = .small},
+    .{ .word = "translate", .tier = .small},
+    // Medium tier — code work
+    .{ .word = "fix", .tier = .medium},
+    .{ .word = "debug", .tier = .medium},
+    .{ .word = "implement", .tier = .medium},
+    .{ .word = "add a ", .tier = .medium},
+    .{ .word = "add the", .tier = .medium},
+    .{ .word = "create a", .tier = .medium},
+    .{ .word = "write a", .tier = .medium},
+    .{ .word = "modify", .tier = .medium},
+    .{ .word = "change", .tier = .medium},
+    .{ .word = "update", .tier = .medium},
+    .{ .word = "refactor", .tier = .medium},
+    .{ .word = "optimize", .tier = .medium},
+    .{ .word = "build", .tier = .medium},
+    .{ .word = "test", .tier = .medium},
+    .{ .word = "generate", .tier = .medium},
+    .{ .word = "convert", .tier = .medium},
+    .{ .word = "migrate", .tier = .medium},
+    .{ .word = "port", .tier = .medium},
+    .{ .word = "rename", .tier = .medium},
+    .{ .word = "extract", .tier = .medium},
+    .{ .word = "move the", .tier = .medium},
+    .{ .word = "split", .tier = .medium},
+    .{ .word = "merge", .tier = .medium},
+    .{ .word = "clean up", .tier = .medium},
+    // Large tier — complex reasoning
+    .{ .word = "audit", .tier = .large},
+    .{ .word = "review all", .tier = .large},
+    .{ .word = "redesign", .tier = .large},
+    .{ .word = "architect", .tier = .large},
+    .{ .word = "security", .tier = .large},
+    .{ .word = "analyze the entire", .tier = .large},
+    .{ .word = "compare and contrast", .tier = .large},
+    .{ .word = "deep dive", .tier = .large},
+    .{ .word = "comprehensive", .tier = .large},
+    .{ .word = "thoroughly", .tier = .large},
+    .{ .word = "performance analysis", .tier = .large},
+    .{ .word = "investigate", .tier = .large},
 };
 
 /// Try to classify query using only local heuristics. Returns null if ambiguous.
 pub fn classifyLocal(query: []const u8) ?RouteDecision {
+    return classifyLocalWithConfig(query, null);
+}
+
+pub fn classifyLocalWithConfig(query: []const u8, config: ?*const RouterConfig) ?RouteDecision {
     if (query.len == 0) return null;
 
     const trimmed = std.mem.trim(u8, query, " \t\r\n");
@@ -266,26 +299,22 @@ pub fn classifyLocal(query: []const u8) ?RouteDecision {
     var lower_buf: [512]u8 = undefined;
     const lower = toLower(trimmed, &lower_buf);
 
-    // If first word is a known shell command, only match agent keywords at START of query
-    // This prevents "sha256sum build.zig" from matching agent keyword "build"
-    const first_word_is_shell = isShellCommand(trimmed);
-
     for (AGENT_KEYWORDS) |kw| {
         if (std.mem.startsWith(u8, lower, kw.word) or
-            (!first_word_is_shell and containsWord(lower, kw.word)))
+            containsWord(lower, kw.word))
         {
             var rd = RouteDecision{
                 .action = .agent,
                 .model_tier = kw.tier,
                 .cost = switch (kw.tier) {
-                    .haiku => .low,
-                    .sonnet => .medium,
-                    .opus => .high,
+                    .small => .low,
+                    .medium => .medium,
+                    .large => .high,
                 },
                 .tools = switch (kw.tier) {
-                    .haiku => READ_ONLY,
-                    .sonnet => ALL_TOOLS,
-                    .opus => ALL_TOOLS,
+                    .small => READ_ONLY,
+                    .medium => ALL_TOOLS,
+                    .large => ALL_TOOLS,
                 },
             };
             rd.setReason("local: keyword match");
@@ -293,11 +322,40 @@ pub fn classifyLocal(query: []const u8) ?RouteDecision {
         }
     }
 
-    // Short queries with question marks -> haiku
+    // Check user-contributed agent keywords from ~/.zish/patterns/
+    if (config) |cfg| {
+        for (0..cfg.extra_keyword_count) |i| {
+            const kw = &cfg.extra_keywords[i];
+            if (kw.word_len == 0) continue;
+            const word = kw.word[0..kw.word_len];
+            if (std.mem.startsWith(u8, lower, word) or
+                containsWord(lower, word))
+            {
+                var rd = RouteDecision{
+                    .action = .agent,
+                    .model_tier = kw.tier,
+                    .cost = switch (kw.tier) {
+                        .small => .low,
+                        .medium => .medium,
+                        .large => .high,
+                    },
+                    .tools = switch (kw.tier) {
+                        .small => READ_ONLY,
+                        .medium => ALL_TOOLS,
+                        .large => ALL_TOOLS,
+                    },
+                };
+                rd.setReason("plugin: keyword match");
+                return rd;
+            }
+        }
+    }
+
+    // Short queries with question marks -> small
     if (trimmed.len < 80 and std.mem.indexOfScalar(u8, trimmed, '?') != null) {
         var rd = RouteDecision{
             .action = .agent,
-            .model_tier = .haiku,
+            .model_tier = .small,
             .cost = .low,
             .tools = READ_ONLY,
         };
@@ -305,86 +363,8 @@ pub fn classifyLocal(query: []const u8) ?RouteDecision {
         return rd;
     }
 
-    // Check for shell command patterns — AFTER agent keywords so natural language
-    // queries like "find any TODO comments" don't get misrouted as shell "find"
-    if (isShellCommand(trimmed) and !looksLikeNaturalLanguage(lower)) {
-        var rd = RouteDecision{
-            .action = .shell,
-            .model_tier = .haiku,
-            .cost = .low,
-        };
-        rd.setReason("local: shell command");
-        return rd;
-    }
-
     // Ambiguous — needs model classification
     return null;
-}
-
-fn isShellCommand(query: []const u8) bool {
-    // Get the first word
-    const first_space = std.mem.indexOfAny(u8, query, " \t|;&") orelse query.len;
-    const first_word = query[0..first_space];
-
-    // Check against known commands
-    for (SHELL_COMMANDS) |cmd| {
-        if (std.mem.eql(u8, first_word, cmd)) return true;
-    }
-
-    // Starts with ./ or / (executable path)
-    if (std.mem.startsWith(u8, query, "./") or std.mem.startsWith(u8, query, "/")) return true;
-
-    // Starts with $ or # (copy-pasted command)
-    if (query[0] == '$' or query[0] == '#') return true;
-
-    // Starts with sudo/doas followed by a command
-    if (std.mem.startsWith(u8, query, "sudo ") or std.mem.startsWith(u8, query, "doas ")) {
-        const rest = std.mem.trimLeft(u8, query[5..], " \t");
-        return isShellCommand(rest);
-    }
-
-    // Variable assignment: FOO=bar or FOO=bar command
-    if (first_word.len > 0 and first_word[0] >= 'A' and first_word[0] <= 'Z') {
-        if (std.mem.indexOfScalar(u8, first_word, '=') != null) return true;
-    }
-
-    // Contains pipe, redirect, or semicolon early -> likely a command
-    if (query.len < 120) {
-        for (query) |c| {
-            if (c == '|' or c == '>' or c == '<') return true;
-        }
-    }
-
-    // Looks like a file path with extension (e.g., "script.sh")
-    if (std.mem.indexOfScalar(u8, first_word, '.') != null and
-        first_word.len > 3 and query.len < 100)
-    {
-        // common executable extensions
-        for ([_][]const u8{ ".sh", ".py", ".rb", ".pl", ".js" }) |ext| {
-            if (std.mem.endsWith(u8, first_word, ext)) return true;
-        }
-    }
-
-    return false;
-}
-
-/// Detect natural language queries that start with shell command names.
-/// E.g. "find any TODO comments in the codebase" vs "find . -name '*.zig'"
-fn looksLikeNaturalLanguage(lower_query: []const u8) bool {
-    // Natural language indicators — articles, pronouns, prepositions common in queries
-    const nl_words = [_][]const u8{
-        " any ", " the ", " all ", " every ", " each ",
-        " my ", " our ", " this ", " that ", " these ",
-        " please ", " can you ", " could you ",
-        " where ", " which ", " who ", " what ", " how ",
-        " about ", " from the ", " in the ", " of the ",
-        " comments", " functions", " files ", " errors",
-        " code ", " codebase", " project", " repository",
-    };
-    for (nl_words) |w| {
-        if (std.mem.indexOf(u8, lower_query, w) != null) return true;
-    }
-    return false;
 }
 
 fn toLower(s: []const u8, buf: *[512]u8) []const u8 {
@@ -657,25 +637,26 @@ fn parseRouteResponse(text: []const u8) ?RouteDecision {
     var rd = RouteDecision{};
 
     // Support compact format: {"r":"s"} / {"r":"a","t":"h|s|o"}
-    // and verbose format: {"action":"shell","model":"sonnet",...}
+    // and verbose format: {"action":"agent","model":"medium",...}
     if (jsonGetStr(json, "r")) |r| {
-        // Compact format
+        // Compact format — "s" (shell) now treated as agent/small
         if (std.mem.eql(u8, r, "s")) {
-            rd.action = .shell;
+            rd.action = .agent;
+            rd.model_tier = .small;
             rd.cost = .low;
-            rd.setReason("model: shell command");
+            rd.setReason("model: simple task");
         } else {
             rd.action = .agent;
             // Parse tier
             if (jsonGetStr(json, "t")) |t| {
                 if (std.mem.eql(u8, t, "h")) {
-                    rd.model_tier = .haiku;
+                    rd.model_tier = .small;
                     rd.cost = .low;
                 } else if (std.mem.eql(u8, t, "o")) {
-                    rd.model_tier = .opus;
+                    rd.model_tier = .large;
                     rd.cost = .high;
                 } else {
-                    rd.model_tier = .sonnet;
+                    rd.model_tier = .medium;
                     rd.cost = .medium;
                 }
             }
@@ -683,9 +664,7 @@ fn parseRouteResponse(text: []const u8) ?RouteDecision {
         }
     } else if (jsonGetStr(json, "action")) |a| {
         // Verbose format
-        if (std.mem.eql(u8, a, "shell")) {
-            rd.action = .shell;
-        } else if (std.mem.eql(u8, a, "fan_out")) {
+        if (std.mem.eql(u8, a, "fan_out")) {
             rd.action = .fan_out;
             rd.fan_out_count = 3;
         } else {
@@ -693,12 +672,12 @@ fn parseRouteResponse(text: []const u8) ?RouteDecision {
         }
 
         if (jsonGetStr(json, "model")) |m| {
-            if (std.mem.eql(u8, m, "haiku")) {
-                rd.model_tier = .haiku;
-            } else if (std.mem.eql(u8, m, "opus")) {
-                rd.model_tier = .opus;
+            if (std.mem.eql(u8, m, "haiku") or std.mem.eql(u8, m, "small")) {
+                rd.model_tier = .small;
+            } else if (std.mem.eql(u8, m, "opus") or std.mem.eql(u8, m, "large")) {
+                rd.model_tier = .large;
             } else {
-                rd.model_tier = .sonnet;
+                rd.model_tier = .medium;
             }
         }
 
@@ -723,11 +702,10 @@ fn parseRouteResponse(text: []const u8) ?RouteDecision {
 
     // Set tool mask based on action/tier
     rd.tools = switch (rd.action) {
-        .shell => ToolMask{},
         .agent => switch (rd.model_tier) {
-            .haiku => READ_ONLY,
-            .sonnet => ALL_TOOLS,
-            .opus => ALL_TOOLS,
+            .small => READ_ONLY,
+            .medium => ALL_TOOLS,
+            .large => ALL_TOOLS,
         },
         .fan_out => READ_ONLY,
     };
@@ -835,4 +813,198 @@ pub fn classifyWithLocalModel(
 
     // Parse the JSON classification from the response
     return parseRouteResponse(response);
+}
+
+// ============================================================
+// Correction logging — user feedback on router decisions
+// ============================================================
+
+/// Log a correction when user overrides the routed tier via /model.
+/// Written to ~/.zish/router_log.jsonl alongside normal route decisions.
+pub fn logCorrection(query: []const u8, routed_tier: []const u8, corrected_tier: []const u8) void {
+    if (query.len == 0 or query.len > 2048) return;
+
+    const alloc = std.heap.page_allocator;
+    const home = std.process.getEnvVarOwned(alloc, "HOME") catch return;
+    defer alloc.free(home);
+
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/.zish/router_log.jsonl", .{home}) catch return;
+
+    const file = std.fs.cwd().openFile(path, .{ .mode = .write_only }) catch |e| switch (e) {
+        error.FileNotFound => std.fs.cwd().createFile(path, .{}) catch return,
+        else => return,
+    };
+    defer file.close();
+    file.seekFromEnd(0) catch return;
+
+    const ts: u64 = @bitCast(std.time.timestamp());
+    var buf: [4096]u8 = undefined;
+    var pos: usize = 0;
+
+    const prefix = "{\"q\":\"";
+    @memcpy(buf[pos..][0..prefix.len], prefix);
+    pos += prefix.len;
+    for (query) |c| {
+        if (pos + 6 >= buf.len) break;
+        switch (c) {
+            '"' => { @memcpy(buf[pos..][0..2], "\\\""); pos += 2; },
+            '\\' => { @memcpy(buf[pos..][0..2], "\\\\"); pos += 2; },
+            '\n' => { @memcpy(buf[pos..][0..2], "\\n"); pos += 2; },
+            '\r' => {},
+            '\t' => { @memcpy(buf[pos..][0..2], "\\t"); pos += 2; },
+            else => { buf[pos] = c; pos += 1; },
+        }
+    }
+    const mid = std.fmt.bufPrint(buf[pos..], "\",\"routed\":\"{s}\",\"corrected\":\"{s}\",\"ts\":{d}}}\n", .{
+        routed_tier, corrected_tier, ts,
+    }) catch return;
+    pos += mid.len;
+    file.writeAll(buf[0..pos]) catch {};
+}
+
+// ============================================================
+// Pattern learner — extract corrections into learned patterns
+// ============================================================
+
+/// Scan router_log.jsonl for corrections, extract common words per tier,
+/// write ~/.zish/patterns/learned.txt. Called on agent startup.
+pub fn learnPatterns() void {
+    const alloc = std.heap.page_allocator;
+    const home = std.process.getEnvVarOwned(alloc, "HOME") catch return;
+    defer alloc.free(home);
+
+    // Read the log file
+    var log_path_buf: [512]u8 = undefined;
+    const log_path = std.fmt.bufPrint(&log_path_buf, "{s}/.zish/router_log.jsonl", .{home}) catch return;
+    const log_content = std.fs.cwd().readFileAlloc(alloc, log_path, 1 << 20) catch return; // 1MB max
+    defer alloc.free(log_content);
+
+    // Count word → tier corrections
+    // Simple approach: for each correction entry, extract words from query,
+    // tally which tier each word maps to
+    const MAX_WORDS = 256;
+    var words: [MAX_WORDS][48]u8 = undefined;
+    var word_lens: [MAX_WORDS]u8 = [_]u8{0} ** MAX_WORDS;
+    var word_tiers: [MAX_WORDS]ModelTier = [_]ModelTier{.medium} ** MAX_WORDS;
+    var word_counts: [MAX_WORDS]u16 = [_]u16{0} ** MAX_WORDS;
+    var word_total: usize = 0;
+
+    // Parse each line
+    var line_start: usize = 0;
+    for (log_content, 0..) |c, ci| {
+        if (c != '\n' and ci != log_content.len - 1) continue;
+        const end = if (c == '\n') ci else ci + 1;
+        const line = log_content[line_start..end];
+        line_start = ci + 1;
+
+        // Only process correction entries (have "corrected" field)
+        const corrected = jsonGetStr(line, "corrected") orelse continue;
+        const query = jsonGetStr(line, "q") orelse continue;
+
+        const tier: ModelTier = if (std.mem.eql(u8, corrected, "small")) .small
+            else if (std.mem.eql(u8, corrected, "large")) .large
+            else .medium;
+
+        // Extract words from query (lowercase, skip short ones)
+        var lower_buf: [512]u8 = undefined;
+        const lower = toLower(query, &lower_buf);
+        var wstart: usize = 0;
+        for (lower, 0..) |lc, li| {
+            if (lc == ' ' or li == lower.len - 1) {
+                const wend = if (lc == ' ') li else li + 1;
+                const word = lower[wstart..wend];
+                wstart = li + 1;
+                if (word.len < 3 or word.len > 47) continue;
+                // Skip common stopwords
+                if (isStopword(word)) continue;
+
+                // Find or insert word
+                var found = false;
+                for (0..word_total) |wi| {
+                    if (word_lens[wi] == word.len and
+                        std.mem.eql(u8, words[wi][0..word_lens[wi]], word))
+                    {
+                        word_counts[wi] += 1;
+                        word_tiers[wi] = tier; // last correction wins
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found and word_total < MAX_WORDS) {
+                    const wl: u8 = @intCast(word.len);
+                    @memcpy(words[word_total][0..wl], word);
+                    word_lens[word_total] = wl;
+                    word_tiers[word_total] = tier;
+                    word_counts[word_total] = 1;
+                    word_total += 1;
+                }
+            }
+        }
+    }
+
+    // Filter: only keep words with >= 3 corrections (confident signal)
+    var out_buf: [4096]u8 = undefined;
+    var out_pos: usize = 0;
+    const header = "# auto-learned from router corrections\n# regenerated on agent startup\n";
+    @memcpy(out_buf[out_pos..][0..header.len], header);
+    out_pos += header.len;
+
+    // Group by tier
+    const tiers = [_]struct { t: ModelTier, label: []const u8 }{
+        .{ .t = .small, .label = "type: agent\ntier: small\n" },
+        .{ .t = .medium, .label = "type: agent\ntier: medium\n" },
+        .{ .t = .large, .label = "type: agent\ntier: large\n" },
+    };
+    for (tiers) |tg| {
+        var has_words = false;
+        for (0..word_total) |wi| {
+            if (word_tiers[wi] == tg.t and word_counts[wi] >= 3) {
+                has_words = true;
+                break;
+            }
+        }
+        if (!has_words) continue;
+
+        if (out_pos + tg.label.len >= out_buf.len) break;
+        @memcpy(out_buf[out_pos..][0..tg.label.len], tg.label);
+        out_pos += tg.label.len;
+
+        for (0..word_total) |wi| {
+            if (word_tiers[wi] != tg.t or word_counts[wi] < 3) continue;
+            const wl = word_lens[wi];
+            if (out_pos + wl + 1 >= out_buf.len) break;
+            @memcpy(out_buf[out_pos..][0..wl], words[wi][0..wl]);
+            out_pos += wl;
+            out_buf[out_pos] = '\n';
+            out_pos += 1;
+        }
+    }
+
+    if (out_pos <= header.len) return; // nothing learned
+
+    // Write to ~/.zish/patterns/learned.txt
+    var pat_path_buf: [512]u8 = undefined;
+    const pat_dir = std.fmt.bufPrint(&pat_path_buf, "{s}/.zish/patterns", .{home}) catch return;
+    std.fs.cwd().makePath(pat_dir) catch {};
+
+    var file_path_buf: [512]u8 = undefined;
+    const file_path = std.fmt.bufPrint(&file_path_buf, "{s}/.zish/patterns/learned.txt", .{home}) catch return;
+    const file = std.fs.cwd().createFile(file_path, .{}) catch return;
+    defer file.close();
+    file.writeAll(out_buf[0..out_pos]) catch {};
+}
+
+fn isStopword(w: []const u8) bool {
+    const stops = [_][]const u8{
+        "the", "and", "for", "that", "this", "with", "from", "are", "was",
+        "have", "has", "had", "been", "will", "can", "not", "but", "all",
+        "they", "you", "your", "what", "how", "when", "where", "which",
+        "there", "their", "than", "then", "its", "also", "just", "into",
+        "some", "about", "out", "more", "very",
+    };
+    for (stops) |s| {
+        if (std.mem.eql(u8, w, s)) return true;
+    }
+    return false;
 }

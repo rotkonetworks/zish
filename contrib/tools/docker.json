@@ -1,0 +1,6 @@
+{
+  "name": "DockerPs",
+  "description": "List running Docker containers with resource usage",
+  "command": "docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'",
+  "parameters": {}
+}

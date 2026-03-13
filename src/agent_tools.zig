@@ -91,6 +91,77 @@ pub const ToolContext = struct {
     /// Callback for the "Agent" tool — spawns subagent, waits for result
     spawn_and_collect: ?SpawnAndCollectFn,
     spawn_ctx: ?*anyopaque,
+    /// Agent identity for bulletin posts
+    agent_id: []const u8 = "main",
+    agent_depth: u8 = 0,
+
+    /// Broadcast to the shared bulletin board (the commons).
+    pub fn broadcast(self: *const ToolContext, kind: q.PostKind, text: []const u8) void {
+        self.queues.bulletin.post(kind, self.agent_id, self.agent_depth, text);
+    }
+
+    /// Check if another agent has an active claim on this file.
+    /// Scans recent bulletin posts for .claim without matching .release.
+    /// Returns the claimer's ID if claimed, null if free.
+    pub fn checkClaim(self: *const ToolContext, file_path: []const u8) ?[]const u8 {
+        var posts: [128]q.Post = undefined;
+        // Read from position 0 to scan all history (or as much as the ring holds)
+        const br = self.queues.bulletin.read(0, &posts);
+
+        // Track active claims per author — last claim/release wins
+        const MAX_CLAIMS = 32;
+        var claimers: [MAX_CLAIMS][16]u8 = undefined;
+        var claimer_lens: [MAX_CLAIMS]u8 = [_]u8{0} ** MAX_CLAIMS;
+        var claim_files: [MAX_CLAIMS][256]u8 = undefined;
+        var claim_file_lens: [MAX_CLAIMS]u16 = [_]u16{0} ** MAX_CLAIMS;
+        var claim_active: [MAX_CLAIMS]bool = [_]bool{false} ** MAX_CLAIMS;
+        var claim_count: usize = 0;
+
+        for (posts[0..br.count]) |*p| {
+            if (p.kind != .claim and p.kind != .release) continue;
+            const msg = p.slice();
+
+            // Check if this post mentions our file path
+            if (std.mem.indexOf(u8, msg, file_path) == null) continue;
+
+            // Find or create entry for this author
+            const author = p.authorSlice();
+            // Skip our own claims
+            if (std.mem.eql(u8, author, self.agent_id)) continue;
+
+            var found_idx: ?usize = null;
+            for (0..claim_count) |ci| {
+                if (claimer_lens[ci] == author.len and
+                    std.mem.eql(u8, claimers[ci][0..claimer_lens[ci]], author))
+                {
+                    found_idx = ci;
+                    break;
+                }
+            }
+            const idx = found_idx orelse blk: {
+                if (claim_count >= MAX_CLAIMS) continue;
+                const ni = claim_count;
+                claim_count += 1;
+                const al: u8 = @intCast(@min(author.len, 16));
+                @memcpy(claimers[ni][0..al], author[0..al]);
+                claimer_lens[ni] = al;
+                break :blk ni;
+            };
+
+            const fl: u16 = @intCast(@min(file_path.len, 256));
+            @memcpy(claim_files[idx][0..fl], file_path[0..fl]);
+            claim_file_lens[idx] = fl;
+            claim_active[idx] = (p.kind == .claim);
+        }
+
+        // Check if any active claim exists
+        for (0..claim_count) |ci| {
+            if (claim_active[ci]) {
+                return claimers[ci][0..claimer_lens[ci]];
+            }
+        }
+        return null;
+    }
 };
 
 // ============================================================
@@ -181,23 +252,62 @@ pub fn shellEscape(value: []const u8, buf: []u8) ?[]const u8 {
 ///           "parameters":{"param":{"type":"string","description":"..."}},
 ///           "required":["param"]}]
 pub fn loadPluginTools(tools: *[MAX_PLUGIN_TOOLS]PluginTool) u8 {
-    const home = std.process.getEnvVarOwned(std.heap.page_allocator, "HOME") catch return 0;
-    defer std.heap.page_allocator.free(home);
-    var path_buf: [512]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "{s}/.zish/agent-tools.json", .{home}) catch return 0;
-    const content = std.fs.cwd().readFileAlloc(std.heap.page_allocator, path, 32768) catch return 0;
-    defer std.heap.page_allocator.free(content);
+    const alloc = std.heap.page_allocator;
+    const home = std.process.getEnvVarOwned(alloc, "HOME") catch return 0;
+    defer alloc.free(home);
 
     var count: u8 = 0;
 
-    // Simple JSON array parser: find each top-level object { ... }
+    // 1. Load from ~/.zish/agent-tools.json (legacy single-file format)
+    {
+        var path_buf: [512]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/.zish/agent-tools.json", .{home}) catch "";
+        if (path.len > 0) {
+            const content = std.fs.cwd().readFileAlloc(alloc, path, 32768) catch null;
+            if (content) |c| {
+                defer alloc.free(c);
+                count = parseToolArray(c, tools, count);
+            }
+        }
+    }
+
+    // 2. Load from ~/.zish/tools/ directory (one .json file per tool)
+    {
+        var dir_buf: [512]u8 = undefined;
+        const dir_path = std.fmt.bufPrint(&dir_buf, "{s}/.zish/tools", .{home}) catch "";
+        if (dir_path.len > 0) {
+            var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return count;
+            defer dir.close();
+            var iter = dir.iterate();
+            while (iter.next() catch null) |entry| {
+                if (count >= MAX_PLUGIN_TOOLS) break;
+                if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
+                const content = dir.readFileAlloc(alloc, entry.name, 32768) catch continue;
+                defer alloc.free(content);
+                // Single tool file can be either { ... } or [ { ... }, ... ]
+                const trimmed = std.mem.trimLeft(u8, content, " \t\n\r");
+                if (trimmed.len > 0 and trimmed[0] == '[') {
+                    count = parseToolArray(content, tools, count);
+                } else if (trimmed.len > 0 and trimmed[0] == '{') {
+                    parsePluginTool(trimmed, &tools[count]);
+                    if (tools[count].name_len > 0) count += 1;
+                }
+            }
+        }
+    }
+
+    return count;
+}
+
+fn parseToolArray(content: []const u8, tools: *[MAX_PLUGIN_TOOLS]PluginTool, start_count: u8) u8 {
+    var count = start_count;
     var depth: i32 = 0;
     var obj_start: ?usize = null;
     var in_string = false;
     var i: usize = 0;
     while (i < content.len) : (i += 1) {
         if (content[i] == '\\' and in_string) {
-            i += 1; // skip escaped char
+            i += 1;
             continue;
         }
         if (content[i] == '"') {
@@ -205,7 +315,6 @@ pub fn loadPluginTools(tools: *[MAX_PLUGIN_TOOLS]PluginTool) u8 {
             continue;
         }
         if (in_string) continue;
-
         if (content[i] == '{') {
             depth += 1;
             if (depth == 1 and obj_start == null) obj_start = i;
@@ -518,9 +627,18 @@ pub fn dispatch(ctx: *ToolContext, tool_name: []const u8, tool_input: []const u8
         const rp = unescapeJSON(path, &path_buf2) orelse path;
         var detail_buf: [512]u8 = undefined;
         const detail = std.fmt.bufPrint(&detail_buf, "Edit({s})", .{rp}) catch rp;
+        // Check if another agent has claimed this file
+        if (ctx.checkClaim(rp)) |claimer| {
+            var conflict_buf: [256]u8 = undefined;
+            const conflict = std.fmt.bufPrint(&conflict_buf, "File {s} is claimed by agent {s}. Wait for release or coordinate via bulletin.", .{ rp, claimer }) catch "File claimed by another agent.";
+            return ctx.allocator.dupe(u8, conflict);
+        }
         if (!confirmTool(ctx.queues, "Edit", detail, ctx.allow_edit))
             return ctx.allocator.dupe(u8, "Tool execution denied by user.");
-        return executeEdit(ctx.allocator, ctx.queues, ctx.session_log, path, old_str, new_str, replace_all);
+        ctx.broadcast(.claim, detail);
+        const result = executeEdit(ctx.allocator, ctx.queues, ctx.session_log, path, old_str, new_str, replace_all);
+        ctx.broadcast(.release, detail);
+        return result;
     }
     if (std.mem.eql(u8, tool_name, "Write")) {
         const path = extractJsonField(tool_input, "file_path") orelse return error.MissingPath;
@@ -529,9 +647,18 @@ pub fn dispatch(ctx: *ToolContext, tool_name: []const u8, tool_input: []const u8
         const rp = unescapeJSON(path, &path_buf2) orelse path;
         var detail_buf: [512]u8 = undefined;
         const detail = std.fmt.bufPrint(&detail_buf, "Write({s})", .{rp}) catch rp;
+        // Check if another agent has claimed this file
+        if (ctx.checkClaim(rp)) |claimer| {
+            var conflict_buf: [256]u8 = undefined;
+            const conflict = std.fmt.bufPrint(&conflict_buf, "File {s} is claimed by agent {s}. Wait for release or coordinate via bulletin.", .{ rp, claimer }) catch "File claimed by another agent.";
+            return ctx.allocator.dupe(u8, conflict);
+        }
         if (!confirmTool(ctx.queues, "Write", detail, ctx.allow_write))
             return ctx.allocator.dupe(u8, "Tool execution denied by user.");
-        return executeWrite(ctx.allocator, ctx.queues, ctx.session_log, path, content);
+        ctx.broadcast(.claim, detail);
+        const result = executeWrite(ctx.allocator, ctx.queues, ctx.session_log, path, content);
+        ctx.broadcast(.release, detail);
+        return result;
     }
     if (std.mem.eql(u8, tool_name, "Glob")) {
         const pattern = extractJsonField(tool_input, "pattern") orelse return error.MissingPattern;
@@ -572,6 +699,24 @@ pub fn dispatch(ctx: *ToolContext, tool_name: []const u8, tool_input: []const u8
         const max_str = extractJsonField(tool_input, "max_results");
         const max_results: usize = if (max_str) |s| std.fmt.parseInt(usize, s, 10) catch 8 else 8;
         return executeWebSearch(ctx.allocator, ctx.queues, query, max_results);
+    }
+    if (std.mem.eql(u8, tool_name, "Post")) {
+        const post_type = extractJsonField(tool_input, "type") orelse return error.MissingPostType;
+        const message = extractJsonField(tool_input, "message") orelse return error.MissingMessage;
+        var msg_buf: [512]u8 = undefined;
+        const msg = unescapeJSON(message, &msg_buf) orelse message;
+        const kind: q.PostKind = if (std.mem.eql(u8, post_type, "discovery"))
+            .discovery
+        else if (std.mem.eql(u8, post_type, "escalate"))
+            .escalate
+        else if (std.mem.eql(u8, post_type, "request_peer"))
+            .request_peer
+        else if (std.mem.eql(u8, post_type, "vote"))
+            .vote
+        else
+            .discovery;
+        ctx.broadcast(kind, msg);
+        return ctx.allocator.dupe(u8, "Posted to bulletin.");
     }
     // Check plugin tools
     for (ctx.plugin_tools[0..ctx.plugin_count], 0..) |*pt, pi| {
