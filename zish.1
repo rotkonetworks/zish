@@ -1,6 +1,6 @@
-.TH ZISH 1 "January 2026" "zish 0.9.0" "User Commands"
+.TH ZISH 1 "March 2026" "zish 1.0.0" "User Commands"
 .SH NAME
-zish \- a modern shell with vim editing and job control
+zish \- a modern shell with vim editing, job control, and an embedded LLM agent
 .SH SYNOPSIS
 .B zish
 [\fB\-c\fR \fIcommand\fR]
@@ -9,8 +9,11 @@ zish \- a modern shell with vim editing and job control
 [\fIscript\fR [\fIarguments\fR...]]
 .SH DESCRIPTION
 .B zish
-is a Unix shell written in Zig, featuring vim-style line editing,
-job control, arrays, process substitution, and statistical benchmarking.
+is a Unix shell written in Zig, featuring vim-style modal editing,
+job control, arrays, process substitution, statistical benchmarking,
+intelligent tab completion with ghost text prediction,
+syntax highlighting, and an embedded LLM agent with recursive
+subagent spawning, autonomous task execution, and local GGUF inference.
 .PP
 When invoked without arguments, zish starts an interactive session.
 When given \fB\-c\fR, it executes the command string.
@@ -69,11 +72,17 @@ Redirect stdin from file
 .B 2> file
 Redirect stderr to file
 .TP
+.B 2>> file
+Redirect stderr to file (append)
+.TP
 .B 2>&1
 Redirect stderr to stdout
 .TP
 .B &> file
 Redirect both stdout and stderr to file
+.TP
+.B &>> file
+Redirect both stdout and stderr to file (append)
 .SS Process Substitution
 .TP
 .B <(command)
@@ -108,7 +117,7 @@ Escape next character
 VAR=value         # assignment
 echo $VAR         # expansion
 echo ${VAR}       # braced expansion
-echo ${VAR:-def}  # default if unset
+echo ${VAR:\-def}  # default if unset
 echo ${VAR:=def}  # assign default if unset
 echo ${VAR:+alt}  # alternate if set
 echo ${VAR:?err}  # error if unset
@@ -146,7 +155,7 @@ $(command)        # preferred form
 $((expression))   # arithmetic expansion
 .fi
 .RE
-Supports: + \- * / % ** (power), parentheses, variables
+Supports: + \- * / % ** (power), parentheses, variables.
 .SS Globbing
 .TP
 .B *
@@ -158,7 +167,7 @@ Match any single character
 .B [abc]
 Match any character in set
 .TP
-.B [a-z]
+.B [a\-z]
 Match any character in range
 .TP
 .B [!abc]
@@ -203,6 +212,23 @@ function func {
 .fi
 .RE
 .SH BUILTINS
+.SS Simple Returns
+.TP
+.B true
+Return success (0).
+.TP
+.B false
+Return failure (1).
+.TP
+.B :
+No-op, always succeeds.
+.TP
+.B continue
+Continue next loop iteration.
+.TP
+.B break
+Break from loop.
+.SS Directory
 .TP
 .B cd \fR[\fIdir\fR]
 Change directory. With no argument, change to $HOME.
@@ -211,6 +237,26 @@ Supports \fBcd \-\fR to return to previous directory.
 .B pwd
 Print working directory.
 .TP
+.B pushd \fR[\fIdir\fR]
+Push directory onto stack and change to it.
+With no argument, swap top two stack entries.
+.TP
+.B popd
+Pop directory from stack and change to it.
+.TP
+.B dirs
+List directory stack.
+.TP
+.B ..
+Change to parent directory. Shorthand for \fBcd ..\fR.
+.TP
+.B ...
+Change to grandparent directory. Shorthand for \fBcd ../..\fR.
+.TP
+.B \-
+Change to previous directory. Shorthand for \fBcd \-\fR.
+.SS I/O
+.TP
 .B echo \fR[\fB\-n\fR] [\fB\-e\fR] [\fIargs\fR...]
 Print arguments. \fB\-n\fR omits newline, \fB\-e\fR enables escapes.
 .TP
@@ -218,30 +264,22 @@ Print arguments. \fB\-n\fR omits newline, \fB\-e\fR enables escapes.
 Formatted output. Supports %s, %d, %x, %o, %f, %c, %b, %q and width/precision.
 .TP
 .B read \fR[\fB\-r\fR] [\fB\-p\fR \fIprompt\fR] [\fB\-t\fR \fIsec\fR] [\fB\-n\fR \fIcount\fR] [\fB\-s\fR] [\fB\-d\fR \fIdelim\fR] [\fB\-a\fR \fIarray\fR] [\fIvar\fR...]
-Read line into variables. Options:
-.RS
+Read line into variables.
+\fB\-r\fR raw mode (no backslash escapes),
+\fB\-p\fR display prompt,
+\fB\-t\fR timeout in seconds,
+\fB\-n\fR read exactly N characters,
+\fB\-s\fR silent (no echo),
+\fB\-d\fR use delimiter instead of newline,
+\fB\-a\fR read into array.
+.SS Conditionals
 .TP
-.B \-r
-Raw mode (no backslash escapes)
+.B test \fIexpr\fR, [ \fIexpr\fR ]
+Evaluate conditional expression.
 .TP
-.B \-p \fIprompt\fR
-Display prompt
-.TP
-.B \-t \fIseconds\fR
-Timeout
-.TP
-.B \-n \fIcount\fR
-Read exactly N characters
-.TP
-.B \-s
-Silent (no echo)
-.TP
-.B \-d \fIdelim\fR
-Use delimiter instead of newline
-.TP
-.B \-a \fIarray\fR
-Read into array
-.RE
+.B [[ \fIexpr\fR ]]
+Extended conditional with pattern matching and regex.
+.SS Variables
 .TP
 .B export \fR[\fIname\fR[=\fIvalue\fR]...]
 Export variables to environment.
@@ -249,20 +287,47 @@ Export variables to environment.
 .B unset \fIname\fR...
 Remove variables.
 .TP
+.B local \fIname\fR[=\fIvalue\fR]...
+Declare local variables in functions.
+.TP
+.B declare \fR[\fB\-a\fR] \fIname\fR[=\fIvalue\fR]...
+Declare variables. \fB\-a\fR declares array.
+.TP
+.B readonly \fIname\fR[=\fIvalue\fR]...
+Declare read-only variables.
+.TP
 .B set \fR[\fB\-euxo\fR] [\fB\-\-\fR \fIargs\fR...]
 Set shell options or positional parameters.
 .TP
 .B shift \fR[\fIn\fR]
 Shift positional parameters left by n (default 1).
 .TP
-.B source \fIfile\fR, . \fIfile\fR
-Execute commands from file in current shell.
+.B getopts \fIoptstring\fR \fIname\fR
+Parse positional parameters.
+.SS Aliases
 .TP
 .B alias \fR[\fIname\fR[=\fIvalue\fR]...]
 Define or list aliases.
 .TP
 .B unalias \fIname\fR...
 Remove aliases.
+.SS Sourcing and Execution
+.TP
+.B source \fIfile\fR, . \fIfile\fR
+Execute commands from file in current shell.
+.TP
+.B eval \fIarg\fR...
+Concatenate arguments and execute as command.
+.TP
+.B exec \fIcommand\fR
+Replace shell with command.
+.TP
+.B command \fIcmd\fR
+Run cmd bypassing functions and aliases.
+.TP
+.B builtin \fIcmd\fR
+Run builtin bypassing functions and aliases.
+.SS Information
 .TP
 .B type \fIname\fR...
 Show how names would be interpreted.
@@ -270,32 +335,15 @@ Show how names would be interpreted.
 .B which \fIname\fR...
 Show path to executables.
 .TP
+.B hash
+Command hash table (currently no-op).
+.TP
 .B history \fR[\fB\-c\fR]
 Show or clear command history.
 .TP
-.B true
-Return success (0).
-.TP
-.B false
-Return failure (1).
-.TP
-.B exit \fR[\fIn\fR]
-Exit shell with status n (default 0).
-.TP
-.B return \fR[\fIn\fR]
-Return from function with status n.
-.TP
-.B test \fIexpr\fR, [ \fIexpr\fR ]
-Evaluate conditional expression.
-.TP
-.B [[ \fIexpr\fR ]]
-Extended conditional with pattern matching and regex.
-.TP
-.B trap \fR[\fIaction\fR] [\fIsignal\fR...]
-Set signal handlers. Signals: EXIT, INT, TERM, HUP, etc.
-.TP
-.B kill \fR[\fB\-\fIsignal\fR] \fIpid\fR...
-Send signal to process. Supports %jobid.
+.B help
+Print available builtins.
+.SS Job Control
 .TP
 .B jobs \fR[\fB\-l\fR]
 List background jobs.
@@ -309,25 +357,30 @@ Resume job in background.
 .B wait \fR[\fIpid\fR...]
 Wait for background processes.
 .TP
+.B kill \fR[\fB\-\fIsignal\fR] \fIpid\fR...
+Send signal to process. Supports %jobid.
+.TP
+.B disown \fR[\fIjob\fR]
+Remove job from job table.
+.TP
+.B trap \fR[\fIaction\fR] [\fIsignal\fR...]
+Set signal handlers. Signals: EXIT, INT, TERM, HUP, etc.
+.SS Shell Control
+.TP
+.B exit \fR[\fIn\fR]
+Exit shell with status n (default 0).
+.TP
+.B return \fR[\fIn\fR]
+Return from function with status n.
+.SS Benchmarking
+.TP
 .B time \fR[\fB\-n\fR \fIiter\fR] [\fB\-w\fR \fIwarmup\fR] [\fB\-v\fR] [\fB\-q\fR] [\fB\-H\fR] \fIcommand\fR
 Time command execution with optional benchmarking.
-.RS
-.TP
-.B \-n \fIiterations\fR
-Run multiple iterations for statistical analysis
-.TP
-.B \-w \fIwarmup\fR
-Number of warmup runs (discarded)
-.TP
-.B \-v
-Verbose output (detailed resource usage)
-.TP
-.B \-q
-Quiet (suppress command output)
-.TP
-.B \-H
-Show histogram of timing distribution
-.RE
+\fB\-n\fR run multiple iterations for statistical analysis,
+\fB\-w\fR number of warmup runs (discarded),
+\fB\-v\fR verbose output (detailed resource usage),
+\fB\-q\fR quiet (suppress command output),
+\fB\-H\fR show histogram of timing distribution.
 .PP
 Default output format:
 .RS
@@ -335,36 +388,13 @@ Default output format:
 .RE
 .PP
 With \fB\-n\fR, shows statistics: mean, median, stddev, min, max, percentiles.
-.TP
-.B eval \fIarg\fR...
-Concatenate arguments and execute as command.
-.TP
-.B exec \fIcommand\fR
-Replace shell with command.
-.TP
-.B command \fIcmd\fR
-Run cmd bypassing functions and aliases.
-.TP
-.B builtin \fIcmd\fR
-Run builtin bypassing functions and aliases.
-.TP
-.B local \fIname\fR[=\fIvalue\fR]...
-Declare local variables in functions.
-.TP
-.B declare \fR[\fB\-a\fR] \fIname\fR[=\fIvalue\fR]...
-Declare variables. \fB\-a\fR declares array.
+.SS Miscellaneous
 .TP
 .B let \fIexpr\fR
 Evaluate arithmetic expression.
 .TP
-.B getopts \fIoptstring\fR \fIname\fR
-Parse positional parameters.
-.TP
-.B colon (:)
-No-op, always succeeds.
-.TP
-.B hash
-Managed command hash table (currently no-op).
+.B chpw
+Change password (handled internally).
 .SH SHELL OPTIONS
 Set with \fBset \-o\fR \fIoption\fR or \fBset \-\fIx\fR.
 Unset with \fBset +o\fR \fIoption\fR or \fBset +\fIx\fR.
@@ -384,25 +414,99 @@ to exit with non-zero status, or zero if all succeed.
 .SH LINE EDITING
 .B zish
 uses vim-style modal editing by default.
-.SS Normal Mode
+The cursor shape changes between modes: block in normal mode,
+bar in insert mode.
+.SS Insert Mode (Default)
 .TP
-.BR h ", " l
-Move cursor left/right
-.TP
-.BR j ", " k
-Navigate history down/up
-.TP
-.BR w ", " b
-Move forward/backward by word
-.TP
-.BR e
-Move to end of word
-.TP
-.BR 0 ", " ^
+.BR Ctrl\-A
 Move to beginning of line
 .TP
-.BR $
+.BR Ctrl\-B
+Move cursor left
+.TP
+.BR Ctrl\-C
+Cancel (clear input or exit if empty)
+.TP
+.BR Ctrl\-D
+Exit shell (EOF)
+.TP
+.BR Ctrl\-E
 Move to end of line
+.TP
+.BR Ctrl\-F
+Move cursor right
+.TP
+.BR Ctrl\-G
+Cancel agent operation
+.TP
+.BR Ctrl\-H ", " Backspace
+Delete character before cursor
+.TP
+.BR Ctrl\-J ", " Alt\-Enter
+Insert newline (multiline input)
+.TP
+.BR Ctrl\-K
+Kill from cursor to end of line
+.TP
+.BR Ctrl\-L
+Clear screen
+.TP
+.BR Ctrl\-M ", " Enter
+Execute command / submit input
+.TP
+.BR Ctrl\-N
+Next history entry
+.TP
+.BR Ctrl\-P
+Previous history entry
+.TP
+.BR Ctrl\-R
+Reverse incremental history search
+.TP
+.BR Ctrl\-S
+Forward incremental history search
+.TP
+.BR Ctrl\-T
+Transpose characters
+.TP
+.BR Ctrl\-U
+Kill from cursor to beginning of line
+.TP
+.BR Ctrl\-W
+Delete word backward
+.TP
+.BR Ctrl\-Y
+Paste from kill buffer
+.TP
+.BR Ctrl\-Z
+Suspend shell
+.TP
+.BR Tab
+Trigger tab completion
+.TP
+.BR Shift\-Tab
+Cycle completions backward
+.TP
+.BR Ctrl\-Right
+Move word forward / accept one word of ghost text
+.TP
+.BR Ctrl\-Left
+Move word backward
+.TP
+.BR Up / Down
+Navigate command history
+.TP
+.BR Home / End
+Move to beginning/end of line
+.TP
+.BR Alt\-.
+Insert last argument from previous command
+.TP
+.BR Escape
+Enter vi normal mode
+.SS Normal Mode (Vi)
+Enter normal mode by pressing
+.BR Escape .
 .TP
 .BR i ", " a
 Enter insert mode (before/after cursor)
@@ -410,23 +514,50 @@ Enter insert mode (before/after cursor)
 .BR I ", " A
 Enter insert mode at beginning/end of line
 .TP
+.BR o ", " O
+Open line below/above and enter insert mode
+.TP
+.BR h ", " l
+Move cursor left/right
+.TP
+.BR j ", " k
+Navigate history down/up
+.TP
+.BR w ", " b ", " e
+Move forward/backward by word, end of word
+.TP
+.BR W ", " B ", " E
+Move by WORD (whitespace-delimited)
+.TP
+.BR 0 ", " ^
+Move to beginning of line / first non-blank
+.TP
+.BR $
+Move to end of line
+.TP
 .BR x ", " X
 Delete character at/before cursor
 .TP
-.BR dw ", " db ", " dd
-Delete word forward/backward/line
+.BR D
+Delete from cursor to end of line
 .TP
-.BR cw ", " cc
-Change word/line
+.BR dd
+Delete entire line
 .TP
-.BR r
-Replace single character
+.BR dw ", " d$
+Delete word / to end of line
 .TP
-.BR u
-Undo
+.BR C
+Change from cursor to end of line
 .TP
-.BR p ", " P
-Paste after/before cursor
+.BR cc ", " S
+Change entire line
+.TP
+.BR cw
+Change word
+.TP
+.BR r\fIchar\fR
+Replace character under cursor with \fIchar\fR
 .TP
 .BR /
 Search history forward
@@ -439,64 +570,119 @@ Repeat search forward/backward
 .TP
 .BR gg ", " G
 Go to first/last history entry
-.SS Insert Mode
 .TP
-.BR Escape ", " Ctrl-[
-Return to normal mode
+.BR u
+Undo
 .TP
-.BR Ctrl-w
-Delete word backward
-.TP
-.BR Ctrl-u
-Delete to beginning of line
-.TP
-.BR Ctrl-k
-Delete to end of line
-.TP
-.BR Ctrl-a
-Move to beginning of line
-.TP
-.BR Ctrl-e
-Move to end of line
-.TP
-.BR Ctrl-r
-Reverse incremental history search
-.TP
-.BR Tab ", " Shift-Tab
-Cycle completions forward/backward
-.SS Completion
-Tab completion works for:
+.BR p ", " P
+Paste after/before cursor
+.SH COMPLETION
+.B zish
+provides context-aware tab completion with ghost text prediction.
+.SS Completion Types
 .IP \(bu 2
 Commands (builtins, aliases, executables in PATH)
 .IP \(bu 2
-File and directory paths
+File and directory paths (with trailing slash for directories)
 .IP \(bu 2
 Variables ($VAR)
 .IP \(bu 2
-Git subcommands and branches
+Git branches (local, remote, packed-refs, tags, stash entries)
+.IP \(bu 2
+Git subcommands
+.IP \(bu 2
+Docker containers and images
+.IP \(bu 2
+Make targets (from Makefile)
+.IP \(bu 2
+Just recipes (from justfile)
+.IP \(bu 2
+Systemctl units
+.IP \(bu 2
+SSH hosts (from ~/.ssh/config)
+.IP \(bu 2
+Process IDs and signal names (for kill)
+.IP \(bu 2
+Zig build targets
+.IP \(bu 2
+Cargo binaries
+.IP \(bu 2
+npm scripts
+.IP \(bu 2
+Command flags with descriptions (parsed from \-\-help output)
+.IP \(bu 2
+Pipe targets (common commands after |)
+.IP \(bu 2
+History-based prefix matching
+.SS Ghost Text
+When a local GGUF model is configured (see \fBcompletion_model\fR in
+.IR CONFIGURATION ),
+zish displays predictive ghost text in dim color ahead of the cursor.
+Press
+.B Right
+or
+.B End
+to accept the full prediction, or
+.B Ctrl\-Right
+to accept one word at a time.
+Ghost text is generated asynchronously on a background thread
+using pure-Zig inference with no external dependencies.
+.SH SYNTAX HIGHLIGHTING
+.B zish
+highlights input as you type using ANSI 256-color codes:
+.IP \(bu 2
+Builtins and keywords in distinct colors
+.IP \(bu 2
+Valid commands in green, invalid in red
+.IP \(bu 2
+Strings and quoted text highlighted
+.IP \(bu 2
+Variables and expansions highlighted
+.IP \(bu 2
+Operators and redirections highlighted
+.SH PROMPT
+The default prompt format is:
 .PP
-Directory paths are completed with trailing slash.
+.RS
+.B [M] user@host path (branch) [exit] $
+.RE
+.PP
+.TP
+.B [M]
+Vi mode indicator:
+.B [N]
+(blue) normal,
+.B [I]
+(cyan) insert,
+.B [V]
+(yellow) visual,
+.B [VL]
+(yellow) visual line
+.TP
+.B user@host
+Green. Current username and hostname.
+.TP
+.B path
+Cyan. Working directory with ~ expansion for home.
+.TP
+.B (branch)
+Yellow. Current git branch, shown only inside git repositories.
+.TP
+.B [exit]
+Red. Last exit code, shown only when non-zero.
+.SH COMMAND SUGGESTIONS
+When a command is not found, zish suggests similar commands
+using Levenshtein distance matching against builtins, aliases,
+and executables in PATH.
 .SH JOB CONTROL
 .TP
-.BR Ctrl-z
+.BR Ctrl\-Z
 Suspend foreground job
 .TP
-.BR Ctrl-c
+.BR Ctrl\-C
 Interrupt foreground job
-.TP
-.BR jobs
-List jobs
-.TP
-.BR fg " " %n
-Resume job n in foreground
-.TP
-.BR bg " " %n
-Resume job n in background
-.TP
-.BR kill " " %n
-Send signal to job n
 .PP
-Job specifications: %1 (job 1), %+ (current), %- (previous), %string (match).
+Job specifications: %1 (job 1), %+ (current), %\- (previous), %string (match).
 .SH HISTORY
 Command history is saved to \fB~/.zish_history\fR.
 .PP
@@ -510,10 +696,427 @@ Command number n
 .TP
 .B !string
 Most recent command starting with string
-.SH COMMAND SUGGESTIONS
-When a command is not found, zish suggests similar commands
-using Levenshtein distance matching against builtins, aliases,
-and common commands.
+.SH AGENT
+The
+.B agent
+builtin provides an embedded LLM agent with tool use,
+recursive subagent spawning, and autonomous task execution.
+The agent runs on a dedicated background thread and communicates
+with the shell via a lock-free SPSC ring buffer.
+.SS Subcommands
+.TP
+.B agent
+Enter interactive agent mode. Displays model name in header.
+.TP
+.B agent c\fR, \fBagent continue
+Re-enter interactive mode, continuing the current session.
+.TP
+.B agent attach \fR[\fIid\fR]
+Attach to a running session via FIFO pipe (like screen/tmux).
+Input is sent through \fB~/.zish/sessions/\fIid\fB/ctl\fR.
+.TP
+.B agent \fIquery\fR
+Send a one-shot query and print the response.
+.TP
+.B agent \-m \fImodel\fR \fR[\fIquery\fR]
+Switch model before query. Accepts aliases:
+.BR opus ", " sonnet ", " haiku ,
+or a full model ID string.
+.TP
+.B agent stop
+Cancel the current agent operation.
+.TP
+.B agent status
+Show whether the agent is busy or idle.
+.TP
+.B agent sessions
+List recent sessions (last 10).
+.TP
+.B agent log \fR[\fIid\fR]
+View conversation log with markdown rendering.
+Shows latest session if no id given.
+.TP
+.B agent tasks
+List subagent tasks from the current session.
+.TP
+.B agent config
+Show current agent configuration.
+.TP
+.B agent clear
+Reset conversation history and start fresh.
+.TP
+.B agent help
+Show agent usage information.
+.SS Interactive Mode
+In interactive mode, the agent presents a bottom-anchored TUI
+using ANSI scroll regions. Output stays in terminal scrollback
+(no alternate screen). The layout consists of:
+.IP \(bu 2
+Output scroll region (top rows)
+.IP \(bu 2
+Separator line with scroll indicator
+.IP \(bu 2
+Multiline input area (grows up to 5 lines)
+.IP \(bu 2
+Status bar: model name, session cost, elapsed time, keybinding hints
+.PP
+The input area uses
+.B \(rA
+as the prompt character.
+Press
+.B Enter
+to submit,
+.B Ctrl\-J
+or
+.B Alt\-Enter
+to insert a newline.
+.B PageUp / PageDown
+scrolls through message history (512KB ring buffer).
+.SS Interactive Commands
+.TP
+.B /compact
+Summarize conversation to save context window space.
+.TP
+.B /cost
+Show session cost breakdown.
+.TP
+.B /model \fR[\fIname\fR]
+Show or switch model (opus, sonnet, haiku, or full model ID).
+.TP
+.B /diff
+Show uncommitted git changes.
+.TP
+.B /commit \fR[\fImsg\fR]
+Commit changes. If no message given, the agent generates one.
+.TP
+.B /review
+AI code review of all changes made this session.
+.TP
+.B /undo
+Undo the last file change made by the agent.
+.TP
+.B /plan \fItask\fR
+Plan a task without executing (read-only analysis).
+.TP
+.B /spawn \fItask\fR
+Spawn a full-tools worker subagent for parallel work.
+.TP
+.B /queue \fItask\fR
+Queue an autonomous task for execution when agent is idle.
+.TP
+.B /agents\fR, \fB/tasks
+Show subagent workers and task queue status.
+.TP
+.B /sessions
+List recent sessions.
+.TP
+.B /config
+Show current configuration.
+.TP
+.B /search \fIpattern\fR\fR, \fB/s \fIpattern\fR
+Search message history backwards (case-insensitive, strips ANSI).
+.TP
+.B /help
+Show available interactive commands.
+.TP
+.B clear
+Reset conversation history.
+.TP
+.B exit\fR, \fBquit\fR, \fBCtrl\-D
+Leave agent mode.
+.PP
+Additional prefixes:
+.TP
+.B !\fIcommand\fR
+Run a shell command directly via the zish engine.
+.TP
+.B !
+Drop to a full zish shell prompt.
+.TP
+.B ?\fIintent\fR
+Translate natural language to a shell command.
+.SS Agent Tools
+The agent has access to the following built-in tools:
+.TP
+.B Bash
+Execute shell commands. Supports git, builds, package managers.
+.TP
+.B Read
+Read file contents with line numbers. Supports
+.I offset
+and
+.I limit
+parameters for reading sections of large files.
+.TP
+.B Edit
+Make exact string replacements in files (find and replace).
+Shows a diff preview of changes. Requires reading the file first.
+.TP
+.B Write
+Create a new file or overwrite an existing file.
+.TP
+.B Glob
+Find files matching a glob pattern (e.g., "**/*.zig").
+.TP
+.B Grep
+Search file contents using regular expressions.
+.TP
+.B Agent
+Spawn a recursive subagent for autonomous parallel tasks.
+Subagents can themselves spawn further subagents (see
+.IR "RECURSIVE SUBAGENTS" ).
+.TP
+.B WebFetch
+Fetch a URL and convert HTML to plain text.
+.TP
+.B WebSearch
+Search the web using DuckDuckGo.
+.PP
+Tool calls are displayed as
+.B "\(bu ToolName(args)"
+during execution, with results shown after completion.
+.SS Plugin Tools
+Custom tools can be defined in \fB~/.zish/agent-tools.json\fR (max 16).
+Format:
+.PP
+.RS
+.nf
+[{
+  "name": "deploy",
+  "description": "Deploy the application",
+  "command": "deploy.sh {environment}",
+  "parameters": { "environment": "target env" },
+  "confirm": true
+}]
+.fi
+.RE
+.PP
+Parameters use \fB{param}\fR substitution. All parameter values are
+shell-escaped with single-quote wrapping.
+Tools with \fB"confirm": true\fR require user approval before execution.
+.SS Recursive Subagents
+The agent can spawn subagents up to 3 levels deep,
+with a maximum of 8 concurrent subagents per level.
+Worker subagents inherit the full tool set from their parent,
+including the ability to spawn their own subagents.
+Read-only subagents receive only Bash, Read, Glob, and Grep.
+Each subagent makes its own API calls and has atomic status tracking.
+The parent agent blocks on each subagent result with a 120-second timeout.
+.SS Autonomous Tasks
+The task queue holds up to 16 autonomous tasks.
+Tasks are submitted via \fB/queue\fR and execute during the agent's
+idle exhale phase. Use \fB/tasks\fR to inspect queue status.
+.SS Auto-Compact
+When total input tokens exceed 120K and history contains more than
+6 messages, the agent automatically summarizes the conversation
+to free context window space. Old messages are dropped and replaced
+with a summary, preserving the last 4 messages. The token counter
+resets after compaction. Manual compaction is available via \fB/compact\fR.
+The visible TUI history (ring buffer) is not affected.
+.SS Token Tracking
+The agent parses SSE events (message_start, message_delta) to track
+input and output tokens. Cumulative session cost is displayed in the
+status bar and available via \fB/cost\fR.
+.SS CLAUDE.md
+The agent automatically loads CLAUDE.md files from the current
+working directory, walking up parent directories and checking
+\fB.claude/CLAUDE.md\fR as well. Contents are prepended to the
+system prompt (up to 3KB, within an 8KB system prompt buffer).
+.SS Confirmation Flow
+When a tool call requires confirmation, the agent pushes a
+.B confirm_request
+message. The main thread displays the request, reads a keystroke
+from the user, and pushes a
+.B confirm_response
+back to the agent thread.
+.SH QUERY ROUTER
+When enabled, the query router classifies user input before
+dispatching to the agent, reducing cost by routing simple
+queries to cheaper models or bypassing the LLM entirely.
+.SS Classification Pipeline
+.IP 1. 4
+Local pattern matching classifies approximately 70% of queries
+at zero cost, detecting shell commands and keyword patterns.
+.IP 2. 4
+Local GGUF inference (if configured) provides model-based
+classification using pure-Zig inference with no external dependencies.
+.IP 3. 4
+API call to Haiku (~300ms, ~300 tokens) for ambiguous queries.
+.IP 4. 4
+Default to Sonnet if all classifiers are unavailable.
+.SS Route Decisions
+Each classification produces a structured RouteDecision:
+.TP
+.B action
+.BR shell " (bypass LLM entirely),"
+.BR agent " (send to LLM),"
+.BR fan_out " (parallel subagent dispatch)"
+.TP
+.B model tier
+.BR haiku " (fast/cheap),"
+.BR sonnet " (balanced),"
+.BR opus " (reasoning-heavy)"
+.TP
+.B tool mask
+Subset of tools the agent may use for this query.
+.PP
+The router never talks to the user directly; routing decisions
+are displayed as dim
+.B [route info]
+annotations.
+.SS Shell Action
+When the router detects a direct shell command (e.g., \fBls\fR,
+\fBgit status\fR), it runs the command via \fB/bin/sh \-c\fR
+and bypasses the LLM entirely.
+.SH LOCAL INFERENCE
+.B zish
+includes a pure-Zig GGUF inference engine with no external
+dependencies. It supports Transformer models with RoPE,
+RMSNorm, SwiGLU MLP, grouped-query attention, and KV cache.
+.SS Process Isolation
+The inference engine uses fork-based process isolation.
+The parent process communicates with the child via pipes.
+The child process loads the model via mmap and runs continuous
+inference, self-feeding tokens between requests to keep
+internal state warm.
+.SS Quantization
+Supported formats: F32, F16, Q8_0 (SIMD matmul), Q4_K
+(fused dot product), Q6_K (fused dot product). Fused dot
+products operate directly on quantized weights without
+intermediate f32 buffers.
+.SS Multi-threaded Matmul
+Matrix multiplications are split across available CPU cores
+(up to 8 threads), with the last chunk executed on the
+calling thread.
+.SS Sliding Window Attention
+Models with sliding window metadata (e.g., Mistral) use
+windowed attention, reducing complexity from O(T\(sq) to O(T\(muW).
+.SS CTM (Continuous Thinking Model)
+CTM support adds iterative thinking blocks on top of the
+standard MLP. CTM is additive: the MLP always runs first,
+and CTM adds thinking as a second residual. CTM blocks
+include SuperLinear layers, SynapseUNET, and dual
+synchronization accumulators.
+.PP
+CTM parameters are read from GGUF metadata:
+.BR ctm.enabled ", " ctm.iterations ", "
+.BR ctm.memory_length ", " ctm.n_synch .
+.SS CTM Plasticity
+The inference engine supports online learning through
+a breathing architecture:
+.TP
+.B Dopamine gating
+Surprise-based neuromodulation, clamped [0.5, 1.0],
+prevents positive feedback loops.
+.TP
+.B Hebbian learning
+Gradient-free weight updates from synchronization patterns
+with novelty gating and homeostasis (1% norm cap).
+.TP
+.B Replay buffer
+64-entry ring buffer of token sequences with surprise scores.
+Persisted to a \fB.replay\fR file alongside the model.
+.TP
+.B Breathing loop
+Inhale (dopamine-tracked generation) and exhale (compact
+every 100 steps, save every 1000 steps).
+.PP
+State files are stored as siblings of the GGUF model file:
+\fB.ctmstate\fR (sync accumulators),
+\fB.plastic\fR (weight overlay),
+\fB.replay\fR (replay buffer).
+.SH SESSION MANAGEMENT
+Agent sessions are logged in JSONL format under
+\fB~/.zish/sessions/\fIid\fB/conversation.jsonl\fR.
+.PP
+Sessions can be listed with \fBagent sessions\fR, viewed with
+\fBagent log\fR, and attached to (like screen/tmux) with
+\fBagent attach\fR via a FIFO at
+\fB~/.zish/sessions/\fIid\fB/ctl\fR.
+.SH CONFIGURATION
+.SS Agent Configuration
+.B ~/.zish/agent.json
+.PP
+.RS
+.nf
+{
+  "provider": "anthropic",
+  "model": "claude-sonnet-4-6",
+  "base_url": "https://api.anthropic.com",
+  "api_key": "sk-...",
+  "api_key_cmd": "pass show anthropic",
+  "max_tokens": 8192,
+  "max_tool_iterations": 10,
+  "max_agents": 8,
+  "auto_allow": false,
+  "router_enabled": false,
+  "router_provider": "anthropic",
+  "router_model": "claude-haiku-4-5-20251001",
+  "router_base_url": "https://api.anthropic.com",
+  "router_local_only": false,
+  "router_local_model": "/path/to/router.gguf",
+  "completion_model": "/path/to/completion.gguf",
+  "haiku_model": "claude-haiku-4-5-20251001",
+  "sonnet_model": "claude-sonnet-4-6",
+  "opus_model": "claude-opus-4-6"
+}
+.fi
+.RE
+.TP
+.B provider
+API provider: "anthropic", "ollama", or "openai".
+.TP
+.B model
+Default model ID.
+.TP
+.B base_url
+API endpoint URL.
+.TP
+.B api_key
+API key. Overridden by ZISH_AGENT_KEY or ANTHROPIC_API_KEY environment variables.
+.TP
+.B api_key_cmd
+Shell command to retrieve API key dynamically.
+.TP
+.B max_tokens
+Maximum tokens per API response (default: 8192).
+.TP
+.B max_tool_iterations
+Maximum tool calls per query (default: 10).
+.TP
+.B max_agents
+Maximum concurrent subagents (default: 8).
+.TP
+.B auto_allow
+Auto-approve all tool calls without confirmation (default: false).
+.TP
+.B router_enabled
+Enable the query router (default: false).
+.TP
+.B router_local_only
+Never call router API; use local pattern matching only.
+.TP
+.B router_local_model
+Path to a local GGUF model for router inference.
+.TP
+.B completion_model
+Path to a local GGUF model for ghost text prediction.
+.TP
+.B haiku_model\fR, \fBsonnet_model\fR, \fBopus_model
+Model IDs for each tier, used by the router.
+.SS Authentication
+If no API key is configured, zish auto-loads Claude Code
+OAuth credentials from \fB~/.claude/.credentials.json\fR
+and sends appropriate identification headers.
+.SS Plugin Tools
+.B ~/.zish/agent-tools.json
+.PP
+JSON array of custom tool definitions. See
+.IR "AGENT TOOLS" .
+.SS Keybindings
+.B ~/.zish/keybindings.json
+.PP
+Custom keybinding overrides loaded at shell startup.
 .SH ENVIRONMENT
 .TP
 .B HOME
@@ -530,6 +1133,12 @@ Previous working directory (for cd \-).
 .TP
 .B PWD
 Current working directory.
+.TP
+.B ZISH_AGENT_KEY
+API key for the agent (takes precedence over config file).
+.TP
+.B ANTHROPIC_API_KEY
+Anthropic API key (fallback if ZISH_AGENT_KEY is not set).
 .TP
 .B ?
 Exit status of last command.
@@ -557,37 +1166,37 @@ Positional parameters.
 .SH PROMPT ESCAPES
 The PS1 variable supports these escape sequences:
 .TP
-.B \\u
+.B \eu
 Username
 .TP
-.B \\h
+.B \eh
 Hostname (short)
 .TP
-.B \\H
+.B \eH
 Hostname (full)
 .TP
-.B \\w
+.B \ew
 Working directory (~ for home)
 .TP
-.B \\W
+.B \eW
 Basename of working directory
 .TP
-.B \\$
+.B \e$
 # if root, $ otherwise
 .TP
-.B \\n
+.B \en
 Newline
 .TP
-.B \\t
+.B \et
 Time (HH:MM:SS)
 .TP
-.B \\d
+.B \ed
 Date
 .TP
-.B \\e
+.B \ee
 Escape character
 .TP
-.B \\[, \\]
+.B \e[, \e]
 Begin/end non-printing sequence
 .SH FILES
 .TP
@@ -596,12 +1205,35 @@ Startup file for interactive shells.
 .TP
 .B ~/.zish_history
 Command history file.
+.TP
+.B ~/.zish/agent.json
+Agent configuration file.
+.TP
+.B ~/.zish/agent-tools.json
+Custom agent tool definitions.
+.TP
+.B ~/.zish/keybindings.json
+Custom keybinding overrides.
+.TP
+.B ~/.zish/sessions/
+Agent session logs in JSONL format.
+.TP
+.B ~/.zish/sessions/\fIid\fB/ctl
+FIFO pipe for session attachment.
+.TP
+.B ~/.zish/models/
+Local GGUF models for inference.
+.TP
+.B ~/.claude/.credentials.json
+Claude Code OAuth credentials (auto-loaded).
+.TP
+.B CLAUDE.md, .claude/CLAUDE.md
+Agent system prompt context (loaded from cwd and parents).
 .SH EXIT STATUS
 The exit status is that of the last command executed,
 or 0 if no command was executed.
 With \fB\-c\fR, the exit status is that of the command string.
 .SH EXAMPLES
-.PP
 Run a command:
 .RS
 .nf
@@ -609,17 +1241,34 @@ zish \-c 'echo hello'
 .fi
 .RE
 .PP
-Run a script:
-.RS
-.nf
-zish script.sh arg1 arg2
-.fi
-.RE
-.PP
-Benchmark a command:
+Benchmark a command with histogram:
 .RS
 .nf
 time \-n 100 \-w 5 \-H ./myprogram
+.fi
+.RE
+.PP
+One-shot agent query:
+.RS
+.nf
+agent "explain this error" 2>&1 | head
+.fi
+.RE
+.PP
+Agent with model override:
+.RS
+.nf
+agent \-m opus "review this function for security issues"
+.fi
+.RE
+.PP
+Interactive agent session:
+.RS
+.nf
+agent
+> /spawn refactor the auth module
+> /spawn write tests for the API
+> /tasks
 .fi
 .RE
 .PP
@@ -639,11 +1288,18 @@ for f in "${files[@]}"; do
 done
 .fi
 .RE
+.PP
+Natural language to command:
+.RS
+.nf
+?find all rust files larger than 1MB
+.fi
+.RE
 .SH SEE ALSO
 .BR bash (1),
 .BR zsh (1),
-.BR sh (1)
-.SH BUGS
-Report bugs at https://github.com/user/zish/issues
+.BR sh (1),
+.BR screen (1),
+.BR tmux (1)
 .SH AUTHOR
 Written in Zig.

@@ -7,7 +7,7 @@ fast, opinionated shell written in zig. for the brave.
 - hybrid vim/emacs editing (vim text objects + emacs keys + arrows)
 - git prompt (`set git_prompt on`)
 - syntax highlighting
-- tab completion with common prefix
+- tab completion with ghost text prediction
 - persistent history
 - aliases & functions
 - `${VAR:-default}` parameter expansion
@@ -15,6 +15,68 @@ fast, opinionated shell written in zig. for the brave.
 - pipes, redirects, `&&`, `||`
 - `$(cmd)` and `$((math))`
 - builtins: `cd`, `-`, `..`, `...`, `local`, `export`
+
+## agent
+
+embedded LLM agent with tool use, recursive subagents, and local inference.
+
+```
+agent                    # interactive mode
+agent <query>            # one-shot
+agent -m opus <query>    # model override (opus/sonnet/haiku)
+agent continue           # re-enter session
+agent attach [id]        # attach to running session (like screen)
+agent sessions           # list sessions
+agent log [id]           # view conversation with markdown rendering
+```
+
+### tools
+
+bash, read, edit, write, glob, grep, agent (recursive subagents), webfetch, websearch. plugin tools via `~/.zish/agent-tools.json`.
+
+### interactive mode
+
+bottom-anchored TUI with scroll regions, markdown rendering, and vi mode input.
+
+| key | action |
+|-----|--------|
+| `Enter` | submit query |
+| `Ctrl+J` / `Alt+Enter` | insert newline |
+| `PageUp` / `PageDown` | scroll history |
+| `Esc` | vi normal mode |
+| `Ctrl+D` | exit |
+
+commands: `/compact`, `/cost`, `/model`, `/diff`, `/commit`, `/review`, `/undo`, `/plan`, `/spawn`, `/queue`, `/agents`, `/tasks`, `/search`, `/help`
+
+### subagents
+
+recursive spawning up to 3 levels deep, 8 per level. workers get full tools, read-only subagents get bash/read/glob/grep. autonomous task queue (16 slots) for background work.
+
+### query router
+
+classifies queries before dispatch: local patterns (70% zero-cost) → local GGUF inference → haiku API call. routes to shell (bypass LLM), or selects model tier (haiku/sonnet/opus).
+
+### local inference
+
+pure-zig GGUF inference engine. fork-based process isolation, continuous inference between requests. supports F32, F16, Q8_0, Q4_K, Q6_K quantization. SIMD matmul, sliding window attention, CTM (continuous thinking model) with online plasticity.
+
+## architecture
+
+follows "your server as a function" (eriksen/finagle): services, filters, composable pipelines.
+
+```
+RouterFilter → LoggingFilter → TokenTrackingFilter → RetryFilter → ToolLoopService
+```
+
+| module | role |
+|--------|------|
+| `agent_service.zig` | request/response types, comptime `Stack()` composer |
+| `agent_filters.zig` | router, logging, token tracking, retry filters |
+| `agent_tools.zig` | tool dispatch with `ToolContext` |
+| `agent_drain.zig` | comptime drain handler for message output |
+| `agent_commands.zig` | table-driven slash command dispatch |
+| `agent_router.zig` | query classification pipeline |
+| `agent.zig` | agent thread, API calls, SSE parsing, markdown renderer |
 
 ## performance
 
@@ -28,12 +90,7 @@ fast, opinionated shell written in zig. for the brave.
 | functions | **3.4x faster** | **3.8x faster** |
 | pipelines | **1.7x faster** | **1.9x faster** |
 
-methodology: `./bench.sh` runs from `/bin/sh` with hyperfine. all shells use `--norc --noprofile` / `--no-rcs` to skip user config. output correctness is validated against bash before each benchmark.
-
-why it's fast:
-- **static binary** - no dynamic linker overhead, no shared libs
-- **stack buffers** - echo/test builtins use stack allocation in loops, no malloc
-- **minimal init** - no readline/job control setup for `-c` mode
+methodology: `./bench.sh` runs from `/bin/sh` with hyperfine. all shells use `--norc --noprofile` / `--no-rcs`.
 
 ## build
 
@@ -48,116 +105,37 @@ zig build --release=fast
 cp example.zishrc ~/.zishrc
 ```
 
+agent config: `~/.zish/agent.json`. credentials: `~/.claude/.credentials.json` (auto-loaded from claude code) or `api_key`/`api_key_cmd` in config.
+
 ## vim mode
 
-zish has vim-style modal editing enabled by default.
+see `man zish` for full vim mode documentation, or the tables below.
 
-### modes
-
-| mode | indicator | description |
-|------|-----------|-------------|
-| insert | `[I]` | normal typing (default) |
-| normal | `[N]` | vim commands |
-| visual | `[V]` | character selection |
-| visual line | `[VL]` | line selection |
-| replace | `[R]` | overwrite mode |
-
-### normal mode commands
-
-**mode entry**
-| key | action |
-|-----|--------|
-| `i` | insert at cursor |
-| `I` | insert at line start |
-| `a` | append after cursor |
-| `A` | append at line end |
-| `o` | open line below |
-| `O` | open line above |
-| `s` | substitute char |
-| `S` | substitute line |
-| `v` | visual mode |
-| `V` | visual line mode |
-| `R` | replace mode |
-
-**motions**
-| key | action |
-|-----|--------|
-| `h` `l` | left / right |
-| `j` `k` | down / up (multiline) |
-| `w` `W` | word / WORD forward |
-| `b` `B` | word / WORD backward |
-| `e` `E` | word / WORD end |
-| `0` | line start |
-| `^` | first non-blank |
-| `$` | line end |
-| `G` | buffer end |
-
-**operators** (combine with motions or text objects)
-| key | action |
-|-----|--------|
-| `d` | delete |
-| `c` | change (delete + insert) |
-| `y` | yank (copy) |
-
-**text objects** (use with `i` inner or `a` around)
-| object | description |
-|--------|-------------|
-| `w` `W` | word / WORD |
-| `"` `'` `` ` `` | quoted string |
-| `(` `)` `b` | parentheses |
-| `[` `]` | brackets |
-| `{` `}` `B` | braces |
-| `<` `>` | angle brackets |
-
-**common combos**
-```
-ciw     change inner word
-diw     delete inner word
-daw     delete around word (includes space)
-ci"     change inside quotes
-da(     delete around parentheses
-yiw     yank inner word
-dd      delete line
-cc      change line
-yy      yank line
-3dw     delete 3 words
-```
-
-**single char operations**
-| key | action |
-|-----|--------|
-| `x` | delete char under cursor |
-| `X` | delete char before cursor |
-| `r` | replace single char |
-| `C` | change to end of line |
-| `D` | delete to end of line |
-| `p` | paste after |
-| `P` | paste before |
-
-### visual mode
-
-select text then operate:
-- `d` / `x` - delete selection
-- `c` / `s` - change selection
-- `y` - yank selection
-- `o` - swap cursor/anchor
-- `Esc` - cancel
-
-### insert mode
+### normal mode
 
 | key | action |
 |-----|--------|
-| `Esc` | back to normal |
-| `Ctrl-a` | line start |
-| `Ctrl-e` | line end |
-| `Ctrl-u` | delete to start |
-| `Ctrl-w` | delete word back |
-| `Ctrl-c` | cancel |
+| `i/a/A/I/o/O` | enter insert mode |
+| `h/j/k/l` | movement |
+| `w/W/b/B/e/E` | word motions |
+| `0/^/$` | line position |
+| `gg/G` | buffer start/end |
+| `d/c/y` | operators (combine with motions) |
+| `dd/cc/yy/Y` | line operations |
+| `x/X` | delete char |
+| `r` | replace char |
+| `~` | toggle case |
+| `J` | join lines |
+| `p/P` | paste after/before |
+| `v/V` | visual / visual line |
+| `di"/ci(/da[` | text objects |
 
 ## platform
 
-linux only. no macos support - uses linux-specific syscalls and maintainer has no way to test mac builds. PRs welcome if someone wants to add libc abstraction layer.
+linux only. uses linux-specific syscalls. PRs welcome for portability.
 
-## status
+## man page
 
-v0.10.2 - production ready
+```
+man zish
+```
