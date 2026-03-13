@@ -18,6 +18,10 @@ pub const MsgKind = enum(u8) {
     confirm_response, // main -> agent: "y" or "n"
     usage_info,       // agent -> main: token usage "input:N output:N cost:$X.XX"
     router_info,      // agent -> main: routing decision "agent -> sonnet (med cost)"
+    add_task,         // main -> agent: queue a task for autonomous processing
+    spawn_worker,     // main -> agent: spawn a full-tools worker subagent
+    agent_status_req, // main -> agent: request subagent status listing
+    agent_status,     // agent -> main: subagent status line
 };
 
 pub const Msg = struct {
