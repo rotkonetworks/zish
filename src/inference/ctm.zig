@@ -45,7 +45,6 @@ pub const SuperLinear = struct {
 
     /// Compute: out[n, o] = sum_m(x[n, m] * w[m, o, n]) + b[n, o]
     pub fn forward(self: *const SuperLinear, x: []const f32, out: []f32) void {
-        @setFloatMode(.optimized);
         const M = self.in_dims;
         const O = self.out_dims;
         const N = self.n_neurons;
@@ -125,7 +124,6 @@ pub const SynapseUNET = struct {
     /// Forward pass: x (2*D) -> out (D)
     /// scratch must be large enough for intermediate activations
     pub fn forward(self: *const SynapseUNET, x: []const f32, out: []f32, scratch: []f32) void {
-        @setFloatMode(.optimized);
         // We need skip connection storage. Use regions of scratch buffer.
         // scratch layout: [down_activations...] [work_a] [work_b]
         const max_dim = self.down_in_dims[0]; // input dim is largest
@@ -341,7 +339,6 @@ pub const CTMBlock = struct {
         layer_idx: usize,
         scratch: []f32,
     ) void {
-        @setFloatMode(.optimized);
         const cfg = self.config;
         const D = cfg.dim;
         const K = cfg.iterations;
@@ -429,6 +426,19 @@ pub const CTMBlock = struct {
                 obs[i] = score * attn_v[i];
             }
 
+            if (debug_ctm) {
+                var obs_nan: usize = 0;
+                var obs_max: f32 = 0;
+                for (obs[0..D]) |v| {
+                    if (std.math.isNan(v)) obs_nan += 1;
+                    const av = @abs(v);
+                    if (av > obs_max and !std.math.isNan(av)) obs_max = av;
+                }
+                if (obs_nan > 0 or k < 2 or k == K - 1) {
+                    std.debug.print("  [CTM k={d}] obs: nan={d} max={e}\n", .{ k, obs_nan, obs_max });
+                }
+            }
+
             // 3. U-NET synapse: concat(obs, state + tick_embed) -> residual
             const tick_emb = self.tick_embed[k * D ..][0..D];
             for (0..D) |i| {
@@ -436,6 +446,19 @@ pub const CTMBlock = struct {
                 synapse_in[D + i] = state[i] + tick_emb[i];
             }
             self.synapses.forward(synapse_in, synapse_out, unet_scratch);
+
+            if (debug_ctm) {
+                var syn_nan: usize = 0;
+                var syn_max: f32 = 0;
+                for (synapse_out[0..D]) |v| {
+                    if (std.math.isNan(v)) syn_nan += 1;
+                    const av = @abs(v);
+                    if (av > syn_max and !std.math.isNan(av)) syn_max = av;
+                }
+                if (syn_nan > 0 or k < 2 or k == K - 1) {
+                    std.debug.print("  [CTM k={d}] syn_out: nan={d} max={e}\n", .{ k, syn_nan, syn_max });
+                }
+            }
 
             // Residual: state = state + synapse_out
             for (0..D) |i| state[i] += synapse_out[i];
@@ -453,10 +476,25 @@ pub const CTMBlock = struct {
             self.nlm1.forward(trace, nlm1_out_buf);
             glu(nlm1_out_buf, D, 2 * hidden);
 
+            // (nlm1 debug removed for brevity)
+
             // 6. NLM2: (D, hidden) -> GLU -> (D, 1) -> squeeze -> (D)
             self.nlm2.forward(nlm1_out_buf[0 .. D * hidden], nlm2_out_buf);
             glu(nlm2_out_buf, D, 2);
             for (0..D) |d| state[d] = nlm2_out_buf[d * 2];
+
+            if (debug_ctm) {
+                var state_nan: usize = 0;
+                var state_max: f32 = 0;
+                for (state[0..D]) |v| {
+                    if (std.math.isNan(v)) { state_nan += 1; }
+                    const av = @abs(v);
+                    if (av > state_max and !std.math.isNan(av)) state_max = av;
+                }
+                if (state_nan > 0 or k < 2 or k == K - 1) {
+                    std.debug.print("  [CTM k={d}] state: nan={d}/{d} max={e}\n", .{ k, state_nan, D, state_max });
+                }
+            }
 
             // 7. Update sync accumulators
             for (0..n_synch) |s| {
@@ -480,7 +518,38 @@ pub const CTMBlock = struct {
             synch_readout[s] = if (denom > 1e-8) sync.alpha_out[s] / denom else 0;
         }
         linearForward(out, synch_readout, self.c_proj_w, D, n_synch);
+
+        // Debug: check for NaN/inf in output
+        if (debug_ctm) {
+            var nan_count: usize = 0;
+            var inf_count: usize = 0;
+            var max_abs: f32 = 0;
+            for (out[0..D]) |v| {
+                if (std.math.isNan(v)) nan_count += 1;
+                if (std.math.isInf(v)) inf_count += 1;
+                const abs_v = @abs(v);
+                if (abs_v > max_abs and !std.math.isNan(abs_v) and !std.math.isInf(abs_v)) max_abs = abs_v;
+            }
+            // Also check state
+            var state_nan: usize = 0;
+            for (state[0..D]) |v| if (std.math.isNan(v)) { state_nan += 1; };
+            // Check synch readout
+            var sync_nan: usize = 0;
+            var sync_max: f32 = 0;
+            for (synch_readout[0..n_synch]) |v| {
+                if (std.math.isNan(v)) sync_nan += 1;
+                const abs_v = @abs(v);
+                if (abs_v > sync_max and !std.math.isNan(abs_v)) sync_max = abs_v;
+            }
+            if (nan_count > 0 or inf_count > 0 or max_abs > 1e6) {
+                std.debug.print("  [CTM] out: nan={d} inf={d} max={e} | state_nan={d} | sync: nan={d} max={e}\n", .{
+                    nan_count, inf_count, max_abs, state_nan, sync_nan, sync_max,
+                });
+            }
+        }
     }
+
+    pub var debug_ctm: bool = false;
 
     /// Calculate scratch buffer size needed for forward pass.
     pub fn scratchSize(cfg: CTMConfig) usize {
