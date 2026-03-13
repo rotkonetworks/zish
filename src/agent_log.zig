@@ -592,7 +592,8 @@ pub const AgentConfig = struct {
         }
     }
 
-    /// Load OAuth access token from Claude Code's credentials file (~/.claude/.credentials.json)
+    /// Load OAuth access token from Claude Code's credentials file (~/.claude/.credentials.json).
+    /// If the token is expired, refreshes it using the refresh token and updates the file.
     fn loadClaudeCodeCredentials(self: *AgentConfig, allocator: std.mem.Allocator) void {
         const home = std.process.getEnvVarOwned(allocator, "HOME") catch return;
         defer allocator.free(home);
@@ -608,12 +609,112 @@ pub const AgentConfig = struct {
         if (std.mem.indexOf(u8, content, "\"accessToken\"")) |_| {
             if (jsonExtractStr(content, "accessToken")) |token| {
                 if (token.len > 0) {
+                    // Check if token is expired (expiresAt is milliseconds since epoch)
+                    const expired = blk: {
+                        const expires_str = jsonExtractStr(content, "expiresAt") orelse break :blk false;
+                        const expires_ms = std.fmt.parseInt(i64, expires_str, 10) catch break :blk false;
+                        const now_ms: i64 = @intCast(std.time.milliTimestamp());
+                        break :blk now_ms >= expires_ms - 300_000; // 5 min buffer
+                    };
+
+                    if (expired) {
+                        // Try to refresh the token
+                        if (jsonExtractStr(content, "refreshToken")) |refresh| {
+                            if (refreshOAuthToken(allocator, refresh, path)) |new_token| {
+                                self.trackAlloc(new_token);
+                                self.api_key = new_token;
+                                return;
+                            }
+                        }
+                    }
                     self.api_key = token;
                 }
             }
         }
     }
 };
+
+/// Refresh an expired OAuth token via platform.claude.com/v1/oauth/token.
+/// Returns the new access token (caller must track allocation) or null on failure.
+/// On success, also rewrites the credentials file with the new tokens.
+fn refreshOAuthToken(allocator: std.mem.Allocator, refresh_token: []const u8, creds_path: []const u8) ?[]const u8 {
+    const client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+
+    // Build POST body
+    var body_buf: [2048]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_buf, "grant_type=refresh_token&refresh_token={s}&client_id={s}", .{ refresh_token, client_id }) catch return null;
+
+    // Use curl to call the token endpoint
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &[_][]const u8{
+            "curl", "-s", "-X", "POST",
+            "https://platform.claude.com/v1/oauth/token",
+            "-H", "content-type: application/x-www-form-urlencoded",
+            "-d", body,
+        },
+        .max_output_bytes = 8192,
+    }) catch return null;
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+
+    // Parse response: {"access_token":"...","refresh_token":"...","expires_in":28800,...}
+    const new_access = jsonExtractStr(result.stdout, "access_token") orelse return null;
+    const new_refresh = jsonExtractStr(result.stdout, "refresh_token") orelse refresh_token;
+    const expires_in_str = jsonExtractStr(result.stdout, "expires_in") orelse "28800";
+    const expires_in = std.fmt.parseInt(i64, expires_in_str, 10) catch 28800;
+    const expires_at: i64 = @intCast(std.time.milliTimestamp() + expires_in * 1000);
+
+    // Dupe the token so it outlives result.stdout
+    const token_copy = allocator.dupe(u8, new_access) catch return null;
+
+    // Rewrite credentials file with new tokens
+    rewriteCredentials(allocator, creds_path, new_access, new_refresh, expires_at);
+
+    return token_copy;
+}
+
+/// Rewrite the Claude Code credentials file with updated OAuth tokens.
+fn rewriteCredentials(allocator: std.mem.Allocator, path: []const u8, access: []const u8, refresh: []const u8, expires_at: i64) void {
+    // Read existing file to preserve other fields (scopes, subscriptionType, etc.)
+    const existing = std.fs.cwd().readFileAlloc(allocator, path, 8192) catch return;
+    defer allocator.free(existing);
+
+    // Extract preserved fields
+    const scopes = jsonExtractStr(existing, "scopes");
+    const sub_type = jsonExtractStr(existing, "subscriptionType") orelse "max";
+    const rate_tier = jsonExtractStr(existing, "rateLimitTier") orelse "default_claude_max_20x";
+
+    // Build scopes array string
+    var scopes_buf: [512]u8 = undefined;
+    const scopes_str = blk: {
+        // Find the scopes array in the original JSON and copy it verbatim
+        if (std.mem.indexOf(u8, existing, "\"scopes\"")) |idx| {
+            if (std.mem.indexOfPos(u8, existing, idx, "[")) |arr_start| {
+                if (std.mem.indexOfPos(u8, existing, arr_start, "]")) |arr_end| {
+                    break :blk existing[arr_start .. arr_end + 1];
+                }
+            }
+        }
+        break :blk "[\"user:inference\"]";
+    };
+    _ = scopes;
+    _ = &scopes_buf;
+
+    // Write new credentials
+    var buf: [4096]u8 = undefined;
+    var ea_buf: [32]u8 = undefined;
+    const ea_str = std.fmt.bufPrint(&ea_buf, "{d}", .{expires_at}) catch return;
+    const json = std.fmt.bufPrint(&buf,
+        \\{{"claudeAiOauth":{{"accessToken":"{s}","refreshToken":"{s}","expiresAt":{s},"scopes":{s},"subscriptionType":"{s}","rateLimitTier":"{s}"}}}}
+    , .{ access, refresh, ea_str, scopes_str, sub_type, rate_tier }) catch return;
+
+    const file = std.fs.cwd().createFile(path, .{}) catch return;
+    defer file.close();
+    file.writeAll(json) catch {};
+}
 
 // ============================================================
 // Session listing
