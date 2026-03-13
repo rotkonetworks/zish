@@ -2378,6 +2378,10 @@ pub fn enableRawMode(self: *Shell) !void {
     termios.lflag.ECHO = false;
     termios.lflag.ISIG = false; // disable ctrl+c/ctrl+z signals
 
+    // disable input translations (ICRNL translates CR to NL, breaking Enter/Ctrl+J distinction)
+    termios.iflag.ICRNL = false;
+    termios.iflag.IXON = false; // disable Ctrl+S/Ctrl+Q flow control
+
     // set minimum characters to read and timeout
     termios.cc[@intFromEnum(std.posix.V.MIN)] = 1; // read 1 char at a time
     termios.cc[@intFromEnum(std.posix.V.TIME)] = 0; // no timeout
