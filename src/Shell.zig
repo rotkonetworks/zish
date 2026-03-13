@@ -2000,15 +2000,18 @@ fn drainAgentOutput(self: *Shell) !void {
             .tool_call => {
                 if (last_was_text) try writer.writeAll("\x1b[0m\n");
                 last_was_text = false;
-                try writer.writeAll("\x1b[90m");
+                try writer.writeAll("\x1b[1m\xe2\x97\x8f \x1b[0m\x1b[90m");
                 try writer.writeAll(msg.slice());
                 try writer.writeAll("\x1b[0m\n");
             },
             .tool_done => {
                 last_was_text = false;
-                try writer.writeAll("\x1b[90m");
-                try writer.writeAll(msg.slice());
-                try writer.writeAll("\x1b[0m\n");
+                const dt = msg.slice();
+                if (dt.len > 0) {
+                    try writer.writeAll("  \x1b[90m\xe2\x8e\xbf  ");
+                    try writer.writeAll(dt);
+                    try writer.writeAll("\x1b[0m\n");
+                }
             },
             .error_msg => {
                 if (last_was_text) try writer.writeAll("\x1b[0m\n");
@@ -2064,7 +2067,14 @@ fn drainAgentOutput(self: *Shell) !void {
                 try writer.writeAll(msg.slice());
                 try writer.writeAll("]\x1b[0m\n");
             },
-            .confirm_response => {}, // handled on agent side
+            .confirm_response, .add_task, .spawn_worker, .agent_status_req => {}, // handled on agent side
+            .agent_status => {
+                last_was_text = false;
+                if (msg.len > 0) {
+                    try writer.writeAll(msg.slice());
+                    try writer.writeByte('\n');
+                }
+            },
             .cancel => {
                 last_was_text = false;
                 self.agent_output_active = false;

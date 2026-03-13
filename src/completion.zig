@@ -2768,7 +2768,7 @@ pub fn updateGhostText(self: *Shell) void {
 
     // check for CTM inference result (non-blocking)
     const cur_seq = self.ghost_infer_seq.load(.monotonic);
-    const res_seq = self.ghost_infer_result_seq.load(.monotonic);
+    const res_seq = self.ghost_infer_result_seq.load(.acquire); // acquire: sync with background thread's release store
     if (res_seq == cur_seq and res_seq > 0) {
         const rlen = self.ghost_infer_result_len.load(.monotonic);
         if (rlen > 0) {

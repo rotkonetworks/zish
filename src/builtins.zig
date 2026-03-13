@@ -244,6 +244,7 @@ pub fn pushd(shell: *Shell, args: []const []const u8) !u8 {
             dir_stack.append(shell.allocator, top) catch {};
             return 1;
         };
+        shell.allocator.free(@constCast(top)); // free the popped string after successful chdir
         try dir_stack.append(shell.allocator, try shell.allocator.dupe(u8, cwd));
         try printDirStack(shell);
         return 0;
@@ -2556,14 +2557,17 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
                 switch (msg.kind) {
                     .text_delta => try out.writeAll(msg.slice()),
                     .tool_call => {
-                        try out.writeAll("\x1b[90m");
+                        try out.writeAll("\x1b[1m\xe2\x97\x8f \x1b[0m\x1b[90m");
                         try out.writeAll(msg.slice());
                         try out.writeAll("\x1b[0m\n");
                     },
                     .tool_done => {
-                        try out.writeAll("\x1b[90m");
-                        try out.writeAll(msg.slice());
-                        try out.writeAll("\x1b[0m\n");
+                        const dt = msg.slice();
+                        if (dt.len > 0) {
+                            try out.writeAll("  \x1b[90m\xe2\x8e\xbf  ");
+                            try out.writeAll(dt);
+                            try out.writeAll("\x1b[0m\n");
+                        }
                     },
                     .error_msg => {
                         try out.writeAll("\x1b[31m");
@@ -2575,9 +2579,7 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
                         // auto-deny in non-interactive mode
                         _ = shell.agent.queues.request.push(.confirm_response, "n");
                     },
-                    .usage_info => {},
-                    .router_info => {},
-                    .confirm_response => {},
+                    .usage_info, .router_info, .confirm_response, .add_task, .spawn_worker, .agent_status_req, .agent_status => {},
                     .done => {
                         done = true;
                     },
@@ -3105,6 +3107,7 @@ fn agentInteractive(shell: *Shell) !u8 {
     var cost_len: usize = 0;
     var status_text: [64]u8 = undefined;
     var status_len: usize = 0;
+    var query_start_ms: i64 = 0; // timestamp when current query started
 
     // Message history for scrollback
     var msg_history: MessageHistory = .{};
@@ -3144,17 +3147,17 @@ fn agentInteractive(shell: *Shell) !u8 {
             w.print("\x1b[{d};1H\x1b[2K\x1b[90m", .{row}) catch {};
             if (scroll_off > 0) {
                 var indicator_buf: [64]u8 = undefined;
-                const indicator = std.fmt.bufPrint(&indicator_buf, " ^ {d} lines ", .{scroll_off}) catch "";
+                const indicator = std.fmt.bufPrint(&indicator_buf, " \xe2\x86\x91 {d} lines ", .{scroll_off}) catch "";
                 const ind_cols = displayWidth(indicator);
                 const pad_left = (cols -| ind_cols) / 2;
                 var ci: u16 = 0;
-                while (ci < pad_left) : (ci += 1) w.writeByte('-') catch {};
+                while (ci < pad_left) : (ci += 1) w.writeAll("\xe2\x94\x80") catch {};
                 w.writeAll(indicator) catch {};
                 ci += ind_cols;
-                while (ci < cols) : (ci += 1) w.writeByte('-') catch {};
+                while (ci < cols) : (ci += 1) w.writeAll("\xe2\x94\x80") catch {};
             } else {
                 var ci: u16 = 0;
-                while (ci < cols) : (ci += 1) w.writeByte('-') catch {};
+                while (ci < cols) : (ci += 1) w.writeAll("\xe2\x94\x80") catch {};
             }
             w.writeAll("\x1b[0m") catch {};
         }
@@ -3169,9 +3172,9 @@ fn agentInteractive(shell: *Shell) !u8 {
                     const line_text = ebuf.getLine(line_i);
                     if (line_i == 0) {
                         if (ebuf.vi_mode == .normal) {
-                            w.writeAll("\x1b[33m ::\x1b[0m ") catch {}; // :: yellow
+                            w.writeAll("\x1b[33m \xe2\x9d\xaf\x1b[0m  ") catch {}; // ❯ yellow
                         } else {
-                            w.writeAll("\x1b[34m >>\x1b[0m ") catch {}; // >> blue
+                            w.writeAll("\x1b[34m \xe2\x9d\xaf\x1b[0m  ") catch {}; // ❯ blue
                         }
                     } else {
                         w.writeAll("    ") catch {};
@@ -3200,6 +3203,10 @@ fn agentInteractive(shell: *Shell) !u8 {
         }
 
         fn drawStatusBar(w: anytype, row: u16, cols: u16, mdl: []const u8, cost: []const u8, status: []const u8) void {
+            drawStatusBarFull(w, row, cols, mdl, cost, status, 0);
+        }
+
+        fn drawStatusBarFull(w: anytype, row: u16, cols: u16, mdl: []const u8, cost: []const u8, status: []const u8, elapsed_ms: i64) void {
             w.print("\x1b[{d};1H\x1b[2K\x1b[90;7m ", .{row}) catch {};
             var display_cols: u16 = 1; // leading space
             // Model name
@@ -3207,7 +3214,7 @@ fn agentInteractive(shell: *Shell) !u8 {
             display_cols += displayWidth(mdl);
             // Activity status (thinking, tool use, etc.)
             if (status.len > 0) {
-                w.writeAll(" | ") catch {};
+                w.writeAll(" \xe2\x94\x82 ") catch {}; // │
                 display_cols += 3;
                 w.writeAll("\x1b[0;93;7m") catch {}; // bright yellow on reverse
                 w.writeAll(status) catch {};
@@ -3216,14 +3223,27 @@ fn agentInteractive(shell: *Shell) !u8 {
             }
             // Cost
             if (cost.len > 0) {
-                w.writeAll(" | ") catch {};
+                w.writeAll(" \xe2\x94\x82 ") catch {}; // │
                 display_cols += 3;
                 w.writeAll(cost) catch {};
                 display_cols += displayWidth(cost);
             }
+            // Elapsed time (only when active)
+            if (elapsed_ms > 0) {
+                const secs = @divTrunc(elapsed_ms, 1000);
+                var elapsed_buf: [32]u8 = undefined;
+                const elapsed = if (secs >= 60)
+                    std.fmt.bufPrint(&elapsed_buf, " {d}m {d}s", .{ @divTrunc(secs, 60), @mod(secs, 60) }) catch ""
+                else
+                    std.fmt.bufPrint(&elapsed_buf, " {d}s", .{secs}) catch "";
+                w.writeAll(" \xe2\x94\x82") catch {};
+                display_cols += 2;
+                w.writeAll(elapsed) catch {};
+                display_cols += displayWidth(elapsed);
+            }
             // Key hints
-            w.writeAll(" | ^D:exit | /help ") catch {};
-            display_cols += 19;
+            w.writeAll(" \xe2\x94\x82 ^D:exit \xe2\x94\x82 /help ") catch {}; // │
+            display_cols += 18;
             // Pad remaining width
             while (display_cols < cols) : (display_cols += 1) w.writeByte(' ') catch {};
             w.writeAll("\x1b[0m") catch {};
@@ -3232,10 +3252,18 @@ fn agentInteractive(shell: *Shell) !u8 {
         /// Draw input area, preserving cursor position if streaming.
         /// Expands scroll region temporarily so cursor moves outside output area work.
         fn drawInputSafe(w: anytype, first_row: u16, rows: u16, ebuf: *const editor.EditBuffer, streaming: bool) void {
-            if (streaming) {
+            drawInputSafeFull(w, first_row, rows, ebuf, streaming, 0, 0);
+        }
+
+        /// Draw input area mid-stream: expand scroll region, save cursor, draw, restore.
+        /// scroll_last/t_rows needed to properly expand/restore scroll region during streaming.
+        fn drawInputSafeFull(w: anytype, first_row: u16, rows: u16, ebuf: *const editor.EditBuffer, streaming: bool, scroll_last: u16, t_rows: u16) void {
+            if (streaming and t_rows > 0) {
+                w.print("\x1b[1;{d}r", .{t_rows}) catch {}; // expand to full terminal
                 w.writeAll("\x1b[s") catch {};
                 drawInput(w, first_row, rows, ebuf);
                 w.writeAll("\x1b[u") catch {};
+                w.print("\x1b[1;{d}r", .{scroll_last}) catch {}; // restore scroll region
             } else {
                 drawInput(w, first_row, rows, ebuf);
             }
@@ -3243,9 +3271,13 @@ fn agentInteractive(shell: *Shell) !u8 {
 
         /// Draw status bar mid-stream: save cursor, expand scroll region, draw, restore.
         fn drawStatusBarSafe(w: anytype, stat_row: u16, t_rows: u16, scroll_last: u16, cols: u16, mdl: []const u8, cost: []const u8, status: []const u8) void {
+            drawStatusBarSafeElapsed(w, stat_row, t_rows, scroll_last, cols, mdl, cost, status, 0);
+        }
+
+        fn drawStatusBarSafeElapsed(w: anytype, stat_row: u16, t_rows: u16, scroll_last: u16, cols: u16, mdl: []const u8, cost: []const u8, status: []const u8, elapsed_ms: i64) void {
             w.print("\x1b[1;{d}r", .{t_rows}) catch {}; // expand to full terminal
             w.writeAll("\x1b[s") catch {};
-            drawStatusBar(w, stat_row, cols, mdl, cost, status);
+            drawStatusBarFull(w, stat_row, cols, mdl, cost, status, elapsed_ms);
             w.writeAll("\x1b[u") catch {};
             w.print("\x1b[1;{d}r", .{scroll_last}) catch {}; // restore output scroll region
         }
@@ -3402,7 +3434,7 @@ fn agentInteractive(shell: *Shell) !u8 {
         var msg: agent_queue.Msg = undefined;
         while (shell.agent.queues.output.pop(&msg)) {
             got_output = true;
-            if (!agent_active and msg.kind != .done and msg.kind != .usage_info and msg.kind != .router_info and msg.kind != .confirm_response) {
+            if (!agent_active and msg.kind != .done and msg.kind != .usage_info and msg.kind != .router_info and msg.kind != .confirm_response and msg.kind != .add_task and msg.kind != .spawn_worker and msg.kind != .agent_status_req and msg.kind != .agent_status) {
                 agent_active = true;
             }
 
@@ -3428,7 +3460,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                         const resp = "responding";
                         @memcpy(status_text[0..resp.len], resp);
                         status_len = resp.len;
-                        Layout.drawStatusBarSafe(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len]);
+                        Layout.drawStatusBarSafeElapsed(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0);
                     }
                     try md.render(tee, msg.slice());
                     last_was_text = true;
@@ -3448,24 +3480,19 @@ fn agentInteractive(shell: *Shell) !u8 {
                         try tee.writeAll("\x1b[0m\n");
                     }
                     last_was_text = false;
-                    // Compact tool rendering: ⚡ ToolName args...
                     const tool_text = msg.slice();
                     // Update status bar with tool name
                     {
-                        // Extract tool name (format: "Tool: Name")
-                        const tool_prefix = "Tool: ";
-                        const tname = if (std.mem.startsWith(u8, tool_text, tool_prefix))
-                            tool_text[tool_prefix.len..]
-                        else
-                            tool_text;
-                        // Find end of tool name (space or end)
-                        const name_end = std.mem.indexOfScalar(u8, tname, ' ') orelse tname.len;
+                        // Extract tool name (up to '(' or space)
+                        const paren = std.mem.indexOfScalar(u8, tool_text, '(') orelse tool_text.len;
+                        const name_end = @min(paren, std.mem.indexOfScalar(u8, tool_text, ' ') orelse tool_text.len);
                         const slen = @min(name_end, status_text.len);
-                        @memcpy(status_text[0..slen], tname[0..slen]);
+                        @memcpy(status_text[0..slen], tool_text[0..slen]);
                         status_len = slen;
-                        Layout.drawStatusBarSafe(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len]);
+                        Layout.drawStatusBarSafeElapsed(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0);
                     }
-                    try tee.writeAll("\x1b[90m>");
+                    // ● ToolName(args) — Claude Code style
+                    try tee.writeAll("\x1b[1m\xe2\x97\x8f \x1b[0m\x1b[90m");
                     // Truncate to terminal width
                     const max_w: usize = if (term_cols > 4) term_cols - 4 else term_cols;
                     if (tool_text.len > max_w) {
@@ -3478,12 +3505,58 @@ fn agentInteractive(shell: *Shell) !u8 {
                 },
                 .tool_done => {
                     last_was_text = false;
-                    try tee.writeAll("\x1b[90m\xe2\x9c\x93\x1b[0m\n");
+                    // Show result summary with ⎿ connector
+                    const done_text = msg.slice();
+                    if (done_text.len > 0) {
+                        // Count lines
+                        var line_count: usize = 1;
+                        for (done_text) |dc| {
+                            if (dc == '\n') line_count += 1;
+                        }
+                        if (line_count <= 3) {
+                            // Short result — show inline
+                            var line_start: usize = 0;
+                            for (done_text, 0..) |dc, di| {
+                                if (dc == '\n' or di == done_text.len - 1) {
+                                    const end = if (dc == '\n') di else di + 1;
+                                    const line = done_text[line_start..end];
+                                    const max_lw: usize = if (term_cols > 6) term_cols - 6 else term_cols;
+                                    try tee.writeAll("  \x1b[90m\xe2\x8e\xbf  ");
+                                    if (line.len > max_lw) {
+                                        try tee.writeAll(line[0..max_lw]);
+                                        try tee.writeAll("\xe2\x80\xa6");
+                                    } else {
+                                        try tee.writeAll(line);
+                                    }
+                                    try tee.writeAll("\x1b[0m\n");
+                                    line_start = di + 1;
+                                }
+                            }
+                        } else {
+                            // Long result — show first line + summary
+                            const first_nl = std.mem.indexOfScalar(u8, done_text, '\n') orelse done_text.len;
+                            const max_lw: usize = if (term_cols > 6) term_cols - 6 else term_cols;
+                            try tee.writeAll("  \x1b[90m\xe2\x8e\xbf  ");
+                            const first_line = done_text[0..first_nl];
+                            if (first_line.len > max_lw) {
+                                try tee.writeAll(first_line[0..max_lw]);
+                                try tee.writeAll("\xe2\x80\xa6");
+                            } else {
+                                try tee.writeAll(first_line);
+                            }
+                            try tee.writeAll("\x1b[0m\n");
+                            var more_buf: [64]u8 = undefined;
+                            const more = std.fmt.bufPrint(&more_buf, "  \x1b[90m\xe2\x8e\xbf  ({d} more lines)\x1b[0m\n", .{line_count - 1}) catch "";
+                            try tee.writeAll(more);
+                        }
+                    } else {
+                        try tee.writeAll("  \x1b[90m\xe2\x8e\xbf  \xe2\x9c\x93\x1b[0m\n");
+                    }
                     // Back to thinking after tool completes
                     const thinking = "thinking...";
                     @memcpy(status_text[0..thinking.len], thinking);
                     status_len = thinking.len;
-                    Layout.drawStatusBarSafe(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len]);
+                    Layout.drawStatusBarSafeElapsed(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0);
                 },
                 .error_msg => {
                     if (last_was_text) try tee.writeAll("\x1b[0m\n");
@@ -3506,7 +3579,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                         }
                     }
                     // Update status bar with new cost
-                    Layout.drawStatusBarSafe(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len]);
+                    Layout.drawStatusBarSafeElapsed(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0);
                     if (last_was_text) {
                         try tee.writeAll("\x1b[0m\n");
                         last_was_text = false;
@@ -3521,6 +3594,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                     last_was_text = false;
                     md.reset();
                     agent_active = false;
+                    query_start_ms = 0;
                     // Clear status indicator
                     status_len = 0;
                     Layout.drawStatusBarSafe(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], "");
@@ -3549,7 +3623,19 @@ fn agentInteractive(shell: *Shell) !u8 {
                     try out.print("\x1b[{d};1H\x1b[2K\x1b[33m{s} [y/n/a] \x1b[0m", .{ input_first_row, msg.slice() });
                     cursor_at = .input;
                 },
-                .confirm_response => {},
+                .confirm_response, .add_task, .spawn_worker, .agent_status_req => {},
+                .agent_status => {
+                    if (last_was_text) try out.writeByte('\n');
+                    last_was_text = false;
+                    if (msg.len > 0) {
+                        Layout.goOutput(out, out_last);
+                        cursor_at = .output;
+                        try out.writeAll(msg.slice());
+                        try out.writeByte('\n');
+                        msg_history.appendSlice(msg.slice());
+                        msg_history.commitLine();
+                    }
+                },
                 .cancel => {
                     agent_active = false;
                     translate_mode = false;
@@ -3561,7 +3647,7 @@ fn agentInteractive(shell: *Shell) !u8 {
         if (got_output) {
             // Refresh input area while keeping output cursor position
             if (cursor_at == .output) {
-                Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, true);
+                Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, true, out_last, term_rows);
             }
             try out.flush();
         }
@@ -3951,7 +4037,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                 msg_history.appendSlice(query);
                 msg_history.commitLine();
 
-                Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, true);
+                Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, true, out_last, term_rows);
                 try out.flush();
 
                 // Local commands
@@ -4080,7 +4166,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                         msg_history.appendSlice("Model switched");
                         msg_history.commitLine();
                         // Redraw status bar with new model
-                        Layout.drawStatusBarSafe(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len]);
+                        Layout.drawStatusBarSafeElapsed(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0);
                     } else {
                         try out.print("\x1b[1mCurrent model:\x1b[0m {s}\n", .{model_name});
                         try out.writeAll("\x1b[90mUsage: /model <opus|sonnet|haiku|model-id>\x1b[0m\n");
@@ -4173,17 +4259,51 @@ fn agentInteractive(shell: *Shell) !u8 {
                     try out.flush();
                     continue;
                 }
-                // /agents or /tasks — show subagent info
+                // /spawn <task> — spawn a full-tools worker subagent
+                if (std.mem.startsWith(u8, query, "/spawn ")) {
+                    Layout.goOutput(out, out_last);
+                    cursor_at = .output;
+                    const task_text = std.mem.trim(u8, query[7..], " ");
+                    if (task_text.len > 0) {
+                        _ = shell.agent.queues.request.push(.spawn_worker, task_text);
+                        try out.print("\x1b[90mSpawning worker: {s}\x1b[0m\n", .{task_text[0..@min(task_text.len, 60)]});
+                    } else {
+                        try out.writeAll("\x1b[90mUsage: /spawn <task description>\x1b[0m\n");
+                    }
+                    msg_history.appendSlice("Worker spawned");
+                    msg_history.commitLine();
+                    try out.flush();
+                    continue;
+                }
+                // /queue <task> — add autonomous task
+                if (std.mem.startsWith(u8, query, "/queue ")) {
+                    Layout.goOutput(out, out_last);
+                    cursor_at = .output;
+                    const task_text = std.mem.trim(u8, query[7..], " ");
+                    if (task_text.len > 0) {
+                        _ = shell.agent.queues.request.push(.add_task, task_text);
+                        try out.print("\x1b[90mQueued: {s}\x1b[0m\n", .{task_text});
+                    } else {
+                        try out.writeAll("\x1b[90mUsage: /queue <task description>\x1b[0m\n");
+                    }
+                    msg_history.appendSlice("Task queued");
+                    msg_history.commitLine();
+                    try out.flush();
+                    continue;
+                }
+                // /agents or /tasks — show subagent info and task queue
                 if (std.mem.eql(u8, query, "/agents") or std.mem.eql(u8, query, "/tasks")) {
                     Layout.goOutput(out, out_last);
                     cursor_at = .output;
                     if (shell.agent.isBusy()) {
-                        try out.writeAll("\x1b[33mAgent is busy\x1b[0m (may have subagents running)\n");
+                        try out.writeAll("\x1b[33mAgent busy\x1b[0m\n");
                     } else {
-                        try out.writeAll("\x1b[90mAgent idle, no active tasks.\x1b[0m\n");
+                        try out.writeAll("\x1b[90mAgent idle\x1b[0m\n");
                     }
-                    try out.writeAll("\x1b[90mUse `agent tasks` from shell for detailed subagent log.\x1b[0m\n");
-                    msg_history.appendSlice("Task status displayed");
+                    // Request status from agent thread
+                    _ = shell.agent.queues.request.push(.agent_status_req, "");
+                    try out.writeAll("\x1b[90mWorkers & tasks:\x1b[0m\n");
+                    msg_history.appendSlice("Agent status requested");
                     msg_history.commitLine();
                     try out.flush();
                     continue;
@@ -4287,7 +4407,9 @@ fn agentInteractive(shell: *Shell) !u8 {
                         \\  \x1b[33m/review\x1b[0m              — review session changes
                         \\  \x1b[33m/undo\x1b[0m                — undo last file change
                         \\  \x1b[33m/plan\x1b[0m <task>          — plan without executing
-                        \\  \x1b[33m/agents\x1b[0m              — list active subagents
+                        \\  \x1b[33m/spawn\x1b[0m <task>         — spawn worker (full tools)
+                        \\  \x1b[33m/queue\x1b[0m <task>         — queue autonomous task
+                        \\  \x1b[33m/agents\x1b[0m              — list workers & tasks
                         \\  \x1b[33m/sessions\x1b[0m            — list recent sessions
                         \\  \x1b[33m/config\x1b[0m              — show configuration
                         \\  \x1b[33m/search\x1b[0m <pattern>    — search history (also /s)
@@ -4328,11 +4450,12 @@ fn agentInteractive(shell: *Shell) !u8 {
                 } else {
                     agent_active = true;
                     cursor_at = .output;
+                    query_start_ms = std.time.milliTimestamp();
                     // Show "thinking..." in status bar
                     const thinking = "thinking...";
                     @memcpy(status_text[0..thinking.len], thinking);
                     status_len = thinking.len;
-                    Layout.drawStatusBarSafe(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len]);
+                    Layout.drawStatusBarSafeElapsed(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0);
                 }
                 try out.flush();
                 continue;

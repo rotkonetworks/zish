@@ -19,7 +19,7 @@ pub const Provider = enum { anthropic, ollama, openai_compat };
 
 pub const Config = struct {
     provider: Provider = .anthropic,
-    model: []const u8 = "claude-sonnet-4-6",
+    model: []const u8 = "claude-opus-4-6",
     api_key: []const u8 = "",
     base_url: []const u8 = "https://api.anthropic.com",
     max_tokens: u32 = 8192,
@@ -50,7 +50,7 @@ pub const Config = struct {
             if (cfg.base_url.len == 0 or std.mem.eql(u8, cfg.base_url, "https://api.anthropic.com")) {
                 cfg.base_url = "http://localhost:11434";
             }
-            if (std.mem.eql(u8, cfg.model, "claude-sonnet-4-6")) {
+            if (std.mem.eql(u8, cfg.model, "claude-opus-4-6")) {
                 cfg.model = "llama3.2";
             }
         }
@@ -439,7 +439,7 @@ fn shellEscape(value: []const u8, buf: []u8) ?[]const u8 {
 // Conversation history
 // ============================================================
 
-const MAX_HISTORY = 20;
+const MAX_MSGS = 20;
 const MAX_CONTENT_LEN = 65536;
 
 const Role = enum { user, assistant };
@@ -454,7 +454,7 @@ const Message = struct {
 };
 
 const ConversationHistory = struct {
-    messages: [MAX_HISTORY]Message = undefined,
+    messages: [MAX_MSGS]Message = undefined,
     count: usize = 0,
     allocator: std.mem.Allocator,
 
@@ -473,7 +473,7 @@ const ConversationHistory = struct {
     }
 
     fn addKind(self: *ConversationHistory, role: Role, kind: MsgKindH, content: []const u8) !void {
-        if (self.count >= MAX_HISTORY) {
+        if (self.count >= MAX_MSGS) {
             // drop oldest two (user+assistant pair)
             const n = 2;
             self.allocator.free(self.messages[0].content[0..self.messages[0].alloc_len]);
@@ -553,6 +553,24 @@ fn getGitBranch(buf: []u8) ![]const u8 {
 }
 
 // ============================================================
+// Autonomous Task Queue — agent works through these when idle
+// ============================================================
+
+const MAX_TASKS = 16;
+
+const Task = struct {
+    buf: [512]u8 = undefined,
+    len: u16 = 0,
+    status: TaskStatus = .pending,
+
+    fn text(self: *const Task) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+const TaskStatus = enum { pending, running, done, failed };
+
+// ============================================================
 // SubAgent — lightweight agent thread for parallel tasks
 // ============================================================
 
@@ -574,6 +592,8 @@ const SubAgent = struct {
     desc_len: u8 = 0,
     // Cancellation
     cancel_requested: bool = false,
+    // Full tool access (Edit/Write) — user-spawned workers get this
+    full_tools: bool = false,
 
     fn id(self: *const SubAgent) []const u8 {
         return self.id_buf[0..self.id_len];
@@ -638,6 +658,12 @@ const AgentThread = struct {
     subagents: [MAX_SUBAGENTS]SubAgent = [_]SubAgent{.{}} ** MAX_SUBAGENTS,
     subagent_count: u8 = 0,
     next_subagent_id: u16 = 1,
+    // Recursion depth — 0 = main agent, incremented for each subagent level
+    depth: u8 = 0,
+    // Autonomous task queue — agent works through these when idle
+    task_queue: [MAX_TASKS]Task = undefined,
+    task_count: u8 = 0,
+    task_head: u8 = 0, // next task to process
 
     fn init(allocator: std.mem.Allocator, queues: *AgentQueues, config: Config, rc: router_mod.RouterConfig) AgentThread {
         var self = AgentThread{
@@ -810,6 +836,17 @@ const AgentThread = struct {
     // ============================================================
 
     fn spawnSubAgent(self: *AgentThread, prompt: []const u8, description: []const u8) ![]const u8 {
+        return self.spawnSubAgentFull(prompt, description, false);
+    }
+
+    fn spawnWorker(self: *AgentThread, prompt: []const u8, description: []const u8) ![]const u8 {
+        return self.spawnSubAgentFull(prompt, description, true);
+    }
+
+    fn spawnSubAgentFull(self: *AgentThread, prompt: []const u8, description: []const u8, full_tools: bool) ![]const u8 {
+        // Recursion depth limit — max 3 levels deep
+        if (self.depth >= 3) return error.TooDeep;
+
         // Find a free slot (reuse completed subagents)
         var slot: ?usize = null;
         for (&self.subagents, 0..) |*sa, i| {
@@ -831,6 +868,7 @@ const AgentThread = struct {
 
         const sa = &self.subagents[slot.?];
         sa.* = .{}; // reset
+        sa.full_tools = full_tools;
 
         // Generate ID
         const id_num = self.next_subagent_id;
@@ -858,9 +896,10 @@ const AgentThread = struct {
         // deinit() joins all subagent threads before freeing AgentThread.
         const cfg = self.config;
 
-        // Spawn thread
+        // Spawn thread — pass depth+1 for recursion tracking
+        const child_depth = self.depth + 1;
         sa.thread = std.Thread.spawn(.{}, subAgentThreadFn, .{
-            self.allocator, sa, prompt_copy, cfg, &self.system_prompt_buf, self.system_prompt_len,
+            self.allocator, sa, prompt_copy, cfg, &self.system_prompt_buf, self.system_prompt_len, full_tools, child_depth,
         }) catch {
             self.allocator.free(prompt_copy);
             sa.setResult("Failed to spawn subagent thread", .failed);
@@ -868,6 +907,18 @@ const AgentThread = struct {
         };
 
         return sa.id();
+    }
+
+    fn addTask(self: *AgentThread, text: []const u8) bool {
+        if (self.task_count >= MAX_TASKS) return false;
+        var task = &self.task_queue[self.task_count];
+        task.* = .{};
+        const n: u16 = @intCast(@min(text.len, 512));
+        @memcpy(task.buf[0..n], text[0..n]);
+        task.len = n;
+        task.status = .pending;
+        self.task_count += 1;
+        return true;
     }
 
     fn collectSubAgent(self: *AgentThread, agent_id: []const u8, timeout_ms: u64) []const u8 {
@@ -935,6 +986,57 @@ const AgentThread = struct {
             // Check SPSC queue first
             if (self.queues.request.pop(&req_msg)) {
                 if (req_msg.kind == .cancel) break;
+                if (req_msg.kind == .add_task) {
+                    if (self.addTask(req_msg.slice())) {
+                        var tbuf: [128]u8 = undefined;
+                        const tmsg = std.fmt.bufPrint(&tbuf, "Queued task {d}: {s}", .{
+                            self.task_count, req_msg.slice()[0..@min(req_msg.slice().len, 60)],
+                        }) catch "Task queued";
+                        _ = self.queues.output.push(.tool_done, tmsg);
+                    }
+                    continue;
+                }
+                if (req_msg.kind == .spawn_worker) {
+                    const task_text = req_msg.slice();
+                    const desc = task_text[0..@min(task_text.len, 60)];
+                    _ = self.spawnWorker(task_text, desc) catch {
+                        _ = self.queues.output.push(.error_msg, "Failed to spawn worker (max 8)");
+                    };
+                    continue;
+                }
+                if (req_msg.kind == .agent_status_req) {
+                    // Report subagent status back to main thread
+                    for (&self.subagents, 0..) |*sa, i| {
+                        if (sa.id_len == 0) continue;
+                        var sbuf: [256]u8 = undefined;
+                        const status_str = switch (@atomicLoad(SubAgentStatus, &sa.status, .acquire)) {
+                            .running => "\x1b[33mrunning\x1b[0m",
+                            .done => "\x1b[32mdone\x1b[0m",
+                            .failed => "\x1b[31mfailed\x1b[0m",
+                        };
+                        const tools_str: []const u8 = if (sa.full_tools) " \x1b[36m[full]\x1b[0m" else "";
+                        const smsg = std.fmt.bufPrint(&sbuf, "  \x1b[33m{d}\x1b[0m ({s}) [{s}]{s} {s}", .{
+                            i, sa.id(), status_str, tools_str, sa.desc(),
+                        }) catch continue;
+                        _ = self.queues.output.push(.agent_status, smsg);
+                    }
+                    // Also report task queue
+                    for (self.task_queue[0..self.task_count], 0..) |*task, i| {
+                        var tbuf2: [256]u8 = undefined;
+                        const tstat = switch (task.status) {
+                            .pending => "\x1b[90mpending\x1b[0m",
+                            .running => "\x1b[33mrunning\x1b[0m",
+                            .done => "\x1b[32mdone\x1b[0m",
+                            .failed => "\x1b[31mfailed\x1b[0m",
+                        };
+                        const tmsg2 = std.fmt.bufPrint(&tbuf2, "  \x1b[90mtask {d}\x1b[0m [{s}] {s}", .{
+                            i, tstat, task.text(),
+                        }) catch continue;
+                        _ = self.queues.output.push(.agent_status, tmsg2);
+                    }
+                    _ = self.queues.output.push(.agent_status, "");
+                    continue;
+                }
                 const query_text = req_msg.slice();
                 self.queues.clearCancel();
                 self.queues.setBusy(true);
@@ -979,6 +1081,33 @@ const AgentThread = struct {
                     }
                     continue; // check for more
                 }
+            }
+
+            // ── EXHALE: process autonomous tasks when idle ──
+            if (self.task_head < self.task_count and self.task_queue[self.task_head].status == .pending) {
+                const task = &self.task_queue[self.task_head];
+                task.status = .running;
+                const task_text = task.text();
+
+                // Notify user
+                var notify_buf: [256]u8 = undefined;
+                const notify = std.fmt.bufPrint(&notify_buf, "⚙ task {d}/{d}: {s}", .{
+                    self.task_head + 1, self.task_count, task_text[0..@min(task_text.len, 80)],
+                }) catch "⚙ processing task";
+                _ = self.queues.output.push(.tool_call, notify);
+
+                self.queues.setBusy(true);
+                self.processQuery(task_text) catch |err| {
+                    var errbuf: [256]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&errbuf, "task error: {}", .{err}) catch "task error";
+                    _ = self.queues.output.push(.error_msg, msg);
+                    task.status = .failed;
+                };
+                if (task.status == .running) task.status = .done;
+                self.queues.setBusy(false);
+                _ = self.queues.output.push(.done, "");
+                self.task_head += 1;
+                continue;
             }
 
             std.Thread.sleep(10 * std.time.ns_per_ms);
@@ -1041,15 +1170,6 @@ const AgentThread = struct {
 
             // Apply routing decision
             if (route) |*rd| {
-                // Resolve model name from tier
-                const model_name = self.router_config.resolveModel(rd.model_tier);
-                rd.setModel(model_name);
-
-                // Notify user about routing decision
-                var summary_buf: [256]u8 = undefined;
-                const summary = rd.summary(&summary_buf);
-                _ = self.queues.output.push(.router_info, summary);
-
                 // Log routing decision for training data
                 logRouterDecision(query, rd.*);
 
@@ -1073,9 +1193,17 @@ const AgentThread = struct {
                         _ = self.queues.output.push(.error_msg, result.stderr);
                     return;
                 }
-
-                // Override model for this query
-                self.config.model = rd.modelName();
+                // Agent action — fall through to Opus (no model override)
+            }
+            // Log unclassified queries too
+            if (route == null) {
+                var default_rd = router_mod.RouteDecision{
+                    .action = .agent,
+                    .model_tier = .opus,
+                    .cost = .high,
+                };
+                default_rd.setReason("default: opus");
+                logRouterDecision(query, default_rd);
             }
         }
 
@@ -1112,9 +1240,9 @@ const AgentThread = struct {
             }
 
             // tool use response — build proper assistant content with tool_use block
-            const tool_name = response.tool_name;
-            const tool_input = response.tool_command;
-            const tool_id = response.tool_use_id;
+            const tool_name = response.tool_name();
+            const tool_input = response.tool_command();
+            const tool_id = response.tool_use_id();
 
             // Build assistant message with content blocks: [text (if any), tool_use]
             var assist_buf: [MAX_CONTENT_LEN]u8 = undefined;
@@ -1133,11 +1261,6 @@ const AgentThread = struct {
             }) catch {};
             aw.writeByte(']') catch {};
             try self.history.addKind(.assistant, .tool_use_response, assist_buf[0..assist_fbs.pos]);
-
-            // Notify user about tool call
-            var notify_buf: [256]u8 = undefined;
-            const notify = std.fmt.bufPrint(&notify_buf, "Tool: {s}", .{tool_name}) catch "Tool call";
-            _ = self.queues.output.push(.tool_call, notify);
 
             if (self.session_log) |*sl| sl.logToolCall(tool_name, tool_input) catch {};
 
@@ -1245,11 +1368,13 @@ const AgentThread = struct {
         ;
 
         // Drop oldest messages to free context, keeping last 4 messages (recent context)
-        const saved_count = self.history.count;
-        if (saved_count < 6) return;
+        if (self.history.count < 6) return;
 
         // Add the compact query as a user message
+        // Note: addKind may evict oldest 2 messages if at MAX_MSGS capacity,
+        // so we capture saved_count AFTER the add to avoid stale indices.
         self.history.add(.user, compact_query) catch return;
+        const saved_count = self.history.count - 1; // count before compact_query was added
 
         // Call API to get summary
         const response = self.callAPI() catch {
@@ -1280,8 +1405,17 @@ const AgentThread = struct {
             self.history.count = saved_count;
         }
 
-        // Free all but the last 4 messages
-        const keep = @min(saved_count, 4);
+        // Free all but the last few messages, ensuring we start at a clean boundary
+        // (not a tool_result, which would reference a missing tool_use)
+        var keep = @min(saved_count, 4);
+        // Walk backwards from the keep boundary to find a user text message
+        while (keep < saved_count) {
+            const boundary_idx = saved_count - keep;
+            if (self.history.messages[boundary_idx].kind == .tool_result) {
+                keep += 1; // include the preceding tool_use_response too
+            } else break;
+        }
+        keep = @min(keep, saved_count); // don't exceed total
         const drop = saved_count - keep;
         for (0..drop) |i| {
             self.allocator.free(self.history.messages[i].content[0..self.history.messages[i].alloc_len]);
@@ -1292,7 +1426,7 @@ const AgentThread = struct {
             self.history.count = 2 + keep;
         } else {
             // Need to make room — shift everything right by 2
-            if (self.history.count + 2 <= MAX_HISTORY) {
+            if (self.history.count + 2 <= MAX_MSGS) {
                 var si = self.history.count;
                 while (si > 0) {
                     si -= 1;
@@ -1382,7 +1516,7 @@ const AgentThread = struct {
             var path_buf2: [512]u8 = undefined;
             const rp = unescapeJSON(path, &path_buf2) orelse path;
             var detail_buf: [512]u8 = undefined;
-            const detail = std.fmt.bufPrint(&detail_buf, "Edit {s}", .{rp}) catch rp;
+            const detail = std.fmt.bufPrint(&detail_buf, "Edit({s})", .{rp}) catch rp;
             if (!self.confirmTool("Edit", detail, &self.allow_edit))
                 return self.allocator.dupe(u8, "Tool execution denied by user.");
             return self.executeEdit(path, old_str, new_str, replace_all);
@@ -1393,7 +1527,7 @@ const AgentThread = struct {
             var path_buf2: [512]u8 = undefined;
             const rp = unescapeJSON(path, &path_buf2) orelse path;
             var detail_buf: [512]u8 = undefined;
-            const detail = std.fmt.bufPrint(&detail_buf, "Write {s}", .{rp}) catch rp;
+            const detail = std.fmt.bufPrint(&detail_buf, "Write({s})", .{rp}) catch rp;
             if (!self.confirmTool("Write", detail, &self.allow_write))
                 return self.allocator.dupe(u8, "Tool execution denied by user.");
             return self.executeWrite(path, content);
@@ -1416,7 +1550,8 @@ const AgentThread = struct {
             const prompt = unescapeJSON(prompt_raw, &prompt_buf) orelse prompt_raw;
             var desc_buf2: [128]u8 = undefined;
             const description = unescapeJSON(desc_raw, &desc_buf2) orelse desc_raw;
-            const agent_id = self.spawnSubAgent(prompt, description) catch |err| {
+            // Inherit full_tools from parent — workers spawn workers
+            const agent_id = self.spawnSubAgentFull(prompt, description, self.allow_edit) catch |err| {
                 var errbuf: [256]u8 = undefined;
                 const msg = std.fmt.bufPrint(&errbuf, "Failed to spawn subagent: {}", .{err}) catch "spawn failed";
                 return self.allocator.dupe(u8, msg);
@@ -1565,11 +1700,25 @@ const AgentThread = struct {
         text: []u8,           // sub-slice of text_alloc (the actual content)
         text_alloc: []u8,     // full allocation — caller must free this
         has_tool_call: bool,
-        tool_command: []const u8, // raw JSON input for the tool
-        tool_name: []const u8,
-        tool_use_id: []const u8, // Anthropic tool_use block id
+        // Inline buffers — NOT slices into caller's stack frame
+        tool_cmd_buf: [4096]u8 = undefined,
+        tool_cmd_len: u16 = 0,
+        tool_name_buf: [64]u8 = undefined,
+        tool_name_len: u8 = 0,
+        tool_id_buf: [64]u8 = undefined,
+        tool_id_len: u8 = 0,
         input_tokens: u32 = 0,
         output_tokens: u32 = 0,
+
+        fn tool_command(self: *const APIResponse) []const u8 {
+            return self.tool_cmd_buf[0..self.tool_cmd_len];
+        }
+        fn tool_name(self: *const APIResponse) []const u8 {
+            return self.tool_name_buf[0..self.tool_name_len];
+        }
+        fn tool_use_id(self: *const APIResponse) []const u8 {
+            return self.tool_id_buf[0..self.tool_id_len];
+        }
     };
 
     fn callAPI(self: *AgentThread) !APIResponse {
@@ -1733,7 +1882,11 @@ const AgentThread = struct {
                 argc += 1;
                 argv_buf[argc] = "-H";
                 argc += 1;
-                argv_buf[argc] = "anthropic-beta: prompt-caching-scope-2026-01-05";
+                // OAuth tokens require the oauth beta flag
+                argv_buf[argc] = if (is_oauth)
+                    "anthropic-beta: oauth-2025-04-20,prompt-caching-scope-2026-01-05"
+                else
+                    "anthropic-beta: prompt-caching-scope-2026-01-05";
                 argc += 1;
 
                 // Anthropic TypeScript SDK 0.74.0 identification
@@ -1898,16 +2051,24 @@ const AgentThread = struct {
             return error.EmptyResponse;
         }
 
-        return APIResponse{
+        var resp = APIResponse{
             .text = text_buf[0..text_len],
             .text_alloc = text_buf,
             .has_tool_call = has_tool_call,
-            .tool_command = tool_cmd_buf[0..tool_cmd_len],
-            .tool_name = tool_name_buf[0..tool_name_len],
-            .tool_use_id = tool_id_buf[0..tool_id_len],
             .input_tokens = resp_input_tokens,
             .output_tokens = resp_output_tokens,
         };
+        // Copy tool data into response's inline buffers (not slices into our stack)
+        const tcl = @min(tool_cmd_len, resp.tool_cmd_buf.len);
+        @memcpy(resp.tool_cmd_buf[0..tcl], tool_cmd_buf[0..tcl]);
+        resp.tool_cmd_len = @intCast(tcl);
+        const tnl = @min(tool_name_len, resp.tool_name_buf.len);
+        @memcpy(resp.tool_name_buf[0..tnl], tool_name_buf[0..tnl]);
+        resp.tool_name_len = @intCast(tnl);
+        const til = @min(tool_id_len, resp.tool_id_buf.len);
+        @memcpy(resp.tool_id_buf[0..til], tool_id_buf[0..til]);
+        resp.tool_id_len = @intCast(til);
+        return resp;
     }
 
     fn executeBash(self: *AgentThread, command: []const u8) ![]u8 {
@@ -1917,7 +2078,7 @@ const AgentThread = struct {
 
         // notify main thread
         var notif_buf: [512]u8 = undefined;
-        const notif = std.fmt.bufPrint(&notif_buf, "$ {s}", .{cmd}) catch cmd;
+        const notif = std.fmt.bufPrint(&notif_buf, "Bash({s})", .{cmd}) catch cmd;
         _ = self.queues.output.push(.tool_call, notif);
 
         const result = std.process.Child.run(.{
@@ -1941,10 +2102,10 @@ const AgentThread = struct {
 
         var notif_buf: [512]u8 = undefined;
         if (offset > 0 or limit > 0) {
-            const notif = std.fmt.bufPrint(&notif_buf, "Read {s}:{d}", .{ real_path, offset }) catch real_path;
+            const notif = std.fmt.bufPrint(&notif_buf, "Read({s}:{d})", .{ real_path, offset }) catch real_path;
             _ = self.queues.output.push(.tool_call, notif);
         } else {
-            const notif = std.fmt.bufPrint(&notif_buf, "Read {s}", .{real_path}) catch real_path;
+            const notif = std.fmt.bufPrint(&notif_buf, "Read({s})", .{real_path}) catch real_path;
             _ = self.queues.output.push(.tool_call, notif);
         }
 
@@ -1983,6 +2144,9 @@ const AgentThread = struct {
             line_num += 1;
         }
 
+        var done_buf: [128]u8 = undefined;
+        const done_msg = std.fmt.bufPrint(&done_buf, "{d} lines", .{lines_output}) catch "";
+        _ = self.queues.output.push(.tool_done, done_msg);
         return result.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
     }
 
@@ -1996,7 +2160,7 @@ const AgentThread = struct {
         const real_content = unescapeJSON(content, content_buf) orelse content;
 
         var notif_buf: [512]u8 = undefined;
-        const notif = std.fmt.bufPrint(&notif_buf, "Write {s} ({d} bytes)", .{ real_path, real_content.len }) catch real_path;
+        const notif = std.fmt.bufPrint(&notif_buf, "Write({s})", .{real_path}) catch real_path;
         _ = self.queues.output.push(.tool_call, notif);
 
         // backup existing file before overwriting
@@ -2014,6 +2178,11 @@ const AgentThread = struct {
             return self.allocator.dupe(u8, msg);
         };
 
+        var wcount: usize = 1;
+        for (real_content) |wc| { if (wc == '\n') wcount += 1; }
+        var wdone_buf: [64]u8 = undefined;
+        const wdone = std.fmt.bufPrint(&wdone_buf, "{d} lines written", .{wcount}) catch "";
+        _ = self.queues.output.push(.tool_done, wdone);
         var result_buf: [128]u8 = undefined;
         const result = std.fmt.bufPrint(&result_buf, "Wrote {d} bytes to {s}", .{ real_content.len, real_path }) catch "ok";
         return self.allocator.dupe(u8, result);
@@ -2033,7 +2202,7 @@ const AgentThread = struct {
         const real_new = unescapeJSON(new_str, new_buf) orelse new_str;
 
         var notif_buf: [512]u8 = undefined;
-        const notif = std.fmt.bufPrint(&notif_buf, "Edit {s}", .{real_path}) catch real_path;
+        const notif = std.fmt.bufPrint(&notif_buf, "Edit({s})", .{real_path}) catch real_path;
         _ = self.queues.output.push(.tool_call, notif);
 
         // Read current file content
@@ -2097,20 +2266,27 @@ const AgentThread = struct {
             return self.allocator.dupe(u8, msg);
         };
 
-        // Show diff preview in tool output
+        // Show diff summary in tool output (Claude Code style)
         var diff_result: std.ArrayList(u8) = .{};
         const dw = diff_result.writer(self.allocator);
-        dw.print("Edited {s}: {d} replacement(s)\n", .{ real_path, replacements }) catch {};
-        // Show context: what was replaced
-        const old_preview = if (real_old.len > 200) real_old[0..200] else real_old;
-        const new_preview = if (real_new.len > 200) real_new[0..200] else real_new;
-        dw.writeAll("--- old\n") catch {};
-        dw.writeAll(old_preview) catch {};
-        if (real_old.len > 200) dw.writeAll("...") catch {};
-        dw.writeAll("\n+++ new\n") catch {};
-        dw.writeAll(new_preview) catch {};
-        if (real_new.len > 200) dw.writeAll("...") catch {};
-        dw.writeByte('\n') catch {};
+        // Count added/removed lines
+        var old_lines: usize = 1;
+        for (real_old) |oc| { if (oc == '\n') old_lines += 1; }
+        var new_lines: usize = 1;
+        for (real_new) |nc| { if (nc == '\n') new_lines += 1; }
+        const added = if (new_lines > old_lines) new_lines - old_lines else 0;
+        const removed = if (old_lines > new_lines) old_lines - new_lines else 0;
+        if (replacements > 1) {
+            dw.print("Added {d} lines, removed {d} lines ({d} replacements)", .{ added, removed, replacements }) catch {};
+        } else if (added > 0 and removed > 0) {
+            dw.print("Added {d} lines, removed {d} lines", .{ added, removed }) catch {};
+        } else if (added > 0) {
+            dw.print("Added {d} lines", .{added}) catch {};
+        } else if (removed > 0) {
+            dw.print("Removed {d} lines", .{removed}) catch {};
+        } else {
+            dw.print("Modified {d} lines", .{old_lines}) catch {};
+        }
 
         _ = self.queues.output.push(.tool_done, diff_result.items);
         return diff_result.toOwnedSlice(self.allocator) catch return error.OutOfMemory;
@@ -2121,7 +2297,7 @@ const AgentThread = struct {
         const real_url = unescapeJSON(url, &url_buf) orelse url;
 
         var notif_buf: [512]u8 = undefined;
-        const notif = std.fmt.bufPrint(&notif_buf, "Fetch {s}", .{real_url}) catch real_url;
+        const notif = std.fmt.bufPrint(&notif_buf, "WebFetch({s})", .{real_url}) catch real_url;
         _ = self.queues.output.push(.tool_call, notif);
 
         // Use curl to fetch URL content
@@ -2309,7 +2485,7 @@ const AgentThread = struct {
         const real_query = unescapeJSON(query, &query_buf) orelse query;
 
         var notif_buf: [512]u8 = undefined;
-        const notif = std.fmt.bufPrint(&notif_buf, "Search: {s}", .{real_query}) catch real_query;
+        const notif = std.fmt.bufPrint(&notif_buf, "WebSearch({s})", .{real_query}) catch real_query;
         _ = self.queues.output.push(.tool_call, notif);
 
         // URL-encode the query
@@ -2453,10 +2629,10 @@ const AgentThread = struct {
 
         var notif_buf: [512]u8 = undefined;
         if (search_path) |p| {
-            const notif = std.fmt.bufPrint(&notif_buf, "Glob {s} in {s}", .{ real_pattern, p }) catch real_pattern;
+            const notif = std.fmt.bufPrint(&notif_buf, "Glob({s} in {s})", .{ real_pattern, p }) catch real_pattern;
             _ = self.queues.output.push(.tool_call, notif);
         } else {
-            const notif = std.fmt.bufPrint(&notif_buf, "Glob {s}", .{real_pattern}) catch real_pattern;
+            const notif = std.fmt.bufPrint(&notif_buf, "Glob({s})", .{real_pattern}) catch real_pattern;
             _ = self.queues.output.push(.tool_call, notif);
         }
 
@@ -2490,6 +2666,12 @@ const AgentThread = struct {
             return self.allocator.dupe(u8, msg);
         };
         defer self.allocator.free(result.stderr);
+        // Count result lines for feedback
+        var match_count: usize = 0;
+        for (result.stdout) |sc| { if (sc == '\n') match_count += 1; }
+        var done_buf2: [64]u8 = undefined;
+        const done_msg2 = std.fmt.bufPrint(&done_buf2, "{d} files", .{match_count}) catch "";
+        _ = self.queues.output.push(.tool_done, done_msg2);
         return result.stdout;
     }
 
@@ -2498,7 +2680,7 @@ const AgentThread = struct {
         const real_pattern = unescapeJSON(pattern, &pattern_buf) orelse pattern;
 
         var notif_buf: [512]u8 = undefined;
-        const notif = std.fmt.bufPrint(&notif_buf, "Grep '{s}'", .{real_pattern}) catch real_pattern;
+        const notif = std.fmt.bufPrint(&notif_buf, "Grep({s})", .{real_pattern}) catch real_pattern;
         _ = self.queues.output.push(.tool_call, notif);
 
         // build grep/rg command
@@ -2544,6 +2726,11 @@ const AgentThread = struct {
             return self.allocator.dupe(u8, msg);
         };
         defer self.allocator.free(result.stderr);
+        var grep_count: usize = 0;
+        for (result.stdout) |gc| { if (gc == '\n') grep_count += 1; }
+        var grep_done_buf: [64]u8 = undefined;
+        const grep_done = std.fmt.bufPrint(&grep_done_buf, "{d} matches", .{grep_count}) catch "";
+        _ = self.queues.output.push(.tool_done, grep_done);
         return result.stdout;
     }
 };
@@ -2584,6 +2771,9 @@ fn parseAnthropicDelta(
     if (std.mem.eql(u8, type_val, "content_block_start")) {
         if (std.mem.indexOf(u8, data, "\"tool_use\"") != null) {
             has_tool_call.* = true;
+            // Reset tool input buffer — handles multiple tool_use blocks in one response
+            // by keeping only the last one (earlier tool calls are re-requested next turn)
+            tool_cmd_len.* = 0;
             // extract tool name
             if (jsonGetStr(data, "name")) |name| {
                 const n = @min(name.len, 64);
@@ -2604,10 +2794,14 @@ fn parseAnthropicDelta(
         // text delta
         if (std.mem.indexOf(u8, data, "\"text_delta\"") != null) {
             if (jsonGetStr(data, "text")) |text| {
-                const decoded = unescapeJSON(text, text_buf.*[text_len.*..]) orelse text;
-                text_len.* += decoded.len;
-                if (text_len.* > text_buf.len) text_len.* = text_buf.len;
-                queues.output.pushWait(.text_delta, decoded);
+                if (unescapeJSON(text, text_buf.*[text_len.*..])) |decoded| {
+                    // Unescape succeeded — decoded is a slice of text_buf
+                    text_len.* += decoded.len;
+                    queues.output.pushWait(.text_delta, decoded);
+                } else {
+                    // Buffer full or unescape failed — push raw text, don't advance text_buf
+                    queues.output.pushWait(.text_delta, text);
+                }
             }
             return;
         }
@@ -2635,10 +2829,12 @@ fn parseOpenAIDelta(
 ) void {
     // Extract delta.content from OpenAI streaming format
     if (jsonGetStr(data, "content")) |text| {
-        const decoded = unescapeJSON(text, text_buf.*[text_len.*..]) orelse text;
-        text_len.* += decoded.len;
-        if (text_len.* > text_buf.len) text_len.* = text_buf.len;
-        queues.output.pushWait(.text_delta, decoded);
+        if (unescapeJSON(text, text_buf.*[text_len.*..])) |decoded| {
+            text_len.* += decoded.len;
+            queues.output.pushWait(.text_delta, decoded);
+        } else {
+            queues.output.pushWait(.text_delta, text);
+        }
     }
 }
 
@@ -2740,15 +2936,100 @@ pub const MarkdownRenderer = struct {
     in_bold: bool = false,
     in_inline_code: bool = false,
     line_start: bool = true,
+    // Pending characters from end of previous chunk (for cross-chunk ** and ``` detection)
+    pending_stars: u8 = 0, // count of trailing * from previous chunk
+    pending_backticks: u8 = 0, // count of trailing ` from previous chunk
 
     /// Process a chunk of text and write ANSI-formatted output
     pub fn render(self: *MarkdownRenderer, writer: anytype, text: []const u8) !void {
         var i: usize = 0;
+
+        // Handle pending characters from previous chunk
+        if (self.pending_backticks > 0) {
+            const pb = self.pending_backticks;
+            self.pending_backticks = 0;
+            // Count leading backticks in current chunk
+            var leading: u8 = 0;
+            while (i < text.len and text[i] == '`' and leading + pb < 3) : (i += 1) {
+                leading += 1;
+            }
+            const total = pb + leading;
+            if (total >= 3) {
+                // Code block fence split across chunks
+                if (!self.in_code_block) {
+                    self.in_code_block = true;
+                    // Skip language identifier
+                    var skip = i;
+                    while (skip < text.len and text[skip] != '\n') : (skip += 1) {}
+                    const lang = std.mem.trim(u8, text[i..skip], " \t\r");
+                    if (lang.len > 0) {
+                        try writer.writeAll("\x1b[90m─── ");
+                        try writer.writeAll(lang);
+                        try writer.writeAll(" ───\x1b[0m\n");
+                    } else {
+                        try writer.writeAll("\x1b[90m──────────\x1b[0m\n");
+                    }
+                    try writer.writeAll("\x1b[36m");
+                    i = if (skip < text.len) skip + 1 else skip;
+                    self.line_start = true;
+                } else {
+                    self.in_code_block = false;
+                    try writer.writeAll("\x1b[0m");
+                    try writer.writeAll("\x1b[90m──────────\x1b[0m");
+                    while (i < text.len and text[i] != '\n') : (i += 1) {}
+                    self.line_start = true;
+                }
+            } else if (total >= 1 and !self.in_code_block) {
+                // Inline code toggle
+                if (!self.in_inline_code) {
+                    self.in_inline_code = true;
+                    try writer.writeAll("\x1b[36m");
+                } else {
+                    self.in_inline_code = false;
+                    try writer.writeAll("\x1b[0m");
+                }
+                // Emit any extra backticks as literal
+                var extra: u8 = total - 1;
+                while (extra > 0) : (extra -= 1) try writer.writeByte('`');
+            } else {
+                // Not enough for a toggle — emit as literal
+                var j: u8 = 0;
+                while (j < pb) : (j += 1) try writer.writeByte('`');
+            }
+        }
+        if (self.pending_stars > 0) {
+            const ps = self.pending_stars;
+            self.pending_stars = 0;
+            if (ps >= 1 and i < text.len and text[i] == '*') {
+                // ** split across chunks — bold toggle
+                i += 1;
+                if (!self.in_bold) {
+                    self.in_bold = true;
+                    try writer.writeAll("\x1b[1m");
+                } else {
+                    self.in_bold = false;
+                    try writer.writeAll("\x1b[22m"); // unbold only, not full reset
+                }
+            } else {
+                // Single trailing * from prev chunk — emit as literal
+                try writer.writeByte('*');
+            }
+        }
+
         while (i < text.len) {
             const c = text[i];
 
             // Handle code blocks (```)
             if (c == '`') {
+                // At chunk boundary — defer backticks to next chunk
+                if (i + 2 >= text.len and !self.in_code_block) {
+                    var bt: u8 = 0;
+                    while (i + bt < text.len and text[i + bt] == '`') : (bt += 1) {}
+                    if (i + bt == text.len and bt < 3) {
+                        self.pending_backticks = bt;
+                        break; // end of chunk
+                    }
+                }
                 // Check for ``` (code block fence)
                 if (i + 2 < text.len and text[i + 1] == '`' and text[i + 2] == '`') {
                     if (!self.in_code_block) {
@@ -2789,7 +3070,7 @@ pub const MarkdownRenderer = struct {
                         try writer.writeAll("\x1b[36m"); // cyan
                     } else {
                         self.in_inline_code = false;
-                        try writer.writeAll("\x1b[0m");
+                        try writer.writeAll("\x1b[39m"); // reset fg only, preserve bold
                     }
                     i += 1;
                     continue;
@@ -2829,16 +3110,23 @@ pub const MarkdownRenderer = struct {
             }
 
             // Bold (**text**)
-            if (c == '*' and i + 1 < text.len and text[i + 1] == '*') {
-                if (!self.in_bold) {
-                    self.in_bold = true;
-                    try writer.writeAll("\x1b[1m"); // bold
-                } else {
-                    self.in_bold = false;
-                    try writer.writeAll("\x1b[0m");
+            if (c == '*' and !self.in_code_block) {
+                if (i + 1 < text.len and text[i + 1] == '*') {
+                    if (!self.in_bold) {
+                        self.in_bold = true;
+                        try writer.writeAll("\x1b[1m"); // bold
+                    } else {
+                        self.in_bold = false;
+                        try writer.writeAll("\x1b[22m"); // unbold only
+                    }
+                    i += 2;
+                    continue;
+                } else if (i + 1 == text.len) {
+                    // Trailing * at chunk boundary — defer to next chunk
+                    self.pending_stars = 1;
+                    i += 1;
+                    continue;
                 }
-                i += 2;
-                continue;
             }
 
             // List items at line start
@@ -2975,7 +3263,8 @@ pub const AgentContext = struct {
 };
 
 /// Subagent thread: runs a single query, stores result, exits.
-/// Has read-only tools (Read/Glob/Grep/Bash). No confirmation needed.
+/// When full_tools=false: read-only (Bash/Read/Glob/Grep). No confirmation needed.
+/// When full_tools=true: full tool access (Edit/Write included). For user-spawned workers.
 fn subAgentThreadFn(
     allocator: std.mem.Allocator,
     sa: *SubAgent,
@@ -2983,6 +3272,8 @@ fn subAgentThreadFn(
     config: Config,
     sys_prompt: *const [8192]u8,
     sys_prompt_len: u16,
+    full_tools: bool,
+    depth: u8,
 ) void {
     defer allocator.free(prompt_owned);
 
@@ -3005,25 +3296,33 @@ fn subAgentThreadFn(
         .all_tools_json = undefined,
         .all_tools_json_len = 0,
         .allow_bash = true,
-        .allow_edit = false,
-        .allow_write = false,
+        .allow_edit = full_tools,
+        .allow_write = full_tools,
         .allow_plugins = 0,
+        .depth = depth,
     };
     // Set cwd
     const cwd = std.process.getCwd(&agent.cwd) catch "/";
     agent.cwd_len = @intCast(cwd.len);
 
-    // Build subagent-specific tools (read-only: Bash, Read, Glob, Grep — no Edit/Write/Agent)
-    const SUBAGENT_TOOLS =
-        \\[
-        \\{"name":"Bash","description":"Run a shell command.","input_schema":{"type":"object","properties":{"command":{"type":"string","description":"Shell command to run"}},"required":["command"]}},
-        \\{"name":"Read","description":"Read a file. Returns contents with line numbers.","input_schema":{"type":"object","properties":{"file_path":{"type":"string","description":"Absolute path to the file"},"offset":{"type":"integer","description":"Line offset (optional)"},"limit":{"type":"integer","description":"Max lines (optional)"}},"required":["file_path"]}},
-        \\{"name":"Glob","description":"Find files matching a glob pattern.","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern"},"path":{"type":"string","description":"Directory (default: cwd)"}},"required":["pattern"]}},
-        \\{"name":"Grep","description":"Search file contents with regex.","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern"},"path":{"type":"string","description":"File or directory"},"glob":{"type":"string","description":"Filter files by glob"}},"required":["pattern"]}}
-        \\]
-    ;
-    @memcpy(agent.all_tools_json[0..SUBAGENT_TOOLS.len], SUBAGENT_TOOLS);
-    agent.all_tools_json_len = SUBAGENT_TOOLS.len;
+    if (full_tools) {
+        // Full tool set — same as main agent (Edit, Write, Glob, Grep, Read, Bash, WebFetch, WebSearch)
+        const tools = std.mem.trim(u8, TOOLS_JSON, " \n\r\t");
+        @memcpy(agent.all_tools_json[0..tools.len], tools);
+        agent.all_tools_json_len = @intCast(tools.len);
+    } else {
+        // Read-only subagent tools (Bash, Read, Glob, Grep — no Edit/Write/Agent)
+        const SUBAGENT_TOOLS =
+            \\[
+            \\{"name":"Bash","description":"Run a shell command.","input_schema":{"type":"object","properties":{"command":{"type":"string","description":"Shell command to run"}},"required":["command"]}},
+            \\{"name":"Read","description":"Read a file. Returns contents with line numbers.","input_schema":{"type":"object","properties":{"file_path":{"type":"string","description":"Absolute path to the file"},"offset":{"type":"integer","description":"Line offset (optional)"},"limit":{"type":"integer","description":"Max lines (optional)"}},"required":["file_path"]}},
+            \\{"name":"Glob","description":"Find files matching a glob pattern.","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern"},"path":{"type":"string","description":"Directory (default: cwd)"}},"required":["pattern"]}},
+            \\{"name":"Grep","description":"Search file contents with regex.","input_schema":{"type":"object","properties":{"pattern":{"type":"string","description":"Regex pattern"},"path":{"type":"string","description":"File or directory"},"glob":{"type":"string","description":"Filter files by glob"}},"required":["pattern"]}}
+            \\]
+        ;
+        @memcpy(agent.all_tools_json[0..SUBAGENT_TOOLS.len], SUBAGENT_TOOLS);
+        agent.all_tools_json_len = SUBAGENT_TOOLS.len;
+    }
 
     defer agent.history.deinit();
 
@@ -3068,9 +3367,9 @@ fn subAgentThreadFn(
         }
 
         // Tool use — dispatch it
-        const tool_name = response.tool_name;
-        const tool_input = response.tool_command;
-        const tool_id = response.tool_use_id;
+        const tool_name = response.tool_name();
+        const tool_input = response.tool_command();
+        const tool_id = response.tool_use_id();
 
         // Build assistant history entry
         var assist_buf: [MAX_CONTENT_LEN]u8 = undefined;
@@ -3090,7 +3389,7 @@ fn subAgentThreadFn(
         agent.history.addKind(.assistant, .tool_use_response, assist_buf[0..assist_fbs.pos]) catch {};
         allocator.free(response.text_alloc);
 
-        // Dispatch tool (subagent: no Edit/Write/Agent, auto-allow Bash)
+        // Dispatch tool (full_tools: all tools including Agent for recursive spawning)
         const tool_output = agent.dispatchTool(tool_name, tool_input) catch |err| blk: {
             var errbuf: [256]u8 = undefined;
             const msg = std.fmt.bufPrint(&errbuf, "tool error: {}", .{err}) catch "tool error";
@@ -3140,6 +3439,16 @@ fn subAgentThreadFn(
         }
         rw.writeAll("}]") catch {};
         agent.history.addKind(.user, .tool_result, result_json_buf[0..result_fbs.pos]) catch {};
+    }
+
+    // Join any sub-agents this worker spawned (recursive cleanup)
+    for (&agent.subagents, 0..) |*child_sa, i| {
+        if (i >= agent.subagent_count) break;
+        if (child_sa.thread) |t| {
+            child_sa.requestCancel();
+            t.join();
+            child_sa.thread = null;
+        }
     }
 
     sa.setResult(if (final_text.len > 0) final_text else "No response from subagent", if (final_text.len > 0) .done else .failed);
