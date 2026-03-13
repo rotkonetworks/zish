@@ -2356,14 +2356,17 @@ pub fn exitCompletionMode(self: *Shell) void {
 
     // clear the completion menu if displayed
     if (self.completion_displayed and self.completion_menu_lines > 0) {
-        // save cursor, move to bottom of command area, clear below, restore
+        // Move to one row below command area and clear everything below.
+        // Use save/restore cursor to return to original position.
+        // Avoid \n which can scroll the terminal and desync term.row.
         self.stdout().writeAll("\x1b[s") catch {};
         const cmd_rows = self.term_view.term.rows_owned;
         const cursor_row = self.term_view.term.row;
-        if (cmd_rows > cursor_row + 1) {
-            self.stdout().print("\x1b[{d}B", .{cmd_rows - cursor_row - 1}) catch {};
+        const rows_to_menu = cmd_rows -| cursor_row;
+        if (rows_to_menu > 0) {
+            self.stdout().print("\x1b[{d}B", .{rows_to_menu}) catch {};
         }
-        self.stdout().writeAll("\n\x1b[J\x1b[u") catch {};
+        self.stdout().writeAll("\x1b[J\x1b[u") catch {};
         self.stdout().flush() catch {};
     }
 

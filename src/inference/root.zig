@@ -63,6 +63,13 @@ pub const ForkServer = struct {
             posix.close(req_pipe[1]); // parent's write end
             posix.close(resp_pipe[0]); // parent's read end
 
+            // Redirect stdout/stderr to /dev/null so inference noise
+            // doesn't corrupt the terminal
+            const devnull = posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0) catch posix.exit(1);
+            posix.dup2(devnull, 1) catch {}; // stdout
+            posix.dup2(devnull, 2) catch {}; // stderr
+            posix.close(devnull);
+
             // Run the inference loop (never returns on success)
             childMain(req_pipe[0], resp_pipe[1], model_path);
 

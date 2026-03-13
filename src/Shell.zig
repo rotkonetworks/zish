@@ -705,8 +705,13 @@ pub fn run(self: *Shell) !void {
         try self.stdout().flush();
     }
 
-    // stop agent thread on shell exit
-    self.agent.stop();
+    // restore terminal and exit immediately — background threads
+    // (agent, ghost inference) are cleaned up by the OS on process exit
+    self.disableRawMode();
+    self.setCursorStyle(.default) catch {};
+    self.stdout().flush() catch {};
+    if (self.history) |h| h.sync();
+    std.process.exit(self.last_exit_code);
 }
 
 pub inline fn stdout(self: *Shell) *std.Io.Writer {

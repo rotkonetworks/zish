@@ -1623,6 +1623,10 @@ const AgentThread = struct {
     }
 
     fn callAnthropic(self: *AgentThread) !APIResponse {
+        if (self.config.api_key.len == 0) {
+            _ = self.queues.output.push(.error_msg, "No API key configured — set ANTHROPIC_API_KEY, ~/.zish/key, or login to Claude Code");
+            return error.NoAPIKey;
+        }
         // Build request body with proper JSON escaping
         var body_buf: [MAX_CONTENT_LEN * 4]u8 = undefined;
         var msg_buf: [MAX_CONTENT_LEN * 3]u8 = undefined;
@@ -1710,8 +1714,12 @@ const AgentThread = struct {
 
         switch (provider) {
             .anthropic => {
-                // API key
-                const h0 = std.fmt.bufPrint(&header_bufs[hdr_idx], "x-api-key: {s}", .{self.config.api_key}) catch "";
+                // OAuth tokens (sk-ant-oat01-) use Bearer auth; API keys use X-Api-Key
+                const is_oauth = std.mem.startsWith(u8, self.config.api_key, "sk-ant-oat01-");
+                const h0 = if (is_oauth)
+                    std.fmt.bufPrint(&header_bufs[hdr_idx], "Authorization: Bearer {s}", .{self.config.api_key}) catch ""
+                else
+                    std.fmt.bufPrint(&header_bufs[hdr_idx], "X-Api-Key: {s}", .{self.config.api_key}) catch "";
                 argv_buf[argc] = "-H";
                 argc += 1;
                 argv_buf[argc] = h0;
@@ -1728,7 +1736,7 @@ const AgentThread = struct {
                 argv_buf[argc] = "anthropic-beta: prompt-caching-scope-2026-01-05";
                 argc += 1;
 
-                // Claude Code SDK identification (Anthropic TypeScript SDK 0.74.0)
+                // Anthropic TypeScript SDK 0.74.0 identification
                 argv_buf[argc] = "-H";
                 argc += 1;
                 argv_buf[argc] = "User-Agent: Anthropic/JS 0.74.0";
@@ -1760,6 +1768,14 @@ const AgentThread = struct {
                 argv_buf[argc] = "-H";
                 argc += 1;
                 argv_buf[argc] = "X-Stainless-Arch: x64";
+                argc += 1;
+                argv_buf[argc] = "-H";
+                argc += 1;
+                argv_buf[argc] = "X-Stainless-Retry-Count: 0";
+                argc += 1;
+                argv_buf[argc] = "-H";
+                argc += 1;
+                argv_buf[argc] = "X-Stainless-Timeout: 120";
                 argc += 1;
                 argv_buf[argc] = "-H";
                 argc += 1;
@@ -1876,6 +1892,10 @@ const AgentThread = struct {
                     return error.HTTPError;
                 }
             }
+            // Empty response with no tool call — likely auth failure or network issue
+            _ = self.queues.output.push(.error_msg, "API returned empty response — check authentication or network");
+            self.allocator.free(text_buf);
+            return error.EmptyResponse;
         }
 
         return APIResponse{
