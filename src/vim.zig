@@ -48,6 +48,7 @@ pub const Vim = struct {
     // preferred column for j/k movement (vim remembers target col)
     preferred_col: u16 = 0,
     preferred_col_set: bool = false,
+    pending_g: bool = false, // waiting for second char after g
 
     const Self = @This();
 
@@ -69,6 +70,18 @@ pub const Vim = struct {
     }
 
     fn handleNormal(self: *Self, buf: *editor.EditBuffer, key: u8) KeyResult {
+        // handle pending g prefix (gg = go to top)
+        if (self.pending_g) {
+            self.pending_g = false;
+            if (key == 'g') {
+                self.preferred_col_set = false;
+                buf.cursor = 0;
+                return .consumed;
+            }
+            // unknown g-sequence, ignore
+            return .consumed;
+        }
+
         // numeric prefix
         if (key >= '1' and key <= '9') {
             self.count = self.count * 10 + (key - '0');
@@ -203,7 +216,7 @@ pub const Vim = struct {
                 return .consumed;
             },
             'g' => {
-                // wait for second char (gg, etc)
+                self.pending_g = true;
                 return .need_more;
             },
             'G' => {
@@ -229,6 +242,53 @@ pub const Vim = struct {
                 self.pending_op = .yank;
                 self.last_cmd = 'y';
                 self.last_count = count;
+                return .consumed;
+            },
+
+            // Y — yank entire line (vim compat)
+            'Y' => {
+                const save = buf.cursor;
+                buf.moveLineStart();
+                const start = buf.cursor;
+                buf.moveLineEnd();
+                const end = buf.cursor;
+                if (end > start) self.yankRange(buf, start, end);
+                buf.cursor = save;
+                return .consumed;
+            },
+            // ~ — toggle case under cursor, advance
+            '~' => {
+                for (0..count) |_| {
+                    if (buf.cursor < buf.len and buf.text[buf.cursor] < 0x80) {
+                        const c = buf.text[buf.cursor];
+                        if (c >= 'a' and c <= 'z') {
+                            buf.text[buf.cursor] = c - 32;
+                        } else if (c >= 'A' and c <= 'Z') {
+                            buf.text[buf.cursor] = c + 32;
+                        }
+                        _ = buf.moveRight();
+                    }
+                }
+                return .consumed;
+            },
+            // J — join current line with next (remove newline at end of line)
+            'J' => {
+                // find newline at end of current line
+                var pos = buf.cursor;
+                while (pos < buf.len and buf.text[pos] != '\n') : (pos += 1) {}
+                if (pos < buf.len) {
+                    // delete the newline
+                    const old = buf.cursor;
+                    buf.cursor = pos;
+                    _ = buf.deleteForward();
+                    // ensure a space if the join point has none
+                    if (buf.cursor < buf.len and buf.text[buf.cursor] != ' ' and
+                        buf.cursor > 0 and buf.text[buf.cursor - 1] != ' ')
+                    {
+                        buf.insert(' ');
+                    }
+                    buf.cursor = old;
+                }
                 return .consumed;
             },
 
@@ -855,18 +915,20 @@ pub const Vim = struct {
         while (buf.cursor < buf.len and isWhitespace(buf.text[buf.cursor])) {
             _ = buf.moveRight();
         }
+        if (buf.len == 0 or buf.cursor >= buf.len) return;
         while (buf.cursor < buf.len - 1 and !isWhitespace(buf.text[buf.cursor + 1])) {
             _ = buf.moveRight();
         }
     }
 
     pub fn moveDown(self: *Self, buf: *editor.EditBuffer) void {
-        // get current column
+        // get current column (count UTF-8 characters, not bytes)
         var col: u16 = 0;
         var i = buf.cursor;
         while (i > 0 and buf.text[i - 1] != '\n') {
             i -= 1;
-            col += 1;
+            // Only count lead bytes (skip continuation bytes)
+            if ((buf.text[i] & 0xC0) != 0x80) col += 1;
         }
 
         // set preferred column if not already set (first j/k in sequence)
@@ -889,12 +951,12 @@ pub const Vim = struct {
     }
 
     pub fn moveUp(self: *Self, buf: *editor.EditBuffer) void {
-        // get current column
+        // get current column (count UTF-8 characters, not bytes)
         var col: u16 = 0;
         var i = buf.cursor;
         while (i > 0 and buf.text[i - 1] != '\n') {
             i -= 1;
-            col += 1;
+            if ((buf.text[i] & 0xC0) != 0x80) col += 1;
         }
 
         // set preferred column if not already set
@@ -985,7 +1047,7 @@ fn isWordChar(c: u8) bool {
     return (c >= 'a' and c <= 'z') or
         (c >= 'A' and c <= 'Z') or
         (c >= '0' and c <= '9') or
-        c == '_';
+        c == '_' or c >= 0x80;
 }
 
 fn isPunct(c: u8) bool {

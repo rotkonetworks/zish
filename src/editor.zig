@@ -58,28 +58,37 @@ pub const EditBuffer = struct {
 
     pub fn delete(self: *Self) bool {
         if (self.cursor == 0) return false;
+        // Find start of UTF-8 character before cursor
+        var char_start = self.cursor - 1;
+        while (char_start > 0 and (self.text[char_start] & 0xC0) == 0x80) char_start -= 1;
+        const char_len = self.cursor - char_start;
         if (self.cursor < self.len) {
             std.mem.copyForwards(
                 u8,
-                self.text[self.cursor - 1 .. self.len - 1],
+                self.text[char_start .. self.len - char_len],
                 self.text[self.cursor .. self.len],
             );
         }
-        self.len -= 1;
-        self.cursor -= 1;
+        self.len -= @intCast(char_len);
+        self.cursor = @intCast(char_start);
         return true;
     }
 
     pub fn deleteForward(self: *Self) bool {
         if (self.cursor >= self.len) return false;
-        if (self.cursor < self.len - 1) {
+        // Find length of UTF-8 character at cursor
+        const b0 = self.text[self.cursor];
+        const char_len: usize = if (b0 < 0x80) 1 else if ((b0 & 0xE0) == 0xC0) 2 else if ((b0 & 0xF0) == 0xE0) 3 else if ((b0 & 0xF8) == 0xF0) 4 else 1;
+        const del_end = @min(self.cursor + char_len, self.len);
+        const actual_len = del_end - self.cursor;
+        if (del_end < self.len) {
             std.mem.copyForwards(
                 u8,
-                self.text[self.cursor .. self.len - 1],
-                self.text[self.cursor + 1 .. self.len],
+                self.text[self.cursor .. self.len - actual_len],
+                self.text[del_end .. self.len],
             );
         }
-        self.len -= 1;
+        self.len -= @intCast(actual_len);
         return true;
     }
 
@@ -101,22 +110,28 @@ pub const EditBuffer = struct {
 
     pub fn moveLeft(self: *Self) bool {
         if (self.cursor == 0) return false;
+        // Skip back over UTF-8 continuation bytes (10xxxxxx)
         self.cursor -= 1;
+        while (self.cursor > 0 and (self.text[self.cursor] & 0xC0) == 0x80)
+            self.cursor -= 1;
         return true;
     }
 
     pub fn moveRight(self: *Self) bool {
         if (self.cursor >= self.len) return false;
-        self.cursor += 1;
+        // Skip forward over full UTF-8 sequence
+        const b0 = self.text[self.cursor];
+        const char_len: u16 = if (b0 < 0x80) 1 else if ((b0 & 0xE0) == 0xC0) 2 else if ((b0 & 0xF0) == 0xE0) 3 else if ((b0 & 0xF8) == 0xF0) 4 else 1;
+        self.cursor = @min(self.cursor + char_len, self.len);
         return true;
     }
 
     pub fn moveHome(self: *Self) void {
-        self.cursor = 0;
+        self.moveLineStart();
     }
 
     pub fn moveEnd(self: *Self) void {
-        self.cursor = self.len;
+        self.moveLineEnd();
     }
 
     /// move to start of current line (after newline or pos 0)
@@ -167,7 +182,10 @@ pub const EditBuffer = struct {
             prev_start -= 1;
         }
         const prev_len = prev_end - prev_start;
-        self.cursor = @intCast(prev_start + @min(col, prev_len));
+        var target: u16 = @intCast(prev_start + @min(col, prev_len));
+        // Snap to UTF-8 character boundary (don't land on continuation byte)
+        while (target > prev_start and (self.text[target] & 0xC0) == 0x80) target -= 1;
+        self.cursor = target;
         return true;
     }
 
@@ -188,14 +206,17 @@ pub const EditBuffer = struct {
             next_end += 1;
         }
         const next_len = next_end - next_start;
-        self.cursor = @intCast(next_start + @min(col, next_len));
+        var target: u16 = @intCast(next_start + @min(col, next_len));
+        // Snap to UTF-8 character boundary (don't land on continuation byte)
+        while (target > next_start and (self.text[target] & 0xC0) == 0x80) target -= 1;
+        self.cursor = target;
         return true;
     }
 
     // ── Vi-mode motions ──
 
     fn isWordChar(c: u8) bool {
-        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_';
+        return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c >= 0x80;
     }
 
     /// move forward to start of next word (vi 'w')
@@ -225,7 +246,12 @@ pub const EditBuffer = struct {
         while (self.cursor < self.len and !isWordChar(self.text[self.cursor])) self.cursor += 1;
         // skip to end of word
         while (self.cursor < self.len and isWordChar(self.text[self.cursor])) self.cursor += 1;
-        if (self.cursor > 0) self.cursor -= 1;
+        // Back up to last char of word, snapping to UTF-8 lead byte
+        if (self.cursor > 0) {
+            self.cursor -= 1;
+            while (self.cursor > 0 and (self.text[self.cursor] & 0xC0) == 0x80)
+                self.cursor -= 1;
+        }
     }
 
     /// delete from cursor to end of line (vi 'D' / 'd$')
@@ -259,6 +285,14 @@ pub const EditBuffer = struct {
     pub fn deleteLine(self: *Self) void {
         self.moveLineStart();
         self.deleteToEnd();
+        // Also remove the trailing newline (vi 'dd' removes the whole line)
+        if (self.cursor < self.len and self.text[self.cursor] == '\n') {
+            _ = self.deleteForward();
+        } else if (self.cursor > 0 and self.cursor == self.len) {
+            // Last line: remove the preceding newline instead
+            self.cursor -= 1;
+            _ = self.deleteForward();
+        }
     }
 
     /// replace character under cursor (vi 'r')

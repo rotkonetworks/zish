@@ -22,6 +22,15 @@ pub const MsgKind = enum(u8) {
     spawn_worker,     // main -> agent: spawn a full-tools worker subagent
     agent_status_req, // main -> agent: request subagent status listing
     agent_status,     // agent -> main: subagent status line
+
+    /// Returns true if this message kind is an output (agent → main) message.
+    pub fn isOutput(self: MsgKind) bool {
+        return switch (self) {
+            .text_delta, .tool_call, .tool_done, .done, .error_msg, .cancel,
+            .confirm_request, .usage_info, .router_info, .agent_status => true,
+            .confirm_response, .add_task, .spawn_worker, .agent_status_req => false,
+        };
+    }
 };
 
 pub const Msg = struct {

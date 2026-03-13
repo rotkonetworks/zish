@@ -2033,8 +2033,9 @@ fn drainAgentOutput(self: *Shell) !void {
                 try self.renderLine();
             },
             .confirm_request => {
-                if (last_was_text) try writer.writeByte('\n');
+                if (last_was_text) try writer.writeAll("\x1b[0m\n");
                 last_was_text = false;
+                self.agent_md.reset();
                 // Show confirmation prompt
                 try writer.writeAll("\x1b[33m");
                 try writer.writeAll(msg.slice());
