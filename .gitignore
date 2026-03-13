@@ -1,3 +1,6 @@
 .zig-cache/
 zig-out/
 zishrc
+test_infer
+test_gguf_open
+root
