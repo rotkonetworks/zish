@@ -145,8 +145,7 @@ pub const MetadataKV = struct {
 };
 
 pub const GGUFHeader = struct {
-    const magic_str = "GGUF";
-    const magic_num = std.mem.readInt(u32, magic_str, .little);
+    const magic_num: u32 = 0x46475547; // GGUF spec magic
 
     version: u32,
     tensor_count: u64,
