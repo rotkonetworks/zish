@@ -56,9 +56,44 @@ recursive spawning up to 3 levels deep, 8 per level. workers get full tools, rea
 
 classifies queries before dispatch: local patterns (70% zero-cost) → local GGUF inference → haiku API call. routes to shell (bypass LLM), or selects model tier (haiku/sonnet/opus).
 
-### local inference
+### local GGUF inference engine
 
-pure-zig GGUF inference engine. fork-based process isolation, continuous inference between requests. supports F32, F16, Q8_0, Q4_K, Q6_K quantization. SIMD matmul, sliding window attention, CTM (continuous thinking model) with online plasticity.
+pure-zig inference engine in `src/inference/` — zero external dependencies, no python, no llama.cpp.
+
+- **GGUF v3 parser**: mmap-based, reads metadata, tensor info, alignment
+- **transformer forward pass**: RoPE, RMSNorm, SwiGLU MLP, grouped-query attention, KV cache
+- **quantization**: F32, F16, Q8_0 (SIMD matmul), Q4_K (fused dot), Q6_K (fused dot)
+- **SIMD math**: fused quantized dot products, multi-threaded matmul (up to 8 cores)
+- **sliding window attention**: for mistral-family models, O(T×W) instead of O(T²)
+- **fork-based process isolation**: child loads model via mmap, parent sends queries via pipes
+- **continuous inference**: child self-feeds tokens between requests, keeps KV cache and CTM state warm
+- **BPE tokenizer**: built from GGUF metadata, SentencePiece compatible
+
+#### CTM (continuous thinking model)
+
+additive thinking blocks on top of standard MLP — preserves all pretrained knowledge. includes SuperLinear layers, SynapseUNET, dual sync accumulators.
+
+#### CTM plasticity (breathing architecture)
+
+online learning without gradients:
+- **dopamine gating**: surprise-based neuromodulation, clamped [0.5, 1.0]
+- **hebbian learning**: weight updates from sync patterns, novelty gating + homeostasis
+- **replay buffer**: 64-entry ring of token sequences with surprise scores
+- **breathing loop**: inhale (generate with dopamine tracking) → exhale (compact weights, persist state)
+- **persistence**: `.ctmstate`, `.plastic`, `.replay` files alongside the GGUF model
+
+```
+~/.zish/agent.json: "router_local_model": "~/.zish/models/qwen25_ctm_k32.gguf"
+```
+
+| module | role |
+|--------|------|
+| `inference/root.zig` | ForkServer (fork+pipes), InferenceContext, continuous child loop |
+| `inference/gguf.zig` | GGUF v3 parser: mmap, metadata KV, tensor info |
+| `inference/model.zig` | transformer forward pass, KV cache, attention |
+| `inference/math.zig` | SIMD math, fused quantized dot products, parallel matmul |
+| `inference/tokenizer.zig` | BPE tokenizer from GGUF metadata |
+| `inference/ctm.zig` | CTM blocks, SuperLinear, SynapseUNET, plasticity |
 
 ## architecture
 
