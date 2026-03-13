@@ -2926,21 +2926,29 @@ fn ghostInferThread(ctx: anytype) void {
         var input_buf: [512]u8 = undefined;
         @memcpy(input_buf[0..ilen], shell.ghost_infer_input[0..ilen]);
 
-        // run inference (short: max 32 tokens, low temp for deterministic)
+        // run inference with shell completion prompt framing
         if (!server.isAlive()) {
             server = inference.ForkServer.spawn(model_path) catch break;
         }
-        const result = server.generate(input_buf[0..ilen], 32, 0.1, alloc) catch continue;
+        // Frame as shell completion: "$ git st" -> model completes "atus"
+        var prompt_buf: [640]u8 = undefined;
+        const prompt = std.fmt.bufPrint(&prompt_buf, "$ {s}", .{input_buf[0..ilen]}) catch continue;
+        const result = server.generate(prompt, 12, 0.0, alloc) catch continue;
         defer alloc.free(result);
 
         // check if still current
         if (shell.ghost_infer_seq.load(.monotonic) != seq) continue;
 
-        // write result
-        const rlen: u32 = @intCast(@min(result.len, 512));
-        if (rlen > 0) {
-            @memcpy(shell.ghost_infer_result[0..rlen], result[0..rlen]);
+        // Sanitize: only keep printable ASCII, stop at newline or control chars
+        var clean_len: u32 = 0;
+        for (result) |rc| {
+            if (rc == '\n' or rc == '\r' or rc < 0x20) break;
+            if (clean_len < 512) {
+                shell.ghost_infer_result[clean_len] = rc;
+                clean_len += 1;
+            }
         }
+        const rlen = clean_len;
         shell.ghost_infer_result_len.store(rlen, .monotonic);
         shell.ghost_infer_result_seq.store(seq, .release);
     }

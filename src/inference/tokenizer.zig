@@ -127,19 +127,39 @@ pub const Tokenizer = struct {
     }
 
     /// Decode a sequence of tokens to a string.
+    /// Handles BPE space markers: Ġ (GPT-2/Qwen, U+0120 = \xc4\xa0) and ▁ (SentencePiece, U+2581 = \xe2\x96\x81)
     pub fn decodeAll(self: *const Tokenizer, tokens: []const Token, alloc: Allocator) ![]u8 {
         var result: std.ArrayList(u8) = .{};
         for (tokens) |tok| {
             if (self.decode(tok)) |s| {
-                // Handle SentencePiece's "▁" (U+2581) -> space mapping
-                for (s) |c| {
-                    if (c == 0xe2) {
-                        // Check for ▁ (0xe2 0x96 0x81)
-                        // We'll just pass through for now; proper handling needs look-ahead
-                        result.append(alloc, c) catch {};
-                    } else {
-                        result.append(alloc, c) catch {};
+                var i: usize = 0;
+                while (i < s.len) {
+                    // GPT-2/Qwen BPE: Ġ (U+0120 = 0xc4 0xa0) -> space
+                    if (i + 1 < s.len and s[i] == 0xc4 and s[i + 1] == 0xa0) {
+                        result.append(alloc, ' ') catch {};
+                        i += 2;
+                        continue;
                     }
+                    // SentencePiece: ▁ (U+2581 = 0xe2 0x96 0x81) -> space
+                    if (i + 2 < s.len and s[i] == 0xe2 and s[i + 1] == 0x96 and s[i + 2] == 0x81) {
+                        result.append(alloc, ' ') catch {};
+                        i += 3;
+                        continue;
+                    }
+                    // GPT-2 byte-level BPE: Ā-ÿ range (U+0100-U+01FF) encodes raw bytes
+                    // First byte 0xc4 (U+0100-U+013F) or 0xc5 (U+0140-U+017F) etc.
+                    if (i + 1 < s.len and s[i] >= 0xc4 and s[i] <= 0xc7) {
+                        // Decode 2-byte UTF-8 to codepoint, then extract byte value
+                        const cp: u16 = (@as(u16, s[i] & 0x1f) << 6) | @as(u16, s[i + 1] & 0x3f);
+                        if (cp >= 0x100 and cp <= 0x1ff) {
+                            // This is a byte-level token: codepoint 0x100+N encodes byte N
+                            result.append(alloc, @intCast(cp - 0x100)) catch {};
+                            i += 2;
+                            continue;
+                        }
+                    }
+                    result.append(alloc, s[i]) catch {};
+                    i += 1;
                 }
             }
         }
