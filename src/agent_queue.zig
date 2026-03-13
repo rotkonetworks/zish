@@ -161,10 +161,6 @@ pub const PostKind = enum(u8) {
     request_peer,
     /// Agent broadcasting its status change
     status_change,
-    /// Agent warning — "don't touch this file/resource, I'm working on it"
-    claim,
-    /// Agent releasing a previously claimed resource
-    release,
     /// Agent voting on a decision (consensus)
     vote,
 };

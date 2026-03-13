@@ -1355,8 +1355,6 @@ fn drawBulletin(
             .escalate => "\x1b[31m\xe2\x96\xb2\x1b[0m", // ▲ red
             .request_peer => "\x1b[33m\xe2\x97\x8b\x1b[0m", // ○ yellow
             .status_change => "\x1b[36m\xe2\x97\x8f\x1b[0m", // ● cyan
-            .claim => "\x1b[35m\xe2\x96\xa0\x1b[0m", // ■ magenta
-            .release => "\x1b[90m\xe2\x96\xa1\x1b[0m", // □ dim
             .vote => "\x1b[34m\xe2\x9c\x93\x1b[0m", // ✓ blue
         };
         w.writeAll(icon) catch {};

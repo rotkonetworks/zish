@@ -94,75 +94,36 @@ pub const ToolContext = struct {
     /// Agent identity for bulletin posts
     agent_id: []const u8 = "main",
     agent_depth: u8 = 0,
+    /// Working directory for this agent. Worktree path for workers, null = process cwd.
+    cwd: ?[]const u8 = null,
 
     /// Broadcast to the shared bulletin board (the commons).
     pub fn broadcast(self: *const ToolContext, kind: q.PostKind, text: []const u8) void {
         self.queues.bulletin.post(kind, self.agent_id, self.agent_depth, text);
     }
 
-    /// Check if another agent has an active claim on this file.
-    /// Scans recent bulletin posts for .claim without matching .release.
-    /// Returns the claimer's ID if claimed, null if free.
-    pub fn checkClaim(self: *const ToolContext, file_path: []const u8) ?[]const u8 {
-        var posts: [128]q.Post = undefined;
-        // Read from position 0 to scan all history (or as much as the ring holds)
-        const br = self.queues.bulletin.read(0, &posts);
-
-        // Track active claims per author — last claim/release wins
-        const MAX_CLAIMS = 32;
-        var claimers: [MAX_CLAIMS][16]u8 = undefined;
-        var claimer_lens: [MAX_CLAIMS]u8 = [_]u8{0} ** MAX_CLAIMS;
-        var claim_files: [MAX_CLAIMS][256]u8 = undefined;
-        var claim_file_lens: [MAX_CLAIMS]u16 = [_]u16{0} ** MAX_CLAIMS;
-        var claim_active: [MAX_CLAIMS]bool = [_]bool{false} ** MAX_CLAIMS;
-        var claim_count: usize = 0;
-
-        for (posts[0..br.count]) |*p| {
-            if (p.kind != .claim and p.kind != .release) continue;
-            const msg = p.slice();
-
-            // Check if this post mentions our file path
-            if (std.mem.indexOf(u8, msg, file_path) == null) continue;
-
-            // Find or create entry for this author
-            const author = p.authorSlice();
-            // Skip our own claims
-            if (std.mem.eql(u8, author, self.agent_id)) continue;
-
-            var found_idx: ?usize = null;
-            for (0..claim_count) |ci| {
-                if (claimer_lens[ci] == author.len and
-                    std.mem.eql(u8, claimers[ci][0..claimer_lens[ci]], author))
-                {
-                    found_idx = ci;
-                    break;
-                }
-            }
-            const idx = found_idx orelse blk: {
-                if (claim_count >= MAX_CLAIMS) continue;
-                const ni = claim_count;
-                claim_count += 1;
-                const al: u8 = @intCast(@min(author.len, 16));
-                @memcpy(claimers[ni][0..al], author[0..al]);
-                claimer_lens[ni] = al;
-                break :blk ni;
-            };
-
-            const fl: u16 = @intCast(@min(file_path.len, 256));
-            @memcpy(claim_files[idx][0..fl], file_path[0..fl]);
-            claim_file_lens[idx] = fl;
-            claim_active[idx] = (p.kind == .claim);
+    /// Resolve a file path relative to this agent's cwd.
+    /// Returns the path as-is if absolute, or prepends cwd if relative.
+    pub fn resolvePath(self: *const ToolContext, path: []const u8, buf: *[512]u8) []const u8 {
+        if (path.len > 0 and path[0] == '/') return path; // already absolute
+        if (self.cwd) |c| {
+            return std.fmt.bufPrint(buf, "{s}/{s}", .{ c, path }) catch path;
         }
-
-        // Check if any active claim exists
-        for (0..claim_count) |ci| {
-            if (claim_active[ci]) {
-                return claimers[ci][0..claimer_lens[ci]];
-            }
-        }
-        return null;
+        return path;
     }
 };
+
+// ============================================================
+// Path resolution helper for tool executors
+// ============================================================
+
+fn resolvePath(path: []const u8, cwd: ?[]const u8, buf: *[512]u8) []const u8 {
+    if (path.len > 0 and path[0] == '/') return path;
+    if (cwd) |c| {
+        return std.fmt.bufPrint(buf, "{s}/{s}", .{ c, path }) catch path;
+    }
+    return path;
+}
 
 // ============================================================
 // Confirmation flow
@@ -605,7 +566,7 @@ pub fn dispatch(ctx: *ToolContext, tool_name: []const u8, tool_input: []const u8
         const detail = std.fmt.bufPrint(&detail_buf, "$ {s}", .{preview}) catch preview;
         if (!confirmTool(ctx.queues, "Bash", detail, ctx.allow_bash))
             return ctx.allocator.dupe(u8, "Tool execution denied by user.");
-        return executeBash(ctx.allocator, ctx.queues, cmd);
+        return executeBash(ctx.allocator, ctx.queues, cmd, ctx.cwd);
     }
     if (std.mem.eql(u8, tool_name, "Read")) {
         const path = extractJsonField(tool_input, "file_path") orelse return error.MissingPath;
@@ -613,7 +574,7 @@ pub fn dispatch(ctx: *ToolContext, tool_name: []const u8, tool_input: []const u8
         const limit_str = extractJsonField(tool_input, "limit");
         const offset: usize = if (offset_str) |s| std.fmt.parseInt(usize, s, 10) catch 0 else 0;
         const limit: usize = if (limit_str) |s| std.fmt.parseInt(usize, s, 10) catch 0 else 0;
-        return executeRead(ctx.allocator, ctx.queues, path, offset, limit);
+        return executeRead(ctx.allocator, ctx.queues, path, offset, limit, ctx.cwd);
     }
     if (std.mem.eql(u8, tool_name, "Edit")) {
         const path = extractJsonField(tool_input, "file_path") orelse return error.MissingPath;
@@ -627,18 +588,9 @@ pub fn dispatch(ctx: *ToolContext, tool_name: []const u8, tool_input: []const u8
         const rp = unescapeJSON(path, &path_buf2) orelse path;
         var detail_buf: [512]u8 = undefined;
         const detail = std.fmt.bufPrint(&detail_buf, "Edit({s})", .{rp}) catch rp;
-        // Check if another agent has claimed this file
-        if (ctx.checkClaim(rp)) |claimer| {
-            var conflict_buf: [256]u8 = undefined;
-            const conflict = std.fmt.bufPrint(&conflict_buf, "File {s} is claimed by agent {s}. Wait for release or coordinate via bulletin.", .{ rp, claimer }) catch "File claimed by another agent.";
-            return ctx.allocator.dupe(u8, conflict);
-        }
         if (!confirmTool(ctx.queues, "Edit", detail, ctx.allow_edit))
             return ctx.allocator.dupe(u8, "Tool execution denied by user.");
-        ctx.broadcast(.claim, detail);
-        const result = executeEdit(ctx.allocator, ctx.queues, ctx.session_log, path, old_str, new_str, replace_all);
-        ctx.broadcast(.release, detail);
-        return result;
+        return executeEdit(ctx.allocator, ctx.queues, ctx.session_log, path, old_str, new_str, replace_all, ctx.cwd);
     }
     if (std.mem.eql(u8, tool_name, "Write")) {
         const path = extractJsonField(tool_input, "file_path") orelse return error.MissingPath;
@@ -647,29 +599,20 @@ pub fn dispatch(ctx: *ToolContext, tool_name: []const u8, tool_input: []const u8
         const rp = unescapeJSON(path, &path_buf2) orelse path;
         var detail_buf: [512]u8 = undefined;
         const detail = std.fmt.bufPrint(&detail_buf, "Write({s})", .{rp}) catch rp;
-        // Check if another agent has claimed this file
-        if (ctx.checkClaim(rp)) |claimer| {
-            var conflict_buf: [256]u8 = undefined;
-            const conflict = std.fmt.bufPrint(&conflict_buf, "File {s} is claimed by agent {s}. Wait for release or coordinate via bulletin.", .{ rp, claimer }) catch "File claimed by another agent.";
-            return ctx.allocator.dupe(u8, conflict);
-        }
         if (!confirmTool(ctx.queues, "Write", detail, ctx.allow_write))
             return ctx.allocator.dupe(u8, "Tool execution denied by user.");
-        ctx.broadcast(.claim, detail);
-        const result = executeWrite(ctx.allocator, ctx.queues, ctx.session_log, path, content);
-        ctx.broadcast(.release, detail);
-        return result;
+        return executeWrite(ctx.allocator, ctx.queues, ctx.session_log, path, content, ctx.cwd);
     }
     if (std.mem.eql(u8, tool_name, "Glob")) {
         const pattern = extractJsonField(tool_input, "pattern") orelse return error.MissingPattern;
         const path = extractJsonField(tool_input, "path");
-        return executeGlob(ctx.allocator, ctx.queues, pattern, path);
+        return executeGlob(ctx.allocator, ctx.queues, pattern, path, ctx.cwd);
     }
     if (std.mem.eql(u8, tool_name, "Grep")) {
         const pattern = extractJsonField(tool_input, "pattern") orelse return error.MissingPattern;
         const path = extractJsonField(tool_input, "path");
         const file_glob = extractJsonField(tool_input, "glob");
-        return executeGrep(ctx.allocator, ctx.queues, pattern, path, file_glob);
+        return executeGrep(ctx.allocator, ctx.queues, pattern, path, file_glob, ctx.cwd);
     }
     if (std.mem.eql(u8, tool_name, "Agent")) {
         const prompt_raw = extractJsonField(tool_input, "prompt") orelse return error.MissingPrompt;
@@ -731,7 +674,7 @@ pub fn dispatch(ctx: *ToolContext, tool_name: []const u8, tool_input: []const u8
 // Individual tool executors
 // ============================================================
 
-pub fn executeBash(allocator: std.mem.Allocator, queues: *AgentQueues, command: []const u8) ![]u8 {
+pub fn executeBash(allocator: std.mem.Allocator, queues: *AgentQueues, command: []const u8, cwd: ?[]const u8) ![]u8 {
     // unescape JSON string escapes in the command
     var cmd_buf: [8192]u8 = undefined;
     const cmd = unescapeJSON(command, &cmd_buf) orelse command;
@@ -745,6 +688,7 @@ pub fn executeBash(allocator: std.mem.Allocator, queues: *AgentQueues, command: 
         .allocator = allocator,
         .argv = &[_][]const u8{ "/bin/sh", "-c", cmd },
         .max_output_bytes = 65536,
+        .cwd = cwd,
     }) catch |err| {
         var errbuf: [128]u8 = undefined;
         const msg = std.fmt.bufPrint(&errbuf, "exec failed: {}", .{err}) catch "exec failed";
@@ -756,9 +700,11 @@ pub fn executeBash(allocator: std.mem.Allocator, queues: *AgentQueues, command: 
     return result.stdout;
 }
 
-pub fn executeRead(allocator: std.mem.Allocator, queues: *AgentQueues, path: []const u8, offset: usize, limit: usize) ![]u8 {
+pub fn executeRead(allocator: std.mem.Allocator, queues: *AgentQueues, path: []const u8, offset: usize, limit: usize, cwd: ?[]const u8) ![]u8 {
     var path_buf: [512]u8 = undefined;
     const real_path = unescapeJSON(path, &path_buf) orelse path;
+    var resolve_buf: [512]u8 = undefined;
+    const resolved = resolvePath(real_path, cwd, &resolve_buf);
 
     var notif_buf: [512]u8 = undefined;
     if (offset > 0 or limit > 0) {
@@ -769,9 +715,9 @@ pub fn executeRead(allocator: std.mem.Allocator, queues: *AgentQueues, path: []c
         _ = queues.output.push(.tool_call, notif);
     }
 
-    const content = std.fs.cwd().readFileAlloc(allocator, real_path, 512 * 1024) catch |err| {
+    const content = std.fs.cwd().readFileAlloc(allocator, resolved, 512 * 1024) catch |err| {
         var errbuf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&errbuf, "read error: {s}: {}", .{ real_path, err }) catch "read error";
+        const msg = std.fmt.bufPrint(&errbuf, "read error: {s}: {}", .{ resolved, err }) catch "read error";
         return allocator.dupe(u8, msg);
     };
     defer allocator.free(content);
@@ -810,9 +756,11 @@ pub fn executeRead(allocator: std.mem.Allocator, queues: *AgentQueues, path: []c
     return result_list.toOwnedSlice(allocator) catch return error.OutOfMemory;
 }
 
-pub fn executeWrite(allocator: std.mem.Allocator, queues: *AgentQueues, session_log: ?*SessionLog, path: []const u8, content: []const u8) ![]u8 {
+pub fn executeWrite(allocator: std.mem.Allocator, queues: *AgentQueues, session_log: ?*SessionLog, path: []const u8, content: []const u8, cwd: ?[]const u8) ![]u8 {
     var path_buf: [512]u8 = undefined;
     const real_path = unescapeJSON(path, &path_buf) orelse path;
+    var resolve_buf: [512]u8 = undefined;
+    const resolved = resolvePath(real_path, cwd, &resolve_buf);
 
     // unescape content
     const content_buf = try allocator.alloc(u8, content.len);
@@ -824,11 +772,11 @@ pub fn executeWrite(allocator: std.mem.Allocator, queues: *AgentQueues, session_
     _ = queues.output.push(.tool_call, notif);
 
     // backup existing file before overwriting
-    if (session_log) |sl| sl.backupFile(real_path) catch {};
+    if (session_log) |sl| sl.backupFile(resolved) catch {};
 
-    const file = std.fs.cwd().createFile(real_path, .{}) catch |err| {
+    const file = std.fs.cwd().createFile(resolved, .{}) catch |err| {
         var errbuf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&errbuf, "write error: {s}: {}", .{ real_path, err }) catch "write error";
+        const msg = std.fmt.bufPrint(&errbuf, "write error: {s}: {}", .{ resolved, err }) catch "write error";
         return allocator.dupe(u8, msg);
     };
     defer file.close();
@@ -848,9 +796,11 @@ pub fn executeWrite(allocator: std.mem.Allocator, queues: *AgentQueues, session_
     return allocator.dupe(u8, result);
 }
 
-pub fn executeEdit(allocator: std.mem.Allocator, queues: *AgentQueues, session_log: ?*SessionLog, path: []const u8, old_str: []const u8, new_str: []const u8, replace_all: bool) ![]u8 {
+pub fn executeEdit(allocator: std.mem.Allocator, queues: *AgentQueues, session_log: ?*SessionLog, path: []const u8, old_str: []const u8, new_str: []const u8, replace_all: bool, cwd: ?[]const u8) ![]u8 {
     var path_buf: [512]u8 = undefined;
     const real_path = unescapeJSON(path, &path_buf) orelse path;
+    var resolve_buf: [512]u8 = undefined;
+    const resolved = resolvePath(real_path, cwd, &resolve_buf);
 
     // Unescape the search and replace strings
     const old_buf = try allocator.alloc(u8, old_str.len);
@@ -866,9 +816,9 @@ pub fn executeEdit(allocator: std.mem.Allocator, queues: *AgentQueues, session_l
     _ = queues.output.push(.tool_call, notif);
 
     // Read current file content
-    const content = std.fs.cwd().readFileAlloc(allocator, real_path, 512 * 1024) catch |err| {
+    const content = std.fs.cwd().readFileAlloc(allocator, resolved, 512 * 1024) catch |err| {
         var errbuf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&errbuf, "edit error: cannot read {s}: {}", .{ real_path, err }) catch "read error";
+        const msg = std.fmt.bufPrint(&errbuf, "edit error: cannot read {s}: {}", .{ resolved, err }) catch "read error";
         return allocator.dupe(u8, msg);
     };
     defer allocator.free(content);
@@ -888,7 +838,7 @@ pub fn executeEdit(allocator: std.mem.Allocator, queues: *AgentQueues, session_l
     }
 
     // Backup before editing
-    if (session_log) |sl| sl.backupFile(real_path) catch {};
+    if (session_log) |sl| sl.backupFile(resolved) catch {};
 
     // Build new content with replacements
     var result_content: std.ArrayList(u8) = .{};
@@ -914,9 +864,9 @@ pub fn executeEdit(allocator: std.mem.Allocator, queues: *AgentQueues, session_l
     }
 
     // Write back
-    const file = std.fs.cwd().createFile(real_path, .{}) catch |err| {
+    const file = std.fs.cwd().createFile(resolved, .{}) catch |err| {
         var errbuf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&errbuf, "edit error: cannot write {s}: {}", .{ real_path, err }) catch "write error";
+        const msg = std.fmt.bufPrint(&errbuf, "edit error: cannot write {s}: {}", .{ resolved, err }) catch "write error";
         return allocator.dupe(u8, msg);
     };
     defer file.close();
@@ -1281,7 +1231,7 @@ pub fn executeWebSearch(allocator: std.mem.Allocator, queues: *AgentQueues, quer
     return final;
 }
 
-pub fn executeGlob(allocator: std.mem.Allocator, queues: *AgentQueues, pattern: []const u8, search_path: ?[]const u8) ![]u8 {
+pub fn executeGlob(allocator: std.mem.Allocator, queues: *AgentQueues, pattern: []const u8, search_path: ?[]const u8, cwd: ?[]const u8) ![]u8 {
     var pattern_buf: [256]u8 = undefined;
     const real_pattern = unescapeJSON(pattern, &pattern_buf) orelse pattern;
 
@@ -1318,6 +1268,7 @@ pub fn executeGlob(allocator: std.mem.Allocator, queues: *AgentQueues, pattern: 
         .allocator = allocator,
         .argv = &[_][]const u8{ "/bin/sh", "-c", cmd },
         .max_output_bytes = 65536,
+        .cwd = cwd,
     }) catch |err| {
         var errbuf: [128]u8 = undefined;
         const msg = std.fmt.bufPrint(&errbuf, "glob error: {}", .{err}) catch "glob error";
@@ -1333,7 +1284,7 @@ pub fn executeGlob(allocator: std.mem.Allocator, queues: *AgentQueues, pattern: 
     return result.stdout;
 }
 
-pub fn executeGrep(allocator: std.mem.Allocator, queues: *AgentQueues, pattern: []const u8, search_path: ?[]const u8, file_glob: ?[]const u8) ![]u8 {
+pub fn executeGrep(allocator: std.mem.Allocator, queues: *AgentQueues, pattern: []const u8, search_path: ?[]const u8, file_glob: ?[]const u8, cwd: ?[]const u8) ![]u8 {
     var pattern_buf: [256]u8 = undefined;
     const real_pattern = unescapeJSON(pattern, &pattern_buf) orelse pattern;
 
@@ -1378,6 +1329,7 @@ pub fn executeGrep(allocator: std.mem.Allocator, queues: *AgentQueues, pattern: 
         .allocator = allocator,
         .argv = &[_][]const u8{ "/bin/sh", "-c", cmd },
         .max_output_bytes = 65536,
+        .cwd = cwd,
     }) catch |err| {
         var errbuf: [128]u8 = undefined;
         const msg = std.fmt.bufPrint(&errbuf, "grep error: {}", .{err}) catch "grep error";

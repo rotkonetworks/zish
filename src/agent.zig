@@ -335,6 +335,12 @@ const SubAgent = struct {
     cancel_requested: bool = false,
     // Full tool access (Edit/Write) — user-spawned workers get this
     full_tools: bool = false,
+    // Git worktree isolation — workers get their own worktree
+    worktree_path: [256]u8 = undefined,
+    worktree_path_len: u16 = 0,
+    branch_name: [64]u8 = undefined,
+    branch_name_len: u8 = 0,
+    has_worktree: bool = false,
 
     fn id(self: *const SubAgent) []const u8 {
         return self.id_buf[0..self.id_len];
@@ -342,6 +348,14 @@ const SubAgent = struct {
 
     fn desc(self: *const SubAgent) []const u8 {
         return self.desc_buf[0..self.desc_len];
+    }
+
+    fn worktreePath(self: *const SubAgent) []const u8 {
+        return self.worktree_path[0..self.worktree_path_len];
+    }
+
+    fn branchName(self: *const SubAgent) []const u8 {
+        return self.branch_name[0..self.branch_name_len];
     }
 
     fn result(self: *const SubAgent) []const u8 {
@@ -456,8 +470,6 @@ const AgentThread = struct {
                 .discovery => "discovery",
                 .escalate => "ESCALATE",
                 .request_peer => "help wanted",
-                .claim => "claimed",
-                .release => "released",
                 .vote => "vote",
                 .status_change => "status",
             };
@@ -659,7 +671,7 @@ const AgentThread = struct {
     }
 
     fn deinit(self: *AgentThread) void {
-        // join all subagent threads
+        // join all subagent threads and clean up worktrees
         for (&self.subagents, 0..) |*sa, i| {
             if (i >= self.subagent_count) break;
             if (sa.thread) |t| {
@@ -667,6 +679,7 @@ const AgentThread = struct {
                 t.join();
                 sa.thread = null;
             }
+            if (sa.has_worktree) self.cleanupWorktree(sa);
         }
         // Shut down fork-based inference server if running
         if (self.router_config.fork_server) |srv| {
@@ -728,6 +741,38 @@ const AgentThread = struct {
         @memcpy(sa.desc_buf[0..dn], description[0..dn]);
         sa.desc_len = @intCast(dn);
 
+        // Create git worktree for full-tools workers (filesystem isolation)
+        if (full_tools) {
+            const branch = std.fmt.bufPrint(&sa.branch_name, "zish-worker-{d}", .{id_num}) catch "zish-worker";
+            sa.branch_name_len = @intCast(branch.len);
+
+            const wt_path = std.fmt.bufPrint(&sa.worktree_path, "/tmp/zish-worktree-{d}", .{id_num}) catch "";
+            sa.worktree_path_len = @intCast(wt_path.len);
+
+            // git worktree add -b <branch> <path> HEAD
+            var wt_cmd_buf: [512]u8 = undefined;
+            const wt_cmd = std.fmt.bufPrint(&wt_cmd_buf, "git worktree add -b {s} {s} HEAD 2>&1", .{
+                branch, wt_path,
+            }) catch "";
+            const wt_result = std.process.Child.run(.{
+                .allocator = self.allocator,
+                .argv = &[_][]const u8{ "/bin/sh", "-c", wt_cmd },
+                .max_output_bytes = 4096,
+                .cwd = if (self.cwd_len > 0) self.cwd[0..self.cwd_len] else null,
+            }) catch {
+                sa.setResult("Failed to create git worktree", .failed);
+                return error.SpawnFailed;
+            };
+            self.allocator.free(wt_result.stdout);
+            self.allocator.free(wt_result.stderr);
+
+            if (wt_result.term != .Exited or wt_result.term.Exited != 0) {
+                sa.setResult("git worktree add failed", .failed);
+                return error.SpawnFailed;
+            }
+            sa.has_worktree = true;
+        }
+
         // Log spawn
         if (self.session_log) |*sl| sl.logAgentSpawn(sa.id(), "subagent", description) catch {};
 
@@ -749,6 +794,7 @@ const AgentThread = struct {
             self.allocator, sa, prompt_copy, cfg, &self.system_prompt_buf, self.system_prompt_len, full_tools, child_depth, self.queues.bulletin,
         }) catch {
             self.allocator.free(prompt_copy);
+            if (sa.has_worktree) self.cleanupWorktree(sa);
             sa.setResult("Failed to spawn subagent thread", .failed);
             return error.SpawnFailed;
         };
@@ -791,12 +837,125 @@ const AgentThread = struct {
                     t.join();
                     sa.thread = null;
                 }
+                // Merge worktree branch if worker made changes
+                if (sa.has_worktree) {
+                    self.mergeWorktree(sa);
+                }
                 // Log result
                 if (self.session_log) |*sl| sl.logAgentResult(sa.id(), sa.result()) catch {};
                 return sa.result();
             }
         }
         return "Unknown subagent ID";
+    }
+
+    /// Merge a worker's worktree branch, then clean up.
+    /// Auto-commits any uncommitted changes in the worktree first.
+    fn mergeWorktree(self: *AgentThread, sa: *SubAgent) void {
+        const cwd = if (self.cwd_len > 0) self.cwd[0..self.cwd_len] else null;
+        const wt = sa.worktreePath();
+        const branch = sa.branchName();
+
+        // 1. Auto-commit any uncommitted changes in the worktree
+        var commit_cmd_buf: [512]u8 = undefined;
+        const desc_trunc = sa.desc()[0..@min(sa.desc().len, 60)];
+        const commit_cmd = std.fmt.bufPrint(&commit_cmd_buf,
+            "cd {s} && git add -A && git diff --cached --quiet 2>/dev/null || git commit -m 'worker {s}: {s}' 2>&1",
+            .{ wt, sa.id(), desc_trunc },
+        ) catch "";
+        if (commit_cmd.len > 0) {
+            const cr = std.process.Child.run(.{
+                .allocator = self.allocator,
+                .argv = &[_][]const u8{ "/bin/sh", "-c", commit_cmd },
+                .max_output_bytes = 4096,
+            }) catch null;
+            if (cr) |r| {
+                self.allocator.free(r.stdout);
+                self.allocator.free(r.stderr);
+            }
+        }
+
+        // 2. Merge worker branch into parent
+        const status = @atomicLoad(SubAgentStatus, &sa.status, .acquire);
+        if (status == .done) {
+            var merge_buf: [256]u8 = undefined;
+            const merge_cmd = std.fmt.bufPrint(&merge_buf,
+                "git merge --no-edit {s} 2>&1", .{branch},
+            ) catch "";
+            if (merge_cmd.len > 0) {
+                const mr = std.process.Child.run(.{
+                    .allocator = self.allocator,
+                    .argv = &[_][]const u8{ "/bin/sh", "-c", merge_cmd },
+                    .max_output_bytes = 4096,
+                    .cwd = cwd,
+                }) catch null;
+                if (mr) |r| {
+                    defer self.allocator.free(r.stdout);
+                    defer self.allocator.free(r.stderr);
+                    if (r.term != .Exited or r.term.Exited != 0) {
+                        // Merge conflict — abort, keep branch for manual resolution
+                        const abort = std.process.Child.run(.{
+                            .allocator = self.allocator,
+                            .argv = &[_][]const u8{ "/bin/sh", "-c", "git merge --abort 2>/dev/null" },
+                            .max_output_bytes = 256,
+                            .cwd = cwd,
+                        }) catch null;
+                        if (abort) |ar| {
+                            self.allocator.free(ar.stdout);
+                            self.allocator.free(ar.stderr);
+                        }
+                        _ = self.queues.output.push(.error_msg,
+                            "merge conflict from worker — branch preserved for manual resolution");
+                        // Remove worktree but keep branch
+                        var rm_buf: [256]u8 = undefined;
+                        const rm_cmd = std.fmt.bufPrint(&rm_buf,
+                            "git worktree remove --force {s} 2>/dev/null", .{wt},
+                        ) catch "";
+                        if (rm_cmd.len > 0) {
+                            const rr = std.process.Child.run(.{
+                                .allocator = self.allocator,
+                                .argv = &[_][]const u8{ "/bin/sh", "-c", rm_cmd },
+                                .max_output_bytes = 256,
+                                .cwd = cwd,
+                            }) catch null;
+                            if (rr) |r2| {
+                                self.allocator.free(r2.stdout);
+                                self.allocator.free(r2.stderr);
+                            }
+                        }
+                        sa.has_worktree = false;
+                        return;
+                    }
+                }
+            }
+        }
+
+        // 3. Clean up worktree + branch
+        self.cleanupWorktree(sa);
+    }
+
+    /// Remove worktree directory and delete the branch.
+    fn cleanupWorktree(self: *AgentThread, sa: *SubAgent) void {
+        if (!sa.has_worktree) return;
+        const cwd = if (self.cwd_len > 0) self.cwd[0..self.cwd_len] else null;
+        var cleanup_buf: [512]u8 = undefined;
+        const cleanup_cmd = std.fmt.bufPrint(&cleanup_buf,
+            "git worktree remove --force {s} 2>/dev/null; git branch -D {s} 2>/dev/null",
+            .{ sa.worktreePath(), sa.branchName() },
+        ) catch "";
+        if (cleanup_cmd.len > 0) {
+            const cr = std.process.Child.run(.{
+                .allocator = self.allocator,
+                .argv = &[_][]const u8{ "/bin/sh", "-c", cleanup_cmd },
+                .max_output_bytes = 256,
+                .cwd = cwd,
+            }) catch null;
+            if (cr) |r| {
+                self.allocator.free(r.stdout);
+                self.allocator.free(r.stderr);
+            }
+        }
+        sa.has_worktree = false;
     }
 
     fn listSubAgents(self: *AgentThread, buf: []u8) []const u8 {
@@ -1392,6 +1551,7 @@ const AgentThread = struct {
             .spawn_ctx = @ptrCast(self),
             .agent_id = self.agent_id[0..self.agent_id_len],
             .agent_depth = self.depth,
+            .cwd = if (self.cwd_len > 0) self.cwd[0..self.cwd_len] else null,
         };
     }
 
@@ -2571,9 +2731,16 @@ fn subAgentThreadFn(
     // Announce arrival on the bulletin
     agent.broadcast(.status_change, "spawned");
 
-    // Set cwd
-    const cwd = std.process.getCwd(&agent.cwd) catch "/";
-    agent.cwd_len = @intCast(cwd.len);
+    // Set cwd — use worktree path if this is an isolated worker
+    if (sa.has_worktree) {
+        const wt = sa.worktreePath();
+        @memcpy(agent.cwd[0..wt.len], wt);
+        agent.cwd_len = @intCast(wt.len);
+    } else {
+        const cwd = std.process.getCwd(&agent.cwd) catch "/";
+        agent.cwd_len = @intCast(cwd.len);
+    }
+    agent.peer_scan_cursor = agent.bulletin_cursor;
 
     if (full_tools) {
         // Full tool set — same as main agent (Edit, Write, Glob, Grep, Read, Bash, WebFetch, WebSearch)
