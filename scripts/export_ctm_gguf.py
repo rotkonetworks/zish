@@ -204,6 +204,7 @@ def export_model(backbone_name, ctm_checkpoint_path, output_path, quantize='f16'
     use_ctm = ctm_checkpoint_path is not None
     ctm_state = None
     ctm_config = {}
+    full_state = {}
 
     if use_ctm:
         print(f"Loading CTM checkpoint: {ctm_checkpoint_path}")
@@ -214,6 +215,8 @@ def export_model(backbone_name, ctm_checkpoint_path, output_path, quantize='f16'
         val_bpb = ckpt.get('val_bpb', '?')
         print(f"  Step: {step}, Val BPB: {val_bpb}")
         print(f"  CTM tensors: {len(ctm_state)}")
+        # Full model state dict may also be in checkpoint (has resid_lambdas, ve_gate, etc.)
+        full_state = ckpt.get('model_state_dict', {})
 
     ctm_iterations = ctm_config.get('ctm_iterations', 32)
     ctm_memory_length = ctm_config.get('ctm_memory_length', 16)
@@ -235,7 +238,7 @@ def export_model(backbone_name, ctm_checkpoint_path, output_path, quantize='f16'
     elif quantize == 'f32':
         weight_type = GGML_TYPE_F32
 
-    ctm_layer_idx = n_layer - 1  # CTM replaces last layer's MLP
+    ctm_layer_idx = n_layer - 1  # CTM is additive on top of last layer's MLP
 
     # Load HuggingFace model weights
     print(f"Loading backbone weights: {backbone_name}")
@@ -300,8 +303,15 @@ def export_model(backbone_name, ctm_checkpoint_path, output_path, quantize='f16'
         add_tensor(f'blk.{i}.ffn_norm.weight',
                    hf_state[f'{prefix}.post_attention_layernorm.weight'], GGML_TYPE_F32)
 
+        # Standard MLP (SwiGLU): gate_proj, up_proj, down_proj
+        # ALWAYS included — even for CTM layers. CTM is additive, not a replacement.
+        # The pretrained MLP captures backbone knowledge; CTM adds thinking on top.
+        add_tensor(f'blk.{i}.ffn_gate.weight', hf_state[f'{prefix}.mlp.gate_proj.weight'])
+        add_tensor(f'blk.{i}.ffn_up.weight', hf_state[f'{prefix}.mlp.up_proj.weight'])
+        add_tensor(f'blk.{i}.ffn_down.weight', hf_state[f'{prefix}.mlp.down_proj.weight'])
+
         if use_ctm and i == ctm_layer_idx:
-            # CTM block tensors (from CTM checkpoint, keyed without layer prefix)
+            # CTM block tensors (additive on top of MLP)
             # Cross-attention projections
             for src, dst in [
                 ('attn_q_proj.weight', 'ctm_attn_q'),
@@ -351,11 +361,62 @@ def export_model(backbone_name, ctm_checkpoint_path, output_path, quantize='f16'
             for idx_name in ['synch_out_left', 'synch_out_right', 'synch_act_left', 'synch_act_right']:
                 if idx_name in ctm_state:
                     add_tensor(f'blk.{i}.ctm_{idx_name}', ctm_state[idx_name].int(), GGML_TYPE_F32)
-        else:
-            # Standard MLP (SwiGLU): gate_proj, up_proj, down_proj
-            add_tensor(f'blk.{i}.ffn_gate.weight', hf_state[f'{prefix}.mlp.gate_proj.weight'])
-            add_tensor(f'blk.{i}.ffn_up.weight', hf_state[f'{prefix}.mlp.up_proj.weight'])
-            add_tensor(f'blk.{i}.ffn_down.weight', hf_state[f'{prefix}.mlp.down_proj.weight'])
+
+            # Gate scalar: sigmoid(gate) controls CTM contribution.
+            # Init negative → sigmoid ≈ 0 → CTM doesn't disrupt backbone at start.
+            if 'gate' in ctm_state:
+                add_tensor(f'blk.{i}.ctm_gate', ctm_state['gate'], GGML_TYPE_F32)
+            else:
+                # Default: -4.0 → sigmoid(-4) ≈ 0.018
+                add_tensor(f'blk.{i}.ctm_gate', torch.tensor([-4.0]), GGML_TYPE_F32)
+
+    # Merge CTM full model state dict if available (has resid_lambdas, ve_gate, etc.)
+    all_states = dict(hf_state)
+    if use_ctm and full_state:
+        for k, v in full_state.items():
+            if k not in all_states:
+                all_states[k] = v
+
+    # Residual scaling lambdas (per-layer scalars)
+    for key_prefix in ['', 'transformer.']:
+        rl_key = f'{key_prefix}resid_lambdas'
+        xl_key = f'{key_prefix}x0_lambdas'
+        if rl_key in all_states:
+            add_tensor('resid_lambdas', all_states[rl_key], GGML_TYPE_F32)
+            break
+    for key_prefix in ['', 'transformer.']:
+        xl_key = f'{key_prefix}x0_lambdas'
+        if xl_key in all_states:
+            add_tensor('x0_lambdas', all_states[xl_key], GGML_TYPE_F32)
+            break
+
+    # Value Embedding gates and embeddings (alternating layers, ResFormer-style)
+    # has_ve(i) = i % 2 == (n_layer - 1) % 2
+    ve_parity = (n_layer - 1) % 2
+    n_ve_layers = 0
+    for i in range(n_layer):
+        if i % 2 != ve_parity:
+            continue
+        # VE gate weight: (n_kv_head, ve_gate_channels)
+        # Try multiple naming conventions: HF, nanochat, and CTM full state
+        ve_gate_found = False
+        for ve_gate_key in [
+            f'model.layers.{i}.self_attn.ve_gate.weight',
+            f'transformer.h.{i}.attn.ve_gate.weight',
+        ]:
+            if ve_gate_key in all_states:
+                add_tensor(f'blk.{i}.ve_gate.weight', all_states[ve_gate_key], GGML_TYPE_F32)
+                n_ve_layers += 1
+                ve_gate_found = True
+                break
+
+        # Value embedding: (vocab_size, kv_dim)
+        ve_embed_key = f'transformer.value_embeds.{i}.weight'
+        if ve_embed_key in all_states:
+            add_tensor(f'blk.{i}.value_embed.weight', all_states[ve_embed_key])
+
+    if n_ve_layers > 0:
+        print(f"VE gate: {n_ve_layers} layers with value embeddings")
 
     print(f"Collected {len(tensors)} tensors")
 
@@ -372,6 +433,7 @@ def export_model(backbone_name, ctm_checkpoint_path, output_path, quantize='f16'
     metadata.append(('qwen2.attention.head_count_kv', GGUF_TYPE_UINT32, n_kv_head))
     metadata.append(('qwen2.context_length', GGUF_TYPE_UINT32, seq_len))
     metadata.append(('qwen2.rope.freq_base', GGUF_TYPE_FLOAT32, rope_theta))
+    metadata.append(('qwen2.ve_gate_channels', GGUF_TYPE_UINT32, 32))
 
     # CTM metadata
     if use_ctm:
