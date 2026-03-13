@@ -136,9 +136,6 @@ pub const State = struct {
     k_cache: []f32,
     v_cache: []f32,
 
-    // F16 dequantization scratch (only needed for f16 weight matrices)
-    dequant_buf: []f32,
-
     // Q8_0 quantization scratch for matmul
     quant_vec: []math.Q80Block,
 
@@ -181,10 +178,6 @@ pub const State = struct {
             .output = try a.alloc(f32, config.vocab_size),
             .k_cache = try a.alloc(f32, config.n_layers * config.max_seq_length * kv_dim),
             .v_cache = try a.alloc(f32, config.n_layers * config.max_seq_length * kv_dim),
-            // F16 scratch: only need one row at a time (max_dim * max_dim for full matrix)
-            // With fused Q4_K/Q6_K dot products, we no longer need massive dequant buffers.
-            // F16 still needs dequant — allocate enough for the largest weight matrix.
-            .dequant_buf = try a.alloc(f32, max_dim * max_dim),
             .quant_vec = try a.alloc(math.Q80Block, max_dim / 32),
             .n_threads = @min(math.cpuCount(), 8),
         };
@@ -528,10 +521,9 @@ pub const Transformer = struct {
                 math.matmulParallel(out, rows, math.F32MatmulCtx, ctx, n_threads);
             },
             .f16 => |data| {
-                // Dequantize to scratch, then matmul
-                for (0..data.len) |i| state.dequant_buf[i] = @floatCast(data[i]);
-                const ctx = math.F32MatmulCtx{ .data = state.dequant_buf[0 .. rows * cols], .x = x, .cols = cols };
-                math.matmulParallel(out, rows, math.F32MatmulCtx, ctx, n_threads);
+                // Fused f16→f32 dot product per row — no intermediate buffer needed
+                const ctx = math.F16MatmulCtx{ .data = data, .x = x, .cols = cols };
+                math.matmulParallel(out, rows, math.F16MatmulCtx, ctx, n_threads);
             },
             .q8_0 => |data| {
                 // Quantize input vector to Q8_0, then SIMD matmul

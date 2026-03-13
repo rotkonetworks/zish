@@ -569,6 +569,43 @@ pub const Q6KMatmulCtx = struct {
     }
 };
 
+/// Fused f16→f32 dot product: no intermediate buffer needed.
+pub fn dotF16(weights: []const f16, x: []const f32) f32 {
+    std.debug.assert(weights.len == x.len);
+    const Vec16 = @Vector(16, f32);
+    const vl = 16;
+    const chunks = weights.len / vl;
+    const leftover = chunks * vl;
+
+    var sum: f32 = 0;
+    for (0..chunks) |i| {
+        const idx = i * vl;
+        // Convert f16 to f32 in register
+        var wv: Vec16 = undefined;
+        inline for (0..vl) |j| {
+            wv[j] = @as(f32, @floatCast(weights[idx + j]));
+        }
+        const xv: Vec16 = x[idx..][0..vl].*;
+        sum += @reduce(.Add, wv * xv);
+    }
+    for (leftover..weights.len) |i| {
+        sum += @as(f32, @floatCast(weights[i])) * x[i];
+    }
+    return sum;
+}
+
+/// Job context for f16 matmul (fused f16→f32 dot product per row).
+pub const F16MatmulCtx = struct {
+    data: []const f16,
+    x: []const f32,
+    cols: usize,
+
+    pub fn computeRow(self: F16MatmulCtx, row: usize) f32 {
+        const m_off = row * self.cols;
+        return dotF16(self.data[m_off..][0..self.cols], self.x);
+    }
+};
+
 /// Job context for f32 matmul.
 pub const F32MatmulCtx = struct {
     data: []const f32,
