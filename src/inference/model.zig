@@ -24,6 +24,13 @@ pub const Config = struct {
     /// Sliding window attention size (0 = full context, >0 = attend only to last N tokens).
     /// Mistral models use this to reduce O(T²) attention to O(T×W).
     sliding_window: usize = 0,
+    /// Post-QK-norm scaling factor (q,k *= qk_scale after RMS norm). Sharpens attention.
+    qk_scale: f32 = 1.0,
+    /// Logit softcap: logits = softcap * tanh(logits / softcap). 0 = disabled.
+    /// Prevents extreme logits, stabilizes output distribution.
+    logit_softcap: f32 = 0,
+    /// Number of input channels for VE gate linear projection (default 32).
+    ve_gate_channels: usize = 32,
 
     pub fn fromGGUF(file: *const gguf.GGUFFile) Config {
         const arch = file.getString("general.architecture") orelse "llama";
@@ -40,6 +47,9 @@ pub const Config = struct {
             .rms_norm_eps = file.getF32(archKey(arch, "attention.layer_norm_rms_epsilon")) orelse 1e-6,
             .arch = arch,
             .sliding_window = file.getU32(archKey(arch, "attention.sliding_window")) orelse 0,
+            .qk_scale = file.getF32(archKey(arch, "attention.qk_scale")) orelse 1.0,
+            .logit_softcap = file.getF32(archKey(arch, "logit_softcap")) orelse 0,
+            .ve_gate_channels = file.getU32(archKey(arch, "ve_gate_channels")) orelse 32,
         };
     }
 };
@@ -64,13 +74,22 @@ const Layer = struct {
     bq: ?[]const f32 = null,
     bk: ?[]const f32 = null,
     bv: ?[]const f32 = null,
-    // MLP (standard SwiGLU) or CTM block
+    // MLP (standard SwiGLU) — always present
     ffn_norm: []const f32,
-    w1: ?TensorRef = null, // gate (null when CTM replaces MLP)
+    w1: ?TensorRef = null, // gate
     w2: ?TensorRef = null, // down
     w3: ?TensorRef = null, // up
-    // CTM block (replaces MLP when present)
+    // CTM block (gated, additive on top of MLP)
     ctm_block: ?*ctm.CTMBlock = null,
+    // Learned gate scalar: output = MLP(x) + sigmoid(ctm_gate) * CTM(x)
+    // Initialized negative so sigmoid ≈ 0 at start — CTM doesn't disrupt backbone.
+    ctm_gate: f32 = -4.0, // sigmoid(-4) ≈ 0.018
+    // Value Embedding gate: Linear(ve_gate_channels, n_kv_head) — only for alternating layers
+    // gate = 3 * sigmoid(ve_gate(x[:32])), applied to value embeddings in attention
+    ve_gate: ?[]const f32 = null, // (n_kv_head × ve_gate_channels) row-major
+    // Value embedding: per-token embedding table (vocab_size × kv_dim)
+    // ResFormer-style: v += gate * value_embed[token]
+    value_embed: ?TensorRef = null,
 };
 
 /// Reference to quantized or float tensor data in mmap'd file.
@@ -142,10 +161,17 @@ pub const State = struct {
     // Thread count for parallel matmul
     n_threads: usize,
 
+    // x0: normalized token embedding saved at start of forward pass.
+    // Used for resid_lambdas/x0_lambdas residual scaling.
+    x0: []f32 = &.{},
+
     // CTM persistent state (sync accumulators across tokens)
     ctm_state: ?*ctm.CTMState = null,
     // CTM scratch buffer for forward pass
     ctm_scratch: []f32 = &.{},
+
+    // VE gate scratch buffer: holds gate values per kv_head
+    ve_gate_out: []f32 = &.{},
 
     pub fn init(alloc: Allocator, config: Config) !State {
         var arena = std.heap.ArenaAllocator.init(alloc);
@@ -180,6 +206,8 @@ pub const State = struct {
             .v_cache = try a.alloc(f32, config.n_layers * config.max_seq_length * kv_dim),
             .quant_vec = try a.alloc(math.Q80Block, max_dim / 32),
             .n_threads = @min(math.cpuCount(), 8),
+            .x0 = try a.alloc(f32, config.dim),
+            .ve_gate_out = try a.alloc(f32, config.n_kv_heads),
         };
     }
 
@@ -221,6 +249,10 @@ pub const Transformer = struct {
     token_embed: TensorRef,
     norm: []const f32, // output RMS norm weights
     classifier: TensorRef, // output projection (lm_head)
+    // Per-layer residual scaling: x = resid_lambdas[i] * x + x0_lambdas[i] * x0
+    // Defaults: resid=1.0 (identity), x0=0.0 (no skip). Null = disabled.
+    resid_lambdas: ?[]const f32 = null,
+    x0_lambdas: ?[]const f32 = null,
 
     arena: std.heap.ArenaAllocator,
 
@@ -251,6 +283,17 @@ pub const Transformer = struct {
                 .w2 = tryGetTensorRef(file, td, fmtBuf(&name_buf, "blk.{d}.ffn_down.weight", .{i})),
                 .w3 = tryGetTensorRef(file, td, fmtBuf(&name_buf, "blk.{d}.ffn_up.weight", .{i})),
             };
+        }
+
+        // Load Value Embedding gates and embeddings for alternating layers
+        // Pattern: has_ve(i) = i % 2 == (n_layer-1) % 2
+        const ve_parity = (real_config.n_layers - 1) % 2;
+        for (0..real_config.n_layers) |i| {
+            if (i % 2 != ve_parity) continue;
+            // VE gate weight: (n_kv_head, ve_gate_channels)
+            layers[i].ve_gate = tryGetF32Tensor(file, td, fmtBuf(&name_buf, "blk.{d}.ve_gate.weight", .{i}));
+            // Value embedding: (vocab_size, kv_dim)
+            layers[i].value_embed = tryGetTensorRef(file, td, fmtBuf(&name_buf, "blk.{d}.value_embed.weight", .{i}));
         }
 
         // Load CTM blocks from GGUF if present
@@ -361,6 +404,15 @@ pub const Transformer = struct {
             }
 
             layers[ctm_layer_idx].ctm_block = block;
+
+            // Load gate scalar from GGUF (or default to -4.0 → sigmoid ≈ 0.018)
+            if (file.getF32(archKey(arch, "ctm.gate_init"))) |gate_val| {
+                layers[ctm_layer_idx].ctm_gate = gate_val;
+            }
+            // Also check for a per-tensor gate value
+            if (tryGetF32Tensor(file, td, fmtBuf(&name_buf, "blk.{d}.ctm_gate", .{ctm_layer_idx}))) |gate_tensor| {
+                layers[ctm_layer_idx].ctm_gate = gate_tensor[0];
+            }
         }
 
         // Load embedding and output weights
@@ -377,6 +429,8 @@ pub const Transformer = struct {
             .token_embed = token_embed,
             .norm = norm_weights,
             .classifier = classifier,
+            .resid_lambdas = tryGetF32Tensor(file, td, "resid_lambdas"),
+            .x0_lambdas = tryGetF32Tensor(file, td, "x0_lambdas"),
             .arena = arena,
         };
     }
@@ -397,9 +451,24 @@ pub const Transformer = struct {
         // Token embedding
         self.applyEmbedding(state.input, tok);
 
+        // Save x0 for resid_lambdas/x0_lambdas residual scaling
+        if (self.resid_lambdas != null or self.x0_lambdas != null) {
+            @memcpy(state.x0[0..dim], state.input[0..dim]);
+        }
+
         for (0..c.n_layers) |i| {
             const layer_offset = i * c.max_seq_length * kv_dim;
             const layer = self.layers[i];
+
+            // Residual scaling: x = resid_lambdas[i] * x + x0_lambdas[i] * x0
+            if (self.resid_lambdas) |rl| {
+                const x0l = self.x0_lambdas orelse &[_]f32{};
+                const r = rl[i];
+                const x0_w: f32 = if (i < x0l.len) x0l[i] else 0.0;
+                for (0..dim) |d| {
+                    state.input[d] = r * state.input[d] + x0_w * state.x0[d];
+                }
+            }
 
             // Attention norm
             math.rmsNorm(state.work, state.input, layer.attn_norm);
@@ -414,9 +483,54 @@ pub const Transformer = struct {
             if (layer.bk) |bk| math.add(state.k, state.k, bk);
             if (layer.bv) |bv| math.add(state.v, state.v, bv);
 
+            // Value Embedding gate (ResFormer): v += gate * value_embed[token]
+            if (layer.ve_gate) |ve_gate_w| {
+                if (layer.value_embed) |ve_ref| {
+                    // Compute gate: Linear(ve_gate_channels, n_kv_head) on first channels of input
+                    const n_kv = c.n_kv_heads;
+                    const ve_ch = c.ve_gate_channels;
+                    const gate_out = state.ve_gate_out[0..n_kv];
+                    for (0..n_kv) |h| {
+                        var sum: f32 = 0;
+                        const row = ve_gate_w[h * ve_ch ..][0..ve_ch];
+                        for (0..ve_ch) |ch| sum += row[ch] * state.work[ch];
+                        // gate = 3 * sigmoid(sum)
+                        gate_out[h] = 3.0 / (1.0 + std.math.exp(-sum));
+                    }
+                    // Lookup value embedding for this token
+                    const ve_head_dim = kv_dim / n_kv;
+                    const ve_offset: usize = @intCast(tok * @as(i64, @intCast(kv_dim)));
+                    switch (ve_ref) {
+                        .f32 => |data| {
+                            const ve = data[ve_offset..][0..kv_dim];
+                            for (0..n_kv) |h| {
+                                const g = gate_out[h];
+                                const base = h * ve_head_dim;
+                                for (0..ve_head_dim) |j| state.v[base + j] += g * ve[base + j];
+                            }
+                        },
+                        .f16 => |data| {
+                            const ve = data[ve_offset..][0..kv_dim];
+                            for (0..n_kv) |h| {
+                                const g = gate_out[h];
+                                const base = h * ve_head_dim;
+                                for (0..ve_head_dim) |j| state.v[base + j] += g * @as(f32, @floatCast(ve[base + j]));
+                            }
+                        },
+                        else => {}, // VE embeddings should be f32 or f16
+                    }
+                }
+            }
+
             // RoPE
             applyRoPE(state.q, state.sin, state.cos, c.n_heads, head_size, n_tok);
             applyRoPE(state.k, state.sin, state.cos, c.n_kv_heads, head_size, n_tok);
+
+            // Post-QK-norm scaling: sharpens attention patterns
+            if (c.qk_scale != 1.0) {
+                for (state.q[0..dim]) |*v| v.* *= c.qk_scale;
+                for (state.k[0..kv_dim]) |*v| v.* *= c.qk_scale;
+            }
 
             // Update KV cache (wrap position for continuous inference)
             const cache_pos = n_tok % c.max_seq_length;
@@ -437,7 +551,31 @@ pub const Transformer = struct {
             math.rmsNorm(state.work, state.input, layer.ffn_norm);
 
             if (layer.ctm_block) |ctm_block| {
-                // CTM block replaces MLP: K thinking iterations with sync
+                // GATED INTERPOLATION: output = (1-g)*MLP(x) + g*CTM(x)
+                // Gate starts near 0 → pure MLP. As CTM trains, gate opens
+                // and CTM can OVERRIDE the MLP, not just add a correction.
+                // This gives CTM gradient pressure to actually contribute.
+                const gate = 1.0 / (1.0 + std.math.exp(-layer.ctm_gate));
+
+                // Run MLP
+                if (layer.w1 != null and layer.w2 != null and layer.w3 != null) {
+                    self.matmulTensor(state.hidden1, layer.w1.?, state.work, c.hidden_dim, dim, state);
+                    self.matmulTensor(state.hidden2, layer.w3.?, state.work, c.hidden_dim, dim, state);
+
+                    math.swiglu(state.hidden1);
+                    math.elementProduct(state.hidden1, state.hidden1, state.hidden2);
+
+                    self.matmulTensor(state.work2, layer.w2.?, state.hidden1, dim, c.hidden_dim, state);
+
+                    // Scale MLP output by (1 - gate)
+                    const mlp_scale = 1.0 - gate;
+                    for (state.work2[0..dim]) |*v| v.* *= mlp_scale;
+
+                    // MLP residual
+                    math.add(state.input, state.input, state.work2);
+                }
+
+                // Run CTM on the same pre-norm input (state.work still holds it)
                 ctm_block.forward(
                     state.work,
                     state.work2,
@@ -445,10 +583,14 @@ pub const Transformer = struct {
                     i,
                     state.ctm_scratch,
                 );
-                // Residual
+
+                // Scale CTM output by gate
+                for (state.work2[0..dim]) |*v| v.* *= gate;
+
+                // CTM residual
                 math.add(state.input, state.input, state.work2);
             } else if (layer.w1 != null and layer.w2 != null and layer.w3 != null) {
-                // Standard MLP: SwiGLU(w1(x)) * w3(x), then w2
+                // Standard MLP (no CTM): SwiGLU(w1(x)) * w3(x), then w2
                 self.matmulTensor(state.hidden1, layer.w1.?, state.work, c.hidden_dim, dim, state);
                 self.matmulTensor(state.hidden2, layer.w3.?, state.work, c.hidden_dim, dim, state);
 
@@ -460,7 +602,6 @@ pub const Transformer = struct {
                 // Residual
                 math.add(state.input, state.input, state.work);
             }
-            // else: CTM layer with no MLP and no loaded CTM block — skip (identity residual)
         }
 
         // Final norm
@@ -468,6 +609,16 @@ pub const Transformer = struct {
 
         // Classifier projection
         self.matmulTensor(state.output, self.classifier, state.input, c.vocab_size, dim, state);
+
+        // Logit softcap: logits = cap * tanh(logits / cap)
+        // Prevents extreme logits, stabilizes output distribution.
+        if (c.logit_softcap > 0) {
+            const cap = c.logit_softcap;
+            const inv_cap = 1.0 / cap;
+            for (state.output[0..c.vocab_size]) |*v| {
+                v.* = cap * std.math.tanh(v.* * inv_cap);
+            }
+        }
 
         return state.output;
     }

@@ -23,6 +23,7 @@ pub const math = @import("math.zig");
 pub const model = @import("model.zig");
 pub const tokenizer = @import("tokenizer.zig");
 pub const ctm = @import("ctm.zig");
+pub const autonomic = @import("autonomic.zig");
 
 const Allocator = std.mem.Allocator;
 const Token = tokenizer.Token;
@@ -185,12 +186,20 @@ pub const ForkServer = struct {
 
 /// Child process entry point. Loads model, serves requests. Never returns.
 ///
-/// Continuous inference mode: the model keeps running forward passes between
-/// requests, feeding its own output back as input. This keeps CTM sync
-/// accumulators warm and evolving. When a query arrives, the model processes
-/// it with its warm state, generates a response, then resumes thinking.
+/// Breathing architecture:
+///   INHALE (awake — processing input):
+///     - Forward pass on queries, track per-token dopamine (surprise signal)
+///     - Build sync traces in CTMState
+///     - Store high-surprise experiences in replay buffer
+///
+///   EXHALE (idle — consolidating):
+///     - Self-feeding forward passes (thinking / dreaming)
+///     - compactMemory: Hebbian weight updates from sync patterns
+///     - Prune replay buffer, decay old memories
+///     - Periodically persist weights + sync state to disk
 ///
 /// KV cache wraps at max_seq_length (position modular). CTM state never resets.
+/// Sync accumulators carry across all tokens — the model's continuous memory.
 fn childMain(req_fd: posix.fd_t, resp_fd: posix.fd_t, model_path: []const u8) void {
     // Use page allocator in child (simple, no fragmentation concerns since we exit)
     const alloc = std.heap.page_allocator;
@@ -216,6 +225,8 @@ fn childMain(req_fd: posix.fd_t, resp_fd: posix.fd_t, model_path: []const u8) vo
         return;
     };
 
+    var ctm_layer_idx: usize = 0;
+
     // Initialize CTM state if model has CTM blocks
     for (0..transformer.config.n_layers) |i| {
         if (transformer.layers[i].ctm_block) |blk| {
@@ -227,14 +238,33 @@ fn childMain(req_fd: posix.fd_t, resp_fd: posix.fd_t, model_path: []const u8) vo
                 sendError(resp_fd);
                 return;
             };
+            ctm_state_ptr.last_state = alloc.alloc(f32, blk.config.dim) catch null;
             state.ctm_state = ctm_state_ptr;
             state.ctm_scratch = alloc.alloc(f32, ctm.CTMBlock.scratchSize(blk.config)) catch {
                 sendError(resp_fd);
                 return;
             };
+            ctm_layer_idx = i;
+
+            // Make weights plastic (mutable copies for learning)
+            @constCast(blk).makePlastic(alloc) catch {};
             break;
         }
     }
+
+    // ── Initialize autonomic controller ──
+    // "Your Server as a Function": the breathing loop IS the server.
+    // inhale = perceive >> dopamine >> replay
+    // exhale = consolidate >> dream >> persist
+    // controller = route(has_input?, inhale, exhale)
+    var controller = autonomic.Controller.init(
+        &transformer,
+        &state,
+        &tok,
+        model_path,
+        ctm_layer_idx,
+    );
+    controller.restore(); // load persisted state from previous sessions
 
     // Set request pipe to non-blocking for continuous inference polling
     const F_GETFL = 3;
@@ -243,35 +273,27 @@ fn childMain(req_fd: posix.fd_t, resp_fd: posix.fd_t, model_path: []const u8) vo
     const cur_flags = posix.fcntl(req_fd, F_GETFL, 0) catch 0;
     _ = posix.fcntl(req_fd, F_SETFL, cur_flags | O_NONBLOCK) catch {};
 
-    // Continuous inference state
-    var pos: usize = 0;
-    var current_tok: tokenizer.Token = tok.bos_id;
-
-    // Ring buffer for recent tokens (repetition penalty lookback)
-    var recent_ring: [64]tokenizer.Token = [_]tokenizer.Token{-1} ** 64;
-    var recent_count: usize = 0;
-
-    const think_params = SampleParams{
-        .temperature = 0.7,
-        .top_k = 40,
-        .repetition_penalty = 1.1,
-    };
-
-    // ── Continuous inference loop ──
+    // ── Continuous breathing loop ──
+    // The autonomic controller routes between inhale (input) and exhale (idle).
+    // Each tick is one breath. The model thinks, learns, persists — autonomously.
     while (true) {
-        // Check for incoming request (non-blocking)
+        // ════════════════════════════════════
+        // INHALE: check for incoming request
+        // ════════════════════════════════════
         if (pollRequest(req_fd)) |req| {
-            // Process query with warm state
-            const response = handleRequest(
+            // Process query through inhale pipeline with warm state
+            const response = handleRequestWithDopamine(
                 &transformer,
                 &state,
                 &tok,
                 req.prompt,
                 req.max_tokens,
                 req.temperature,
-                &pos,
-                &recent_ring,
-                &recent_count,
+                &controller.ctx.pos,
+                &controller.ctx.recent_ring,
+                &controller.ctx.recent_count,
+                &controller.ctx.replay_buf,
+                controller.ctx.config.surprise_threshold,
                 alloc,
             ) catch {
                 sendError(resp_fd);
@@ -286,29 +308,136 @@ fn childMain(req_fd: posix.fd_t, resp_fd: posix.fd_t, model_path: []const u8) vo
             writeAll(resp_fd, std.mem.asBytes(&resp_len)) catch return;
             writeAll(resp_fd, response) catch return;
 
-            // Continue with last generated token
+            controller.ctx.total_inhales += 1;
+            controller.ctx.exhale_counter = 0;
             continue;
         }
 
-        // No request — run one thinking step (self-feeding forward pass)
-        _ = transformer.forward(&state, current_tok, pos);
-        pos += 1;
+        // ════════════════════════════════════
+        // EXHALE: idle — think and consolidate
+        // ════════════════════════════════════
+        _ = controller.tick();
+    }
+}
 
-        // Track for repetition penalty
-        recent_ring[recent_count % 64] = current_tok;
-        recent_count += 1;
+/// Compute surprise = -log(p(token)) from logits.
+fn computeSurprise(logits: []f32, token: tokenizer.Token) f32 {
+    if (token < 0 or @as(usize, @intCast(token)) >= logits.len) return 0;
 
-        // Sample next thinking token
-        const lookback = @min(recent_count, 64);
-        current_tok = sampleToken(state.output, think_params, recent_ring[0..lookback]);
+    // Compute log-softmax for the target token
+    // First find max for numerical stability
+    var max_logit: f32 = logits[0];
+    for (logits[1..]) |l| {
+        if (l > max_logit) max_logit = l;
+    }
 
-        // Don't spin too fast — yield between thinking steps
-        // (forward pass already takes ~10-100ms depending on model size)
-        if (current_tok == tok.eos_id) {
-            // Restart thinking from BOS
-            current_tok = tok.bos_id;
+    var sum_exp: f32 = 0;
+    for (logits) |l| {
+        sum_exp += std.math.exp(l - max_logit);
+    }
+
+    const target_logit = logits[@intCast(token)];
+    const log_prob = (target_logit - max_logit) - @log(sum_exp);
+
+    return -log_prob; // surprise = -log(p)
+}
+
+/// Handle request with dopamine tracking and replay buffer.
+fn handleRequestWithDopamine(
+    transformer: *const model.Transformer,
+    state: *model.State,
+    tok_: *const tokenizer.Tokenizer,
+    prompt: []const u8,
+    max_tokens: u16,
+    temperature: f32,
+    pos: *usize,
+    recent_ring: *[64]tokenizer.Token,
+    recent_count: *usize,
+    replay_buf: *ctm.ReplayBuffer,
+    surprise_threshold: f32,
+    alloc: std.mem.Allocator,
+) ![]u8 {
+    // Tokenize prompt
+    const tokens = try tok_.encode(prompt, false, alloc);
+    defer alloc.free(tokens);
+
+    // Prefill prompt tokens — tracking surprise
+    var total_surprise: f32 = 0;
+    for (tokens) |t| {
+        _ = transformer.forward(state, t, pos.*);
+        pos.* += 1;
+        recent_ring[recent_count.* % 64] = t;
+        recent_count.* += 1;
+
+        // Update dopamine from prefill
+        if (state.ctm_state) |cs| {
+            const surprise = computeSurprise(state.output, t);
+            cs.updateDopamine(surprise);
+            total_surprise += surprise;
         }
     }
+
+    const params = SampleParams{
+        .temperature = temperature,
+        .top_k = if (temperature > 0) 40 else 0,
+        .repetition_penalty = if (temperature > 0) 1.1 else 1.0,
+    };
+
+    var next_tok: tokenizer.Token = sampleToken(state.output, params, recent_ring[0..@min(recent_count.*, 64)]);
+
+    var output_tokens: std.ArrayList(tokenizer.Token) = .{};
+    defer output_tokens.deinit(alloc);
+
+    for (0..max_tokens) |_| {
+        if (next_tok == tok_.eos_id) break;
+        output_tokens.append(alloc, next_tok) catch return error.OutOfMemory;
+
+        recent_ring[recent_count.* % 64] = next_tok;
+        recent_count.* += 1;
+
+        _ = transformer.forward(state, next_tok, pos.*);
+        pos.* += 1;
+
+        // Track dopamine during generation
+        if (state.ctm_state) |cs| {
+            const surprise = computeSurprise(state.output, next_tok);
+            cs.updateDopamine(surprise);
+            total_surprise += surprise;
+        }
+
+        const lb = @min(recent_count.*, 64);
+        next_tok = sampleToken(state.output, params, recent_ring[0..lb]);
+    }
+
+    // Store in replay buffer if surprising enough
+    const n_total = tokens.len + output_tokens.items.len;
+    if (n_total > 0) {
+        const mean_surprise = total_surprise / @as(f32, @floatFromInt(n_total));
+        replay_buf.push(tokens, mean_surprise, surprise_threshold);
+    }
+
+    return tok_.decodeAll(output_tokens.items, alloc);
+}
+
+/// Derive a sibling path by replacing extension.
+/// e.g., "/path/model.gguf" + ".ctmstate" -> "/path/model.ctmstate"
+fn derivePath(buf: *[512]u8, base: []const u8, suffix: []const u8) ?[]const u8 {
+    // Find last '.'
+    var dot: usize = base.len;
+    var i: usize = base.len;
+    while (i > 0) {
+        i -= 1;
+        if (base[i] == '.') {
+            dot = i;
+            break;
+        }
+        if (base[i] == '/') break;
+    }
+
+    if (dot + suffix.len > 512) return null;
+    @memcpy(buf[0..dot], base[0..dot]);
+    @memcpy(buf[dot..][0..suffix.len], suffix);
+    return buf[0 .. dot + suffix.len];
 }
 
 /// Poll for a request on the non-blocking pipe. Returns null if no request.
@@ -520,8 +649,11 @@ pub const InferenceContext = struct {
     tok: tokenizer.Tokenizer,
     alloc: Allocator,
     n_generated: usize = 0,
+    ctm_layer_idx: usize = 0,
+    model_path: []const u8 = "",
+    replay_buf: ctm.ReplayBuffer = .{},
 
-    /// Load a GGUF model file for inference.
+    /// Load a GGUF model file for inference with plasticity support.
     pub fn load(path: []const u8, alloc: Allocator) !InferenceContext {
         var file = try gguf.GGUFFile.open(path, alloc);
         errdefer file.deinit();
@@ -535,13 +667,28 @@ pub const InferenceContext = struct {
         var tok = try tokenizer.Tokenizer.initFromGGUF(&file, alloc);
         errdefer tok.deinit();
 
+        var ctm_idx: usize = 0;
+
         // Initialize CTM state if model has CTM blocks
         for (0..transformer.config.n_layers) |i| {
             if (transformer.layers[i].ctm_block) |blk| {
                 const ctm_state_ptr = try alloc.create(ctm.CTMState);
                 ctm_state_ptr.* = try ctm.CTMState.init(alloc, transformer.config.n_layers, blk.config.n_synch);
+                ctm_state_ptr.last_state = try alloc.alloc(f32, blk.config.dim);
                 state.ctm_state = ctm_state_ptr;
                 state.ctm_scratch = try alloc.alloc(f32, ctm.CTMBlock.scratchSize(blk.config));
+                ctm_idx = i;
+
+                // Make weights plastic
+                const mutable_blk = @constCast(blk);
+                try mutable_blk.makePlastic(alloc);
+
+                // Load persisted state
+                var sp_buf: [512]u8 = undefined;
+                var wp_buf: [512]u8 = undefined;
+                if (derivePath(&sp_buf, path, ".ctmstate")) |sp| _ = ctm_state_ptr.load(sp);
+                if (derivePath(&wp_buf, path, ".plastic")) |wp| _ = mutable_blk.loadPlasticWeights(wp);
+
                 break;
             }
         }
@@ -552,6 +699,8 @@ pub const InferenceContext = struct {
             .state = state,
             .tok = tok,
             .alloc = alloc,
+            .ctm_layer_idx = ctm_idx,
+            .model_path = path,
         };
     }
 
@@ -591,6 +740,50 @@ pub const InferenceContext = struct {
     pub fn modelInfo(self: *const InferenceContext) struct { arch: []const u8, dim: usize, layers: usize, vocab: usize } {
         const c = self.transformer.config;
         return .{ .arch = c.arch, .dim = c.dim, .layers = c.n_layers, .vocab = c.vocab_size };
+    }
+
+    /// EXHALE: run one consolidation step (compact memory from sync patterns).
+    /// Call this during idle time. Returns plasticity stats.
+    pub fn breathe(self: *InferenceContext, lr: f32) ctm.PlasticityStats {
+        const cs = self.state.ctm_state orelse return .{};
+        const blk = self.transformer.layers[self.ctm_layer_idx].ctm_block orelse return .{};
+        return @constCast(blk).compactMemoryFull(cs, self.ctm_layer_idx, lr);
+    }
+
+    /// Run dream diagnostics on current state. Returns per-tick convergence deltas.
+    pub fn dream(self: *InferenceContext, x: []const f32, deltas: []f32) void {
+        const cs = self.state.ctm_state orelse return;
+        const blk = self.transformer.layers[self.ctm_layer_idx].ctm_block orelse return;
+        blk.dream(x, cs, self.ctm_layer_idx, self.state.ctm_scratch, deltas);
+    }
+
+    /// Update dopamine from prediction surprise after sampling a token.
+    pub fn updateDopamine(self: *InferenceContext, surprise: f32) void {
+        if (self.state.ctm_state) |cs| cs.updateDopamine(surprise);
+    }
+
+    /// Persist all plastic state to disk (sync + weights + replay buffer).
+    pub fn persist(self: *InferenceContext) void {
+        var sp_buf: [512]u8 = undefined;
+        var wp_buf: [512]u8 = undefined;
+        var rp_buf: [512]u8 = undefined;
+
+        if (self.state.ctm_state) |cs| {
+            if (derivePath(&sp_buf, self.model_path, ".ctmstate")) |sp|
+                cs.save(sp) catch {};
+        }
+        if (self.transformer.layers[self.ctm_layer_idx].ctm_block) |blk| {
+            if (derivePath(&wp_buf, self.model_path, ".plastic")) |wp|
+                blk.savePlasticWeights(wp) catch {};
+        }
+        if (derivePath(&rp_buf, self.model_path, ".replay")) |rp|
+            self.replay_buf.save(rp) catch {};
+    }
+
+    /// Check if this model has CTM plasticity enabled.
+    pub fn hasPlasticity(self: *const InferenceContext) bool {
+        return self.state.ctm_state != null and
+            self.transformer.layers[self.ctm_layer_idx].ctm_block != null;
     }
 };
 
