@@ -774,9 +774,24 @@ fn cmdModel(ctx: *CommandCtx, arg: []const u8) DispatchResult {
 
 fn cmdDiff(ctx: *CommandCtx, _: []const u8) DispatchResult {
     Layout.goOutput(ctx.out, ctx.out_last.*);
-    if (ctx.shell.agent.query("Run `git diff --stat && git diff` to show current changes. Show the output directly, don't summarize.")) {
-        ctx.agent_active.* = true;
-        ctx.setStatus("running diff...");
+    // Run git diff directly — no API call needed, saves tokens
+    const result = std.process.Child.run(.{
+        .allocator = ctx.shell.allocator,
+        .argv = &[_][]const u8{ "git", "diff", "--stat", "--color=always" },
+        .max_output_bytes = 64 * 1024,
+    }) catch {
+        ctx.out.writeAll("\x1b[90mnot a git repository\x1b[0m\n") catch {};
+        ctx.out.flush() catch {};
+        return .handled;
+    };
+    defer ctx.shell.allocator.free(result.stdout);
+    defer ctx.shell.allocator.free(result.stderr);
+    if (result.stdout.len > 0) {
+        ctx.out.writeAll(result.stdout) catch {};
+        ctx.historyNote("git diff --stat shown");
+    } else {
+        ctx.out.writeAll("\x1b[90mno changes\x1b[0m\n") catch {};
+        ctx.historyNote("No changes");
     }
     ctx.out.flush() catch {};
     return .handled;
