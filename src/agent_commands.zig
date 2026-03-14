@@ -832,7 +832,7 @@ fn cmdCommit(ctx: *CommandCtx, arg: []const u8) DispatchResult {
             ctx.agent_active.* = true;
         }
     } else {
-        if (ctx.shell.agent.query("Look at `git diff --cached` and `git diff` and `git status`, then create a good commit. Stage relevant files with `git add` (not -A, be selective), write a concise commit message focused on the 'why', and run `git commit`. Show the result.")) {
+        if (ctx.shell.agent.query("Run `git status` and `git diff` to see changes. Stage the relevant files with `git add` (be selective, not -A). Write a concise commit message: first line under 72 chars focused on 'what changed and why', no period at end. Run `git commit -m '...'`. Show the commit hash when done.")) {
             ctx.agent_active.* = true;
             ctx.setStatus("committing...");
         }
