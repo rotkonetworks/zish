@@ -587,7 +587,7 @@ pub fn dispatch(ctx: *ToolContext, tool_name: []const u8, tool_input: []const u8
         var path_buf2: [512]u8 = undefined;
         const rp = unescapeJSON(path, &path_buf2) orelse path;
         var detail_buf: [512]u8 = undefined;
-        const detail = std.fmt.bufPrint(&detail_buf, "Edit({s})", .{rp}) catch rp;
+        const detail = std.fmt.bufPrint(&detail_buf, "Edit {s}", .{rp}) catch rp;
         if (!confirmTool(ctx.queues, "Edit", detail, ctx.allow_edit))
             return ctx.allocator.dupe(u8, "Tool execution denied by user.");
         return executeEdit(ctx.allocator, ctx.queues, ctx.session_log, path, old_str, new_str, replace_all, ctx.cwd);
@@ -598,7 +598,7 @@ pub fn dispatch(ctx: *ToolContext, tool_name: []const u8, tool_input: []const u8
         var path_buf2: [512]u8 = undefined;
         const rp = unescapeJSON(path, &path_buf2) orelse path;
         var detail_buf: [512]u8 = undefined;
-        const detail = std.fmt.bufPrint(&detail_buf, "Write({s})", .{rp}) catch rp;
+        const detail = std.fmt.bufPrint(&detail_buf, "Write {s}", .{rp}) catch rp;
         if (!confirmTool(ctx.queues, "Write", detail, ctx.allow_write))
             return ctx.allocator.dupe(u8, "Tool execution denied by user.");
         return executeWrite(ctx.allocator, ctx.queues, ctx.session_log, path, content, ctx.cwd);
@@ -681,7 +681,7 @@ pub fn executeBash(allocator: std.mem.Allocator, queues: *AgentQueues, command: 
 
     // notify main thread
     var notif_buf: [512]u8 = undefined;
-    const notif = std.fmt.bufPrint(&notif_buf, "Bash({s})", .{cmd}) catch cmd;
+    const notif = std.fmt.bufPrint(&notif_buf, "Bash {s}", .{cmd}) catch cmd;
     _ = queues.output.push(.tool_call, notif);
 
     const result = std.process.Child.run(.{
@@ -708,10 +708,10 @@ pub fn executeRead(allocator: std.mem.Allocator, queues: *AgentQueues, path: []c
 
     var notif_buf: [512]u8 = undefined;
     if (offset > 0 or limit > 0) {
-        const notif = std.fmt.bufPrint(&notif_buf, "Read({s}:{d})", .{ real_path, offset }) catch real_path;
+        const notif = std.fmt.bufPrint(&notif_buf, "Read {s}:{d}", .{ real_path, offset }) catch real_path;
         _ = queues.output.push(.tool_call, notif);
     } else {
-        const notif = std.fmt.bufPrint(&notif_buf, "Read({s})", .{real_path}) catch real_path;
+        const notif = std.fmt.bufPrint(&notif_buf, "Read {s}", .{real_path}) catch real_path;
         _ = queues.output.push(.tool_call, notif);
     }
 
@@ -768,7 +768,7 @@ pub fn executeWrite(allocator: std.mem.Allocator, queues: *AgentQueues, session_
     const real_content = unescapeJSON(content, content_buf) orelse content;
 
     var notif_buf: [512]u8 = undefined;
-    const notif = std.fmt.bufPrint(&notif_buf, "Write({s})", .{real_path}) catch real_path;
+    const notif = std.fmt.bufPrint(&notif_buf, "Write {s}", .{real_path}) catch real_path;
     _ = queues.output.push(.tool_call, notif);
 
     // backup existing file before overwriting
@@ -812,7 +812,7 @@ pub fn executeEdit(allocator: std.mem.Allocator, queues: *AgentQueues, session_l
     const real_new = unescapeJSON(new_str, new_buf) orelse new_str;
 
     var notif_buf: [512]u8 = undefined;
-    const notif = std.fmt.bufPrint(&notif_buf, "Edit({s})", .{real_path}) catch real_path;
+    const notif = std.fmt.bufPrint(&notif_buf, "Edit {s}", .{real_path}) catch real_path;
     _ = queues.output.push(.tool_call, notif);
 
     // Read current file content
@@ -927,7 +927,7 @@ pub fn executeWebFetch(allocator: std.mem.Allocator, queues: *AgentQueues, url: 
     const real_url = unescapeJSON(url, &url_buf) orelse url;
 
     var notif_buf: [512]u8 = undefined;
-    const notif = std.fmt.bufPrint(&notif_buf, "WebFetch({s})", .{real_url}) catch real_url;
+    const notif = std.fmt.bufPrint(&notif_buf, "WebFetch {s}", .{real_url}) catch real_url;
     _ = queues.output.push(.tool_call, notif);
 
     // Use curl to fetch URL content
@@ -1115,7 +1115,7 @@ pub fn executeWebSearch(allocator: std.mem.Allocator, queues: *AgentQueues, quer
     const real_query = unescapeJSON(query, &query_buf) orelse query;
 
     var notif_buf: [512]u8 = undefined;
-    const notif = std.fmt.bufPrint(&notif_buf, "WebSearch({s})", .{real_query}) catch real_query;
+    const notif = std.fmt.bufPrint(&notif_buf, "WebSearch {s}", .{real_query}) catch real_query;
     _ = queues.output.push(.tool_call, notif);
 
     // URL-encode the query
@@ -1257,10 +1257,10 @@ pub fn executeGlob(allocator: std.mem.Allocator, queues: *AgentQueues, pattern: 
 
     var notif_buf: [512]u8 = undefined;
     if (search_path) |p| {
-        const notif = std.fmt.bufPrint(&notif_buf, "Glob({s} in {s})", .{ real_pattern, p }) catch real_pattern;
+        const notif = std.fmt.bufPrint(&notif_buf, "Glob {s} in {s}", .{ real_pattern, p }) catch real_pattern;
         _ = queues.output.push(.tool_call, notif);
     } else {
-        const notif = std.fmt.bufPrint(&notif_buf, "Glob({s})", .{real_pattern}) catch real_pattern;
+        const notif = std.fmt.bufPrint(&notif_buf, "Glob {s}", .{real_pattern}) catch real_pattern;
         _ = queues.output.push(.tool_call, notif);
     }
 
@@ -1309,7 +1309,7 @@ pub fn executeGrep(allocator: std.mem.Allocator, queues: *AgentQueues, pattern: 
     const real_pattern = unescapeJSON(pattern, &pattern_buf) orelse pattern;
 
     var notif_buf: [512]u8 = undefined;
-    const notif = std.fmt.bufPrint(&notif_buf, "Grep({s})", .{real_pattern}) catch real_pattern;
+    const notif = std.fmt.bufPrint(&notif_buf, "Grep {s}", .{real_pattern}) catch real_pattern;
     _ = queues.output.push(.tool_call, notif);
 
     // build grep/rg command
