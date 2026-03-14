@@ -3148,9 +3148,13 @@ fn agentInteractive(shell: *Shell) !u8 {
         if (was_running) {
             try out.writeAll(" \xc2\xb7 continuing");
         } else {
-            try out.writeAll(" \xc2\xb7 /help for commands");
+            try out.writeAll(" \xc2\xb7 /help");
         }
         try out.writeAll("\x1b[0m\n");
+        // First-use tips (only on fresh session)
+        if (!was_running) {
+            try out.writeAll("\x1b[2;90m  Tips: @file to include files \xc2\xb7 !cmd to run shell \xc2\xb7 ^P think \xc2\xb7 ^T model\x1b[0m\n");
+        }
     }
     // Capture header in history
     {
@@ -4470,7 +4474,8 @@ fn agentInteractive(shell: *Shell) !u8 {
                         "/review",  "/undo",     "/plan",     "/spawn",   "/queue",
                         "/agents",  "/tasks",    "/tree",     "/sessions", "/config",
                         "/search",  "/voice",    "/init",     "/effort",  "/status",
-                        "/think",   "/pr",       "/run",      "/cd",      "/git",     "/export",
+                        "/think",   "/fix",      "/web",      "/pr",      "/run",     "/cd",
+                        "/git",     "/export",
                         "/new",     "/clear",    "/help",
                     };
                     var matches: [16][]const u8 = undefined;

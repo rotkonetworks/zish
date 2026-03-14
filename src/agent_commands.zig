@@ -725,6 +725,8 @@ const commands = [_]Command{
     .{ .name = "/redo", .has_arg = false, .handler = cmdRedo },
     .{ .name = "/run", .has_arg = true, .handler = cmdRun },
     .{ .name = "/pr", .has_arg = true, .handler = cmdPR },
+    .{ .name = "/web", .has_arg = true, .handler = cmdWeb },
+    .{ .name = "/fix", .has_arg = true, .handler = cmdFix },
     .{ .name = "/cd", .has_arg = true, .handler = cmdCd },
     .{ .name = "/ls", .has_arg = true, .handler = cmdLs },
     .{ .name = "/cat", .has_arg = true, .handler = cmdCat },
@@ -877,6 +879,37 @@ fn cmdPR(ctx: *CommandCtx, arg: []const u8) DispatchResult {
     if (ctx.shell.agent.query(prompt)) {
         ctx.agent_active.* = true;
         ctx.setStatus("creating PR...");
+    }
+    ctx.out.flush() catch {};
+    return .handled;
+}
+
+fn cmdFix(ctx: *CommandCtx, arg: []const u8) DispatchResult {
+    Layout.goOutput(ctx.out, ctx.out_last.*);
+    const context = if (arg.len > 0) arg else "the last error";
+    var prompt_buf: [2048]u8 = undefined;
+    const prompt = std.fmt.bufPrint(&prompt_buf, "Fix {s}. Look at recent terminal output and git diff to understand the problem. Make the necessary code changes to fix it. Run the build/test command to verify the fix works.", .{context}) catch "Fix the last error";
+    if (ctx.shell.agent.query(prompt)) {
+        ctx.agent_active.* = true;
+        ctx.setStatus("fixing...");
+    }
+    ctx.out.flush() catch {};
+    return .handled;
+}
+
+fn cmdWeb(ctx: *CommandCtx, arg: []const u8) DispatchResult {
+    if (arg.len == 0) {
+        Layout.goOutput(ctx.out, ctx.out_last.*);
+        ctx.out.writeAll("\x1b[90musage: /web <query>\x1b[0m\n") catch {};
+        ctx.out.flush() catch {};
+        return .handled;
+    }
+    Layout.goOutput(ctx.out, ctx.out_last.*);
+    var prompt_buf: [2048]u8 = undefined;
+    const prompt = std.fmt.bufPrint(&prompt_buf, "Search the web for: {s}\n\nUse the WebSearch tool to find relevant results, then summarize the top findings concisely.", .{arg}) catch arg;
+    if (ctx.shell.agent.query(prompt)) {
+        ctx.agent_active.* = true;
+        ctx.setStatus("searching...");
     }
     ctx.out.flush() catch {};
     return .handled;
@@ -2116,6 +2149,8 @@ fn cmdHelp(ctx: *CommandCtx, _: []const u8) DispatchResult {
         \\  \x1b[33m/commit\x1b[0m [msg]\x1b[90m ····· commit with AI message\x1b[0m
         \\  \x1b[33m/review\x1b[0m\x1b[90m ··········· review session changes\x1b[0m
         \\  \x1b[33m/undo\x1b[0m\x1b[90m ············· revert last file change\x1b[0m
+        \\  \x1b[33m/fix\x1b[0m [context]\x1b[90m ····· fix last error\x1b[0m
+        \\  \x1b[33m/web\x1b[0m <query>\x1b[90m ······· search the web\x1b[0m
         \\  \x1b[33m/pr\x1b[0m [title]\x1b[90m ········ create GitHub PR\x1b[0m
         \\  \x1b[33m/run\x1b[0m <cmd>\x1b[90m ········ run shell command inline\x1b[0m
         \\  \x1b[33m/cd\x1b[0m [path]\x1b[90m ········ change directory\x1b[0m
@@ -2212,8 +2247,12 @@ fn cmdShellEscape(ctx: *CommandCtx, query: []const u8) DispatchResult {
             ctx.out.writeAll(result.stderr) catch {};
             ctx.out.writeAll("\x1b[0m") catch {};
         }
+        // Show exit code + hint on failure
+        const exited = result.term.Exited;
+        if (exited != 0) {
+            ctx.out.print("\x1b[31mexit {d}\x1b[90m · /fix to auto-repair\x1b[0m\n", .{exited}) catch {};
+        }
         ctx.out.flush() catch {};
-        // No need to rebuild layout — output stayed in scroll region
         return .handled;
     } else {
         // Bare "!" — drop to interactive shell (exit TUI)
