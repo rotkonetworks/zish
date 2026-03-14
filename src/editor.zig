@@ -649,8 +649,8 @@ pub const TermView = struct {
             return;
         }
 
-        // hide cursor during render to prevent flicker at ghost text position
-        _ = self.emit("\x1b[?25l");
+        // Note: cursor hide/show removed — caused flicker in normal shell mode
+        // Agent mode handles cursor visibility separately via \x1b[?25l/h
 
         const w = self.term.width;
         const cont_marker_len: u16 = 2; // "│ "
@@ -746,9 +746,8 @@ pub const TermView = struct {
         self.term.row = render_row;
         self.term.col = render_col;
 
-        // move to cursor position and show cursor
+        // move to cursor position
         self.moveTo(cursor_row, cursor_col);
-        _ = self.emit("\x1b[?25h"); // show cursor at final position
 
         // update state — total_rows matches render_row + 1
         self.term.rows_owned = render_row + 1;

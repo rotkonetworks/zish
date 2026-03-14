@@ -2775,10 +2775,11 @@ fn ghostFileSuggestion(self: *Shell, partial: []const u8) bool {
     if (file_prefix.len == 0) return false;
 
     // Open directory
-    const dir = if (dir_path[0] == '/')
+    var dir = if (dir_path[0] == '/')
         std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return false
     else
         std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return false;
+    defer dir.close();
 
     // Find first match
     var iter = dir.iterate();
