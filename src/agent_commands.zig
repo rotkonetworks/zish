@@ -648,6 +648,7 @@ const commands = [_]Command{
     .{ .name = "/search", .has_arg = true, .handler = cmdSearch },
     .{ .name = "/s", .has_arg = true, .handler = cmdSearch },
     .{ .name = "/voice", .has_arg = false, .handler = cmdVoice },
+    .{ .name = "/init", .has_arg = false, .handler = cmdInit },
     .{ .name = "/help", .has_arg = false, .handler = cmdHelp },
     .{ .name = "help", .has_arg = false, .handler = cmdHelp },
 };
@@ -1524,6 +1525,25 @@ fn cmdVoice(ctx: *CommandCtx, _: []const u8) DispatchResult {
     return .handled;
 }
 
+fn cmdInit(ctx: *CommandCtx, _: []const u8) DispatchResult {
+    Layout.goOutput(ctx.out, ctx.out_last.*);
+    if (ctx.shell.agent.query(
+        "Analyze this project and create a CLAUDE.md file in the current directory. " ++
+        "Use Glob, Read, and Grep to understand the project structure, build system, " ++
+        "key files, and conventions. Write a concise CLAUDE.md with: " ++
+        "1) Build/run/test commands " ++
+        "2) Project structure overview " ++
+        "3) Key architecture decisions " ++
+        "4) Code style conventions. " ++
+        "Keep it under 100 lines. If CLAUDE.md already exists, update it."
+    )) {
+        ctx.agent_active.* = true;
+        ctx.setStatus("initializing...");
+    }
+    ctx.out.flush() catch {};
+    return .handled;
+}
+
 fn cmdHelp(ctx: *CommandCtx, _: []const u8) DispatchResult {
     Layout.goOutput(ctx.out, ctx.out_last.*);
     const help_text =
@@ -1543,6 +1563,7 @@ fn cmdHelp(ctx: *CommandCtx, _: []const u8) DispatchResult {
         \\  \x1b[33m/config\x1b[0m\x1b[90m ··········· show configuration\x1b[0m
         \\  \x1b[33m/search\x1b[0m <pattern>\x1b[90m · search history\x1b[0m
         \\  \x1b[33m/voice\x1b[0m\x1b[90m ············ toggle voice mode\x1b[0m
+        \\  \x1b[33m/init\x1b[0m\x1b[90m ············· generate CLAUDE.md\x1b[0m
         \\
         \\\x1b[1mShortcuts\x1b[0m
         \\  \x1b[33m!command\x1b[0m\x1b[90m ·········· run shell command\x1b[0m

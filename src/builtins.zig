@@ -3996,7 +3996,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                         "/compact", "/cost",     "/model",    "/diff",    "/commit",
                         "/review",  "/undo",     "/plan",     "/spawn",   "/queue",
                         "/agents",  "/tasks",    "/tree",     "/sessions", "/config",
-                        "/search",  "/voice",    "/help",
+                        "/search",  "/voice",    "/init",     "/help",
                     };
                     var matches: [16][]const u8 = undefined;
                     var match_count: u8 = 0;
