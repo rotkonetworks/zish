@@ -2796,6 +2796,7 @@ fn actionToBindable(action: input_mod.Action) BindableAction {
         .suspend_shell => .suspend_shell,
         .execute_command => .execute_command,
         .tap_complete => .tab_complete,
+        .cycle_ghost => .none,
         .vim_mode => .enter_normal_mode,
         else => .none,
     };

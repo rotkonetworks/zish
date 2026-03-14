@@ -2860,38 +2860,78 @@ pub fn updateGhostText(self: *Shell) void {
         }
     }
 
-    // Strategy 1: frecency-ranked history prefix match
+    // Strategy 1: frecency-ranked history prefix match (collect top N candidates)
     const h = self.history orelse return;
     const items = h.entries.items;
     const now_ts: u32 = @intCast(@min(@as(u64, @intCast(std.time.timestamp())), std.math.maxInt(u32)));
 
-    var best_idx: ?usize = null;
-    var best_score: f32 = 0;
+    const MAX_CANDIDATES = 8;
+    var cand_scores: [MAX_CANDIDATES]f32 = [_]f32{0} ** MAX_CANDIDATES;
+    var cand_idxs: [MAX_CANDIDATES]usize = undefined;
+    var cand_count: u8 = 0;
+
     for (0..items.len) |i| {
         const idx = items.len - 1 - i;
         const entry = items[idx];
         const command = h.getCommand(entry);
         if (command.len > cmd.len and std.mem.startsWith(u8, command, cmd)) {
-            // Frecency: frequency × recency_decay
-            // Decay halves every 24 hours of wall-clock time
             const age_secs: f32 = @floatFromInt(if (now_ts > entry.timestamp) now_ts - entry.timestamp else 0);
             const hours = age_secs / 3600.0;
-            const decay = @exp(-0.029 * hours); // half-life ~24h
+            const decay = @exp(-0.029 * hours);
             const freq: f32 = @floatFromInt(@max(entry.frequency, 1));
             const score = freq * decay;
-            if (best_idx == null or score > best_score) {
-                best_idx = idx;
-                best_score = score;
+
+            // Check for duplicate suffixes
+            const suffix = command[cmd.len..];
+            var is_dup = false;
+            for (0..cand_count) |ci| {
+                const existing = h.getCommand(items[cand_idxs[ci]]);
+                if (std.mem.eql(u8, existing[cmd.len..], suffix)) {
+                    is_dup = true;
+                    break;
+                }
+            }
+            if (is_dup) continue;
+
+            // Insert into sorted candidates
+            if (cand_count < MAX_CANDIDATES) {
+                cand_idxs[cand_count] = idx;
+                cand_scores[cand_count] = score;
+                cand_count += 1;
+            } else if (score > cand_scores[cand_count - 1]) {
+                cand_idxs[cand_count - 1] = idx;
+                cand_scores[cand_count - 1] = score;
+            }
+            // Bubble sort to keep sorted
+            if (cand_count > 1) {
+                var si = cand_count - 1;
+                while (si > 0 and cand_scores[si] > cand_scores[si - 1]) {
+                    std.mem.swap(f32, &cand_scores[si], &cand_scores[si - 1]);
+                    std.mem.swap(usize, &cand_idxs[si], &cand_idxs[si - 1]);
+                    si -= 1;
+                }
             }
             if (i > 500) break;
         }
     }
 
-    if (best_idx) |idx| {
-        const command = h.getCommand(items[idx]);
+    // Store all candidates
+    self.ghost_candidate_count = cand_count;
+    for (0..cand_count) |ci| {
+        const command = h.getCommand(items[cand_idxs[ci]]);
         const suffix = command[cmd.len..];
-        const n = @min(suffix.len, self.ghost_buf.len);
-        @memcpy(self.ghost_buf[0..n], suffix[0..n]);
+        const n = @min(suffix.len, self.ghost_candidates[ci].len);
+        @memcpy(self.ghost_candidates[ci][0..n], suffix[0..n]);
+        self.ghost_candidate_lens[ci] = n;
+    }
+
+    // Show first candidate
+    if (cand_count > 0) {
+        // Keep current index if still valid, otherwise reset
+        if (self.ghost_candidate_idx >= cand_count) self.ghost_candidate_idx = 0;
+        const ci = self.ghost_candidate_idx;
+        const n = self.ghost_candidate_lens[ci];
+        @memcpy(self.ghost_buf[0..n], self.ghost_candidates[ci][0..n]);
         self.ghost_len = n;
         self.ghost_from_ctm = false;
         return;
@@ -2974,6 +3014,21 @@ pub fn updateGhostText(self: *Shell) void {
             }
         }
     }
+}
+
+/// Cycle ghost text to next/previous candidate (Alt+Down / Alt+Up)
+pub fn cycleGhostCandidate(self: *Shell, direction: i8) bool {
+    if (self.ghost_candidate_count <= 1) return false;
+    if (direction > 0) {
+        self.ghost_candidate_idx = (self.ghost_candidate_idx + 1) % self.ghost_candidate_count;
+    } else {
+        self.ghost_candidate_idx = if (self.ghost_candidate_idx == 0) self.ghost_candidate_count - 1 else self.ghost_candidate_idx - 1;
+    }
+    const ci = self.ghost_candidate_idx;
+    const n = self.ghost_candidate_lens[ci];
+    @memcpy(self.ghost_buf[0..n], self.ghost_candidates[ci][0..n]);
+    self.ghost_len = n;
+    return true;
 }
 
 /// Start the ghost inference background thread (called when completion_model is configured).

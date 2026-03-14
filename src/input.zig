@@ -107,6 +107,7 @@ pub const Action = union(enum) {
     delete: DeleteAction,
     tap_complete,
     cycle_complete: CycleDirection,
+    cycle_ghost: CycleDirection,
     move_cursor: MoveCursorAction,
     history_nav: HistoryDirection,
     enter_search_mode: SearchDirection,

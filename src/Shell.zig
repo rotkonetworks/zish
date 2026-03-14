@@ -233,11 +233,16 @@ subcmd_cache_lens: [128]u8 = undefined,
 subcmd_cache_count: usize = 0,
 subcmd_cache_ts: i64 = 0,
 
-// ghost text autosuggestion (fish-style)
-opt_autosuggestion: bool = true, // enabled by default, disable with `set autosuggestion off`
+// ghost text autosuggestion (fish-style) with multiple candidates
+opt_autosuggestion: bool = true,
 ghost_buf: [512]u8 = undefined,
 ghost_len: usize = 0,
-ghost_from_ctm: bool = false, // true if ghost text came from CTM inference, false if history
+ghost_from_ctm: bool = false,
+// Multiple ghost candidates (Alt+Up/Down to cycle)
+ghost_candidates: [8][512]u8 = undefined,
+ghost_candidate_lens: [8]usize = [_]usize{0} ** 8,
+ghost_candidate_count: u8 = 0,
+ghost_candidate_idx: u8 = 0, // currently shown candidate
 // CTM inference for ghost text (async — runs on background thread)
 ghost_infer_input: [512]u8 = undefined, // command line sent to inference
 ghost_infer_input_len: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -1341,6 +1346,14 @@ fn handleAction(self: *Shell, action: Action) !void {
             }
         },
 
+        .cycle_ghost => |direction| {
+            // Alt+Up/Down — cycle through ghost text candidates
+            const dir: i8 = if (direction == .forward) 1 else -1;
+            if (completion_mod.cycleGhostCandidate(self, dir)) {
+                try self.renderLine();
+            }
+        },
+
         .cycle_complete => |direction| {
             if (self.completion_mode) {
                 try completion_mod.handleCompletionCycle(self,direction);
@@ -2385,12 +2398,19 @@ fn handleExtendedEscapeSequence(stdin_fd: std.posix.fd_t, flags: usize) !Action 
             else => .none,
         };
     } else if (modifier == '2') {
-        // Shift — treat same as unmodified arrows for now
+        // Shift
         return switch (temp_buf[0]) {
-            'C' => .{ .move_cursor = .{ .relative = 1 } },              // Shift+Right
-            'D' => .{ .move_cursor = .{ .relative = -1 } },             // Shift+Left
-            'A' => .{ .history_nav = .up },                               // Shift+Up
-            'B' => .{ .history_nav = .down },                             // Shift+Down
+            'C' => .{ .move_cursor = .{ .relative = 1 } },
+            'D' => .{ .move_cursor = .{ .relative = -1 } },
+            'A' => .{ .history_nav = .up },
+            'B' => .{ .history_nav = .down },
+            else => .none,
+        };
+    } else if (modifier == '3') {
+        // Alt — cycle ghost text candidates
+        return switch (temp_buf[0]) {
+            'A' => .{ .cycle_ghost = .backward },    // Alt+Up
+            'B' => .{ .cycle_ghost = .forward },     // Alt+Down
             else => .none,
         };
     } else {
