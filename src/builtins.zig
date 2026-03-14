@@ -2893,21 +2893,6 @@ fn agentInteractive(shell: *Shell) !u8 {
     const out = shell.stdout();
     const agent_queue = @import("agent_queue.zig");
 
-    // Debug: log terminal state on agent entry (for -l diagnosis)
-    if (std.fs.cwd().openFile("/tmp/zish_login_debug.log", .{ .mode = .write_only })) |f| {
-        defer f.close();
-        f.seekTo(std.math.maxInt(u64)) catch {};
-        const stdin_fd = std.posix.STDIN_FILENO;
-        if (std.posix.tcgetattr(stdin_fd)) |t| {
-            var dbuf: [256]u8 = undefined;
-            const dmsg = std.fmt.bufPrint(&dbuf, "agent entry: ICANON={} ECHO={} ICRNL={} ISIG={}\n", .{
-                @intFromBool(t.lflag.ICANON), @intFromBool(t.lflag.ECHO),
-                @intFromBool(t.iflag.ICRNL), @intFromBool(t.lflag.ISIG),
-            }) catch "";
-            f.writeAll(dmsg) catch {};
-        } else |_| {}
-    } else |_| {}
-
     const was_running = shell.agent.thread != null;
 
     // Ensure agent thread is running
