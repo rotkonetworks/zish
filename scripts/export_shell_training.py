@@ -30,12 +30,15 @@ def load_jsonl(path):
 def main():
     zish_dir = Path.home() / ".zish"
 
-    # Load completion log — best data (prefix → completion pairs)
+    # Load all data sources
     completions = load_jsonl(zish_dir / "completion_log.jsonl")
-    # Load command history
     history = load_jsonl(zish_dir / "history.jsonl")
-    # Load command log
     commands = load_jsonl(zish_dir / "command_log.jsonl")
+
+    print(f"# Data sources:", file=__import__('sys').stderr)
+    print(f"#   Completions: {len(completions)}", file=__import__('sys').stderr)
+    print(f"#   Commands: {len(commands)}", file=__import__('sys').stderr)
+    print(f"#   History: {len(history)}", file=__import__('sys').stderr)
 
     training_pairs = []
 
@@ -49,8 +52,16 @@ def main():
             completion = cmp
             training_pairs.append({"prompt": prompt, "completion": completion})
 
-    # From history: generate prefix → suffix pairs at various split points
+    # From command_log: real executed commands (best signal — user actually ran these)
     cmd_counter = Counter()
+    for entry in commands:
+        cmd = entry.get("cmd", "")
+        exit_code = entry.get("exit", 0)
+        if cmd and len(cmd) > 3 and len(cmd) < 200 and exit_code == 0:
+            # Only successful commands (exit 0)
+            cmd_counter[cmd] += 1
+
+    # From history: agent queries
     for entry in history:
         q = entry.get("q", "")
         if q and len(q) > 3:

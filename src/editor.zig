@@ -766,14 +766,12 @@ pub const TermView = struct {
         // clear any leftover content after our text
         _ = self.emit("\x1b[J");
 
-        // use tracked position (not recomputed) for cursor state
+        // Track render end position, then move to cursor
         self.term.row = render_row;
         self.term.col = render_col;
-
-        // move to cursor position
         self.moveTo(cursor_row, cursor_col);
+        // moveTo updates self.term.row/col to cursor position
 
-        // update state — total_rows matches render_row + 1
         self.term.rows_owned = render_row + 1;
         self.last_hash = hash;
         self.last_cursor = buf.cursor;
