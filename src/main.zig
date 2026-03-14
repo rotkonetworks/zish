@@ -34,6 +34,23 @@ pub fn main() void {
     const is_interactive = res.args.c == null and (res.positionals.len == 0 or res.positionals[0].len == 0);
     const load_config = is_interactive or res.args.login != 0;
 
+    // Login shell debug: log terminal state to help diagnose -l issues
+    if (res.args.login != 0) {
+        if (std.fs.cwd().createFile("/tmp/zish_login_debug.log", .{})) |f| {
+            defer f.close();
+            const stdin_fd = std.posix.STDIN_FILENO;
+            if (std.posix.tcgetattr(stdin_fd)) |t| {
+                var buf: [256]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "login shell start: ICANON={} ECHO={} ICRNL={} ISIG={}\n", .{
+                    @intFromBool(t.lflag.ICANON), @intFromBool(t.lflag.ECHO),
+                    @intFromBool(t.iflag.ICRNL), @intFromBool(t.lflag.ISIG),
+                }) catch "";
+                f.writeAll(msg) catch {};
+            } else |_| {
+                f.writeAll("login: tcgetattr failed\n") catch {};
+            }
+        } else |_| {}
+    }
 
     // initialize shell (load config for interactive or login mode)
     const shell_instance = (if (load_config)
