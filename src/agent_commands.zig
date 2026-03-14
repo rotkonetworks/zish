@@ -650,6 +650,7 @@ const commands = [_]Command{
     .{ .name = "/voice", .has_arg = false, .handler = cmdVoice },
     .{ .name = "/init", .has_arg = false, .handler = cmdInit },
     .{ .name = "/effort", .has_arg = true, .handler = cmdEffort },
+    .{ .name = "/git", .has_arg = true, .handler = cmdGit },
     .{ .name = "/help", .has_arg = false, .handler = cmdHelp },
     .{ .name = "help", .has_arg = false, .handler = cmdHelp },
 };
@@ -1548,6 +1549,56 @@ fn cmdEffort(ctx: *CommandCtx, arg: []const u8) DispatchResult {
     return .handled;
 }
 
+fn cmdGit(ctx: *CommandCtx, arg: []const u8) DispatchResult {
+    Layout.goOutput(ctx.out, ctx.out_last.*);
+    const sub = if (arg.len > 0) std.mem.trim(u8, arg, " ") else "s";
+
+    // Map shortcuts to git commands
+    const cmd = if (std.mem.eql(u8, sub, "s") or std.mem.eql(u8, sub, "status"))
+        &[_][]const u8{ "git", "status", "--short", "--branch" }
+    else if (std.mem.eql(u8, sub, "d") or std.mem.eql(u8, sub, "diff"))
+        &[_][]const u8{ "git", "diff", "--stat", "--color=always" }
+    else if (std.mem.eql(u8, sub, "dd"))
+        &[_][]const u8{ "git", "diff", "--color=always" }
+    else if (std.mem.eql(u8, sub, "l") or std.mem.eql(u8, sub, "log"))
+        &[_][]const u8{ "git", "log", "--oneline", "--graph", "--color=always", "-15" }
+    else if (std.mem.eql(u8, sub, "b") or std.mem.eql(u8, sub, "branch"))
+        &[_][]const u8{ "git", "branch", "--color=always", "-a" }
+    else if (std.mem.eql(u8, sub, "a") or std.mem.eql(u8, sub, "add"))
+        &[_][]const u8{ "git", "add", "-A" }
+    else if (std.mem.eql(u8, sub, "p") or std.mem.eql(u8, sub, "push"))
+        &[_][]const u8{ "git", "push" }
+    else if (std.mem.eql(u8, sub, "pl") or std.mem.eql(u8, sub, "pull"))
+        &[_][]const u8{ "git", "pull" }
+    else {
+        ctx.out.writeAll("\x1b[90m/git shortcuts: s(tatus) d(iff) dd(full) l(og) b(ranch) a(dd) p(ush) pl(ull)\x1b[0m\n") catch {};
+        ctx.out.flush() catch {};
+        return .handled;
+    };
+
+    const result = std.process.Child.run(.{
+        .allocator = ctx.shell.allocator,
+        .argv = cmd,
+        .max_output_bytes = 64 * 1024,
+    }) catch {
+        ctx.out.writeAll("\x1b[90mnot a git repo\x1b[0m\n") catch {};
+        ctx.out.flush() catch {};
+        return .handled;
+    };
+    defer ctx.shell.allocator.free(result.stdout);
+    defer ctx.shell.allocator.free(result.stderr);
+    if (result.stdout.len > 0) {
+        ctx.out.writeAll(result.stdout) catch {};
+    } else if (result.stderr.len > 0) {
+        ctx.out.writeAll(result.stderr) catch {};
+    } else {
+        ctx.out.writeAll("\x1b[32m\xe2\x9c\x93\x1b[0m\n") catch {}; // ✓
+    }
+    ctx.historyNote("git command");
+    ctx.out.flush() catch {};
+    return .handled;
+}
+
 fn cmdInit(ctx: *CommandCtx, _: []const u8) DispatchResult {
     Layout.goOutput(ctx.out, ctx.out_last.*);
     if (ctx.shell.agent.query(
@@ -1588,6 +1639,7 @@ fn cmdHelp(ctx: *CommandCtx, _: []const u8) DispatchResult {
         \\  \x1b[33m/voice\x1b[0m\x1b[90m ············ toggle voice mode\x1b[0m
         \\  \x1b[33m/init\x1b[0m\x1b[90m ············· generate CLAUDE.md\x1b[0m
         \\  \x1b[33m/effort\x1b[0m <level>\x1b[90m ··· low/medium/high\x1b[0m
+        \\  \x1b[33m/git\x1b[0m <cmd>\x1b[90m ········ s d dd l b a p pl\x1b[0m
         \\
         \\\x1b[1mShortcuts\x1b[0m
         \\  \x1b[33m!command\x1b[0m\x1b[90m ·········· run shell command\x1b[0m
