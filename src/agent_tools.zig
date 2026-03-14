@@ -884,18 +884,38 @@ pub fn executeEdit(allocator: std.mem.Allocator, queues: *AgentQueues, session_l
     for (real_old) |oc| { if (oc == '\n') old_lines += 1; }
     var new_lines: usize = 1;
     for (real_new) |nc| { if (nc == '\n') new_lines += 1; }
-    const added = if (new_lines > old_lines) new_lines - old_lines else 0;
-    const removed = if (old_lines > new_lines) old_lines - new_lines else 0;
-    if (replacements > 1) {
-        dw.print("Added {d} lines, removed {d} lines ({d} replacements)", .{ added, removed, replacements }) catch {};
-    } else if (added > 0 and removed > 0) {
-        dw.print("Added {d} lines, removed {d} lines", .{ added, removed }) catch {};
-    } else if (added > 0) {
-        dw.print("Added {d} lines", .{added}) catch {};
-    } else if (removed > 0) {
-        dw.print("Removed {d} lines", .{removed}) catch {};
-    } else {
-        dw.print("Modified {d} lines", .{old_lines}) catch {};
+    _ = if (new_lines > old_lines) new_lines - old_lines else 0;
+    _ = if (old_lines > new_lines) old_lines - new_lines else 0;
+    // Show inline diff preview (Claude Code style)
+    // Old lines in red, new lines in green, max 6 lines each
+    const max_preview = 6;
+    var old_count: usize = 0;
+    var old_iter = std.mem.splitScalar(u8, real_old, '\n');
+    while (old_iter.next()) |line| {
+        if (old_count >= max_preview) {
+            dw.print("\x1b[31m- ... ({d} more)\x1b[0m\n", .{old_lines - max_preview}) catch {};
+            break;
+        }
+        dw.writeAll("\x1b[31m- ") catch {};
+        const show = if (line.len > 60) line[0..60] else line;
+        dw.writeAll(show) catch {};
+        if (line.len > 60) dw.writeAll("...") catch {};
+        dw.writeAll("\x1b[0m\n") catch {};
+        old_count += 1;
+    }
+    var new_count: usize = 0;
+    var new_iter = std.mem.splitScalar(u8, real_new, '\n');
+    while (new_iter.next()) |line| {
+        if (new_count >= max_preview) {
+            dw.print("\x1b[32m+ ... ({d} more)\x1b[0m\n", .{new_lines - max_preview}) catch {};
+            break;
+        }
+        dw.writeAll("\x1b[32m+ ") catch {};
+        const show = if (line.len > 60) line[0..60] else line;
+        dw.writeAll(show) catch {};
+        if (line.len > 60) dw.writeAll("...") catch {};
+        dw.writeAll("\x1b[0m\n") catch {};
+        new_count += 1;
     }
 
     _ = queues.output.push(.tool_done, diff_result.items);
