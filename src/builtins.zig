@@ -2600,6 +2600,8 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
     {
         const agent_drain = @import("agent_drain.zig");
         var handler = agent_drain.SimpleHandler.init(out, &shell.agent.queues.request);
+        // Disable markdown rendering when piped (not a TTY)
+        if (!std.posix.isatty(std.posix.STDOUT_FILENO)) handler.plain_mode = true;
         // wait up to 120 seconds
         var ticks: usize = 0;
         while (!handler.isDone() and ticks < 2400) : (ticks += 1) {

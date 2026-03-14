@@ -119,6 +119,7 @@ pub const SimpleHandler = struct {
     md: MarkdownRenderer = .{},
     request_queue: *q.Queue(q.QUEUE_CAPACITY),
     done: bool = false,
+    plain_mode: bool = false, // when piped: no ANSI, no markdown
 
     pub fn init(writer: *std.Io.Writer, request_queue: *q.Queue(q.QUEUE_CAPACITY)) SimpleHandler {
         return .{
@@ -136,10 +137,15 @@ pub const SimpleHandler = struct {
     }
 
     pub fn onTextDelta(self: *SimpleHandler, data: []const u8) !void {
-        try self.md.render(self.writer, data);
+        if (self.plain_mode) {
+            try self.writer.writeAll(data);
+        } else {
+            try self.md.render(self.writer, data);
+        }
     }
 
     pub fn onToolCall(self: *SimpleHandler, data: []const u8) !void {
+        if (self.plain_mode) return; // suppress tool output when piped
         try self.md.flush(self.writer);
         try self.writer.writeAll("\x1b[0m");
         self.md.reset();
@@ -149,20 +155,17 @@ pub const SimpleHandler = struct {
     }
 
     pub fn onToolDone(self: *SimpleHandler, data: []const u8) !void {
+        if (self.plain_mode) return; // suppress when piped
         if (data.len > 0) {
-            // Check for ANSI colors (edit diff)
             const has_ansi = std.mem.indexOf(u8, data, "\x1b[3") != null;
             if (has_ansi) {
-                // Show colored output inline
                 try self.writer.writeAll("  ");
                 try self.writer.writeAll(data);
                 try self.writer.writeAll("\x1b[0m\n");
             } else {
-                // Count lines
                 var lc: usize = 1;
                 for (data) |dc| { if (dc == '\n') lc += 1; }
                 if (lc <= 8) {
-                    // Short: show inline
                     var ls: usize = 0;
                     for (data, 0..) |dc, di| {
                         if (dc == '\n' or di == data.len - 1) {
@@ -174,7 +177,6 @@ pub const SimpleHandler = struct {
                         }
                     }
                 } else {
-                    // Long: compact
                     var fmt_buf: [64]u8 = undefined;
                     const msg = std.fmt.bufPrint(&fmt_buf, "  \x1b[32m\xe2\x9c\x93\x1b[90m {d} lines\x1b[0m\n", .{lc}) catch "  \x1b[32m\xe2\x9c\x93\x1b[0m\n";
                     try self.writer.writeAll(msg);
@@ -186,21 +188,30 @@ pub const SimpleHandler = struct {
     }
 
     pub fn onError(self: *SimpleHandler, data: []const u8) !void {
-        try self.writer.writeAll("\x1b[31m\xe2\x9c\x97 "); // ✗ prefix
-        try self.writer.writeAll(data);
-        try self.writer.writeAll("\x1b[0m\n");
+        if (self.plain_mode) {
+            try self.writer.writeAll("error: ");
+            try self.writer.writeAll(data);
+            try self.writer.writeByte('\n');
+        } else {
+            try self.writer.writeAll("\x1b[31m\xe2\x9c\x97 ");
+            try self.writer.writeAll(data);
+            try self.writer.writeAll("\x1b[0m\n");
+        }
     }
 
     pub fn onDone(self: *SimpleHandler) !void {
-        try self.md.flush(self.writer);
-        try self.writer.writeAll("\x1b[0m\n");
+        if (!self.plain_mode) {
+            try self.md.flush(self.writer);
+            try self.writer.writeAll("\x1b[0m");
+        }
+        try self.writer.writeByte('\n');
         self.md.reset();
         self.done = true;
     }
 
     pub fn onCancel(self: *SimpleHandler) !void {
-        try self.md.flush(self.writer);
-        try self.writer.writeAll("\x1b[0m\n");
+        if (!self.plain_mode) try self.md.flush(self.writer);
+        try self.writer.writeByte('\n');
         self.md.reset();
         self.done = true;
     }
