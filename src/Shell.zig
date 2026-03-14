@@ -2582,7 +2582,20 @@ fn loadHistoryEntry(self: *Shell, h: *hist.History) !void {
     const entry = h.entries.items[@intCast(self.history_index)];
     const history_cmd = h.getCommand(entry);
 
-    // Set edit buffer to history command
+    // Force clear all owned rows before setting new content
+    // This prevents stale wrapped lines when switching from long → short command
+    if (self.term_view.term.rows_owned > 1) {
+        const writer = self.stdout();
+        // Move to start of our region
+        if (self.term_view.term.row > 0) {
+            writer.print("\x1b[{d}A", .{self.term_view.term.row}) catch {};
+        }
+        writer.writeAll("\r\x1b[J") catch {}; // clear from here to end of screen
+        self.term_view.term.row = 0;
+        self.term_view.term.col = 0;
+        self.term_view.last_hash = 0; // force full redraw
+    }
+
     self.edit_buf.set(history_cmd);
     }
 
