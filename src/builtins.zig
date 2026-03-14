@@ -3645,31 +3645,46 @@ fn agentInteractive(shell: *Shell) !u8 {
 
             // Ctrl+K — jump to previous user message in scrollback
             // Ctrl+N — jump to next user message in scrollback
+            // Ctrl+O (0x0F) — scroll to show context around current position
+            if (byte[0] == 0x0F and scroll_offset > 0) {
+                // Jump scroll to center the current view
+                if (scroll_offset > out_last) {
+                    scroll_offset -= out_last;
+                } else {
+                    scroll_offset = 0;
+                }
+                Layout.repaintFromHistory(out, &msg_history, out_last, scroll_offset);
+                Layout.drawSeparator(out, sep_row, term_cols, scroll_offset);
+                try out.flush();
+                continue;
+            }
+
             if (byte[0] == 11 or byte[0] == 14) {
                 if (msg_history.line_count > 0) {
                     var hl_line: ?u32 = null;
                     if (byte[0] == 11) {
-                        // Ctrl+K — jump to previous user message
-                        const current_top = if (msg_history.line_count > scroll_offset)
+                        // Ctrl+K — jump to previous user message (search for bold ">")
+                        const current_pos = if (msg_history.line_count > scroll_offset)
                             msg_history.line_count - scroll_offset
-                        else 0;
-                        if (msg_history.searchBack("> ", if (current_top > 1) current_top - 1 else 0)) |found| {
+                        else msg_history.line_count;
+                        const search_start = if (current_pos > 0) current_pos - 1 else 0;
+                        if (msg_history.searchBack("> ", search_start)) |found| {
                             hl_line = found;
                             const from_bottom = msg_history.line_count - found;
-                            scroll_offset = if (from_bottom > out_last / 3) from_bottom - out_last / 3 else 0;
+                            // Position found line near top of screen
+                            scroll_offset = if (from_bottom > 2) from_bottom - 2 else 0;
                         }
                     } else {
                         // Ctrl+N — jump to next user message
-                        if (scroll_offset > 0) {
-                            const current_top = msg_history.line_count - scroll_offset;
-                            const search_from = current_top + out_last / 3 + 1;
-                            if (msg_history.searchForward("> ", search_from)) |found| {
-                                hl_line = found;
-                                const from_bottom = msg_history.line_count - found;
-                                scroll_offset = if (from_bottom > out_last / 3) from_bottom - out_last / 3 else 0;
-                            } else {
-                                scroll_offset = 0;
-                            }
+                        const current_pos = if (msg_history.line_count > scroll_offset)
+                            msg_history.line_count - scroll_offset
+                        else 0;
+                        if (msg_history.searchForward("> ", current_pos + 1)) |found| {
+                            hl_line = found;
+                            const from_bottom = msg_history.line_count - found;
+                            scroll_offset = if (from_bottom > 2) from_bottom - 2 else 0;
+                        } else {
+                            scroll_offset = 0; // no more, go to bottom
                         }
                     }
                     Layout.repaintFromHistoryHL(out, &msg_history, out_last, scroll_offset, hl_line);
