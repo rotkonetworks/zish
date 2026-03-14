@@ -1582,11 +1582,11 @@ fn cmdExport(ctx: *CommandCtx, arg: []const u8) DispatchResult {
                         if (j < line.len and line[j] == '\\') j += 1;
                     }
                 } else {
-                    file.writer().writeByte(line[j]) catch break;
+                    file.writeAll(&[1]u8{line[j]}) catch break;
                     j += 1;
                 }
             }
-            file.writer().writeByte('\n') catch break;
+            file.writeAll("\n") catch break;
         }
     }
 
