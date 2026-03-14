@@ -254,11 +254,11 @@ pub const Layout = struct {
 
     pub fn drawInputSafeFull(w: anytype, first_row: u16, rows: u16, ebuf: *const editor.EditBuffer, streaming: bool, scroll_last: u16, t_rows: u16) void {
         if (streaming and t_rows > 0) {
-            w.writeAll("\x1b[s") catch {};
+            w.writeAll("\x1b" ++ "7") catch {}; // DECSC
             w.print("\x1b[1;{d}r", .{t_rows}) catch {};
             drawInput(w, first_row, rows, ebuf);
             w.print("\x1b[1;{d}r", .{scroll_last}) catch {};
-            w.writeAll("\x1b[u") catch {};
+            w.writeAll("\x1b" ++ "8") catch {}; // DECRC
         } else {
             drawInput(w, first_row, rows, ebuf);
         }
@@ -269,11 +269,13 @@ pub const Layout = struct {
     }
 
     pub fn drawStatusBarSafeElapsed(w: anytype, stat_row: u16, t_rows: u16, scroll_last: u16, cols: u16, mdl: []const u8, cost: []const u8, status: []const u8, elapsed_ms: i64) void {
-        w.writeAll("\x1b[s") catch {};
+        // Use DEC save/restore (ESC 7 / ESC 8) which is more reliable across
+        // scroll region changes than SCO save/restore (ESC[s / ESC[u)
+        w.writeAll("\x1b" ++ "7") catch {}; // DEC save cursor (DECSC)
         w.print("\x1b[1;{d}r", .{t_rows}) catch {};
         drawStatusBarFull(w, stat_row, cols, mdl, cost, status, elapsed_ms);
         w.print("\x1b[1;{d}r", .{scroll_last}) catch {};
-        w.writeAll("\x1b[u") catch {};
+        w.writeAll("\x1b" ++ "8") catch {}; // DEC restore cursor (DECRC)
     }
 
     pub fn goOutput(w: anytype, row: u16) void {
