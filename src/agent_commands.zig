@@ -244,9 +244,9 @@ pub const Layout = struct {
 
     pub fn drawInputSafe(w: anytype, first_row: u16, rows: u16, ebuf: *const editor.EditBuffer, streaming: bool) void {
         if (streaming) {
-            w.writeAll("\x1b[s") catch {};
+            w.writeAll("\x1b" ++ "7") catch {}; // DECSC
             drawInput(w, first_row, rows, ebuf);
-            w.writeAll("\x1b[u") catch {};
+            w.writeAll("\x1b" ++ "8") catch {}; // DECRC
         } else {
             drawInput(w, first_row, rows, ebuf);
         }
