@@ -1026,11 +1026,11 @@ pub const Vim = struct {
     /// get mode indicator with color
     pub fn modeIndicatorColored(self: *const Self) []const u8 {
         return switch (self.mode) {
-            .normal => "\x1b[1;31mN\x1b[0m", // bold red — stands out
-            .insert => "\x1b[90m·\x1b[0m", // dim dot — default, minimal
-            .replace => "\x1b[1;35mR\x1b[0m", // bold magenta
-            .visual => "\x1b[1;36mv\x1b[0m", // bold cyan
-            .visual_line => "\x1b[1;36mV\x1b[0m", // bold cyan
+            .normal => "[\x1b[31mN\x1b[0m]",
+            .insert => "[\x1b[33mI\x1b[0m]",
+            .replace => "[\x1b[35mR\x1b[0m]",
+            .visual => "[\x1b[36mv\x1b[0m]",
+            .visual_line => "[\x1b[36mV\x1b[0m]",
         };
     }
 };
