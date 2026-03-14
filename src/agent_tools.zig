@@ -788,9 +788,25 @@ pub fn executeWrite(allocator: std.mem.Allocator, queues: *AgentQueues, session_
 
     var wcount: usize = 1;
     for (real_content) |wc| { if (wc == '\n') wcount += 1; }
-    var wdone_buf: [64]u8 = undefined;
-    const wdone = std.fmt.bufPrint(&wdone_buf, "{d} lines written", .{wcount}) catch "";
-    _ = queues.output.push(.tool_done, wdone);
+    // Show preview of written content (green, like a diff with all additions)
+    var wdone_result: std.ArrayList(u8) = .{};
+    const wdw = wdone_result.writer(allocator);
+    const max_preview: usize = 4;
+    var line_n: usize = 0;
+    var witer = std.mem.splitScalar(u8, real_content, '\n');
+    while (witer.next()) |line| {
+        if (line_n >= max_preview) {
+            wdw.print("\x1b[32m+ ... ({d} more)\x1b[0m\n", .{wcount - max_preview}) catch {};
+            break;
+        }
+        wdw.writeAll("\x1b[32m+ ") catch {};
+        const show = if (line.len > 60) line[0..60] else line;
+        wdw.writeAll(show) catch {};
+        if (line.len > 60) wdw.writeAll("...") catch {};
+        wdw.writeAll("\x1b[0m\n") catch {};
+        line_n += 1;
+    }
+    _ = queues.output.push(.tool_done, wdone_result.items);
     var result_buf: [128]u8 = undefined;
     const result = std.fmt.bufPrint(&result_buf, "Wrote {d} bytes to {s}", .{ real_content.len, real_path }) catch "ok";
     return allocator.dupe(u8, result);
