@@ -2934,6 +2934,9 @@ fn agentInteractive(shell: *Shell) !u8 {
     // TTS text accumulation buffer: collect response text for voice output
     var tts_buf: [8192]u8 = undefined;
     var tts_len: usize = 0;
+    // Track last tool name for smart output display
+    var last_tool: [32]u8 = undefined;
+    var last_tool_len: usize = 0;
 
     // ? translation mode — captures response to pre-fill input
     var translate_mode = false;
@@ -3208,10 +3211,12 @@ fn agentInteractive(shell: *Shell) !u8 {
                     md.reset();
                     last_was_text = false;
                     const tool_text = msg.slice();
-                    // Update status bar with tool name
+                    // Track tool name for smart output + update status bar
                     {
                         const paren = std.mem.indexOfScalar(u8, tool_text, '(') orelse tool_text.len;
                         const name_end = @min(paren, std.mem.indexOfScalar(u8, tool_text, ' ') orelse tool_text.len);
+                        last_tool_len = @min(name_end, last_tool.len);
+                        @memcpy(last_tool[0..last_tool_len], tool_text[0..last_tool_len]);
                         const slen = @min(name_end, status_text.len);
                         @memcpy(status_text[0..slen], tool_text[0..slen]);
                         status_len = slen;
@@ -3257,45 +3262,74 @@ fn agentInteractive(shell: *Shell) !u8 {
                     last_was_text = false;
                     const done_text = msg.slice();
                     if (done_text.len > 0) {
-                        // Check if output contains ANSI colors (diff preview from Edit tool)
                         const has_ansi = std.mem.indexOf(u8, done_text, "\x1b[3") != null;
                         var line_count: usize = 1;
                         for (done_text) |dc| {
                             if (dc == '\n') line_count += 1;
                         }
-                        if (has_ansi) {
-                            // Colored output (edit diff) — show inline with colors preserved
+
+                        // Smart threshold based on tool type:
+                        // Edit: always show diff (has ANSI)
+                        // Bash: show up to 20 lines (user needs to see command output)
+                        // Glob/Grep: show up to 15 lines (search results)
+                        // Read: show up to 8 lines (file preview)
+                        // Others: 8 lines default
+                        const tool_name = last_tool[0..last_tool_len];
+                        const max_inline: usize = if (has_ansi)
+                            999 // Edit diffs always show
+                        else if (std.mem.eql(u8, tool_name, "Bash"))
+                            20
+                        else if (std.mem.eql(u8, tool_name, "Glob") or std.mem.eql(u8, tool_name, "Grep"))
+                            15
+                        else
+                            8;
+
+                        if (has_ansi or line_count <= max_inline) {
+                            // Show inline with linkified paths
                             var line_start: usize = 0;
+                            var shown: usize = 0;
                             for (done_text, 0..) |dc, di| {
                                 if (dc == '\n' or di == done_text.len - 1) {
                                     const end = if (dc == '\n') di else di + 1;
                                     const line = done_text[line_start..end];
-                                    try tee.writeAll("  ");
-                                    try tee.writeAll(line);
-                                    try tee.writeAll("\x1b[0m\n");
+                                    if (has_ansi) {
+                                        try tee.writeAll("  ");
+                                        try tee.writeAll(line);
+                                        try tee.writeAll("\x1b[0m\n");
+                                    } else {
+                                        try tee.writeAll("  \x1b[90m");
+                                        linkify.writeLinked(tee, line) catch try tee.writeAll(line);
+                                        try tee.writeAll("\x1b[0m\n");
+                                    }
                                     line_start = di + 1;
-                                }
-                            }
-                        } else if (line_count <= 8) {
-                            // Short result — show all lines with linkified paths
-                            var line_start: usize = 0;
-                            for (done_text, 0..) |dc, di| {
-                                if (dc == '\n' or di == done_text.len - 1) {
-                                    const end = if (dc == '\n') di else di + 1;
-                                    const line = done_text[line_start..end];
-                                    try tee.writeAll("  \x1b[90m");
-                                    linkify.writeLinked(tee, line) catch try tee.writeAll(line);
-                                    try tee.writeAll("\x1b[0m\n");
-                                    line_start = di + 1;
+                                    shown += 1;
                                 }
                             }
                         } else {
-                            // Long result — compact on screen, full in history
-                            var info_buf: [64]u8 = undefined;
-                            const info = std.fmt.bufPrint(&info_buf, "  \x1b[32m\xe2\x9c\x93\x1b[90m {d} lines\x1b[0m\n", .{line_count}) catch "  \x1b[32m\xe2\x9c\x93\x1b[0m\n";
-                            try out.writeAll(info);
-                            msg_history.appendSlice("  ");
-                            msg_history.appendSlice(done_text);
+                            // Show first lines + compact remainder
+                            var line_start: usize = 0;
+                            var shown: usize = 0;
+                            const preview = max_inline / 2; // show half the threshold
+                            for (done_text, 0..) |dc, di| {
+                                if (dc == '\n' or di == done_text.len - 1) {
+                                    if (shown < preview) {
+                                        const end = if (dc == '\n') di else di + 1;
+                                        const line = done_text[line_start..end];
+                                        try tee.writeAll("  \x1b[90m");
+                                        linkify.writeLinked(tee, line) catch try tee.writeAll(line);
+                                        try tee.writeAll("\x1b[0m\n");
+                                    }
+                                    line_start = di + 1;
+                                    shown += 1;
+                                }
+                            }
+                            var more_buf: [64]u8 = undefined;
+                            const more = std.fmt.bufPrint(&more_buf, "  \x1b[90m({d} more lines \xc2\xb7 ^U to scroll)\x1b[0m\n", .{line_count - preview}) catch "";
+                            try tee.writeAll(more);
+                            // Full content to history for scrollback
+                            msg_history.appendSlice("  \x1b[90m");
+                            msg_history.appendSlice(done_text[line_start..]);
+                            msg_history.appendSlice("\x1b[0m");
                             msg_history.commitLine();
                         }
                     } else {
