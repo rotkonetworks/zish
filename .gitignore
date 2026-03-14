@@ -4,3 +4,6 @@ zishrc
 test_infer
 test_gguf_open
 root
+
+# Claude Code artifacts
+.claude/scheduled_tasks.lock
