@@ -2107,14 +2107,26 @@ fn cmdGit(ctx: *CommandCtx, arg: []const u8) DispatchResult {
     };
     defer ctx.shell.allocator.free(result.stdout);
     defer ctx.shell.allocator.free(result.stderr);
-    if (result.stdout.len > 0) {
-        ctx.out.writeAll(result.stdout) catch {};
-    } else if (result.stderr.len > 0) {
-        ctx.out.writeAll(result.stderr) catch {};
+    const output = if (result.stdout.len > 0) result.stdout else result.stderr;
+    if (output.len > 0) {
+        ctx.out.writeAll(output) catch {};
+        // Capture to history for scrollback
+        var hs: usize = 0;
+        for (output, 0..) |oc, oi| {
+            if (oc == '\n') {
+                ctx.msg_history.appendSlice(output[hs..oi]);
+                ctx.msg_history.commitLine();
+                hs = oi + 1;
+            }
+        }
+        if (hs < output.len) {
+            ctx.msg_history.appendSlice(output[hs..]);
+            ctx.msg_history.commitLine();
+        }
     } else {
-        ctx.out.writeAll("\x1b[32m\xe2\x9c\x93\x1b[0m\n") catch {}; // ✓
+        ctx.out.writeAll("\x1b[32m\xe2\x9c\x93\x1b[0m\n") catch {};
+        ctx.historyNote("done");
     }
-    ctx.historyNote("git command");
     ctx.out.flush() catch {};
     return .handled;
 }
