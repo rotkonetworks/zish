@@ -7,3 +7,4 @@ root
 
 # Claude Code artifacts
 .claude/scheduled_tasks.lock
+scripts/__pycache__/
