@@ -750,9 +750,32 @@ pub fn executeRead(allocator: std.mem.Allocator, queues: *AgentQueues, path: []c
         line_num += 1;
     }
 
-    var done_buf: [128]u8 = undefined;
-    const done_msg = std.fmt.bufPrint(&done_buf, "{d} lines", .{lines_output}) catch "";
-    _ = queues.output.push(.tool_done, done_msg);
+    // Push preview with line numbers for user display
+    var preview_list: std.ArrayList(u8) = .{};
+    const pw = preview_list.writer(allocator);
+    var pstart: usize = 0;
+    var pline: usize = start_line;
+    const preview_max: usize = 8;
+    var pcount: usize = 0;
+    const items = result_list.items;
+    while (pstart < items.len and pcount < preview_max) {
+        const pend = std.mem.indexOfScalarPos(u8, items, pstart, '\n') orelse items.len;
+        const line = items[pstart..pend];
+        // Line numbers are dim, content normal
+        if (line.len > 6 and line[6] == '\t') {
+            pw.print("\x1b[90m{s}\x1b[0m{s}\n", .{ line[0..6], line[7..] }) catch break;
+        } else {
+            pw.writeAll(line) catch break;
+            pw.writeByte('\n') catch break;
+        }
+        pstart = if (pend < items.len) pend + 1 else items.len;
+        pline += 1;
+        pcount += 1;
+    }
+    if (lines_output > preview_max) {
+        pw.print("\x1b[90m({d} more lines)\x1b[0m\n", .{lines_output - preview_max}) catch {};
+    }
+    _ = queues.output.push(.tool_done, preview_list.items);
     return result_list.toOwnedSlice(allocator) catch return error.OutOfMemory;
 }
 
