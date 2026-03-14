@@ -3579,7 +3579,7 @@ fn agentInteractive(shell: *Shell) !u8 {
             if (byte[0] == 11 or byte[0] == 14) {
                 if (msg_history.line_count > 0) {
                     // Find lines starting with user prompt marker (green "> ")
-                    const user_marker = "\x1b[1;32m> ";
+                    const user_marker = "\x1b[1m> ";
                     if (byte[0] == 11) {
                         // Ctrl+K — search backwards
                         const current_top = if (msg_history.line_count > scroll_offset)
@@ -4058,9 +4058,11 @@ fn agentInteractive(shell: *Shell) !u8 {
                     Layout.drawSeparator(out, sep_row, term_cols, 0);
                 }
 
-                // Echo user message in output scroll region (indent continuation lines)
+                // Echo user message in output scroll region
                 Layout.goOutput(out, out_last);
                 cursor_at = .output;
+                try out.writeByte('\n'); // blank line before user message
+                msg_history.commitLine();
                 {
                     var first = true;
                     var rest: []const u8 = query;
@@ -4068,8 +4070,8 @@ fn agentInteractive(shell: *Shell) !u8 {
                         const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len;
                         const line = rest[0..nl];
                         if (first) {
-                            try out.writeAll("\x1b[1;32m> \x1b[0m");
-                            msg_history.appendSlice("\x1b[1;32m> \x1b[0m");
+                            try out.writeAll("\x1b[1m> \x1b[0m");
+                            msg_history.appendSlice("\x1b[1m> \x1b[0m");
                             first = false;
                         } else {
                             try out.writeAll("  ");
@@ -4082,9 +4084,8 @@ fn agentInteractive(shell: *Shell) !u8 {
                         rest = if (nl < rest.len) rest[nl + 1 ..] else &.{};
                     }
                     if (first) {
-                        // Empty query — still echo the prompt
-                        try out.writeAll("\x1b[1;32m> \x1b[0m\n");
-                        msg_history.appendSlice("\x1b[1;32m> \x1b[0m");
+                        try out.writeAll("\x1b[1m> \x1b[0m\n");
+                        msg_history.appendSlice("\x1b[1m> \x1b[0m");
                         msg_history.commitLine();
                     }
                 }

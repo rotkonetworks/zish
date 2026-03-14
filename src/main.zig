@@ -34,6 +34,7 @@ pub fn main() void {
     const is_interactive = res.args.c == null and (res.positionals.len == 0 or res.positionals[0].len == 0);
     const load_config = is_interactive or res.args.login != 0;
 
+
     // initialize shell (load config for interactive or login mode)
     const shell_instance = (if (load_config)
         Shell.init(allocator)
