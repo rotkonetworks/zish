@@ -1525,7 +1525,8 @@ fn cmdHelp(ctx: *CommandCtx, _: []const u8) DispatchResult {
         \\
         \\\x1b[1mKeys\x1b[0m
         \\  \x1b[33mEnter\x1b[0m\x1b[90m submit\x1b[0m  \x1b[33mAlt+Enter\x1b[0m\x1b[90m newline\x1b[0m  \x1b[33mCtrl+C\x1b[0m\x1b[90m cancel\x1b[0m
-        \\  \x1b[33mPageUp/Down\x1b[0m\x1b[90m scroll\x1b[0m  \x1b[33mEsc\x1b[0m\x1b[90m vi mode\x1b[0m  \x1b[33mCtrl+D\x1b[0m\x1b[90m exit\x1b[0m
+        \\  \x1b[33m^U/^F\x1b[0m\x1b[90m scroll up/down\x1b[0m  \x1b[33m^K/^N\x1b[0m\x1b[90m jump messages\x1b[0m
+        \\  \x1b[33mEsc\x1b[0m\x1b[90m vi mode\x1b[0m  \x1b[33mCtrl+D\x1b[0m\x1b[90m exit\x1b[0m  \x1b[33mRight\x1b[0m\x1b[90m accept ghost\x1b[0m
         \\
     ;
     ctx.out.writeAll(help_text) catch {};

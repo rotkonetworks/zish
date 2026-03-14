@@ -3583,6 +3583,31 @@ fn agentInteractive(shell: *Shell) !u8 {
                 continue;
             }
 
+            // Ctrl+U (0x15) — scroll up half page (vim-style)
+            // Ctrl+F (0x06) — scroll down half page
+            // Ctrl+B (0x02) — scroll up full page
+            if (byte[0] == 0x15 or byte[0] == 0x02 or byte[0] == 0x06) {
+                if (msg_history.line_count > 0) {
+                    const page = if (byte[0] == 0x02) out_last else out_last / 2;
+                    if (byte[0] == 0x06) {
+                        // Down
+                        if (scroll_offset > page) {
+                            scroll_offset -= page;
+                        } else {
+                            scroll_offset = 0;
+                        }
+                    } else {
+                        // Up
+                        scroll_offset += page;
+                        if (scroll_offset > msg_history.line_count) scroll_offset = msg_history.line_count;
+                    }
+                    Layout.repaintFromHistory(out, &msg_history, out_last, scroll_offset);
+                    Layout.drawSeparator(out, sep_row, term_cols, scroll_offset);
+                    try out.flush();
+                }
+                continue;
+            }
+
             // Ctrl+K — jump to previous user message in scrollback
             // Ctrl+N — jump to next user message in scrollback
             if (byte[0] == 11 or byte[0] == 14) {
