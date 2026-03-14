@@ -1676,9 +1676,14 @@ const AgentThread = struct {
 
         var fbs = std.io.fixedBufferStream(&body_buf);
         const w = fbs.writer();
+        // Check for effort override from /effort command
+        const effective_max_tokens = blk: {
+            const override = self.queues.shared_max_tokens.load(.monotonic);
+            break :blk if (override > 0) override else self.config.max_tokens;
+        };
         w.print("{{\"model\":\"{s}\",\"max_tokens\":{d},\"stream\":true,\"system\":", .{
             self.config.model,
-            self.config.max_tokens,
+            effective_max_tokens,
         }) catch return error.BodyTooLarge;
         writeJSONString(w, self.systemPrompt()) catch return error.BodyTooLarge;
         w.print(",\"messages\":{s},\"tools\":{s}}}", .{
@@ -2830,6 +2835,10 @@ pub const AgentContext = struct {
     bulletin: *q.Bulletin,
     pub fn getTotalInputTokens(self: *const AgentContext) u32 {
         return self.queues.shared_input_tokens.load(.monotonic);
+    }
+
+    pub fn setMaxTokens(self: *AgentContext, tokens: u32) void {
+        self.queues.shared_max_tokens.store(tokens, .monotonic);
     }
 
     pub fn init(allocator: std.mem.Allocator) AgentContext {

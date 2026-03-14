@@ -649,6 +649,7 @@ const commands = [_]Command{
     .{ .name = "/s", .has_arg = true, .handler = cmdSearch },
     .{ .name = "/voice", .has_arg = false, .handler = cmdVoice },
     .{ .name = "/init", .has_arg = false, .handler = cmdInit },
+    .{ .name = "/effort", .has_arg = true, .handler = cmdEffort },
     .{ .name = "/help", .has_arg = false, .handler = cmdHelp },
     .{ .name = "help", .has_arg = false, .handler = cmdHelp },
 };
@@ -1525,6 +1526,28 @@ fn cmdVoice(ctx: *CommandCtx, _: []const u8) DispatchResult {
     return .handled;
 }
 
+fn cmdEffort(ctx: *CommandCtx, arg: []const u8) DispatchResult {
+    Layout.goOutput(ctx.out, ctx.out_last.*);
+    if (arg.len > 0) {
+        const level = std.mem.trim(u8, arg, " ");
+        if (std.mem.eql(u8, level, "low") or std.mem.eql(u8, level, "min")) {
+            ctx.shell.agent.setMaxTokens(2048);
+            ctx.out.writeAll("\x1b[90meffort: low (2K tokens)\x1b[0m\n") catch {};
+        } else if (std.mem.eql(u8, level, "high") or std.mem.eql(u8, level, "max")) {
+            ctx.shell.agent.setMaxTokens(16384);
+            ctx.out.writeAll("\x1b[90meffort: high (16K tokens)\x1b[0m\n") catch {};
+        } else {
+            // Default / medium
+            ctx.shell.agent.setMaxTokens(8192);
+            ctx.out.writeAll("\x1b[90meffort: medium (8K tokens)\x1b[0m\n") catch {};
+        }
+    } else {
+        ctx.out.writeAll("\x1b[90mUsage: /effort <low|medium|high>\x1b[0m\n") catch {};
+    }
+    ctx.out.flush() catch {};
+    return .handled;
+}
+
 fn cmdInit(ctx: *CommandCtx, _: []const u8) DispatchResult {
     Layout.goOutput(ctx.out, ctx.out_last.*);
     if (ctx.shell.agent.query(
@@ -1564,6 +1587,7 @@ fn cmdHelp(ctx: *CommandCtx, _: []const u8) DispatchResult {
         \\  \x1b[33m/search\x1b[0m <pattern>\x1b[90m · search history\x1b[0m
         \\  \x1b[33m/voice\x1b[0m\x1b[90m ············ toggle voice mode\x1b[0m
         \\  \x1b[33m/init\x1b[0m\x1b[90m ············· generate CLAUDE.md\x1b[0m
+        \\  \x1b[33m/effort\x1b[0m <level>\x1b[90m ··· low/medium/high\x1b[0m
         \\
         \\\x1b[1mShortcuts\x1b[0m
         \\  \x1b[33m!command\x1b[0m\x1b[90m ·········· run shell command\x1b[0m
