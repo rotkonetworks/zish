@@ -654,7 +654,10 @@ const commands = [_]Command{
 
 /// Look up and dispatch a slash command (or special prefix command).
 /// Returns the dispatch result for the caller to act on.
-pub fn dispatch(ctx: *CommandCtx, query: []const u8) DispatchResult {
+pub fn dispatch(ctx: *CommandCtx, raw_query: []const u8) DispatchResult {
+    // Defensive trim — login shell terminal settings can leave stray CR/whitespace
+    const query = std.mem.trim(u8, raw_query, " \t\r\n\x00");
+
     // Special prefix commands
     if (query.len > 0 and query[0] == '!') return cmdShellEscape(ctx, query);
     if (query.len > 1 and query[0] == '?') return cmdTranslate(ctx, query);
