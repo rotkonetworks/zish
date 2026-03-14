@@ -3276,13 +3276,21 @@ fn agentInteractive(shell: *Shell) !u8 {
                                     line_start = di + 1;
                                 }
                             }
-                        } else if (line_count == 1 and done_text.len < 60) {
-                            // Very short — show inline
-                            try tee.writeAll("  \x1b[90m");
-                            linkify.writeLinked(tee, done_text) catch try tee.writeAll(done_text);
-                            try tee.writeAll("\x1b[0m\n");
+                        } else if (line_count <= 8) {
+                            // Short result — show all lines with linkified paths
+                            var line_start: usize = 0;
+                            for (done_text, 0..) |dc, di| {
+                                if (dc == '\n' or di == done_text.len - 1) {
+                                    const end = if (dc == '\n') di else di + 1;
+                                    const line = done_text[line_start..end];
+                                    try tee.writeAll("  \x1b[90m");
+                                    linkify.writeLinked(tee, line) catch try tee.writeAll(line);
+                                    try tee.writeAll("\x1b[0m\n");
+                                    line_start = di + 1;
+                                }
+                            }
                         } else {
-                            // Compact on screen, full in history for scrollback
+                            // Long result — compact on screen, full in history
                             var info_buf: [64]u8 = undefined;
                             const info = std.fmt.bufPrint(&info_buf, "  \x1b[32m\xe2\x9c\x93\x1b[90m {d} lines\x1b[0m\n", .{line_count}) catch "  \x1b[32m\xe2\x9c\x93\x1b[0m\n";
                             try out.writeAll(info);
