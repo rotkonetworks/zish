@@ -296,6 +296,10 @@ pub const Layout = struct {
     }
 
     pub fn repaintFromHistory(w: anytype, hist: *const MessageHistory, out_rows: u16, scroll_off: u32) void {
+        repaintFromHistoryHL(w, hist, out_rows, scroll_off, null);
+    }
+
+    pub fn repaintFromHistoryHL(w: anytype, hist: *const MessageHistory, out_rows: u16, scroll_off: u32, highlight: ?u32) void {
         if (hist.line_count == 0) return;
         const total = hist.line_count;
         const visible: u32 = @min(out_rows, total);
@@ -309,9 +313,13 @@ pub const Layout = struct {
             line_idx += 1;
         }) {
             w.print("\x1b[{d};1H\x1b[2K", .{row}) catch {};
+            // Subtle background highlight for focused line
+            const is_hl = if (highlight) |hl| line_idx == hl else false;
+            if (is_hl) w.writeAll("\x1b[48;5;236m") catch {}; // dark gray bg
             if (hist.getLine(line_idx)) |line_data| {
                 w.writeAll(line_data) catch {};
             }
+            if (is_hl) w.writeAll("\x1b[K\x1b[49m") catch {}; // clear to EOL with bg, then reset bg
         }
         while (row <= out_rows) : (row += 1) {
             w.print("\x1b[{d};1H\x1b[2K", .{row}) catch {};
