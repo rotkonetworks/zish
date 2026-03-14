@@ -823,3 +823,37 @@ test "EditBuffer multiline" {
     buf.set("line1\nline2\nline3");
     try std.testing.expectEqual(@as(u16, 3), buf.lineCount());
 }
+
+test "EditBuffer undo" {
+    var buf = EditBuffer{};
+    buf.set("hello world");
+    try std.testing.expectEqualStrings("hello world", buf.slice());
+
+    // Save undo, then modify
+    buf.saveUndo();
+    buf.set("goodbye");
+    try std.testing.expectEqualStrings("goodbye", buf.slice());
+
+    // Undo restores
+    try std.testing.expect(buf.undo());
+    try std.testing.expectEqualStrings("hello world", buf.slice());
+
+    // Second undo fails (single level)
+    try std.testing.expect(!buf.undo());
+}
+
+test "EditBuffer undo preserves cursor" {
+    var buf = EditBuffer{};
+    _ = buf.insert('a');
+    _ = buf.insert('b');
+    _ = buf.insert('c');
+    buf.cursor = 1; // cursor at 'b'
+
+    buf.saveUndo();
+    _ = buf.deleteForward(); // delete 'b'
+    try std.testing.expectEqualStrings("ac", buf.slice());
+
+    _ = buf.undo();
+    try std.testing.expectEqualStrings("abc", buf.slice());
+    try std.testing.expectEqual(@as(u16, 1), buf.cursor);
+}

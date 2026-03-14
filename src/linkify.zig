@@ -89,3 +89,30 @@ fn isPathChar(c: u8) bool {
 fn isPathCharOrColon(c: u8) bool {
     return isPathChar(c) or c == ':';
 }
+
+test "linkify detects absolute paths" {
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try writeLinked(fbs.writer(), "see /src/main.zig for details");
+    const out = fbs.getWritten();
+    // Should contain OSC 8 sequence
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b]8;;file:///src/main.zig") != null);
+    // Should contain the path text
+    try std.testing.expect(std.mem.indexOf(u8, out, "/src/main.zig") != null);
+}
+
+test "linkify detects URLs" {
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try writeLinked(fbs.writer(), "visit https://example.com now");
+    const out = fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\x1b]8;;https://example.com") != null);
+}
+
+test "linkify passes plain text through" {
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try writeLinked(fbs.writer(), "just plain text");
+    const out = fbs.getWritten();
+    try std.testing.expectEqualStrings("just plain text", out);
+}
