@@ -328,11 +328,11 @@ pub fn handleTabCompletion(self: *Shell) !void {
             }
 
             if (!already_exists) {
-                // check if entry is a directory - use fallback stat if kind is unknown
+                // check if entry is a directory - stat for symlinks and unknown
                 const is_dir = if (entry.kind == .directory)
                     true
-                else if (entry.kind == .unknown) blk: {
-                    // fallback: stat the entry to check if it's a directory
+                else if (entry.kind == .sym_link or entry.kind == .unknown) blk: {
+                    // stat the entry to check if target is a directory
                     const full_path = std.fs.path.join(self.allocator, &.{ search_dir, entry.name }) catch break :blk false;
                     defer self.allocator.free(full_path);
                     var d = std.fs.cwd().openDir(full_path, .{}) catch break :blk false;

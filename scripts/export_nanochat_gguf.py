@@ -208,8 +208,8 @@ def main():
         write_kv_uint32(f, 'nanochat.context_length', 128)
         write_kv_uint32(f, 'nanochat.embedding_length', n_embd)
         write_kv_uint32(f, 'nanochat.block_count', n_layer)
-        write_kv_uint32(f, 'nanochat.head_count', n_head)
-        write_kv_uint32(f, 'nanochat.head_count_kv', n_kv_head)
+        write_kv_uint32(f, 'nanochat.attention.head_count', n_head)
+        write_kv_uint32(f, 'nanochat.attention.head_count_kv', n_kv_head)
         write_kv_uint32(f, 'nanochat.vocab_size', vocab_size)
         write_kv_uint32(f, 'nanochat.feed_forward_length', n_embd * 4)  # ReLU² MLP: 4*dim hidden
         write_kv_string(f, 'nanochat.activation', 'relu_squared')  # distinguish from SwiGLU

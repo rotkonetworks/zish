@@ -2141,49 +2141,30 @@ fn cmdInit(ctx: *CommandCtx, _: []const u8) DispatchResult {
 fn cmdHelp(ctx: *CommandCtx, _: []const u8) DispatchResult {
     Layout.goOutput(ctx.out, ctx.out_last.*);
     const help_text =
-        \\\x1b[1mCommands\x1b[0m
-        \\  \x1b[33m/compact\x1b[0m\x1b[90m ·········· summarize conversation\x1b[0m
-        \\  \x1b[33m/cost\x1b[0m\x1b[90m ············· show session cost\x1b[0m
-        \\  \x1b[33m/model\x1b[0m [name]\x1b[90m ····· show/switch model\x1b[0m
-        \\  \x1b[33m/diff\x1b[0m\x1b[90m ············· show git changes\x1b[0m
-        \\  \x1b[33m/commit\x1b[0m [msg]\x1b[90m ····· commit with AI message\x1b[0m
-        \\  \x1b[33m/review\x1b[0m\x1b[90m ··········· review session changes\x1b[0m
-        \\  \x1b[33m/undo\x1b[0m\x1b[90m ············· revert last file change\x1b[0m
-        \\  \x1b[33m/fix\x1b[0m [context]\x1b[90m ····· fix last error\x1b[0m
-        \\  \x1b[33m/web\x1b[0m <query>\x1b[90m ······· search the web\x1b[0m
-        \\  \x1b[33m/pr\x1b[0m [title]\x1b[90m ········ create GitHub PR\x1b[0m
-        \\  \x1b[33m/run\x1b[0m <cmd>\x1b[90m ········ run shell command inline\x1b[0m
-        \\  \x1b[33m/cd\x1b[0m [path]\x1b[90m ········ change directory\x1b[0m
-        \\  \x1b[33m/ls\x1b[0m [path]\x1b[90m ········ list directory\x1b[0m
-        \\  \x1b[33m/cat\x1b[0m <file>\x1b[90m ······· view file with line numbers\x1b[0m
-        \\  \x1b[33m/plan\x1b[0m <task>\x1b[90m ······ plan without executing\x1b[0m
-        \\  \x1b[33m/spawn\x1b[0m <task>\x1b[90m ····· spawn worker subagent\x1b[0m
-        \\  \x1b[33m/queue\x1b[0m <task>\x1b[90m ····· queue autonomous task\x1b[0m
-        \\  \x1b[33m/tree\x1b[0m\x1b[90m ············· agent tree view\x1b[0m
-        \\  \x1b[33m/sessions\x1b[0m\x1b[90m ········· list recent sessions\x1b[0m
-        \\  \x1b[33m/config\x1b[0m\x1b[90m ··········· show configuration\x1b[0m
-        \\  \x1b[33m/search\x1b[0m <pattern>\x1b[90m · search history\x1b[0m
-        \\  \x1b[33m/voice\x1b[0m\x1b[90m ············ toggle voice mode\x1b[0m
-        \\  \x1b[33m/init\x1b[0m\x1b[90m ············· generate CLAUDE.md\x1b[0m
-        \\  \x1b[33m/effort\x1b[0m <level>\x1b[90m ··· low/medium/high\x1b[0m
-        \\  \x1b[33m/git\x1b[0m <cmd>\x1b[90m ········ s d dd l b a p pl\x1b[0m
-        \\  \x1b[33m/export\x1b[0m [file]\x1b[90m ···· save as markdown\x1b[0m
-        \\  \x1b[33m/think\x1b[0m [on/mega/ultra]\x1b[90m extended thinking\x1b[0m
-        \\  \x1b[33m/status\x1b[0m\x1b[90m ············ model, cost, context, cwd\x1b[0m
-        \\  \x1b[33m/new\x1b[0m\x1b[90m ··············· new session (clear)\x1b[0m
+        \\\x1b[1mCode\x1b[0m
+        \\  \x1b[33m/fix\x1b[0m\x1b[90m ·· fix last error\x1b[0m  \x1b[33m/plan\x1b[0m\x1b[90m ·· plan task\x1b[0m  \x1b[33m/review\x1b[0m\x1b[90m ·· review changes\x1b[0m
+        \\  \x1b[33m/undo\x1b[0m\x1b[90m · revert file\x1b[0m  \x1b[33m/init\x1b[0m\x1b[90m ·· gen CLAUDE.md\x1b[0m  \x1b[33m/web\x1b[0m\x1b[90m · search web\x1b[0m
+        \\
+        \\\x1b[1mGit\x1b[0m
+        \\  \x1b[33m/diff\x1b[0m\x1b[90m · changes\x1b[0m  \x1b[33m/commit\x1b[0m\x1b[90m · commit\x1b[0m  \x1b[33m/pr\x1b[0m\x1b[90m · pull request\x1b[0m
+        \\  \x1b[33m/git\x1b[0m\x1b[90m ·· s d dd l b a p pl st sp\x1b[0m
+        \\
+        \\\x1b[1mSession\x1b[0m
+        \\  \x1b[33m/model\x1b[0m\x1b[90m · switch\x1b[0m  \x1b[33m/think\x1b[0m\x1b[90m · thinking\x1b[0m  \x1b[33m/effort\x1b[0m\x1b[90m · lo/med/hi\x1b[0m
+        \\  \x1b[33m/compact\x1b[0m\x1b[90m · save context\x1b[0m  \x1b[33m/new\x1b[0m\x1b[90m · reset\x1b[0m  \x1b[33m/export\x1b[0m\x1b[90m · save md\x1b[0m
+        \\  \x1b[33m/cost\x1b[0m\x1b[90m · cost\x1b[0m  \x1b[33m/status\x1b[0m\x1b[90m · info\x1b[0m  \x1b[33m/config\x1b[0m\x1b[90m · config\x1b[0m  \x1b[33m/sessions\x1b[0m\x1b[90m · list\x1b[0m
+        \\
+        \\\x1b[1mTools\x1b[0m
+        \\  \x1b[33m/run\x1b[0m\x1b[90m · shell cmd\x1b[0m  \x1b[33m/cd\x1b[0m\x1b[90m · chdir\x1b[0m  \x1b[33m/ls\x1b[0m\x1b[90m · list\x1b[0m  \x1b[33m/cat\x1b[0m\x1b[90m · view file\x1b[0m
+        \\  \x1b[33m/spawn\x1b[0m\x1b[90m · worker\x1b[0m  \x1b[33m/queue\x1b[0m\x1b[90m · bg task\x1b[0m  \x1b[33m/tree\x1b[0m\x1b[90m · agents\x1b[0m  \x1b[33m/search\x1b[0m\x1b[90m · history\x1b[0m
         \\
         \\\x1b[1mShortcuts\x1b[0m
-        \\  \x1b[33m!command\x1b[0m\x1b[90m ·········· run shell command\x1b[0m
-        \\  \x1b[33m!\x1b[0m\x1b[90m ················· drop to zish shell\x1b[0m
-        \\  \x1b[33m?intent\x1b[0m\x1b[90m ··········· translate to command\x1b[0m
-        \\  \x1b[33m@file\x1b[0m\x1b[90m ············· include file contents\x1b[0m
+        \\  \x1b[33m!cmd\x1b[0m\x1b[90m shell\x1b[0m  \x1b[33m!\x1b[0m\x1b[90m drop to shell\x1b[0m  \x1b[33m?intent\x1b[0m\x1b[90m translate\x1b[0m  \x1b[33m@file\x1b[0m\x1b[90m attach\x1b[0m
         \\
         \\\x1b[1mKeys\x1b[0m
-        \\  \x1b[33mEnter\x1b[0m\x1b[90m submit\x1b[0m  \x1b[33m^J/Alt+Enter\x1b[0m\x1b[90m newline\x1b[0m  \x1b[33m^C\x1b[0m\x1b[90m cancel\x1b[0m
-        \\  \x1b[33m^A/^E\x1b[0m\x1b[90m home/end\x1b[0m  \x1b[33m^W\x1b[0m\x1b[90m del word\x1b[0m  \x1b[33mCtrl+←/→\x1b[0m\x1b[90m word\x1b[0m
-        \\  \x1b[33m↑/↓\x1b[0m\x1b[90m input history\x1b[0m  \x1b[33mCtrl+↑/↓\x1b[0m\x1b[90m jump messages\x1b[0m
-        \\  \x1b[33m^U/^F\x1b[0m\x1b[90m scroll\x1b[0m  \x1b[33m^B\x1b[0m\x1b[90m agents\x1b[0m  \x1b[33m^P\x1b[0m\x1b[90m think\x1b[0m  \x1b[33m^T\x1b[0m\x1b[90m model\x1b[0m
-        \\  \x1b[33mEsc\x1b[0m\x1b[90m vi mode\x1b[0m  \x1b[33m^D\x1b[0m\x1b[90m exit\x1b[0m  \x1b[33mRight\x1b[0m\x1b[90m accept ghost\x1b[0m
+        \\  \x1b[33mEnter\x1b[0m\x1b[90m submit\x1b[0m  \x1b[33m^J\x1b[0m\x1b[90m newline\x1b[0m  \x1b[33m^C\x1b[0m\x1b[90m cancel\x1b[0m  \x1b[33m^D\x1b[0m\x1b[90m exit\x1b[0m  \x1b[33mEsc\x1b[0m\x1b[90m vi\x1b[0m
+        \\  \x1b[33m^A/^E\x1b[0m\x1b[90m home/end\x1b[0m  \x1b[33m^W\x1b[0m\x1b[90m del word\x1b[0m  \x1b[33mCtrl+←/→\x1b[0m\x1b[90m word\x1b[0m  \x1b[33m↑/↓\x1b[0m\x1b[90m history\x1b[0m
+        \\  \x1b[33m^U/^F\x1b[0m\x1b[90m scroll\x1b[0m  \x1b[33m^B\x1b[0m\x1b[90m agents\x1b[0m  \x1b[33m^P\x1b[0m\x1b[90m think\x1b[0m  \x1b[33m^T\x1b[0m\x1b[90m model\x1b[0m  \x1b[33mRight\x1b[0m\x1b[90m ghost\x1b[0m
         \\
     ;
     ctx.out.writeAll(help_text) catch {};
