@@ -294,6 +294,7 @@ pub const Vim = struct {
 
             // single char ops
             'x' => {
+                buf.saveUndo();
                 for (0..count) |_| {
                     if (buf.cursor < buf.len) {
                         _ = buf.deleteForward();
@@ -302,6 +303,7 @@ pub const Vim = struct {
                 return .consumed;
             },
             'X' => {
+                buf.saveUndo();
                 for (0..count) |_| _ = buf.delete();
                 return .consumed;
             },
@@ -315,6 +317,7 @@ pub const Vim = struct {
                 return .mode_changed;
             },
             'S' => {
+                buf.saveUndo();
                 // delete line content, enter insert
                 buf.moveLineStart();
                 while (buf.cursor < buf.len and buf.text[buf.cursor] != '\n') {
@@ -324,6 +327,7 @@ pub const Vim = struct {
                 return .mode_changed;
             },
             'C' => {
+                buf.saveUndo();
                 // change to end of line
                 while (buf.cursor < buf.len and buf.text[buf.cursor] != '\n') {
                     _ = buf.deleteForward();
@@ -332,6 +336,7 @@ pub const Vim = struct {
                 return .mode_changed;
             },
             'D' => {
+                buf.saveUndo();
                 // delete to end of line
                 while (buf.cursor < buf.len and buf.text[buf.cursor] != '\n') {
                     _ = buf.deleteForward();
@@ -349,8 +354,11 @@ pub const Vim = struct {
                 return .consumed;
             },
 
-            // undo - would need undo stack
-            'u' => return .consumed, // TODO: undo
+            // undo
+            'u' => {
+                if (buf.undo()) return .consumed;
+                return .consumed;
+            },
 
             // repeat
             '.' => {
@@ -469,6 +477,7 @@ pub const Vim = struct {
             },
             // operators on selection
             'd', 'x' => {
+                buf.saveUndo();
                 const range = self.getVisualRange(buf);
                 self.yankRange(buf, range.start, range.end);
                 buf.cursor = range.start;
@@ -556,6 +565,7 @@ pub const Vim = struct {
             self.awaiting_text_obj = false;
             const range = self.findTextObject(buf, key, self.text_obj_inner);
             if (range.start < range.end) {
+                buf.saveUndo();
                 const was_change = self.pending_op == .change;
                 self.executeOperator(buf, range.start, range.end);
                 return if (was_change) .mode_changed else .consumed;
@@ -569,6 +579,7 @@ pub const Vim = struct {
             (self.pending_op == .change and key == 'c') or
             (self.pending_op == .yank and key == 'y'))
         {
+            buf.saveUndo();
             buf.moveLineStart();
             const line_start = buf.cursor;
             buf.moveLineEnd();

@@ -29,7 +29,31 @@ pub const EditBuffer = struct {
     cursor: u16 = 0,
     vi_mode: ViMode = .insert,
 
+    // Undo: single-level snapshot (saved before destructive operations)
+    undo_text: [LINE_BUF_SIZE]u8 = undefined,
+    undo_len: u16 = 0,
+    undo_cursor: u16 = 0,
+    has_undo: bool = false,
+
     const Self = @This();
+
+    /// Save current state for undo. Call before destructive edits.
+    pub fn saveUndo(self: *Self) void {
+        @memcpy(self.undo_text[0..self.len], self.text[0..self.len]);
+        self.undo_len = self.len;
+        self.undo_cursor = self.cursor;
+        self.has_undo = true;
+    }
+
+    /// Restore from undo snapshot.
+    pub fn undo(self: *Self) bool {
+        if (!self.has_undo) return false;
+        @memcpy(self.text[0..self.undo_len], self.undo_text[0..self.undo_len]);
+        self.len = self.undo_len;
+        self.cursor = self.undo_cursor;
+        self.has_undo = false;
+        return true;
+    }
 
     pub fn insert(self: *Self, char: u8) bool {
         if (self.len >= LINE_BUF_SIZE - 1) return false;
