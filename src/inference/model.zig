@@ -652,22 +652,31 @@ pub const Transformer = struct {
 
                 // CTM residual
                 math.add(state.input, state.input, state.work2);
-            } else if (layer.w1 != null and layer.w2 != null and layer.w3 != null) {
-                // Standard MLP (no CTM): SwiGLU(w1(x)) * w3(x), then w2
-                // Batch gate+up: 2 matmuls, 1 GPU submit
-                if (!self.batchMatvecGpu(
-                    state.work[0..dim],
-                    &.{ state.hidden1[0..c.hidden_dim], state.hidden2[0..c.hidden_dim] },
-                    &.{ layer.w1.?, layer.w3.? },
-                    &.{ c.hidden_dim, c.hidden_dim },
-                    dim,
-                )) {
-                    self.matmulTensor(state.hidden1, layer.w1.?, state.work, c.hidden_dim, dim, state);
-                    self.matmulTensor(state.hidden2, layer.w3.?, state.work, c.hidden_dim, dim, state);
+            } else if (layer.w2 != null and (layer.w1 != null or layer.w3 != null)) {
+                // Standard MLP (no CTM)
+                if (layer.w1 != null and layer.w3 != null) {
+                    // SwiGLU: gate (w1) + up (w3)
+                    if (!self.batchMatvecGpu(
+                        state.work[0..dim],
+                        &.{ state.hidden1[0..c.hidden_dim], state.hidden2[0..c.hidden_dim] },
+                        &.{ layer.w1.?, layer.w3.? },
+                        &.{ c.hidden_dim, c.hidden_dim },
+                        dim,
+                    )) {
+                        self.matmulTensor(state.hidden1, layer.w1.?, state.work, c.hidden_dim, dim, state);
+                        self.matmulTensor(state.hidden2, layer.w3.?, state.work, c.hidden_dim, dim, state);
+                    }
+                    math.swiglu(state.hidden1);
+                    math.elementProduct(state.hidden1, state.hidden1, state.hidden2);
+                } else {
+                    // ReLU² or plain FFN: single projection + activation
+                    const up = layer.w3 orelse layer.w1.?;
+                    self.matmulTensor(state.hidden1, up, state.work, c.hidden_dim, dim, state);
+                    for (state.hidden1[0..c.hidden_dim]) |*v| {
+                        const r = @max(v.*, 0);
+                        v.* = r * r;
+                    }
                 }
-
-                math.swiglu(state.hidden1);
-                math.elementProduct(state.hidden1, state.hidden1, state.hidden2);
 
                 self.matmulTensor(state.work, layer.w2.?, state.hidden1, dim, c.hidden_dim, state);
 
