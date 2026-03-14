@@ -926,6 +926,14 @@ pub fn executeEdit(allocator: std.mem.Allocator, queues: *AgentQueues, session_l
     _ = if (new_lines > old_lines) new_lines - old_lines else 0;
     _ = if (old_lines > new_lines) old_lines - new_lines else 0;
     // Show inline diff preview (Claude Code style)
+    // Find line number of the change
+    var change_line: usize = 1;
+    if (std.mem.indexOf(u8, content, real_old)) |match_pos| {
+        for (content[0..match_pos]) |cc| {
+            if (cc == '\n') change_line += 1;
+        }
+    }
+    dw.print("\x1b[90m@@ line {d} @@\x1b[0m\n", .{change_line}) catch {};
     // Old lines in red, new lines in green, max 6 lines each
     const max_preview = 6;
     var old_count: usize = 0;
@@ -1397,9 +1405,33 @@ pub fn executeGrep(allocator: std.mem.Allocator, queues: *AgentQueues, pattern: 
     defer allocator.free(result.stderr);
     var grep_count: usize = 0;
     for (result.stdout) |gc| { if (gc == '\n') grep_count += 1; }
-    var grep_done_buf: [64]u8 = undefined;
-    const grep_done = std.fmt.bufPrint(&grep_done_buf, "{d} matches", .{grep_count}) catch "";
-    _ = queues.output.push(.tool_done, grep_done);
+    // Show preview of grep results (file:line:content with colored line numbers)
+    var grep_preview: std.ArrayList(u8) = .{};
+    const gw = grep_preview.writer(allocator);
+    var gstart: usize = 0;
+    var gshown: usize = 0;
+    const gmax: usize = 8;
+    while (gstart < result.stdout.len and gshown < gmax) {
+        const gend = std.mem.indexOfScalarPos(u8, result.stdout, gstart, '\n') orelse result.stdout.len;
+        const gline = result.stdout[gstart..gend];
+        // Color the file:line: prefix dim, content normal
+        if (std.mem.indexOfScalar(u8, gline, ':')) |colon1| {
+            if (std.mem.indexOfScalarPos(u8, gline, colon1 + 1, ':')) |colon2| {
+                gw.print("\x1b[90m{s}\x1b[0m{s}\n", .{ gline[0 .. colon2 + 1], gline[colon2 + 1 ..] }) catch break;
+                gshown += 1;
+                gstart = if (gend < result.stdout.len) gend + 1 else result.stdout.len;
+                continue;
+            }
+        }
+        gw.writeAll(gline) catch break;
+        gw.writeByte('\n') catch break;
+        gshown += 1;
+        gstart = if (gend < result.stdout.len) gend + 1 else result.stdout.len;
+    }
+    if (grep_count > gmax) {
+        gw.print("\x1b[90m({d} more matches)\x1b[0m\n", .{grep_count - gmax}) catch {};
+    }
+    _ = queues.output.push(.tool_done, grep_preview.items);
     return result.stdout;
 }
 
