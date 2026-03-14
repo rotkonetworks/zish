@@ -2008,9 +2008,9 @@ fn drainAgentOutput(self: *Shell) !void {
                 last_was_text = true;
             },
             .tool_call => {
-                if (last_was_text) try writer.writeAll("\x1b[0m\n");
+                if (last_was_text) try writer.writeAll("\x1b[0m");
                 last_was_text = false;
-                try writer.writeAll("\x1b[1m\xe2\x97\x8f \x1b[0m\x1b[90m");
+                try writer.writeAll("\x1b[90m\xe2\x9a\xa1 "); // ⚡
                 try writer.writeAll(msg.slice());
                 try writer.writeAll("\x1b[0m\n");
             },
@@ -2018,9 +2018,18 @@ fn drainAgentOutput(self: *Shell) !void {
                 last_was_text = false;
                 const dt = msg.slice();
                 if (dt.len > 0) {
-                    try writer.writeAll("  \x1b[90m\xe2\x8e\xbf  ");
-                    try writer.writeAll(dt);
-                    try writer.writeAll("\x1b[0m\n");
+                    const has_ansi = std.mem.indexOf(u8, dt, "\x1b[3") != null;
+                    if (has_ansi) {
+                        try writer.writeAll("  ");
+                        try writer.writeAll(dt);
+                        try writer.writeAll("\x1b[0m\n");
+                    } else {
+                        try writer.writeAll("  \x1b[90m");
+                        try writer.writeAll(dt);
+                        try writer.writeAll("\x1b[0m\n");
+                    }
+                } else {
+                    try writer.writeAll("  \x1b[32m\xe2\x9c\x93\x1b[0m\n"); // ✓
                 }
             },
             .error_msg => {
@@ -2073,10 +2082,7 @@ fn drainAgentOutput(self: *Shell) !void {
                 try writer.writeAll("\x1b[0m\n");
             },
             .router_info => {
-                last_was_text = false;
-                try writer.writeAll("\x1b[90m[");
-                try writer.writeAll(msg.slice());
-                try writer.writeAll("]\x1b[0m\n");
+                // Suppress router info (matches interactive mode)
             },
             .confirm_response, .add_task, .spawn_worker, .agent_status_req,
             .agent_tree_req, .agent_result_req => {}, // handled on agent side
