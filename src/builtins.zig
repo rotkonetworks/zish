@@ -3012,6 +3012,8 @@ fn agentInteractive(shell: *Shell) !u8 {
         msg_history.appendSlice(hdr);
         msg_history.commitLine();
     }
+    // Position cursor on input line
+    Layout.drawInput(out, input_first_row, input_height, &edit_buf);
     try out.flush();
 
     // Create TeeWriter for capturing output to history

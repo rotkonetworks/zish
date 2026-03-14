@@ -359,7 +359,7 @@ pub fn handleTabCompletion(self: *Shell) !void {
         }
         // empty line hint if directory is empty
         if (pattern.len == 0 and std.mem.endsWith(u8, effective_word, "/")) {
-            try self.stdout().writeAll("\x1b[s\n\n\x1b[u");
+            try self.stdout().writeAll("\x1b" ++ "7\n\n\x1b" ++ "8");
             try self.stdout().flush();
         }
         return;
@@ -2068,7 +2068,7 @@ fn showFlagCompletionsWithDesc(self: *Shell, matches: *std.ArrayList([]const u8)
     const term_height = self.terminal_height;
     const max_menu_height = if (term_height > 3) term_height - 3 else 1;
 
-    try self.stdout().writeAll("\x1b[s");
+    try self.stdout().writeAll("\x1b" ++ "7");
     const cmd_rows = self.term_view.term.rows_owned;
     const cursor_row = self.term_view.term.row;
     const rows_below_cursor = if (cmd_rows > cursor_row + 1) cmd_rows - cursor_row - 1 else 0;
@@ -2136,7 +2136,7 @@ fn showFlagCompletionsWithDesc(self: *Shell, matches: *std.ArrayList([]const u8)
         self.completion_menu_lines = items_to_show;
     }
 
-    try self.stdout().writeAll("\x1b[u");
+    try self.stdout().writeAll("\x1b" ++ "8");
     try self.stdout().flush();
     self.completion_displayed = true;
     return true;
@@ -2359,14 +2359,14 @@ pub fn exitCompletionMode(self: *Shell) void {
         // Move to one row below command area and clear everything below.
         // Use save/restore cursor to return to original position.
         // Avoid \n which can scroll the terminal and desync term.row.
-        self.stdout().writeAll("\x1b[s") catch {};
+        self.stdout().writeAll("\x1b" ++ "7") catch {};
         const cmd_rows = self.term_view.term.rows_owned;
         const cursor_row = self.term_view.term.row;
         const rows_to_menu = cmd_rows -| cursor_row;
         if (rows_to_menu > 0) {
             self.stdout().print("\x1b[{d}B", .{rows_to_menu}) catch {};
         }
-        self.stdout().writeAll("\x1b[J\x1b[u") catch {};
+        self.stdout().writeAll("\x1b[J\x1b" ++ "8") catch {};
         self.stdout().flush() catch {};
     }
 
@@ -2423,23 +2423,17 @@ pub fn handleCompletionCycle(self: *Shell, direction: CycleDirection) !void {
 
     try applyCompletion(self, self.completion_pattern_len);
 
-    if (self.completion_displayed) {
-        // clear command + menu from start of command area
-        if (self.term_view.term.row > 0) {
-            try self.stdout().print("\x1b[{d}A", .{self.term_view.term.row});
-        }
-        try self.stdout().writeAll("\r\x1b[J");
-        try self.stdout().flush();
-        // reset TermView state so it redraws from scratch
-        self.term_view.term.row = 0;
-        self.term_view.term.col = 0;
-        self.term_view.last_hash = 0;
-        try self.renderLine();
-        try displayCompletions(self);
-    } else {
-        try self.renderLine();
-        try displayCompletions(self);
+    // Always clear from command start to end of screen before redrawing
+    if (self.term_view.term.row > 0) {
+        try self.stdout().print("\x1b[{d}A", .{self.term_view.term.row});
     }
+    try self.stdout().writeAll("\r\x1b[J");
+    try self.stdout().flush();
+    self.term_view.term.row = 0;
+    self.term_view.term.col = 0;
+    self.term_view.last_hash = 0;
+    try self.renderLine();
+    try displayCompletions(self);
 }
 
 fn applyCompletion(self: *Shell, pattern_len: usize) !void {
@@ -2469,7 +2463,7 @@ pub fn displayCompletions(self: *Shell) !void {
     const max_menu_height = if (term_height > 3) term_height - 3 else 1;
 
     // save cursor position; move to bottom of command area before writing menu
-    try self.stdout().writeAll("\x1b[s");
+    try self.stdout().writeAll("\x1b" ++ "7"); // DECSC (more reliable than SCO)
     const cmd_rows = self.term_view.term.rows_owned;
     const cursor_row = self.term_view.term.row;
     const rows_below_cursor = if (cmd_rows > cursor_row + 1) cmd_rows - cursor_row - 1 else 0;
@@ -2513,7 +2507,7 @@ pub fn displayCompletions(self: *Shell) !void {
         }
 
         // restore cursor to command line position
-        try self.stdout().writeAll("\x1b[u");
+        try self.stdout().writeAll("\x1b" ++ "8");
         try self.stdout().flush();
         self.completion_displayed = true;
         return;
@@ -2584,7 +2578,7 @@ pub fn displayCompletions(self: *Shell) !void {
     }
 
     // restore cursor to command line position
-    try self.stdout().writeAll("\x1b[u");
+    try self.stdout().writeAll("\x1b" ++ "8");
     try self.stdout().flush();
     self.completion_displayed = true;
 }
@@ -2688,7 +2682,7 @@ pub fn updateCompletionHighlight(self: *Shell, old_index: usize) !void {
     const term_width = self.terminal_width;
 
     // save cursor position on command line
-    try self.stdout().writeAll("\x1b[s");
+    try self.stdout().writeAll("\x1b" ++ "7");
 
     if (old_index >= self.completion_matches.items.len) {
         const max_item_width: usize = 30;
@@ -2712,7 +2706,7 @@ pub fn updateCompletionHighlight(self: *Shell, old_index: usize) !void {
         try self.stdout().print("{f}{s}{f}", .{ tty.Style.reverse, self.completion_matches.items[self.completion_index], tty.Style.reset });
 
         // restore cursor to command line
-        try self.stdout().writeAll("\x1b[u");
+        try self.stdout().writeAll("\x1b" ++ "8");
         try self.stdout().flush();
         return;
     }
@@ -2722,7 +2716,7 @@ pub fn updateCompletionHighlight(self: *Shell, old_index: usize) !void {
         try self.stdout().writeByte('\n');
         try self.stdout().writeAll("\x1b[J");
         // don't use save/restore here since displayCompletions does its own
-        try self.stdout().writeAll("\x1b[u"); // restore first
+        try self.stdout().writeAll("\x1b" ++ "8"); // restore first
         try displayCompletions(self);
         return;
     }
@@ -2760,7 +2754,7 @@ pub fn updateCompletionHighlight(self: *Shell, old_index: usize) !void {
     try self.stdout().print("{f}{s}{f}", .{ tty.Style.reverse, self.completion_matches.items[self.completion_index], tty.Style.reset });
 
     // restore cursor to command line
-    try self.stdout().writeAll("\x1b[u");
+    try self.stdout().writeAll("\x1b" ++ "8");
     try self.stdout().flush();
 }
 
