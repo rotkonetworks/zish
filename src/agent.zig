@@ -2280,6 +2280,15 @@ pub const MarkdownRenderer = struct {
     pending_stars: u8 = 0, // count of trailing * from previous chunk
     pending_backticks: u8 = 0, // count of trailing ` from previous chunk
 
+    /// Reset column tracking (call when emitting newline from any code path)
+    fn resetCol(self: *MarkdownRenderer) void {
+        self.col = 0;
+    }
+
+    fn advanceCol(self: *MarkdownRenderer, n: u16) void {
+        self.col +|= n;
+    }
+
     /// Process a chunk of text and write ANSI-formatted output
     pub fn render(self: *MarkdownRenderer, writer: anytype, text: []const u8) !void {
         var i: usize = 0;
@@ -2768,7 +2777,14 @@ pub const MarkdownRenderer = struct {
                     }
                 }
             }
-            self.line_start = (c == '\n') or self.line_start;
+            // Track line position — newline resets, other chars clear line_start
+            // (handlers that `continue` manage line_start themselves)
+            if (c == '\n') {
+                self.line_start = true;
+                self.resetCol();
+            } else {
+                self.line_start = false;
+            }
             i += 1;
         }
     }
