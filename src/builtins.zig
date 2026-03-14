@@ -4376,16 +4376,19 @@ fn agentLog(shell: *Shell, args: []const []const u8) !u8 {
     const meta_path = std.fmt.bufPrint(&meta_path_buf, "{s}/sessions/{s}/meta.json", .{ base, session_id }) catch "";
     if (std.fs.cwd().readFileAlloc(shell.allocator, meta_path, 4096)) |meta| {
         defer shell.allocator.free(meta);
-        try out.writeAll("\x1b[1;34m─── Session ");
-        try out.writeAll(session_id);
-        try out.writeAll(" ───\x1b[0m\n");
-        if (agent_log.jsonExtractStr(meta, "cwd")) |cwd| {
-            try out.print("\x1b[90mcwd: {s}\x1b[0m\n", .{cwd});
-        }
+        try out.print("\x1b[90m{s}", .{session_id});
         if (agent_log.jsonExtractStr(meta, "model")) |model| {
-            try out.print("\x1b[90mmodel: {s}\x1b[0m\n", .{model});
+            try out.print(" \xc2\xb7 {s}", .{model});
         }
-        try out.writeByte('\n');
+        if (agent_log.jsonExtractStr(meta, "cwd")) |cwd| {
+            const home = std.posix.getenv("HOME") orelse "";
+            if (home.len > 0 and std.mem.startsWith(u8, cwd, home)) {
+                try out.print(" \xc2\xb7 ~{s}", .{cwd[home.len..]});
+            } else {
+                try out.print(" \xc2\xb7 {s}", .{cwd});
+            }
+        }
+        try out.writeAll("\x1b[0m\n\n");
     } else |_| {}
 
     // Parse and display JSONL entries
@@ -4696,9 +4699,9 @@ fn renderLogLine(out: anytype, md: *agent_mod.MarkdownRenderer, line: []const u8
 
     if (std.mem.eql(u8, entry_type, "u")) {
         if (agent_log.jsonExtractStr(line, "content")) |content| {
-            try out.writeAll("\x1b[1;32m❯ \x1b[0m");
+            try out.writeAll("\n\x1b[1m> ");
             try out.writeAll(content);
-            try out.writeByte('\n');
+            try out.writeAll("\x1b[0m\n\n");
             md.reset();
         }
     } else if (std.mem.eql(u8, entry_type, "a")) {
@@ -4711,25 +4714,25 @@ fn renderLogLine(out: anytype, md: *agent_mod.MarkdownRenderer, line: []const u8
         }
     } else if (std.mem.eql(u8, entry_type, "tc")) {
         if (agent_log.jsonExtractStr(line, "tool")) |tool| {
-            try out.writeAll("\x1b[90m  Tool: ");
+            try out.writeAll("\x1b[90m\xe2\x9a\xa1 ");
             try out.writeAll(tool);
             try out.writeAll("\x1b[0m\n");
         }
     } else if (std.mem.eql(u8, entry_type, "e")) {
         if (agent_log.jsonExtractStr(line, "content")) |content| {
-            try out.writeAll("\x1b[31m  ");
+            try out.writeAll("\x1b[31m");
             try out.writeAll(content);
             try out.writeAll("\x1b[0m\n");
         }
     } else if (std.mem.eql(u8, entry_type, "as")) {
         const desc = agent_log.jsonExtractStr(line, "desc") orelse "task";
         const aid = agent_log.jsonExtractStr(line, "agent_id") orelse "?";
-        try out.print("\x1b[1;36m  ⚡ Subagent {s}: {s}\x1b[0m\n", .{ aid, desc });
+        try out.print("\x1b[90m\xe2\x9a\xa1 subagent {s}: {s}\x1b[0m\n", .{ aid, desc });
     } else if (std.mem.eql(u8, entry_type, "ar")) {
         const aid = agent_log.jsonExtractStr(line, "agent_id") orelse "?";
-        try out.print("\x1b[36m  ← {s} returned\x1b[0m\n", .{aid});
+        try out.print("\x1b[90m  \xe2\x9c\x93 {s} done\x1b[0m\n", .{aid});
     } else if (std.mem.eql(u8, entry_type, "d")) {
-        try out.writeAll("\x1b[90m  ───\x1b[0m\n");
+        // skip dividers in log view
     }
 }
 
