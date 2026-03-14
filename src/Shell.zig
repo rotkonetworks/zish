@@ -1334,10 +1334,9 @@ fn handleAction(self: *Shell, action: Action) !void {
         .tap_complete => {
             if (self.completion_mode) {
                 try completion_mod.handleCompletionCycle(self, .forward);
-            } else if (self.ghost_len > 0 and self.edit_buf.cursor == self.edit_buf.len) {
-                // Tab accepts ghost text (fish-style) when cursor is at end
-                if (completion_mod.acceptGhostText(self)) try self.renderLine();
             } else {
+                // Tab always does traditional completion (ls <tab> shows files)
+                // Ghost text is accepted via Right arrow or End key
                 try completion_mod.handleTabCompletion(self);
             }
         },
