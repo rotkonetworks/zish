@@ -1342,12 +1342,25 @@ pub fn executeGlob(allocator: std.mem.Allocator, queues: *AgentQueues, pattern: 
         return allocator.dupe(u8, msg);
     };
     defer allocator.free(result.stderr);
-    // Count result lines for feedback
+    // Show file list preview (paths will be auto-linkified by display handler)
     var match_count: usize = 0;
     for (result.stdout) |sc| { if (sc == '\n') match_count += 1; }
-    var done_buf2: [64]u8 = undefined;
-    const done_msg2 = std.fmt.bufPrint(&done_buf2, "{d} files", .{match_count}) catch "";
-    _ = queues.output.push(.tool_done, done_msg2);
+    var glob_preview: std.ArrayList(u8) = .{};
+    const gpw = glob_preview.writer(allocator);
+    var gps: usize = 0;
+    var gpn: usize = 0;
+    const gpm: usize = 10;
+    while (gps < result.stdout.len and gpn < gpm) {
+        const gpe = std.mem.indexOfScalarPos(u8, result.stdout, gps, '\n') orelse result.stdout.len;
+        gpw.writeAll(result.stdout[gps..gpe]) catch break;
+        gpw.writeByte('\n') catch break;
+        gps = if (gpe < result.stdout.len) gpe + 1 else result.stdout.len;
+        gpn += 1;
+    }
+    if (match_count > gpm) {
+        gpw.print("\x1b[90m({d} more files)\x1b[0m\n", .{match_count - gpm}) catch {};
+    }
+    _ = queues.output.push(.tool_done, glob_preview.items);
     return result.stdout;
 }
 
