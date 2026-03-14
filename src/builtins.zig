@@ -3659,6 +3659,18 @@ fn agentInteractive(shell: *Shell) !u8 {
                 continue;
             }
 
+            // Ctrl+L (0x0C) — clear screen, redraw from history
+            if (byte[0] == 0x0C) {
+                scroll_offset = 0;
+                out.print("\x1b[1;{d}r", .{term_rows}) catch {};
+                out.writeAll("\x1b[H\x1b[2J") catch {};
+                recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
+                Layout.repaintFromHistory(out, &msg_history, out_last, scroll_offset);
+                try out.flush();
+                cursor_at = .input;
+                continue;
+            }
+
             // Ctrl+K — jump to previous user message in scrollback
             // Ctrl+N — jump to next user message in scrollback
             // Ctrl+O (0x0F) — scroll to show context around current position
