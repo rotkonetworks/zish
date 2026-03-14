@@ -2999,20 +2999,30 @@ fn agentInteractive(shell: *Shell) !u8 {
     // Initial layout
     recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
 
-    // Print header in scroll region
+    // Print header in scroll region (model · cwd · hint)
     Layout.goOutput(out, out_last);
-    if (was_running) {
-        try out.print("\x1b[90m{s} \xc2\xb7 continuing\x1b[0m\n", .{model_name});
-    } else {
-        try out.print("\x1b[90m{s} \xc2\xb7 /help for commands\x1b[0m\n", .{model_name});
+    {
+        var cwd_buf: [256]u8 = undefined;
+        const cwd_full = std.posix.getcwd(&cwd_buf) catch "?";
+        const home = std.posix.getenv("HOME") orelse "";
+        var cwd_short_buf: [256]u8 = undefined;
+        const cwd = if (home.len > 0 and std.mem.startsWith(u8, cwd_full, home))
+            std.fmt.bufPrint(&cwd_short_buf, "~{s}", .{cwd_full[home.len..]}) catch cwd_full
+        else
+            cwd_full;
+        if (was_running) {
+            try out.print("\x1b[90m{s} \xc2\xb7 {s} \xc2\xb7 continuing\x1b[0m\n", .{ model_name, cwd });
+        } else {
+            try out.print("\x1b[90m{s} \xc2\xb7 {s} \xc2\xb7 /help\x1b[0m\n", .{ model_name, cwd });
+        }
     }
     // Capture header in history
     {
-        var hdr_buf: [128]u8 = undefined;
+        var hdr_buf: [256]u8 = undefined;
         const hdr = if (was_running)
             std.fmt.bufPrint(&hdr_buf, "\x1b[90m{s} \xc2\xb7 continuing\x1b[0m", .{model_name}) catch ""
         else
-            std.fmt.bufPrint(&hdr_buf, "\x1b[90m{s} \xc2\xb7 /help for commands\x1b[0m", .{model_name}) catch "";
+            std.fmt.bufPrint(&hdr_buf, "\x1b[90m{s} \xc2\xb7 /help\x1b[0m", .{model_name}) catch "";
         msg_history.appendSlice(hdr);
         msg_history.commitLine();
     }
