@@ -285,7 +285,7 @@ pub const Vim = struct {
                     if (buf.cursor < buf.len and buf.text[buf.cursor] != ' ' and
                         buf.cursor > 0 and buf.text[buf.cursor - 1] != ' ')
                     {
-                        buf.insert(' ');
+                        _ = buf.insert(' ');
                     }
                     buf.cursor = old;
                 }
