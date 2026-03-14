@@ -3010,10 +3010,29 @@ fn agentInteractive(shell: *Shell) !u8 {
             std.fmt.bufPrint(&cwd_short_buf, "~{s}", .{cwd_full[home.len..]}) catch cwd_full
         else
             cwd_full;
+        // Detect git branch for context
+        var branch: []const u8 = "";
+        var branch_read_buf: [256]u8 = undefined;
+        if (std.fs.cwd().openFile(".git/HEAD", .{})) |head| {
+            defer head.close();
+            const n = head.read(&branch_read_buf) catch 0;
+            const content = std.mem.trim(u8, branch_read_buf[0..n], " \t\r\n");
+            if (std.mem.startsWith(u8, content, "ref: refs/heads/"))
+                branch = content[16..];
+        } else |_| {}
+
         if (was_running) {
-            try out.print("\x1b[90m{s} \xc2\xb7 {s} \xc2\xb7 continuing\x1b[0m\n", .{ model_name, cwd });
+            if (branch.len > 0) {
+                try out.print("\x1b[90m{s} \xc2\xb7 {s} \xc2\xb7 \x1b[33m{s}\x1b[90m \xc2\xb7 continuing\x1b[0m\n", .{ model_name, cwd, branch });
+            } else {
+                try out.print("\x1b[90m{s} \xc2\xb7 {s} \xc2\xb7 continuing\x1b[0m\n", .{ model_name, cwd });
+            }
         } else {
-            try out.print("\x1b[90m{s} \xc2\xb7 {s} \xc2\xb7 /help\x1b[0m\n", .{ model_name, cwd });
+            if (branch.len > 0) {
+                try out.print("\x1b[90m{s} \xc2\xb7 {s} \xc2\xb7 \x1b[33m{s}\x1b[90m \xc2\xb7 /help\x1b[0m\n", .{ model_name, cwd, branch });
+            } else {
+                try out.print("\x1b[90m{s} \xc2\xb7 {s} \xc2\xb7 /help\x1b[0m\n", .{ model_name, cwd });
+            }
         }
     }
     // Capture header in history
