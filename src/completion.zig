@@ -3013,12 +3013,21 @@ fn ghostInferThread(ctx: anytype) void {
         if (shell.ghost_infer_seq.load(.monotonic) != seq) continue;
 
         // Sanitize: only keep printable ASCII, stop at newline or control chars
+        // Strict filter: only printable ASCII (0x20-0x7E) + common shell chars
+        // Reject any non-ASCII (UTF-8 multibyte) to avoid garbage from undertrained models
         var clean_len: u32 = 0;
+        var consecutive_junk: u8 = 0;
         for (result) |rc| {
-            if (rc == '\n' or rc == '\r' or rc < 0x20) break;
-            if (clean_len < 512) {
-                shell.ghost_infer_result[clean_len] = rc;
-                clean_len += 1;
+            if (rc == '\n' or rc == '\r') break;
+            if (rc >= 0x20 and rc <= 0x7E) {
+                if (clean_len < 512) {
+                    shell.ghost_infer_result[clean_len] = rc;
+                    clean_len += 1;
+                }
+                consecutive_junk = 0;
+            } else {
+                consecutive_junk += 1;
+                if (consecutive_junk > 2) break; // 3+ non-ASCII = garbage, stop
             }
         }
         const rlen = clean_len;
