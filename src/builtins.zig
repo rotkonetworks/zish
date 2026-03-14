@@ -4474,7 +4474,8 @@ fn agentInteractive(shell: *Shell) !u8 {
                         "/review",  "/undo",     "/plan",     "/spawn",   "/queue",
                         "/agents",  "/tasks",    "/tree",     "/sessions", "/config",
                         "/search",  "/voice",    "/init",     "/effort",  "/status",
-                        "/think",   "/fix",      "/web",      "/pr",      "/run",     "/cd",
+                        "/think",   "/build",    "/test",     "/fix",     "/web",     "/pr",
+                        "/run",     "/cd",
                         "/git",     "/export",
                         "/new",     "/clear",    "/help",
                     };

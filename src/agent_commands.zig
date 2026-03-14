@@ -727,6 +727,8 @@ const commands = [_]Command{
     .{ .name = "/pr", .has_arg = true, .handler = cmdPR },
     .{ .name = "/web", .has_arg = true, .handler = cmdWeb },
     .{ .name = "/fix", .has_arg = true, .handler = cmdFix },
+    .{ .name = "/test", .has_arg = true, .handler = cmdTest },
+    .{ .name = "/build", .has_arg = false, .handler = cmdBuild },
     .{ .name = "/cd", .has_arg = true, .handler = cmdCd },
     .{ .name = "/ls", .has_arg = true, .handler = cmdLs },
     .{ .name = "/cat", .has_arg = true, .handler = cmdCat },
@@ -879,6 +881,101 @@ fn cmdPR(ctx: *CommandCtx, arg: []const u8) DispatchResult {
     if (ctx.shell.agent.query(prompt)) {
         ctx.agent_active.* = true;
         ctx.setStatus("creating PR...");
+    }
+    ctx.out.flush() catch {};
+    return .handled;
+}
+
+fn cmdTest(ctx: *CommandCtx, arg: []const u8) DispatchResult {
+    Layout.goOutput(ctx.out, ctx.out_last.*);
+    // Auto-detect test command from project files
+    const test_cmd: []const u8 = if (arg.len > 0)
+        arg
+    else if (std.fs.cwd().access("build.zig", .{}) catch null != null)
+        "zig build test"
+    else if (std.fs.cwd().access("Cargo.toml", .{}) catch null != null)
+        "cargo test"
+    else if (std.fs.cwd().access("package.json", .{}) catch null != null)
+        "npm test"
+    else if (std.fs.cwd().access("Makefile", .{}) catch null != null)
+        "make test"
+    else if (std.fs.cwd().access("go.mod", .{}) catch null != null)
+        "go test ./..."
+    else if (std.fs.cwd().access("pytest.ini", .{}) catch null != null or
+        std.fs.cwd().access("setup.py", .{}) catch null != null)
+        "python3 -m pytest"
+    else
+        "echo 'No test runner detected'";
+
+    ctx.out.print("\x1b[90m\xe2\x96\xb6 {s}\x1b[0m\n", .{test_cmd}) catch {};
+    const result = std.process.Child.run(.{
+        .allocator = ctx.shell.allocator,
+        .argv = &[_][]const u8{ "/bin/sh", "-c", test_cmd },
+        .max_output_bytes = 64 * 1024,
+    }) catch {
+        ctx.out.writeAll("\x1b[31mexec failed\x1b[0m\n") catch {};
+        ctx.out.flush() catch {};
+        return .handled;
+    };
+    defer ctx.shell.allocator.free(result.stdout);
+    defer ctx.shell.allocator.free(result.stderr);
+    if (result.stdout.len > 0) ctx.out.writeAll(result.stdout) catch {};
+    if (result.stderr.len > 0) {
+        ctx.out.writeAll("\x1b[31m") catch {};
+        ctx.out.writeAll(result.stderr) catch {};
+        ctx.out.writeAll("\x1b[0m") catch {};
+    }
+    const exited = result.term.Exited;
+    if (exited == 0) {
+        ctx.out.writeAll("\x1b[32m\xe2\x9c\x93 tests passed\x1b[0m\n") catch {};
+    } else {
+        ctx.out.print("\x1b[31m\xe2\x9c\x97 tests failed (exit {d})\x1b[90m \xc2\xb7 /fix to repair\x1b[0m\n", .{exited}) catch {};
+    }
+    ctx.out.flush() catch {};
+    return .handled;
+}
+
+fn cmdBuild(ctx: *CommandCtx, _: []const u8) DispatchResult {
+    Layout.goOutput(ctx.out, ctx.out_last.*);
+    // Auto-detect build command
+    const build_cmd: []const u8 = if (std.fs.cwd().access("build.zig", .{}) catch null != null)
+        "zig build"
+    else if (std.fs.cwd().access("Cargo.toml", .{}) catch null != null)
+        "cargo build"
+    else if (std.fs.cwd().access("package.json", .{}) catch null != null)
+        "npm run build"
+    else if (std.fs.cwd().access("Makefile", .{}) catch null != null)
+        "make"
+    else if (std.fs.cwd().access("CMakeLists.txt", .{}) catch null != null)
+        "cmake --build build"
+    else if (std.fs.cwd().access("go.mod", .{}) catch null != null)
+        "go build ./..."
+    else
+        "echo 'No build system detected'";
+
+    ctx.out.print("\x1b[90m\xe2\x96\xb6 {s}\x1b[0m\n", .{build_cmd}) catch {};
+    const result = std.process.Child.run(.{
+        .allocator = ctx.shell.allocator,
+        .argv = &[_][]const u8{ "/bin/sh", "-c", build_cmd },
+        .max_output_bytes = 64 * 1024,
+    }) catch {
+        ctx.out.writeAll("\x1b[31mexec failed\x1b[0m\n") catch {};
+        ctx.out.flush() catch {};
+        return .handled;
+    };
+    defer ctx.shell.allocator.free(result.stdout);
+    defer ctx.shell.allocator.free(result.stderr);
+    if (result.stdout.len > 0) ctx.out.writeAll(result.stdout) catch {};
+    if (result.stderr.len > 0) {
+        ctx.out.writeAll("\x1b[31m") catch {};
+        ctx.out.writeAll(result.stderr) catch {};
+        ctx.out.writeAll("\x1b[0m") catch {};
+    }
+    const exited = result.term.Exited;
+    if (exited == 0) {
+        ctx.out.writeAll("\x1b[32m\xe2\x9c\x93 build succeeded\x1b[0m\n") catch {};
+    } else {
+        ctx.out.print("\x1b[31m\xe2\x9c\x97 build failed (exit {d})\x1b[90m \xc2\xb7 /fix to repair\x1b[0m\n", .{exited}) catch {};
     }
     ctx.out.flush() catch {};
     return .handled;
@@ -2154,8 +2251,8 @@ fn cmdHelp(ctx: *CommandCtx, _: []const u8) DispatchResult {
     Layout.goOutput(ctx.out, ctx.out_last.*);
     const help_text =
         \\\x1b[1mCode\x1b[0m
-        \\  \x1b[33m/fix\x1b[0m\x1b[90m ·· fix last error\x1b[0m  \x1b[33m/plan\x1b[0m\x1b[90m ·· plan task\x1b[0m  \x1b[33m/review\x1b[0m\x1b[90m ·· review changes\x1b[0m
-        \\  \x1b[33m/undo\x1b[0m\x1b[90m · revert file\x1b[0m  \x1b[33m/init\x1b[0m\x1b[90m ·· gen CLAUDE.md\x1b[0m  \x1b[33m/web\x1b[0m\x1b[90m · search web\x1b[0m
+        \\  \x1b[33m/build\x1b[0m\x1b[90m · build project\x1b[0m  \x1b[33m/test\x1b[0m\x1b[90m · run tests\x1b[0m  \x1b[33m/fix\x1b[0m\x1b[90m · fix error\x1b[0m
+        \\  \x1b[33m/plan\x1b[0m\x1b[90m ·· plan task\x1b[0m  \x1b[33m/review\x1b[0m\x1b[90m · review\x1b[0m  \x1b[33m/undo\x1b[0m\x1b[90m · revert\x1b[0m  \x1b[33m/web\x1b[0m\x1b[90m · search\x1b[0m
         \\
         \\\x1b[1mGit\x1b[0m
         \\  \x1b[33m/diff\x1b[0m\x1b[90m · changes\x1b[0m  \x1b[33m/commit\x1b[0m\x1b[90m · commit\x1b[0m  \x1b[33m/pr\x1b[0m\x1b[90m · pull request\x1b[0m
