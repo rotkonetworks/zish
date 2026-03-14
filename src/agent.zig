@@ -26,7 +26,8 @@ pub const Config = struct {
     model: []const u8 = "claude-opus-4-6",
     api_key: []const u8 = "",
     base_url: []const u8 = "https://api.anthropic.com",
-    max_tokens: u32 = 8192,
+    max_tokens: u32 = 16384,
+    thinking_budget: u32 = 0, // 0 = disabled, >0 = extended thinking budget tokens
     max_tool_iterations: u32 = 10,
     auto_allow: bool = false,
     local_model: []const u8 = "", // path to GGUF for local provider
@@ -1681,10 +1682,16 @@ const AgentThread = struct {
             const override = self.queues.shared_max_tokens.load(.monotonic);
             break :blk if (override > 0) override else self.config.max_tokens;
         };
-        w.print("{{\"model\":\"{s}\",\"max_tokens\":{d},\"stream\":true,\"system\":", .{
+        w.print("{{\"model\":\"{s}\",\"max_tokens\":{d},\"stream\":true", .{
             self.config.model,
             effective_max_tokens,
         }) catch return error.BodyTooLarge;
+        // Extended thinking (if budget > 0)
+        const thinking_budget = self.queues.shared_thinking_budget.load(.monotonic);
+        if (thinking_budget > 0) {
+            w.print(",\"thinking\":{{\"type\":\"enabled\",\"budget_tokens\":{d}}}", .{thinking_budget}) catch return error.BodyTooLarge;
+        }
+        w.writeAll(",\"system\":") catch return error.BodyTooLarge;
         writeJSONString(w, self.systemPrompt()) catch return error.BodyTooLarge;
         w.print(",\"messages\":{s},\"tools\":{s}}}", .{
             messages_json,
@@ -2141,7 +2148,7 @@ fn parseAnthropicDelta(
             }
             return;
         }
-        // thinking delta — ignore (internal reasoning)
+        // thinking delta — don't show content, but update status
         if (std.mem.indexOf(u8, data, "\"thinking_delta\"") != null) return;
         // input_json_delta (tool arguments)
         if (std.mem.indexOf(u8, data, "\"input_json_delta\"") != null) {
@@ -2266,6 +2273,42 @@ fn writeJSONString(w: anytype, s: []const u8) !void {
 // Markdown terminal renderer (streaming-aware)
 // ============================================================
 
+// Code syntax helpers for keyword highlighting
+fn isWordBoundary(text: []const u8, pos: usize) bool {
+    if (pos == 0) return true;
+    const prev = text[pos - 1];
+    return prev == ' ' or prev == '\t' or prev == '\n' or prev == '(' or prev == '{' or
+        prev == '[' or prev == ',' or prev == ';' or prev == ':' or prev == '!' or prev == '|';
+}
+
+fn matchKeyword(text: []const u8, pos: usize) ?usize {
+    // Common keywords across languages (sorted by frequency in code output)
+    const keywords = [_][]const u8{
+        "const", "var", "let", "fn", "func", "function", "def", "class", "struct",
+        "if", "else", "for", "while", "return", "import", "from", "pub", "self",
+        "true", "false", "null", "nil", "None", "undefined", "void",
+        "try", "catch", "throw", "async", "await", "yield",
+        "type", "interface", "enum", "match", "switch", "case", "break", "continue",
+        "new", "this", "super", "extends", "implements",
+        "export", "default", "module", "require", "package",
+        "static", "final", "override", "abstract", "private", "public", "protected",
+    };
+    const remaining = text[pos..];
+    for (keywords) |kw| {
+        if (remaining.len >= kw.len and std.mem.eql(u8, remaining[0..kw.len], kw)) {
+            // Must end at word boundary
+            if (remaining.len == kw.len) return kw.len;
+            const after = remaining[kw.len];
+            if (after == ' ' or after == '\t' or after == '\n' or after == '(' or
+                after == ')' or after == '{' or after == '}' or after == '[' or
+                after == ']' or after == ',' or after == ';' or after == ':' or
+                after == '.' or after == '<' or after == '>')
+                return kw.len;
+        }
+    }
+    return null;
+}
+
 /// Tracks state for rendering markdown with ANSI codes across streamed chunks
 pub const MarkdownRenderer = struct {
     in_code_block: bool = false,
@@ -2316,16 +2359,18 @@ pub const MarkdownRenderer = struct {
                     while (skip < text.len and text[skip] != '\n') : (skip += 1) {}
                     const lang = std.mem.trim(u8, text[i..skip], " \t\r");
                     if (lang.len > 0) {
-                        try writer.writeAll("\x1b[90m");
+                        try writer.writeAll("\x1b[90m\xe2\x94\x8c "); // ┌
                         try writer.writeAll(lang);
                         try writer.writeAll("\x1b[0m\n");
+                    } else {
+                        try writer.writeAll("\x1b[90m\xe2\x94\x8c\x1b[0m\n"); // ┌
                     }
-                    try writer.writeAll("\x1b[36m");
+                    try writer.writeAll("\x1b[90m\xe2\x94\x82\x1b[36m ");
                     i = if (skip < text.len) skip + 1 else skip;
                     self.line_start = true;
                 } else {
                     self.in_code_block = false;
-                    try writer.writeAll("\x1b[0m\n");
+                    try writer.writeAll("\x1b[0m\x1b[90m\xe2\x94\x94\x1b[0m\n"); // └
                     while (i < text.len and text[i] != '\n') : (i += 1) {}
                     self.line_start = true;
                 }
@@ -2407,20 +2452,22 @@ pub const MarkdownRenderer = struct {
                         // Skip language identifier on same line
                         var skip = i + 3;
                         while (skip < text.len and text[skip] != '\n') : (skip += 1) {}
-                        // Code block header
+                        // Code block header with language label
                         const lang = std.mem.trim(u8, text[i + 3 .. skip], " \t\r");
                         if (lang.len > 0) {
-                            try writer.writeAll("\x1b[90m");
+                            try writer.writeAll("\x1b[90m\xe2\x94\x8c "); // ┌ top border
                             try writer.writeAll(lang);
                             try writer.writeAll("\x1b[0m\n");
+                        } else {
+                            try writer.writeAll("\x1b[90m\xe2\x94\x8c\x1b[0m\n"); // ┌
                         }
-                        try writer.writeAll("\x1b[36m"); // cyan for code
+                        try writer.writeAll("\x1b[90m\xe2\x94\x82\x1b[36m "); // │ prefix + cyan
                         i = if (skip < text.len) skip + 1 else skip;
                         self.line_start = true;
                         continue;
                     } else {
                         self.in_code_block = false;
-                        try writer.writeAll("\x1b[0m\n");
+                        try writer.writeAll("\x1b[0m\x1b[90m\xe2\x94\x94\x1b[0m\n"); // └ bottom border
                         i += 3;
                         // skip rest of line
                         while (i < text.len and text[i] != '\n') : (i += 1) {}
@@ -2452,7 +2499,7 @@ pub const MarkdownRenderer = struct {
                 }
             }
 
-            // Inside code blocks — lightweight syntax coloring
+            // Inside code blocks — syntax coloring
             if (self.in_code_block) {
                 if (self.line_start) {
                     // Diff coloring: +lines green, -lines red
@@ -2479,14 +2526,38 @@ pub const MarkdownRenderer = struct {
                         try writer.writeAll("\x1b[36m");
                         self.in_code_string = false;
                     }
-                    try writer.writeAll("\x1b[36m"); // reset to cyan on newline
-                    try writer.writeByte(c);
+                    try writer.writeAll("\x1b[0m\n\x1b[90m\xe2\x94\x82\x1b[36m "); // newline + │ prefix
                 } else {
                     // Comments: // or # at line start
                     if (self.line_start and (c == '#' or (c == '/' and i + 1 < text.len and text[i + 1] == '/'))) {
                         try writer.writeAll("\x1b[90m"); // dim for comments
                     }
-                    try writer.writeByte(c);
+                    // Keywords at word boundary — magenta
+                    else if (!self.in_code_string and isWordBoundary(text, i)) {
+                        if (matchKeyword(text, i)) |kw_len| {
+                            try writer.writeAll("\x1b[35m"); // magenta
+                            try writer.writeAll(text[i..][0..kw_len]);
+                            try writer.writeAll("\x1b[36m"); // back to cyan
+                            i += kw_len;
+                            self.line_start = false;
+                            continue;
+                        } else {
+                            // Number literals at word boundary — yellow
+                            if (c >= '0' and c <= '9') {
+                                try writer.writeAll("\x1b[33m"); // yellow
+                                while (i < text.len and ((text[i] >= '0' and text[i] <= '9') or text[i] == '.' or text[i] == 'x' or text[i] == 'b' or text[i] == '_' or (text[i] >= 'a' and text[i] <= 'f') or (text[i] >= 'A' and text[i] <= 'F'))) {
+                                    try writer.writeByte(text[i]);
+                                    i += 1;
+                                }
+                                try writer.writeAll("\x1b[36m"); // back to cyan
+                                self.line_start = false;
+                                continue;
+                            }
+                            try writer.writeByte(c);
+                        }
+                    } else {
+                        try writer.writeByte(c);
+                    }
                 }
                 self.line_start = (c == '\n');
                 i += 1;
@@ -2612,8 +2683,8 @@ pub const MarkdownRenderer = struct {
                 // 3+ of the same char, followed by newline or end of text
                 if (hr_count >= 3 and (hr_j >= text.len or text[hr_j] == '\n')) {
                     try writer.writeAll("\x1b[2;90m"); // dim + gray
-                    var hk: usize = 0;
-                    while (hk < 40) : (hk += 1) try writer.writeAll("\xe2\x94\x80");
+                    var hk: u16 = 0;
+                    while (hk < self.term_width) : (hk += 1) try writer.writeAll("\xe2\x94\x80");
                     try writer.writeAll("\x1b[0m\n");
                     i = hr_j;
                     if (i < text.len and text[i] == '\n') i += 1;
@@ -2690,7 +2761,7 @@ pub const MarkdownRenderer = struct {
                 }
             }
 
-            // Table rows: | col | col | — render with dim pipes
+            // Table rows: | col | col | — render with dim pipes and bold headers
             if (self.line_start and c == '|' and !self.in_code_block) {
                 // Check if this looks like a table row (has at least one more |)
                 if (std.mem.indexOfScalarPos(u8, text, i + 1, '|')) |_| {
@@ -2704,22 +2775,51 @@ pub const MarkdownRenderer = struct {
                         }
                     }
                     if (is_sep) {
-                        // Skip separator row — visually replace with thin line
-                        try writer.writeAll("\x1b[2;90m──\x1b[0m\n");
+                        // Replace separator with box-drawing line
+                        try writer.writeAll("\x1b[90m");
+                        var sep_j = i;
+                        while (sep_j < si) : (sep_j += 1) {
+                            if (text[sep_j] == '|') {
+                                try writer.writeAll("\xe2\x94\xbc"); // ┼
+                            } else {
+                                try writer.writeAll("\xe2\x94\x80"); // ─
+                            }
+                        }
+                        try writer.writeAll("\x1b[0m\n");
                         i = si;
                         if (i < text.len and text[i] == '\n') i += 1;
                         self.line_start = true;
                         continue;
                     }
-                    // Render table row: dim pipes, content in normal color
+                    // Check if this is a header row (next non-empty line is separator)
+                    var is_header = false;
+                    var ni = si;
+                    if (ni < text.len and text[ni] == '\n') ni += 1;
+                    if (ni < text.len and text[ni] == '|') {
+                        // Check if next line is separator
+                        var nj = ni + 1;
+                        var next_is_sep = true;
+                        while (nj < text.len and text[nj] != '\n') : (nj += 1) {
+                            if (text[nj] != '-' and text[nj] != '|' and text[nj] != ' ' and text[nj] != ':') {
+                                next_is_sep = false;
+                                break;
+                            }
+                        }
+                        is_header = next_is_sep;
+                    }
+                    // Render table row: dim pipes, content normal (bold if header)
+                    if (is_header) try writer.writeAll("\x1b[1m"); // bold headers
                     while (i < text.len and text[i] != '\n') {
                         if (text[i] == '|') {
+                            if (is_header) try writer.writeAll("\x1b[22m"); // unbold for pipe
                             try writer.writeAll("\x1b[90m\xe2\x94\x82\x1b[0m"); // dim │
+                            if (is_header) try writer.writeAll("\x1b[1m"); // re-bold
                         } else {
                             try writer.writeByte(text[i]);
                         }
                         i += 1;
                     }
+                    if (is_header) try writer.writeAll("\x1b[22m"); // end bold
                     if (i < text.len and text[i] == '\n') {
                         try writer.writeByte('\n');
                         i += 1;
@@ -2758,6 +2858,36 @@ pub const MarkdownRenderer = struct {
                             continue;
                         }
                     }
+                }
+            }
+
+            // HTML tags: strip or convert to ANSI
+            if (c == '<' and !self.in_code_block and !self.in_inline_code) {
+                var ti = i + 1;
+                const closing = ti < text.len and text[ti] == '/';
+                if (closing) ti += 1;
+                const tag_start = ti;
+                while (ti < text.len and text[ti] != '>' and text[ti] != ' ' and text[ti] != '\n') : (ti += 1) {}
+                if (ti < text.len and (text[ti] == '>' or text[ti] == ' ')) {
+                    const tag = text[tag_start..ti];
+                    // Skip to closing >
+                    while (ti < text.len and text[ti] != '>') : (ti += 1) {}
+                    if (ti < text.len) ti += 1;
+                    // Handle specific tags
+                    if (std.mem.eql(u8, tag, "br")) {
+                        try writer.writeByte('\n');
+                        self.line_start = true;
+                        self.resetCol();
+                    } else if (std.mem.eql(u8, tag, "b") or std.mem.eql(u8, tag, "strong")) {
+                        if (!closing) try writer.writeAll("\x1b[1m") else try writer.writeAll("\x1b[22m");
+                    } else if (std.mem.eql(u8, tag, "i") or std.mem.eql(u8, tag, "em")) {
+                        if (!closing) try writer.writeAll("\x1b[3m") else try writer.writeAll("\x1b[23m");
+                    } else if (std.mem.eql(u8, tag, "code")) {
+                        if (!closing) try writer.writeAll("\x1b[36m") else try writer.writeAll("\x1b[39m");
+                    }
+                    // details/summary/div/p/span — just strip the tag
+                    i = ti;
+                    continue;
                 }
             }
 

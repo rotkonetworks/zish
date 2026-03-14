@@ -186,8 +186,7 @@ pub const SimpleHandler = struct {
     }
 
     pub fn onError(self: *SimpleHandler, data: []const u8) !void {
-        try self.writer.writeAll("\x1b[31m");
-        try self.writer.writeAll("agent: ");
+        try self.writer.writeAll("\x1b[31m\xe2\x9c\x97 "); // ✗ prefix
         try self.writer.writeAll(data);
         try self.writer.writeAll("\x1b[0m\n");
     }

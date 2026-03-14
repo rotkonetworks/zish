@@ -2809,12 +2809,17 @@ const EscAction = union(enum) {
     arrow_down,
     arrow_left,
     arrow_right,
+    ctrl_left, // Ctrl+Left: word left
+    ctrl_right, // Ctrl+Right: word right
+    ctrl_up, // Ctrl+Up: jump to previous message
+    ctrl_down, // Ctrl+Down: jump to next message
     page_up,
     page_down,
     home,
     end,
     alt_enter,
     delete,
+    paste, // bracketed paste start (ESC[200~)
     alt_key: u8, // Alt+<byte> — looked up in keybindings table by caller
 };
 
@@ -2853,6 +2858,70 @@ fn parseEscSequence() EscAction {
         'D' => .arrow_left,
         'H' => .home,
         'F' => .end,
+        '1' => blk: {
+            // ESC[1;Nx — modified arrows (Shift/Alt/Ctrl)
+            // Read ";N<dir>" sequence
+            var mod_buf: [3]u8 = undefined;
+            var mi: usize = 0;
+            while (mi < 3) : (mi += 1) {
+                if ((std.posix.poll(&esc_poll, 10) catch 0) == 0) break;
+                const mn = stdin.read(mod_buf[mi..][0..1]) catch break;
+                if (mn == 0) break;
+                // Direction letter terminates the sequence
+                if (mod_buf[mi] >= 'A' and mod_buf[mi] <= 'H') { mi += 1; break; }
+            }
+            // We expect ";N<dir>" where N is modifier, dir is A/B/C/D/H/F
+            if (mi >= 3 and mod_buf[0] == ';') {
+                const modifier = mod_buf[1];
+                const direction = mod_buf[2];
+                if (modifier == '5') { // Ctrl+
+                    break :blk switch (direction) {
+                        'C' => .ctrl_right,
+                        'D' => .ctrl_left,
+                        'A' => .ctrl_up,
+                        'B' => .ctrl_down,
+                        'H' => .home,
+                        'F' => .end,
+                        else => .none,
+                    };
+                }
+                // Shift (2), Alt (3) — treat as normal arrows
+                break :blk switch (direction) {
+                    'A' => .arrow_up,
+                    'B' => .arrow_down,
+                    'C' => .arrow_right,
+                    'D' => .arrow_left,
+                    'H' => .home,
+                    'F' => .end,
+                    else => .none,
+                };
+            }
+            // Consume remaining
+            while ((std.posix.poll(&esc_poll, 5) catch 0) > 0) {
+                _ = stdin.read(&b) catch break;
+            }
+            break :blk .none;
+        },
+        '2' => blk: {
+            // ESC [ 2 0 0 ~ = bracketed paste start
+            // Read remaining chars to check for "00~"
+            var seq: [4]u8 = undefined;
+            var si: usize = 0;
+            while (si < 4) : (si += 1) {
+                if ((std.posix.poll(&esc_poll, 10) catch 0) == 0) break;
+                const sn = stdin.read(seq[si..][0..1]) catch break;
+                if (sn == 0) break;
+                if (seq[si] == '~') { si += 1; break; }
+            }
+            if (si >= 3 and seq[0] == '0' and seq[1] == '0' and seq[2] == '~') {
+                break :blk .paste;
+            }
+            // Not paste — consume rest
+            while ((std.posix.poll(&esc_poll, 5) catch 0) > 0) {
+                _ = stdin.read(&b) catch break;
+            }
+            break :blk .none;
+        },
         '5' => blk: {
             // PageUp: ESC [ 5 ~ (or ESC [ 5 ; N ~)
             var discard: [1]u8 = undefined;
@@ -2965,6 +3034,25 @@ fn agentInteractive(shell: *Shell) !u8 {
     var last_routed_tier: [16]u8 = undefined;
     var last_routed_tier_len: usize = 0;
 
+    // Context window tracking for progress bar
+    // Restore context tokens from agent if continuing a session
+    var ctx_tokens: u32 = if (was_running) shell.agent.getTotalInputTokens() else 0;
+    const ctx_max: u32 = 200_000; // default context window size
+
+    // Files changed counter (shown in status bar cost area)
+    var files_changed: u16 = 0;
+
+    // Input history (ring buffer of previous queries)
+    const HIST_SIZE = 64;
+    var input_history: [HIST_SIZE][editor.LINE_BUF_SIZE]u8 = undefined;
+    var input_history_lens: [HIST_SIZE]u16 = [_]u16{0} ** HIST_SIZE;
+    var input_history_count: usize = 0;
+    var input_history_write: usize = 0; // next write position
+    var input_history_pos: usize = 0; // browsing position (0 = newest, counting backwards)
+    var input_history_saved: [editor.LINE_BUF_SIZE]u8 = undefined; // saved current input when browsing
+    var input_history_saved_len: u16 = 0;
+    var input_history_browsing: bool = false;
+
     // ── Layout helpers (defined in agent_commands.zig) ──
 
     const TermWidth = agent_commands.TermWidth;
@@ -2997,6 +3085,9 @@ fn agentInteractive(shell: *Shell) !u8 {
         while (i < term_rows) : (i += 1) try out.writeByte('\n');
     }
 
+    // Enable bracketed paste mode so we can handle Ctrl+V / paste correctly
+    try out.writeAll("\x1b[?2004h");
+
     // Initial layout
     recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
 
@@ -3022,19 +3113,44 @@ fn agentInteractive(shell: *Shell) !u8 {
                 branch = content[16..];
         } else |_| {}
 
-        if (was_running) {
-            if (branch.len > 0) {
-                try out.print("\x1b[90m{s} \xc2\xb7 {s} \xc2\xb7 \x1b[33m{s}\x1b[90m \xc2\xb7 continuing\x1b[0m\n", .{ model_name, cwd, branch });
-            } else {
-                try out.print("\x1b[90m{s} \xc2\xb7 {s} \xc2\xb7 continuing\x1b[0m\n", .{ model_name, cwd });
-            }
-        } else {
-            if (branch.len > 0) {
-                try out.print("\x1b[90m{s} \xc2\xb7 {s} \xc2\xb7 \x1b[33m{s}\x1b[90m \xc2\xb7 /help\x1b[0m\n", .{ model_name, cwd, branch });
-            } else {
-                try out.print("\x1b[90m{s} \xc2\xb7 {s} \xc2\xb7 /help\x1b[0m\n", .{ model_name, cwd });
+        // Count dirty files for context
+        var dirty_count: u16 = 0;
+        {
+            const git_result = std.process.Child.run(.{
+                .allocator = shell.allocator,
+                .argv = &[_][]const u8{ "git", "status", "--porcelain" },
+                .max_output_bytes = 8192,
+            }) catch null;
+            if (git_result) |gr| {
+                defer shell.allocator.free(gr.stdout);
+                defer shell.allocator.free(gr.stderr);
+                for (gr.stdout) |gc| {
+                    if (gc == '\n') dirty_count += 1;
+                }
             }
         }
+
+        // Header: ╭ model · cwd · branch [dirty] · tips
+        try out.writeAll("\x1b[90m\xe2\x95\xad "); // ╭
+        try out.writeAll(model_name);
+        try out.writeAll(" \xc2\xb7 "); // ·
+        try out.writeAll(cwd);
+        if (branch.len > 0) {
+            try out.writeAll(" \xc2\xb7 \x1b[33m"); // · yellow
+            try out.writeAll(branch);
+            if (dirty_count > 0) {
+                var dirty_buf: [16]u8 = undefined;
+                const dirty_str = std.fmt.bufPrint(&dirty_buf, "\x1b[31m +{d}", .{dirty_count}) catch "";
+                try out.writeAll(dirty_str);
+            }
+            try out.writeAll("\x1b[90m");
+        }
+        if (was_running) {
+            try out.writeAll(" \xc2\xb7 continuing");
+        } else {
+            try out.writeAll(" \xc2\xb7 /help for commands");
+        }
+        try out.writeAll("\x1b[0m\n");
     }
     // Capture header in history
     {
@@ -3047,7 +3163,7 @@ fn agentInteractive(shell: *Shell) !u8 {
         msg_history.commitLine();
     }
     // Position cursor on input line
-    Layout.drawInput(out, input_first_row, input_height, &edit_buf);
+    Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, false, out_last, term_rows);
     try out.flush();
 
     // Create TeeWriter for capturing output to history
@@ -3055,26 +3171,33 @@ fn agentInteractive(shell: *Shell) !u8 {
 
     // ── Main event loop ──
     while (true) {
-        // Check terminal resize
+        // Check terminal resize (debounced — bspwm sends rapid SIGWINCH during tiling)
         if (@atomicLoad(bool, &shell.terminal_resized, .acquire)) {
             @atomicStore(bool, &shell.terminal_resized, false, .release);
-            term_rows = getTermRows();
-            term_cols = getTermCols();
+            const new_rows = getTermRows();
+            const new_cols = getTermCols();
+            // Skip if dimensions unchanged (spurious signal)
+            if (new_rows == term_rows and new_cols == term_cols) continue;
+            term_rows = new_rows;
+            term_cols = new_cols;
             md.term_width = term_cols;
-            // Full redraw: reset scroll region, clear, recalc layout, repaint from history
-            out.print("\x1b[1;{d}r", .{term_rows}) catch {}; // full scroll region first
-            out.writeAll("\x1b[H\x1b[2J") catch {}; // home + clear screen
-            // Recalc sets up fixed elements and scroll region
+            // Full redraw: reset scroll region, clear, recalc layout, repaint
+            out.print("\x1b[1;{d}r", .{term_rows}) catch {}; // expand to full screen
+            out.writeAll("\x1b[H\x1b[2J") catch {}; // home + clear
+            // Recalc: draws separator, input, status bar, sets scroll region to 1..out_last
             recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
-            // Repaint output from history within the scroll region
+            // Repaint history inside scroll region
             Layout.repaintFromHistory(out, &msg_history, out_last, scroll_offset);
+            // Redraw input outside scroll region (recalcLayout already drew it, but repaint may have scrolled)
+            Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, false, out_last, term_rows);
+            Layout.drawSeparator(out, sep_row, term_cols, scroll_offset);
             if (!agent_active) cursor_at = .input;
             try out.flush();
         }
 
         // When idle, move cursor to input area (once, not every loop iteration)
         if (!agent_active and !in_confirm and cursor_at == .output) {
-            Layout.drawInput(out, input_first_row, input_height, &edit_buf);
+            Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, false, out_last, term_rows);
             cursor_at = .input;
             // Also redraw separator in case scroll state changed
             Layout.drawSeparator(out, sep_row, term_cols, scroll_offset);
@@ -3118,7 +3241,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                         const s = "listening...";
                         @memcpy(status_text[0..s.len], s);
                         status_len = s.len;
-                        Layout.drawStatusBarSafeElapsed(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], 0);
+                        Layout.drawStatusBarSafeCtx(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], 0, ctx_tokens, ctx_max);
                     }
                 } else if (voice_was_speaking and voice_audio_len > 0) {
                     // Speech just stopped — start silence timer
@@ -3146,7 +3269,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                 const s = "transcribing...";
                 @memcpy(status_text[0..s.len], s);
                 status_len = s.len;
-                Layout.drawStatusBarSafeElapsed(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], 0);
+                Layout.drawStatusBarSafeCtx(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], 0, ctx_tokens, ctx_max);
                 try out.flush();
 
                 // Write audio to temp WAV file, run curl to ASR endpoint
@@ -3180,7 +3303,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                     @memcpy(status_text[0..vs.len], vs);
                     status_len = vs.len;
                 }
-                Layout.drawStatusBarSafeElapsed(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0);
+                Layout.drawStatusBarSafeCtx(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0, ctx_tokens, ctx_max);
                 try out.flush();
             }
         }
@@ -3214,7 +3337,9 @@ fn agentInteractive(shell: *Shell) !u8 {
                     // Hide cursor during streaming for clean appearance
                     if (!last_was_text) {
                         try out.writeAll("\x1b[?25l"); // hide cursor
-                        status_len = 0; // clear "thinking..." — let spinner stop
+                        const writing = "writing";
+                        @memcpy(status_text[0..writing.len], writing);
+                        status_len = writing.len;
                     }
                     try md.render(tee, msg.slice());
                     try out.flush(); // flush each delta for smooth streaming
@@ -3257,9 +3382,9 @@ fn agentInteractive(shell: *Shell) !u8 {
                         const slen = @min(name_end, status_text.len);
                         @memcpy(status_text[0..slen], tool_text[0..slen]);
                         status_len = slen;
-                        Layout.drawStatusBarSafeElapsed(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0);
+                        Layout.drawStatusBarSafeCtx(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0, ctx_tokens, ctx_max);
                     }
-                    // ⚡ ToolName args — compact indicator with clickable paths
+                    // ⚡ ToolName args — compact indicator
                     try tee.writeAll("\n\x1b[90m\xe2\x9a\xa1 ");
                     // Find tool name and path argument
                     const space_pos = std.mem.indexOfScalar(u8, tool_text, ' ');
@@ -3268,14 +3393,27 @@ fn agentInteractive(shell: *Shell) !u8 {
                         const tool_args = std.mem.trim(u8, tool_text[sp + 1 ..], " ");
                         try tee.writeAll(tool_name);
                         try tee.writeAll(" ");
-                        // If args start with /, make it a clickable file link
+                        // If args start with /, make it a clickable file link with short display
                         if (tool_args.len > 0 and tool_args[0] == '/') {
                             const path_end = std.mem.indexOfScalar(u8, tool_args, ' ') orelse tool_args.len;
                             const path = tool_args[0..path_end];
+                            // Shorten: /home/user/... → ~/... or /cwd/... → ./...
+                            const home = std.posix.getenv("HOME") orelse "";
+                            var short_buf: [256]u8 = undefined;
+                            const display_path = if (home.len > 0 and std.mem.startsWith(u8, path, home))
+                                std.fmt.bufPrint(&short_buf, "~{s}", .{path[home.len..]}) catch path
+                            else blk: {
+                                var cwd_b: [256]u8 = undefined;
+                                const cwd_s = std.posix.getcwd(&cwd_b) catch break :blk path;
+                                if (std.mem.startsWith(u8, path, cwd_s) and path.len > cwd_s.len and path[cwd_s.len] == '/')
+                                    break :blk path[cwd_s.len + 1 ..]
+                                else
+                                    break :blk path;
+                            };
                             try tee.writeAll("\x1b]8;;file://");
                             try tee.writeAll(path);
                             try tee.writeAll("\x1b\\\x1b[4m"); // OSC 8 + underline
-                            try tee.writeAll(path);
+                            try tee.writeAll(display_path);
                             try tee.writeAll("\x1b[24m\x1b]8;;\x1b\\"); // end underline + close OSC 8
                             if (path_end < tool_args.len) try tee.writeAll(tool_args[path_end..]);
                         } else {
@@ -3298,6 +3436,15 @@ fn agentInteractive(shell: *Shell) !u8 {
                 .tool_done => {
                     last_was_text = false;
                     const done_text = msg.slice();
+
+                    // Track file changes for status bar
+                    {
+                        const tool_name_fc = last_tool[0..last_tool_len];
+                        if (std.mem.eql(u8, tool_name_fc, "Edit") or std.mem.eql(u8, tool_name_fc, "Write")) {
+                            files_changed +|= 1;
+                        }
+                    }
+
                     if (done_text.len > 0) {
                         const has_ansi = std.mem.indexOf(u8, done_text, "\x1b[3") != null;
                         var line_count: usize = 1;
@@ -3305,12 +3452,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                             if (dc == '\n') line_count += 1;
                         }
 
-                        // Smart threshold based on tool type:
-                        // Edit: always show diff (has ANSI)
-                        // Bash: show up to 20 lines (user needs to see command output)
-                        // Glob/Grep: show up to 15 lines (search results)
-                        // Read: show up to 8 lines (file preview)
-                        // Others: 8 lines default
+                        // Smart threshold based on tool type
                         const tool_name = last_tool[0..last_tool_len];
                         const max_inline: usize = if (has_ansi)
                             999 // Edit diffs always show
@@ -3376,7 +3518,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                     const thinking = "thinking...";
                     @memcpy(status_text[0..thinking.len], thinking);
                     status_len = thinking.len;
-                    Layout.drawStatusBarSafeElapsed(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0);
+                    Layout.drawStatusBarSafeCtx(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0, ctx_tokens, ctx_max);
                 },
                 .error_msg => {
                     if (last_was_text) {
@@ -3385,9 +3527,13 @@ fn agentInteractive(shell: *Shell) !u8 {
                         try tee.writeAll("\x1b[0m\n");
                     }
                     last_was_text = false;
-                    try tee.writeAll("\x1b[31m");
+                    try tee.writeAll("\x1b[31m\xe2\x9c\x97 "); // ✗ red prefix
                     linkify.writeLinked(tee, msg.slice()) catch try tee.writeAll(msg.slice());
                     try tee.writeAll("\x1b[0m\n");
+                    // Update status bar to show error state
+                    const err_s = "error";
+                    @memcpy(status_text[0..err_s.len], err_s);
+                    status_len = err_s.len;
                 },
                 .usage_info => {
                     // Parse cost + token totals from usage_info for status bar
@@ -3412,11 +3558,16 @@ fn agentInteractive(shell: *Shell) !u8 {
                                 for (tok_str) |tc| {
                                     if (tc >= '0' and tc <= '9') tok_val = tok_val * 10 + (tc - '0');
                                 }
-                                if (tok_val > 1000) {
-                                    cost_len = (std.fmt.bufPrint(&cost_buf, "{s} \xc2\xb7 {d}K/200K", .{ cost_str, tok_val / 1000 }) catch cost_str).len;
+                                const prev_tokens = ctx_tokens;
+                                ctx_tokens = tok_val;
+                                // Warn at 80% context usage (once)
+                                if (tok_val > ctx_max * 80 / 100 and prev_tokens <= ctx_max * 80 / 100) {
+                                    out.print("\x1b[33m\xe2\x9a\xa0 Context {d}% full \xe2\x80\x94 consider /compact\x1b[0m\n", .{tok_val * 100 / ctx_max}) catch {};
+                                }
+                                if (files_changed > 0) {
+                                    cost_len = (std.fmt.bufPrint(&cost_buf, "{s} \xc2\xb7 {d} file{s}", .{ cost_str, files_changed, if (files_changed == 1) "" else "s" }) catch cost_str).len;
                                 } else {
-                                    cost_len = @min(cost_str.len, cost_buf.len);
-                                    @memcpy(cost_buf[0..cost_len], cost_str[0..cost_len]);
+                                    cost_len = (std.fmt.bufPrint(&cost_buf, "{s}", .{cost_str}) catch cost_str).len;
                                 }
                             } else {
                                 cost_len = @min(cost_str.len, cost_buf.len);
@@ -3424,7 +3575,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                             }
                         }
                     }
-                    Layout.drawStatusBarSafeElapsed(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0);
+                    Layout.drawStatusBarSafeCtx(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0, ctx_tokens, ctx_max);
                     if (last_was_text) {
                         try md.flush(tee);
                         md.reset();
@@ -3455,6 +3606,27 @@ fn agentInteractive(shell: *Shell) !u8 {
                     last_was_text = false;
                     md.reset();
                     agent_active = false;
+                    // Show elapsed time + cost summary after response
+                    if (query_start_ms > 0) {
+                        const resp_elapsed = std.time.milliTimestamp() - query_start_ms;
+                        const resp_secs = @divTrunc(resp_elapsed, 1000);
+                        var time_buf: [64]u8 = undefined;
+                        const time_str = if (resp_secs >= 60)
+                            std.fmt.bufPrint(&time_buf, "\x1b[90m{d}m{d:0>2}s", .{ @divTrunc(resp_secs, 60), @mod(resp_secs, 60) }) catch ""
+                        else
+                            std.fmt.bufPrint(&time_buf, "\x1b[90m{d}s", .{resp_secs}) catch "";
+                        try tee.writeAll(time_str);
+                        if (cost_len > 0) {
+                            try tee.writeAll(" \xc2\xb7 ");
+                            try tee.writeAll(cost_buf[0..cost_len]);
+                        }
+                        if (ctx_tokens > 1000) {
+                            var tok_buf: [16]u8 = undefined;
+                            const tok_str = std.fmt.bufPrint(&tok_buf, " \xc2\xb7 {d}K ctx", .{ctx_tokens / 1000}) catch "";
+                            try tee.writeAll(tok_str);
+                        }
+                        try tee.writeAll("\x1b[0m\n");
+                    }
                     query_start_ms = 0;
                     // Voice TTS: speak the response
                     if (shell.voice_active and tts_len > 0) {
@@ -3500,9 +3672,14 @@ fn agentInteractive(shell: *Shell) !u8 {
                     last_was_text = false;
                     md.reset();
                     in_confirm = true;
+                    // Update status bar to show awaiting confirmation
+                    const confirm_s = "awaiting";
+                    @memcpy(status_text[0..confirm_s.len], confirm_s);
+                    status_len = confirm_s.len;
+                    Layout.drawStatusBarSafeCtx(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0, ctx_tokens, ctx_max);
                     // Render confirm prompt in input area (outside scroll region)
                     out.print("\x1b[1;{d}r", .{term_rows}) catch {};
-                    try out.print("\x1b[{d};1H\x1b[2K{s} \x1b[90m[\x1b[32my\x1b[90m/\x1b[31mn\x1b[90m/\x1b[33ma\x1b[90mlways]\x1b[0m ", .{ input_first_row, msg.slice() });
+                    try out.print("\x1b[{d};1H\x1b[2K\x1b[33m\xe2\x9a\xa0 \x1b[0m{s} \x1b[90m[\x1b[32my\x1b[90m/\x1b[31mn\x1b[90m/\x1b[33ma\x1b[90mlways]\x1b[0m ", .{ input_first_row, msg.slice() }); // ⚠ prefix
                     out.print("\x1b[1;{d}r", .{out_last}) catch {};
                     // Leave cursor at confirm prompt (don't restore to output)
                     cursor_at = .input;
@@ -3546,35 +3723,10 @@ fn agentInteractive(shell: *Shell) !u8 {
 
             // Live token counter from agent thread
             const live_tokens = shell.agent.getTotalInputTokens();
-            if (live_tokens > 1000) {
-                // Context window size depends on model
-                const ctx_limit: u32 = if (std.mem.indexOf(u8, model_name, "opus") != null) 200_000
-                    else if (std.mem.indexOf(u8, model_name, "sonnet") != null) 200_000
-                    else if (std.mem.indexOf(u8, model_name, "haiku") != null) 200_000
-                    else 200_000;
-                const pct = (live_tokens * 100) / ctx_limit;
-                var live_cost_buf: [32]u8 = undefined;
-                const live_cost = if (pct > 0)
-                    std.fmt.bufPrint(&live_cost_buf, "{d}K/{d}K", .{ live_tokens / 1000, ctx_limit / 1000 }) catch ""
-                else
-                    std.fmt.bufPrint(&live_cost_buf, "{d}K tok", .{live_tokens / 1000}) catch "";
-                if (live_cost.len > 0) {
-                    cost_len = @min(live_cost.len, cost_buf.len);
-                    @memcpy(cost_buf[0..cost_len], live_cost[0..cost_len]);
-                }
-            }
+            if (live_tokens > 1000) ctx_tokens = live_tokens;
 
-            // Animate spinner in status text while waiting
-            const spinner = [_][]const u8{ "\xe2\xa0\x8b", "\xe2\xa0\x99", "\xe2\xa0\xb9", "\xe2\xa0\xb8", "\xe2\xa0\xbc", "\xe2\xa0\xb4", "\xe2\xa0\xa6", "\xe2\xa0\xa7", "\xe2\xa0\x87", "\xe2\xa0\x8f" }; // braille spinner
-            const frame_idx: usize = @intCast(@mod(@divTrunc(elapsed, 100), 10));
-            const spin = spinner[frame_idx];
-            var spin_status: [68]u8 = undefined;
-            @memcpy(spin_status[0..spin.len], spin);
-            spin_status[spin.len] = ' ';
-            const rest = @min(status_len, spin_status.len - spin.len - 1);
-            @memcpy(spin_status[spin.len + 1 ..][0..rest], status_text[0..rest]);
-            const spin_len = spin.len + 1 + rest;
-            Layout.drawStatusBarSafeElapsed(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], spin_status[0..spin_len], elapsed);
+            // Status bar with spinner + context progress bar (spinner is built into drawStatusBarCtx)
+            Layout.drawStatusBarSafeCtx(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], elapsed, ctx_tokens, ctx_max);
             try out.flush();
         }
 
@@ -3582,7 +3734,20 @@ fn agentInteractive(shell: *Shell) !u8 {
         if (poll_n > 0 and (poll_fds[0].revents & std.posix.POLL.IN) != 0) {
             var byte: [1]u8 = undefined;
             const n = std.fs.File.stdin().read(&byte) catch break;
-            if (n == 0) { Layout.doExit(out, term_rows, input_height); return 0; }
+            if (n == 0) {
+                Layout.doExit(out, term_rows, input_height);
+                if (cost_len > 0 or files_changed > 0) {
+                    out.writeAll("\x1b[90m") catch {};
+                    if (cost_len > 0) out.writeAll(cost_buf[0..cost_len]) catch {};
+                    if (files_changed > 0) {
+                        if (cost_len > 0) out.writeAll(" \xc2\xb7 ") catch {};
+                        out.print("{d} file{s} changed", .{ files_changed, if (files_changed == 1) @as([]const u8, "") else "s" }) catch {};
+                    }
+                    out.writeAll("\x1b[0m\n") catch {};
+                    out.flush() catch {};
+                }
+                return 0;
+            }
 
             if (in_confirm) {
                 if (byte[0] == 'y' or byte[0] == 'Y') {
@@ -3599,7 +3764,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                     msg_history.commitLine();
                 }
                 in_confirm = false;
-                Layout.drawInput(out, input_first_row, input_height, &edit_buf);
+                Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, false, out_last, term_rows);
                 cursor_at = .input;
                 try out.flush();
                 continue;
@@ -3616,12 +3781,23 @@ fn agentInteractive(shell: *Shell) !u8 {
                         msg_history.appendSlice("\x1b[0m");
                     }
                     msg_history.commitLine(); // commit partial streamed line
-                    try out.writeAll("\n\x1b[90m(cancelled)\x1b[0m\n");
-                    msg_history.appendSlice("\x1b[90m(cancelled)\x1b[0m");
+                    // Show what was happening when cancelled
+                    const cancel_elapsed = if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0;
+                    const cancel_secs = @divTrunc(cancel_elapsed, 1000);
+                    if (status_len > 0 and cancel_secs > 0) {
+                        var cancel_buf: [96]u8 = undefined;
+                        const cancel_msg = std.fmt.bufPrint(&cancel_buf, "\n\x1b[90m(cancelled after {d}s while {s})\x1b[0m\n", .{ cancel_secs, status_text[0..status_len] }) catch "\n\x1b[90m(cancelled)\x1b[0m\n";
+                        try out.writeAll(cancel_msg);
+                        msg_history.appendSlice(cancel_msg);
+                    } else {
+                        try out.writeAll("\n\x1b[90m(cancelled)\x1b[0m\n");
+                        msg_history.appendSlice("\x1b[90m(cancelled)\x1b[0m");
+                    }
                     msg_history.commitLine();
                     try md.flush(out);
                     md.reset();
                     agent_active = false;
+                    query_start_ms = 0;
                     status_len = 0;
                     last_was_text = false;
                     cursor_at = .output;
@@ -3634,10 +3810,25 @@ fn agentInteractive(shell: *Shell) !u8 {
                         input_height = new_h;
                         recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
                     }
-                    Layout.drawInput(out, input_first_row, input_height, &edit_buf);
+                    Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, false, out_last, term_rows);
                     cursor_at = .input;
                 } else {
-                    Layout.doExit(out, term_rows, input_height);
+                    {
+                        // Show exit summary
+                        Layout.doExit(out, term_rows, input_height);
+                        if (cost_len > 0 or files_changed > 0) {
+                            out.writeAll("\x1b[90m") catch {};
+                            if (cost_len > 0) {
+                                out.writeAll(cost_buf[0..cost_len]) catch {};
+                            }
+                            if (files_changed > 0) {
+                                if (cost_len > 0) out.writeAll(" \xc2\xb7 ") catch {};
+                                out.print("{d} file{s} changed", .{ files_changed, if (files_changed == 1) @as([]const u8, "") else "s" }) catch {};
+                            }
+                            out.writeAll("\x1b[0m\n") catch {};
+                            out.flush() catch {};
+                        }
+                    }
                     return 0;
                 }
                 try out.flush();
@@ -3648,18 +3839,131 @@ fn agentInteractive(shell: *Shell) !u8 {
             if (byte[0] == 4) {
                 if (edit_buf.len == 0) {
                     if (agent_active) shell.agent.cancel();
-                    Layout.doExit(out, term_rows, input_height);
+                    {
+                        // Show exit summary
+                        Layout.doExit(out, term_rows, input_height);
+                        if (cost_len > 0 or files_changed > 0) {
+                            out.writeAll("\x1b[90m") catch {};
+                            if (cost_len > 0) {
+                                out.writeAll(cost_buf[0..cost_len]) catch {};
+                            }
+                            if (files_changed > 0) {
+                                if (cost_len > 0) out.writeAll(" \xc2\xb7 ") catch {};
+                                out.print("{d} file{s} changed", .{ files_changed, if (files_changed == 1) @as([]const u8, "") else "s" }) catch {};
+                            }
+                            out.writeAll("\x1b[0m\n") catch {};
+                            out.flush() catch {};
+                        }
+                    }
                     return 0;
                 }
                 continue;
             }
 
+            // Ctrl+A (0x01) — readline home (move to line start)
+            if (byte[0] == 0x01) {
+                edit_buf.moveLineStart();
+                Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, agent_active, out_last, term_rows);
+                if (!agent_active) cursor_at = .input;
+                try out.flush();
+                continue;
+            }
+
+            // Ctrl+E (0x05) — readline end (move to line end)
+            if (byte[0] == 0x05) {
+                edit_buf.moveLineEnd();
+                Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, agent_active, out_last, term_rows);
+                if (!agent_active) cursor_at = .input;
+                try out.flush();
+                continue;
+            }
+
+            // Ctrl+T (0x14) — cycle model (haiku → sonnet → opus)
+            if (byte[0] == 0x14) {
+                const next_model: []const u8 = if (std.mem.indexOf(u8, model_name, "haiku") != null)
+                    "sonnet"
+                else if (std.mem.indexOf(u8, model_name, "sonnet") != null)
+                    "opus"
+                else
+                    "haiku";
+                // Dispatch /model command
+                var cmd_ctx = agent_commands.CommandCtx{
+                    .shell = shell, .out = out, .model_name = model_name, .model_buf = &model_buf,
+                    .cost_buf = &cost_buf, .cost_len = &cost_len, .status_text = &status_text,
+                    .status_len = &status_len, .msg_history = &msg_history, .edit_buf = &edit_buf,
+                    .agent_active = &agent_active, .query_start_ms = &query_start_ms,
+                    .scroll_offset = &scroll_offset, .out_last = &out_last, .sep_row = &sep_row,
+                    .input_first_row = &input_first_row, .status_row = &status_row,
+                    .term_rows = &term_rows, .term_cols = &term_cols, .input_height = &input_height,
+                    .md = &md, .last_was_text = &last_was_text, .last_query_buf = &last_query_buf,
+                    .last_query_len = &last_query_len, .last_routed_tier = &last_routed_tier,
+                    .last_routed_tier_len = &last_routed_tier_len,
+                };
+                _ = agent_commands.dispatch(&cmd_ctx, std.fmt.bufPrint(&model_buf, "/model {s}", .{next_model}) catch "/model sonnet");
+                model_name = cmd_ctx.model_name;
+                Layout.drawStatusBarSafeCtx(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], 0, ctx_tokens, ctx_max);
+                try out.flush();
+                continue;
+            }
+
+            // Ctrl+W (0x17) — delete word backward
+            if (byte[0] == 0x17) {
+                if (edit_buf.len > 0 and edit_buf.cursor > 0) {
+                    const old_cursor = edit_buf.cursor;
+                    edit_buf.wordBack();
+                    const new_cursor = edit_buf.cursor;
+                    // Delete from new_cursor to old_cursor
+                    var di: usize = old_cursor - new_cursor;
+                    while (di > 0) : (di -= 1) {
+                        _ = edit_buf.deleteForward();
+                    }
+                    const new_h: u16 = @min(edit_buf.lineCount(), 5);
+                    if (new_h != input_height) {
+                        input_height = new_h;
+                        recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
+                    }
+                    Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, agent_active, out_last, term_rows);
+                    if (!agent_active) cursor_at = .input;
+                    try out.flush();
+                }
+                continue;
+            }
+
+            // Ctrl+P (0x10) — toggle extended thinking
+            if (byte[0] == 0x10) {
+                const current_tb = shell.agent.queues.shared_thinking_budget.load(.monotonic);
+                if (current_tb > 0) {
+                    shell.agent.queues.shared_thinking_budget.store(0, .monotonic);
+                    const off_s = "thinking off";
+                    @memcpy(status_text[0..off_s.len], off_s);
+                    status_len = off_s.len;
+                } else {
+                    shell.agent.queues.shared_thinking_budget.store(10000, .monotonic);
+                    const on_s = "thinking on (10K)";
+                    @memcpy(status_text[0..on_s.len], on_s);
+                    status_len = on_s.len;
+                }
+                Layout.drawStatusBarSafeCtx(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], 0, ctx_tokens, ctx_max);
+                try out.flush();
+                continue;
+            }
+
+            // Ctrl+B (0x02) — show background tasks / agents
+            if (byte[0] == 0x02) {
+                // Trigger /tree command
+                const cmds = @import("agent_commands.zig");
+                cmds.runTreeView(shell, out, term_rows, term_cols);
+                recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
+                cursor_at = .output;
+                try out.flush();
+                continue;
+            }
+
             // Ctrl+U (0x15) — scroll up half page (vim-style)
             // Ctrl+F (0x06) — scroll down half page
-            // Ctrl+B (0x02) — scroll up full page
-            if (byte[0] == 0x15 or byte[0] == 0x02 or byte[0] == 0x06) {
+            if (byte[0] == 0x15 or byte[0] == 0x06) {
                 if (msg_history.line_count > 0) {
-                    const page = if (byte[0] == 0x02) out_last else out_last / 2;
+                    const page = out_last / 2;
                     if (byte[0] == 0x06) {
                         // Down
                         if (scroll_offset > page) {
@@ -3751,37 +4055,119 @@ fn agentInteractive(shell: *Shell) !u8 {
                 switch (action) {
                     .arrow_left => {
                         _ = edit_buf.moveLeft();
-                        Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                        Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, agent_active, out_last, term_rows);
                         if (!agent_active) cursor_at = .input;
                         try out.flush();
                     },
                     .arrow_right => {
                         _ = edit_buf.moveRight();
-                        Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                        Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, agent_active, out_last, term_rows);
                         if (!agent_active) cursor_at = .input;
                         try out.flush();
                     },
                     .arrow_up => {
-                        _ = edit_buf.moveUp();
-                        Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                        // Single-line: browse input history. Multi-line: move cursor up.
+                        if (edit_buf.lineCount() <= 1 and input_history_count > 0) {
+                            if (!input_history_browsing) {
+                                // Save current input
+                                input_history_browsing = true;
+                                input_history_pos = 0;
+                                input_history_saved_len = @intCast(edit_buf.len);
+                                @memcpy(input_history_saved[0..edit_buf.len], edit_buf.text[0..edit_buf.len]);
+                            }
+                            if (input_history_pos < input_history_count) {
+                                input_history_pos += 1;
+                                // Load from history
+                                const idx = (input_history_write + HIST_SIZE - input_history_pos) % HIST_SIZE;
+                                const hlen = input_history_lens[idx];
+                                edit_buf.clear();
+                                _ = edit_buf.insertSlice(input_history[idx][0..hlen]);
+                            }
+                        } else {
+                            _ = edit_buf.moveUp();
+                        }
+                        Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, agent_active, out_last, term_rows);
                         if (!agent_active) cursor_at = .input;
                         try out.flush();
                     },
                     .arrow_down => {
-                        _ = edit_buf.moveDown();
-                        Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                        if (edit_buf.lineCount() <= 1 and input_history_browsing) {
+                            if (input_history_pos > 1) {
+                                input_history_pos -= 1;
+                                const idx = (input_history_write + HIST_SIZE - input_history_pos) % HIST_SIZE;
+                                const hlen = input_history_lens[idx];
+                                edit_buf.clear();
+                                _ = edit_buf.insertSlice(input_history[idx][0..hlen]);
+                            } else {
+                                // Back to original input
+                                input_history_pos = 0;
+                                input_history_browsing = false;
+                                edit_buf.clear();
+                                _ = edit_buf.insertSlice(input_history_saved[0..input_history_saved_len]);
+                            }
+                        } else {
+                            _ = edit_buf.moveDown();
+                        }
+                        Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, agent_active, out_last, term_rows);
+                        if (!agent_active) cursor_at = .input;
+                        try out.flush();
+                    },
+                    .ctrl_up => {
+                        // Jump to previous user message (same as Ctrl+K)
+                        if (msg_history.line_count > 0) {
+                            const current_pos = if (msg_history.line_count > scroll_offset)
+                                msg_history.line_count - scroll_offset
+                            else msg_history.line_count;
+                            const search_start = if (current_pos > 0) current_pos - 1 else 0;
+                            if (msg_history.searchBack("> ", search_start)) |found| {
+                                const from_bottom = msg_history.line_count - found;
+                                scroll_offset = if (from_bottom > 2) from_bottom - 2 else 0;
+                            } else {
+                                scroll_offset = msg_history.line_count;
+                            }
+                            Layout.repaintFromHistory(out, &msg_history, out_last, scroll_offset);
+                            Layout.drawSeparator(out, sep_row, term_cols, scroll_offset);
+                            try out.flush();
+                        }
+                    },
+                    .ctrl_down => {
+                        // Jump to next user message (same as Ctrl+N)
+                        if (scroll_offset > 0 and msg_history.line_count > 0) {
+                            const current_pos = if (msg_history.line_count > scroll_offset)
+                                msg_history.line_count - scroll_offset
+                            else 0;
+                            if (msg_history.searchForward("> ", current_pos + 1)) |found| {
+                                const from_bottom = msg_history.line_count - found;
+                                scroll_offset = if (from_bottom > 2) from_bottom - 2 else 0;
+                            } else {
+                                scroll_offset = 0;
+                            }
+                            Layout.repaintFromHistory(out, &msg_history, out_last, scroll_offset);
+                            Layout.drawSeparator(out, sep_row, term_cols, scroll_offset);
+                            try out.flush();
+                        }
+                    },
+                    .ctrl_left => {
+                        edit_buf.wordBack();
+                        Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, agent_active, out_last, term_rows);
+                        if (!agent_active) cursor_at = .input;
+                        try out.flush();
+                    },
+                    .ctrl_right => {
+                        edit_buf.wordForward();
+                        Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, agent_active, out_last, term_rows);
                         if (!agent_active) cursor_at = .input;
                         try out.flush();
                     },
                     .home => {
                         edit_buf.moveLineStart();
-                        Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                        Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, agent_active, out_last, term_rows);
                         if (!agent_active) cursor_at = .input;
                         try out.flush();
                     },
                     .end => {
                         edit_buf.moveLineEnd();
-                        Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                        Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, agent_active, out_last, term_rows);
                         if (!agent_active) cursor_at = .input;
                         try out.flush();
                     },
@@ -3815,7 +4201,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                                 input_height = new_h;
                                 recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
                             }
-                            Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                            Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, agent_active, out_last, term_rows);
                             if (!agent_active) cursor_at = .input;
                             try out.flush();
                         }
@@ -3827,7 +4213,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                                 input_height = new_h;
                                 recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
                             }
-                            Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                            Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, agent_active, out_last, term_rows);
                             if (!agent_active) cursor_at = .input;
                             try out.flush();
                         }
@@ -3845,10 +4231,51 @@ fn agentInteractive(shell: *Shell) !u8 {
                                         recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
                                     }
                                 }
-                                Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                                Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, agent_active, out_last, term_rows);
                                 if (!agent_active) cursor_at = .input;
                                 try out.flush();
                             }
+                        }
+                    },
+                    .paste => {
+                        // Bracketed paste: read until ESC[201~
+                        const stdin_f = std.fs.File.stdin();
+                        var paste_byte: [1]u8 = undefined;
+                        var esc_state: u8 = 0; // 0=normal, 1=ESC, 2=[, 3=2, 4=0, 5=1
+                        var pasted = false;
+                        while (true) {
+                            const pn = stdin_f.read(&paste_byte) catch break;
+                            if (pn == 0) break;
+                            const pc = paste_byte[0];
+                            // Detect ESC[201~ end sequence
+                            switch (esc_state) {
+                                0 => if (pc == 0x1b) { esc_state = 1; continue; },
+                                1 => { esc_state = if (pc == '[') 2 else 0; if (esc_state == 0) { _ = edit_buf.insert(0x1b); _ = edit_buf.insert(pc); pasted = true; } continue; },
+                                2 => { esc_state = if (pc == '2') 3 else 0; if (esc_state == 0) { _ = edit_buf.insert(pc); pasted = true; } continue; },
+                                3 => { esc_state = if (pc == '0') 4 else 0; if (esc_state == 0) { _ = edit_buf.insert(pc); pasted = true; } continue; },
+                                4 => { esc_state = if (pc == '1') 5 else 0; if (esc_state == 0) { _ = edit_buf.insert(pc); pasted = true; } continue; },
+                                5 => { if (pc == '~') break; esc_state = 0; _ = edit_buf.insert(pc); pasted = true; continue; }, // end of paste
+                                else => { esc_state = 0; },
+                            }
+                            // Insert the character (convert \r to \n)
+                            if (pc == '\r') {
+                                _ = edit_buf.insert('\n');
+                            } else if (pc >= 0x20 or pc == '\n' or pc == '\t') {
+                                _ = edit_buf.insert(pc);
+                            }
+                            pasted = true;
+                        }
+                        if (pasted) {
+                            // Switch to insert mode if in vi normal
+                            edit_buf.vi_mode = .insert;
+                            const new_h: u16 = @min(edit_buf.lineCount(), 5);
+                            if (new_h != input_height) {
+                                input_height = new_h;
+                                recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
+                            }
+                            Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, agent_active, out_last, term_rows);
+                            if (!agent_active) cursor_at = .input;
+                            try out.flush();
                         }
                     },
                     .none => {
@@ -3856,7 +4283,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                         if (edit_buf.vi_mode == .insert) {
                             edit_buf.vi_mode = .normal;
                             if (edit_buf.cursor > 0) edit_buf.cursor -= 1; // vi convention
-                            Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                            Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, agent_active, out_last, term_rows);
                             if (!agent_active) cursor_at = .input;
                             try out.flush();
                         }
@@ -4011,7 +4438,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                         input_height = new_h;
                         recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
                     }
-                    Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                    Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, agent_active, out_last, term_rows);
                     if (!agent_active) cursor_at = .input;
                     try out.flush();
                 }
@@ -4026,7 +4453,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                         input_height = new_h;
                         recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
                     }
-                    Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                    Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, agent_active, out_last, term_rows);
                     if (!agent_active) cursor_at = .input;
                     try out.flush();
                 }
@@ -4042,8 +4469,9 @@ fn agentInteractive(shell: *Shell) !u8 {
                         "/compact", "/cost",     "/model",    "/diff",    "/commit",
                         "/review",  "/undo",     "/plan",     "/spawn",   "/queue",
                         "/agents",  "/tasks",    "/tree",     "/sessions", "/config",
-                        "/search",  "/voice",    "/init",     "/effort",
-                        "/git",     "/export",   "/help",
+                        "/search",  "/voice",    "/init",     "/effort",  "/status",
+                        "/think",   "/pr",       "/run",      "/cd",      "/git",     "/export",
+                        "/new",     "/clear",    "/help",
                     };
                     var matches: [16][]const u8 = undefined;
                     var match_count: u8 = 0;
@@ -4094,7 +4522,10 @@ fn agentInteractive(shell: *Shell) !u8 {
                     const cur = edit_buf.cursor;
                     var word_start: u16 = cur;
                     while (word_start > 0 and text[word_start - 1] != ' ' and text[word_start - 1] != '\n') : (word_start -= 1) {}
-                    const prefix = text[word_start..cur];
+                    var prefix = text[word_start..cur];
+                    // Strip @ prefix for file mention completion
+                    const is_at_mention = prefix.len > 0 and prefix[0] == '@';
+                    if (is_at_mention) prefix = prefix[1..];
                     if (prefix.len > 0) {
                         // Split into dir and file prefix
                         const last_slash = std.mem.lastIndexOfScalar(u8, prefix, '/');
@@ -4150,7 +4581,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                         }
                     }
                 }
-                Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, agent_active, out_last, term_rows);
                 if (!agent_active) cursor_at = .input;
                 try out.flush();
                 continue;
@@ -4165,6 +4596,18 @@ fn agentInteractive(shell: *Shell) !u8 {
                 const qlen = @min(raw_query.len, query_buf.len);
                 @memcpy(query_buf[0..qlen], raw_query[0..qlen]);
                 const query = query_buf[0..qlen];
+
+                // Save to input history
+                if (qlen > 0) {
+                    const hlen: u16 = @intCast(qlen);
+                    @memcpy(input_history[input_history_write][0..qlen], query_buf[0..qlen]);
+                    input_history_lens[input_history_write] = hlen;
+                    input_history_write = (input_history_write + 1) % HIST_SIZE;
+                    if (input_history_count < HIST_SIZE) input_history_count += 1;
+                }
+                input_history_browsing = false;
+                input_history_pos = 0;
+
                 edit_buf.clear();
                 edit_buf.vi_mode = .insert;
 
@@ -4175,7 +4618,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                 }
 
                 if (query.len == 0) {
-                    Layout.drawInput(out, input_first_row, input_height, &edit_buf);
+                    Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, false, out_last, term_rows);
                     cursor_at = .input;
                     try out.flush();
                     continue;
@@ -4284,8 +4727,42 @@ fn agentInteractive(shell: *Shell) !u8 {
                             last_query_len = qcopy_len;
                             last_routed_tier_len = 0; // reset until router_info arrives
 
+                            // Expand @file mentions: read file and append contents
+                            var expanded_buf: [4096]u8 = undefined;
+                            var at_file_count: u8 = 0;
+                            const expanded_query: []const u8 = if (std.mem.indexOfScalar(u8, query, '@') != null) blk: {
+                                const result_q = expandAtMentions(query, &expanded_buf, shell.allocator) orelse query;
+                                // Count <file> tags to show attachment indicator
+                                var fi: usize = 0;
+                                while (fi < result_q.len) : (fi += 1) {
+                                    if (fi + 6 < result_q.len and std.mem.eql(u8, result_q[fi..][0..6], "<file ")) at_file_count += 1;
+                                }
+                                break :blk result_q;
+                            } else query;
+                            if (at_file_count > 0) {
+                                var fbuf: [32]u8 = undefined;
+                                const fmsg = std.fmt.bufPrint(&fbuf, "\x1b[90m  {d} file{s} attached\x1b[0m\n", .{ at_file_count, if (at_file_count == 1) @as([]const u8, "") else "s" }) catch "";
+                                try out.writeAll(fmsg);
+                                msg_history.appendSlice(fmsg);
+                                msg_history.commitLine();
+                            }
+
+                            // Detect thinking keywords and set budget
+                            // "think" → 4K tokens, "megathink" → 10K, "ultrathink" → 32K
+                            if (std.mem.indexOf(u8, expanded_query, "ultrathink") != null) {
+                                shell.agent.queues.shared_thinking_budget.store(32000, .monotonic);
+                            } else if (std.mem.indexOf(u8, expanded_query, "megathink") != null) {
+                                shell.agent.queues.shared_thinking_budget.store(10000, .monotonic);
+                            } else if (std.mem.indexOf(u8, expanded_query, " think") != null or
+                                std.mem.startsWith(u8, expanded_query, "think"))
+                            {
+                                shell.agent.queues.shared_thinking_budget.store(4000, .monotonic);
+                            } else {
+                                shell.agent.queues.shared_thinking_budget.store(0, .monotonic);
+                            }
+
                             // Send to agent — always queues, never blocks
-                            if (!shell.agent.query(query)) {
+                            if (!shell.agent.query(expanded_query)) {
                                 try out.writeAll("\x1b[31mqueue full, try again\x1b[0m\n");
                                 msg_history.appendSlice("\x1b[31mqueue full, try again\x1b[0m");
                                 msg_history.commitLine();
@@ -4294,10 +4771,11 @@ fn agentInteractive(shell: *Shell) !u8 {
                                 agent_active = true;
                                 cursor_at = .output;
                                 query_start_ms = std.time.milliTimestamp();
-                                const thinking = "thinking...";
-                                @memcpy(status_text[0..thinking.len], thinking);
-                                status_len = thinking.len;
-                                Layout.drawStatusBarSafeElapsed(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0);
+                                const tb = shell.agent.queues.shared_thinking_budget.load(.monotonic);
+                                const thinking_s = if (tb >= 32000) "ultrathinking..." else if (tb >= 10000) "megathinking..." else if (tb > 0) "thinking deeply..." else "thinking...";
+                                @memcpy(status_text[0..thinking_s.len], thinking_s);
+                                status_len = thinking_s.len;
+                                Layout.drawStatusBarSafeCtx(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0, ctx_tokens, ctx_max);
                             }
                             try out.flush();
                             continue;
@@ -4310,7 +4788,7 @@ fn agentInteractive(shell: *Shell) !u8 {
             if (byte[0] == 127 or byte[0] == 8) {
                 if (edit_buf.vi_mode == .normal) {
                     if (edit_buf.moveLeft()) {
-                        Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                        Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, agent_active, out_last, term_rows);
                         if (!agent_active) cursor_at = .input;
                         try out.flush();
                     }
@@ -4322,7 +4800,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                         input_height = new_h;
                         recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
                     }
-                    Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                    Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, agent_active, out_last, term_rows);
                     if (!agent_active) cursor_at = .input;
                     try out.flush();
                 }
@@ -4330,8 +4808,8 @@ fn agentInteractive(shell: *Shell) !u8 {
             }
 
             // Configurable Ctrl key bindings (from ~/.zish/keybindings.json)
-            // Skip keys handled above: 0x03 (Ctrl+C), 0x04 (Ctrl+D), 0x07 (Ctrl+G),
-            // 0x0B (Ctrl+K=scroll up), 0x0E (Ctrl+N=scroll down)
+            // Skip keys handled above: 0x01(^A) 0x02(^B) 0x03(^C) 0x04(^D) 0x05(^E)
+            // 0x06(^F) 0x07(^G) 0x0B(^K) 0x0C(^L) 0x0E(^N) 0x0F(^O) 0x15(^U) 0x17(^W)
             if (byte[0] >= 0x01 and byte[0] <= 0x1A and
                 byte[0] != 0x03 and byte[0] != 0x04 and byte[0] != 0x07 and
                 byte[0] != 0x0B and byte[0] != 0x0E and
@@ -4349,7 +4827,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                                 recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
                             }
                         }
-                        Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                        Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, agent_active, out_last, term_rows);
                         if (!agent_active) cursor_at = .input;
                         try out.flush();
                     }
@@ -4360,8 +4838,24 @@ fn agentInteractive(shell: *Shell) !u8 {
 
             // Regular character — always typeable, even during streaming
             if (byte[0] >= 0x20 or byte[0] == '\t') {
+                // Handle UTF-8 multi-byte: read continuation bytes immediately
+                if (byte[0] >= 0xC0) {
+                    const expect: u8 = if (byte[0] >= 0xF0) 3 else if (byte[0] >= 0xE0) 2 else 1;
+                    _ = edit_buf.insert(byte[0]);
+                    var ci: u8 = 0;
+                    while (ci < expect) : (ci += 1) {
+                        var cb: [1]u8 = undefined;
+                        const cn = std.fs.File.stdin().read(&cb) catch break;
+                        if (cn == 0 or (cb[0] & 0xC0) != 0x80) break;
+                        _ = edit_buf.insert(cb[0]);
+                    }
+                    Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, agent_active, out_last, term_rows);
+                    if (!agent_active) cursor_at = .input;
+                    try out.flush();
+                    continue;
+                }
                 if (edit_buf.insert(byte[0])) {
-                    Layout.drawInputSafe(out, input_first_row, input_height, &edit_buf, agent_active);
+                    Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, agent_active, out_last, term_rows);
                     if (!agent_active) cursor_at = .input;
                     try out.flush();
                 }
@@ -4777,6 +5271,51 @@ fn renderLogLine(out: anytype, md: *agent_mod.MarkdownRenderer, line: []const u8
     } else if (std.mem.eql(u8, entry_type, "d")) {
         // skip dividers in log view
     }
+}
+
+// ── @file mention expansion ──
+
+/// Expand @path mentions in query text. Reads each mentioned file and appends
+/// its contents to the query. Returns null if no expansion needed or on error.
+/// Pattern: "@path/to/file" at word boundary (preceded by space or start of string).
+fn expandAtMentions(query: []const u8, buf: *[4096]u8, alloc: std.mem.Allocator) ?[]const u8 {
+    var result: std.ArrayList(u8) = .{};
+    defer result.deinit(alloc);
+    result.appendSlice(alloc, query) catch return null;
+
+    var files_found = false;
+    var i: usize = 0;
+    while (i < query.len) : (i += 1) {
+        if (query[i] != '@') continue;
+        // Must be at start or after whitespace
+        if (i > 0 and query[i - 1] != ' ' and query[i - 1] != '\n' and query[i - 1] != '\t') continue;
+        // Extract path after @
+        const path_start = i + 1;
+        if (path_start >= query.len) continue;
+        var path_end = path_start;
+        while (path_end < query.len and query[path_end] != ' ' and query[path_end] != '\n' and query[path_end] != '\t') : (path_end += 1) {}
+        const path = query[path_start..path_end];
+        if (path.len == 0) continue;
+        // Try to read the file
+        const file = std.fs.cwd().openFile(path, .{}) catch continue;
+        defer file.close();
+        var read_buf: [3072]u8 = undefined;
+        const n = file.readAll(&read_buf) catch continue;
+        if (n == 0) continue;
+        // Append file contents to query
+        files_found = true;
+        result.appendSlice(alloc, "\n\n<file path=\"") catch continue;
+        result.appendSlice(alloc, path) catch continue;
+        result.appendSlice(alloc, "\">\n") catch continue;
+        result.appendSlice(alloc, read_buf[0..n]) catch continue;
+        result.appendSlice(alloc, "\n</file>") catch continue;
+    }
+
+    if (!files_found) return null;
+    // Copy to static buffer
+    const total = @min(result.items.len, buf.len);
+    @memcpy(buf[0..total], result.items[0..total]);
+    return buf[0..total];
 }
 
 // ── Voice TTS: speak text via remote TTS endpoint ──

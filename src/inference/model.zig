@@ -42,7 +42,7 @@ pub const Config = struct {
             .n_layers = file.getU32(archKey(arch, "block_count")) orelse 24,
             .n_heads = file.getU32(archKey(arch, "attention.head_count")) orelse 8,
             .n_kv_heads = file.getU32(archKey(arch, "attention.head_count_kv")) orelse 4,
-            .vocab_size = if (file.getValue("tokenizer.ggml.tokens")) |v| @intCast(v.array.len) else 32000,
+            .vocab_size = if (file.getValue("tokenizer.ggml.tokens")) |v| @intCast(v.array.len) else file.getU32(archKey(arch, "vocab_size")) orelse 32000,
             .max_seq_length = ctx_len,
             .rope_theta = file.getF32(archKey(arch, "rope.freq_base")) orelse 10000.0,
             .rms_norm_eps = file.getF32(archKey(arch, "attention.layer_norm_rms_epsilon")) orelse 1e-6,
@@ -66,7 +66,7 @@ fn archKey(arch: []const u8, suffix: []const u8) []const u8 {
 /// Weights for a single transformer layer.
 const Layer = struct {
     // Attention
-    attn_norm: []const f32,
+    attn_norm: ?[]const f32 = null, // optional — nanochat has no layer norms
     wq: TensorRef,
     wk: TensorRef,
     wv: TensorRef,
@@ -76,7 +76,7 @@ const Layer = struct {
     bk: ?[]const f32 = null,
     bv: ?[]const f32 = null,
     // MLP (standard SwiGLU) — always present
-    ffn_norm: []const f32,
+    ffn_norm: ?[]const f32 = null, // optional — nanochat has no layer norms
     w1: ?TensorRef = null, // gate
     w2: ?TensorRef = null, // down
     w3: ?TensorRef = null, // up
@@ -248,7 +248,7 @@ pub const Transformer = struct {
     config: Config,
     layers: []Layer,
     token_embed: TensorRef,
-    norm: []const f32, // output RMS norm weights
+    norm: ?[]const f32 = null, // output RMS norm weights (optional for nanochat)
     classifier: TensorRef, // output projection (lm_head)
     // Per-layer residual scaling: x = resid_lambdas[i] * x + x0_lambdas[i] * x0
     // Defaults: resid=1.0 (identity), x0=0.0 (no skip). Null = disabled.
@@ -292,7 +292,7 @@ pub const Transformer = struct {
         var name_buf: [128]u8 = undefined;
         for (0..real_config.n_layers) |i| {
             layers[i] = .{
-                .attn_norm = getF32Tensor(file, td, fmtBuf(&name_buf, "blk.{d}.attn_norm.weight", .{i})),
+                .attn_norm = tryGetF32Tensor(file, td, fmtBuf(&name_buf, "blk.{d}.attn_norm.weight", .{i})),
                 .wq = getTensorRef(file, td, fmtBuf(&name_buf, "blk.{d}.attn_q.weight", .{i})),
                 .wk = getTensorRef(file, td, fmtBuf(&name_buf, "blk.{d}.attn_k.weight", .{i})),
                 .wv = getTensorRef(file, td, fmtBuf(&name_buf, "blk.{d}.attn_v.weight", .{i})),
@@ -300,7 +300,7 @@ pub const Transformer = struct {
                 .bq = tryGetF32Tensor(file, td, fmtBuf(&name_buf, "blk.{d}.attn_q.bias", .{i})),
                 .bk = tryGetF32Tensor(file, td, fmtBuf(&name_buf, "blk.{d}.attn_k.bias", .{i})),
                 .bv = tryGetF32Tensor(file, td, fmtBuf(&name_buf, "blk.{d}.attn_v.bias", .{i})),
-                .ffn_norm = getF32Tensor(file, td, fmtBuf(&name_buf, "blk.{d}.ffn_norm.weight", .{i})),
+                .ffn_norm = tryGetF32Tensor(file, td, fmtBuf(&name_buf, "blk.{d}.ffn_norm.weight", .{i})),
                 .w1 = tryGetTensorRef(file, td, fmtBuf(&name_buf, "blk.{d}.ffn_gate.weight", .{i})),
                 .w2 = tryGetTensorRef(file, td, fmtBuf(&name_buf, "blk.{d}.ffn_down.weight", .{i})),
                 .w3 = tryGetTensorRef(file, td, fmtBuf(&name_buf, "blk.{d}.ffn_up.weight", .{i})),
@@ -439,7 +439,7 @@ pub const Transformer = struct {
 
         // Load embedding and output weights
         const token_embed = getTensorRef(file, td, "token_embd.weight");
-        const norm_weights = getF32Tensor(file, td, "output_norm.weight");
+        const norm_weights = tryGetF32Tensor(file, td, "output_norm.weight");
         const classifier = if (file.getTensorInfo("output.weight")) |_|
             getTensorRef(file, td, "output.weight")
         else
@@ -492,8 +492,12 @@ pub const Transformer = struct {
                 }
             }
 
-            // Attention norm
-            math.rmsNorm(state.work, state.input, layer.attn_norm);
+            // Attention norm (skip if not present — nanochat models)
+            if (layer.attn_norm) |norm| {
+                math.rmsNorm(state.work, state.input, norm);
+            } else {
+                @memcpy(state.work[0..dim], state.input[0..dim]);
+            }
 
             // QKV projections — batched: 3 matmuls, 1 GPU submit
             if (!self.batchMatvecGpu(
@@ -578,8 +582,12 @@ pub const Transformer = struct {
             // Residual connection
             math.add(state.input, state.input, state.work2);
 
-            // FFN norm
-            math.rmsNorm(state.work, state.input, layer.ffn_norm);
+            // FFN norm (skip if not present — nanochat models)
+            if (layer.ffn_norm) |norm| {
+                math.rmsNorm(state.work, state.input, norm);
+            } else {
+                @memcpy(state.work[0..dim], state.input[0..dim]);
+            }
 
             if (layer.ctm_block) |ctm_block| {
                 // GATED INTERPOLATION: output = (1-g)*MLP(x) + g*CTM(x)
@@ -589,21 +597,31 @@ pub const Transformer = struct {
                 const gate = 1.0 / (1.0 + std.math.exp(-layer.ctm_gate));
 
                 // Run MLP
-                if (layer.w1 != null and layer.w2 != null and layer.w3 != null) {
-                    // Batch gate+up: 2 matmuls, 1 GPU submit
-                    if (!self.batchMatvecGpu(
-                        state.work[0..dim],
-                        &.{ state.hidden1[0..c.hidden_dim], state.hidden2[0..c.hidden_dim] },
-                        &.{ layer.w1.?, layer.w3.? },
-                        &.{ c.hidden_dim, c.hidden_dim },
-                        dim,
-                    )) {
-                        self.matmulTensor(state.hidden1, layer.w1.?, state.work, c.hidden_dim, dim, state);
-                        self.matmulTensor(state.hidden2, layer.w3.?, state.work, c.hidden_dim, dim, state);
+                if (layer.w2 != null and (layer.w1 != null or layer.w3 != null)) {
+                    if (layer.w1 != null and layer.w3 != null) {
+                        // SwiGLU: gate (w1) + up (w3), silu(gate) * up, down (w2)
+                        if (!self.batchMatvecGpu(
+                            state.work[0..dim],
+                            &.{ state.hidden1[0..c.hidden_dim], state.hidden2[0..c.hidden_dim] },
+                            &.{ layer.w1.?, layer.w3.? },
+                            &.{ c.hidden_dim, c.hidden_dim },
+                            dim,
+                        )) {
+                            self.matmulTensor(state.hidden1, layer.w1.?, state.work, c.hidden_dim, dim, state);
+                            self.matmulTensor(state.hidden2, layer.w3.?, state.work, c.hidden_dim, dim, state);
+                        }
+                        math.swiglu(state.hidden1);
+                        math.elementProduct(state.hidden1, state.hidden1, state.hidden2);
+                    } else {
+                        // ReLU² or plain FFN: up (w3), relu²(up), down (w2)
+                        const up = layer.w3 orelse layer.w1.?;
+                        self.matmulTensor(state.hidden1, up, state.work, c.hidden_dim, dim, state);
+                        // ReLU²: relu(x)²
+                        for (state.hidden1[0..c.hidden_dim]) |*v| {
+                            const r = @max(v.*, 0);
+                            v.* = r * r;
+                        }
                     }
-
-                    math.swiglu(state.hidden1);
-                    math.elementProduct(state.hidden1, state.hidden1, state.hidden2);
 
                     self.matmulTensor(state.work2, layer.w2.?, state.hidden1, dim, c.hidden_dim, state);
 
@@ -658,8 +676,10 @@ pub const Transformer = struct {
             }
         }
 
-        // Final norm
-        math.rmsNorm(state.input, state.input, self.norm);
+        // Final norm (skip if not present — nanochat models)
+        if (self.norm) |norm| {
+            math.rmsNorm(state.input, state.input, norm);
+        }
 
         // Classifier projection
         self.matmulTensor(state.output, self.classifier, state.input, c.vocab_size, dim, state);

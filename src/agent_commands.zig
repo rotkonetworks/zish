@@ -128,13 +128,20 @@ const truncateToCols = TermWidth.truncate;
 pub const Layout = struct {
     pub fn drawSeparator(w: anytype, row: u16, cols: u16, scroll_off: u32) void {
         w.print("\x1b[{d};1H\x1b[2K\x1b[2;90m", .{row}) catch {}; // dim + dark gray
-        _ = cols;
         if (scroll_off > 0) {
-            var indicator_buf: [64]u8 = undefined;
-            const indicator = std.fmt.bufPrint(&indicator_buf, "\xe2\x94\x80\xe2\x94\x80 \xe2\x86\x91 {d} lines \xe2\x94\x80\xe2\x94\x80", .{scroll_off}) catch "";
+            // Show scroll indicator centered in the line
+            var indicator_buf: [32]u8 = undefined;
+            const indicator = std.fmt.bufPrint(&indicator_buf, " \xe2\x86\x91 {d} lines ", .{scroll_off}) catch " ";
+            const ind_w = displayWidth(indicator);
+            const pad_left = if (cols > ind_w) (cols - ind_w) / 2 else 0;
+            var pi: u16 = 0;
+            while (pi < pad_left) : (pi += 1) w.writeAll("\xe2\x94\x80") catch {}; // ─
             w.writeAll(indicator) catch {};
+            while (pi + ind_w < cols) : (pi += 1) w.writeAll("\xe2\x94\x80") catch {};
         } else {
-            w.writeAll("\xe2\x94\x80\xe2\x94\x80") catch {}; // just a short dash, not full width
+            // Full-width thin line
+            var ci: u16 = 0;
+            while (ci < cols) : (ci += 1) w.writeAll("\xe2\x94\x80") catch {}; // ─
         }
         w.writeAll("\x1b[0m") catch {};
     }
@@ -161,8 +168,12 @@ pub const Layout = struct {
                     } else {
                         w.writeAll("\x1b[90m> \x1b[0m") catch {};
                     }
+                    // Show placeholder when empty
+                    if (ebuf.len == 0 and ebuf.vi_mode == .insert) {
+                        w.writeAll("\x1b[2;90mAsk anything, / for commands\x1b[0m") catch {};
+                    }
                 } else {
-                    w.writeAll("  ") catch {};
+                    w.writeAll("\x1b[90m\xc2\xb7 \x1b[0m") catch {}; // · continuation
                 }
                 w.writeAll(line_text) catch {};
             }
@@ -184,7 +195,26 @@ pub const Layout = struct {
         drawStatusBarFull(w, row, cols, mdl, cost, status, 0);
     }
 
+    // Braille spinner frames for activity indication
+    const spinner_frames = [_][]const u8{
+        "\xe2\xa0\x8b", // ⠋
+        "\xe2\xa0\x99", // ⠙
+        "\xe2\xa0\xb9", // ⠹
+        "\xe2\xa0\xb8", // ⠸
+        "\xe2\xa0\xbc", // ⠼
+        "\xe2\xa0\xb4", // ⠴
+        "\xe2\xa0\xa6", // ⠦
+        "\xe2\xa0\xa7", // ⠧
+        "\xe2\xa0\x87", // ⠇
+        "\xe2\xa0\x8f", // ⠏
+    };
+    var spinner_tick: u8 = 0;
+
     pub fn drawStatusBarFull(w: anytype, row: u16, cols: u16, mdl: []const u8, cost: []const u8, status: []const u8, elapsed_ms: i64) void {
+        drawStatusBarCtx(w, row, cols, mdl, cost, status, elapsed_ms, 0, 0);
+    }
+
+    pub fn drawStatusBarCtx(w: anytype, row: u16, cols: u16, mdl: []const u8, cost: []const u8, status: []const u8, elapsed_ms: i64, ctx_tokens: u32, ctx_max: u32) void {
         w.print("\x1b[{d};1H\x1b[2K\x1b[90m", .{row}) catch {};
         var display_cols: u16 = 0;
         // Model name
@@ -197,11 +227,17 @@ pub const Layout = struct {
             w.writeAll(mdl[0..trunc]) catch {};
             display_cols = cols;
         }
-        // Status (highlighted)
+        // Status with spinner (highlighted)
         if (status.len > 0 and display_cols + 4 < cols) {
-            w.writeAll(" \xc2\xb7 ") catch {}; // · (middle dot separator)
+            w.writeAll(" \xc2\xb7 ") catch {}; // · separator
             display_cols += 3;
-            w.writeAll("\x1b[33m") catch {}; // yellow for active status
+            // Animated spinner before status text
+            w.writeAll("\x1b[33m") catch {}; // yellow
+            const frame = spinner_frames[spinner_tick % spinner_frames.len];
+            w.writeAll(frame) catch {};
+            w.writeAll(" ") catch {};
+            display_cols += 2; // spinner char + space
+            spinner_tick +%= 1;
             const sw = displayWidth(status);
             if (display_cols + sw < cols) {
                 w.writeAll(status) catch {};
@@ -219,6 +255,35 @@ pub const Layout = struct {
             display_cols += 3;
             w.writeAll(cost) catch {};
             display_cols += displayWidth(cost);
+        }
+        // Context window progress bar
+        if (ctx_max > 0 and display_cols + 14 < cols) {
+            w.writeAll(" \xc2\xb7 ") catch {};
+            display_cols += 3;
+            const pct: u32 = @min(100, @divTrunc(ctx_tokens * 100, ctx_max));
+            const bar_width: u32 = 10;
+            const filled: u32 = @divTrunc(pct * bar_width, 100);
+            // Color based on usage: green <70%, yellow 70-89%, red 90%+
+            if (pct >= 90) {
+                w.writeAll("\x1b[31m") catch {}; // red
+            } else if (pct >= 70) {
+                w.writeAll("\x1b[33m") catch {}; // yellow
+            } else {
+                w.writeAll("\x1b[32m") catch {}; // green
+            }
+            var bi: u32 = 0;
+            while (bi < bar_width) : (bi += 1) {
+                if (bi < filled) {
+                    w.writeAll("\xe2\x96\x93") catch {}; // ▓
+                } else {
+                    w.writeAll("\xe2\x96\x91") catch {}; // ░
+                }
+            }
+            var pct_buf: [8]u8 = undefined;
+            const pct_str = std.fmt.bufPrint(&pct_buf, " {d}%", .{pct}) catch "";
+            w.writeAll(pct_str) catch {};
+            w.writeAll("\x1b[90m") catch {};
+            display_cols += @as(u16, @intCast(bar_width)) + displayWidth(pct_str) + 3;
         }
         // Elapsed time
         if (elapsed_ms > 0 and display_cols + 6 < cols) {
@@ -253,12 +318,13 @@ pub const Layout = struct {
     }
 
     pub fn drawInputSafeFull(w: anytype, first_row: u16, rows: u16, ebuf: *const editor.EditBuffer, streaming: bool, scroll_last: u16, t_rows: u16) void {
-        if (streaming and t_rows > 0) {
-            w.writeAll("\x1b" ++ "7") catch {}; // DECSC
+        if (t_rows > 0 and first_row > scroll_last) {
+            // Input is outside scroll region — must expand to position cursor
+            if (streaming) w.writeAll("\x1b" ++ "7") catch {}; // DECSC
             w.print("\x1b[1;{d}r", .{t_rows}) catch {};
             drawInput(w, first_row, rows, ebuf);
             w.print("\x1b[1;{d}r", .{scroll_last}) catch {};
-            w.writeAll("\x1b" ++ "8") catch {}; // DECRC
+            if (streaming) w.writeAll("\x1b" ++ "8") catch {}; // DECRC
         } else {
             drawInput(w, first_row, rows, ebuf);
         }
@@ -269,11 +335,15 @@ pub const Layout = struct {
     }
 
     pub fn drawStatusBarSafeElapsed(w: anytype, stat_row: u16, t_rows: u16, scroll_last: u16, cols: u16, mdl: []const u8, cost: []const u8, status: []const u8, elapsed_ms: i64) void {
+        drawStatusBarSafeCtx(w, stat_row, t_rows, scroll_last, cols, mdl, cost, status, elapsed_ms, 0, 0);
+    }
+
+    pub fn drawStatusBarSafeCtx(w: anytype, stat_row: u16, t_rows: u16, scroll_last: u16, cols: u16, mdl: []const u8, cost: []const u8, status: []const u8, elapsed_ms: i64, ctx_tokens: u32, ctx_max: u32) void {
         // Use DEC save/restore (ESC 7 / ESC 8) which is more reliable across
         // scroll region changes than SCO save/restore (ESC[s / ESC[u)
         w.writeAll("\x1b" ++ "7") catch {}; // DEC save cursor (DECSC)
         w.print("\x1b[1;{d}r", .{t_rows}) catch {};
-        drawStatusBarFull(w, stat_row, cols, mdl, cost, status, elapsed_ms);
+        drawStatusBarCtx(w, stat_row, cols, mdl, cost, status, elapsed_ms, ctx_tokens, ctx_max);
         w.print("\x1b[1;{d}r", .{scroll_last}) catch {};
         w.writeAll("\x1b" ++ "8") catch {}; // DEC restore cursor (DECRC)
     }
@@ -283,7 +353,7 @@ pub const Layout = struct {
     }
 
     pub fn doExit(w: anytype, rows: u16, in_h: u16) void {
-        w.writeAll("\x1b[0 q\x1b[?25h") catch {};
+        w.writeAll("\x1b[0 q\x1b[?25h\x1b[?2004l") catch {}; // reset cursor + show + disable bracketed paste
         w.print("\x1b[1;{d}r", .{rows}) catch {};
         w.print("\x1b[{d};1H\x1b[2K", .{rows}) catch {};
         var ri: u16 = 0;
@@ -652,6 +722,16 @@ const commands = [_]Command{
     .{ .name = "/effort", .has_arg = true, .handler = cmdEffort },
     .{ .name = "/git", .has_arg = true, .handler = cmdGit },
     .{ .name = "/export", .has_arg = true, .handler = cmdExport },
+    .{ .name = "/redo", .has_arg = false, .handler = cmdRedo },
+    .{ .name = "/run", .has_arg = true, .handler = cmdRun },
+    .{ .name = "/pr", .has_arg = true, .handler = cmdPR },
+    .{ .name = "/cd", .has_arg = true, .handler = cmdCd },
+    .{ .name = "/ls", .has_arg = true, .handler = cmdLs },
+    .{ .name = "/cat", .has_arg = true, .handler = cmdCat },
+    .{ .name = "/new", .has_arg = false, .handler = cmdClear },
+    .{ .name = "/clear", .has_arg = false, .handler = cmdClear },
+    .{ .name = "/status", .has_arg = false, .handler = cmdStatus },
+    .{ .name = "/think", .has_arg = true, .handler = cmdThink },
     .{ .name = "/help", .has_arg = false, .handler = cmdHelp },
     .{ .name = "help", .has_arg = false, .handler = cmdHelp },
 };
@@ -738,7 +818,248 @@ fn cmdCost(ctx: *CommandCtx, _: []const u8) DispatchResult {
     Layout.goOutput(ctx.out, ctx.out_last.*);
     ctx.out.print("  \x1b[90mcost\x1b[0m      {s}\n", .{if (ctx.cost_len.* > 0) ctx.cost_buf[0..ctx.cost_len.*] else "n/a"}) catch {};
     ctx.out.print("  \x1b[90mmodel\x1b[0m     {s}\n", .{ctx.model_name}) catch {};
+    // Show live token count from agent thread
+    const live_tokens = ctx.shell.agent.getTotalInputTokens();
+    if (live_tokens > 0) {
+        const ctx_max: u32 = 200_000;
+        const pct = @divTrunc(live_tokens * 100, ctx_max);
+        ctx.out.print("  \x1b[90mcontext\x1b[0m   {d}K / {d}K ({d}%)\n", .{ live_tokens / 1000, ctx_max / 1000, pct }) catch {};
+    }
     ctx.historyNote("Session cost displayed");
+    ctx.out.flush() catch {};
+    return .handled;
+}
+
+fn cmdRedo(ctx: *CommandCtx, _: []const u8) DispatchResult {
+    Layout.goOutput(ctx.out, ctx.out_last.*);
+    // Redo = checkout from stash or re-apply last change
+    // Check if there's a stash to pop
+    const stash_result = std.process.Child.run(.{
+        .allocator = ctx.shell.allocator,
+        .argv = &[_][]const u8{ "git", "stash", "list" },
+        .max_output_bytes = 1024,
+    }) catch {
+        ctx.out.writeAll("\x1b[90mnot a git repository\x1b[0m\n") catch {};
+        ctx.out.flush() catch {};
+        return .handled;
+    };
+    defer ctx.shell.allocator.free(stash_result.stdout);
+    defer ctx.shell.allocator.free(stash_result.stderr);
+    if (stash_result.stdout.len > 0) {
+        // Pop last stash
+        const pop_result = std.process.Child.run(.{
+            .allocator = ctx.shell.allocator,
+            .argv = &[_][]const u8{ "git", "stash", "pop" },
+            .max_output_bytes = 4096,
+        }) catch {
+            ctx.out.writeAll("\x1b[31mredo failed\x1b[0m\n") catch {};
+            ctx.out.flush() catch {};
+            return .handled;
+        };
+        defer ctx.shell.allocator.free(pop_result.stdout);
+        defer ctx.shell.allocator.free(pop_result.stderr);
+        ctx.out.writeAll("\x1b[32m\xe2\x9c\x93\x1b[0m stash popped\n") catch {};
+    } else {
+        ctx.out.writeAll("\x1b[90mnothing to redo\x1b[0m\n") catch {};
+    }
+    ctx.out.flush() catch {};
+    return .handled;
+}
+
+fn cmdPR(ctx: *CommandCtx, arg: []const u8) DispatchResult {
+    Layout.goOutput(ctx.out, ctx.out_last.*);
+    const title = if (arg.len > 0) arg else "";
+    var prompt_buf: [4096]u8 = undefined;
+    const prompt = if (title.len > 0)
+        std.fmt.bufPrint(&prompt_buf, "Create a GitHub pull request with title '{s}'. First run `git status` and `git log --oneline -5` to understand the changes. Then run `gh pr create --title '...' --body '...'` with a good description based on the commits. Show the PR URL when done.", .{title}) catch "Create a PR"
+    else
+        std.fmt.bufPrint(&prompt_buf, "Create a GitHub pull request. First run `git status`, `git log --oneline -5`, and `git diff --stat` to understand the changes. Write a concise PR title and description based on the commits. Run `gh pr create --title '...' --body '...'`. Show the PR URL when done.", .{}) catch "Create a PR";
+    if (ctx.shell.agent.query(prompt)) {
+        ctx.agent_active.* = true;
+        ctx.setStatus("creating PR...");
+    }
+    ctx.out.flush() catch {};
+    return .handled;
+}
+
+fn cmdCd(ctx: *CommandCtx, arg: []const u8) DispatchResult {
+    Layout.goOutput(ctx.out, ctx.out_last.*);
+    const path = if (arg.len > 0) arg else std.posix.getenv("HOME") orelse "/";
+    // Expand ~ to home
+    var path_buf: [512]u8 = undefined;
+    const real_path = if (std.mem.startsWith(u8, path, "~/")) blk: {
+        const home = std.posix.getenv("HOME") orelse "/";
+        break :blk std.fmt.bufPrint(&path_buf, "{s}{s}", .{ home, path[1..] }) catch path;
+    } else path;
+    std.posix.chdir(real_path) catch {
+        ctx.out.print("\x1b[31mcd: {s}: not found\x1b[0m\n", .{real_path}) catch {};
+        ctx.out.flush() catch {};
+        return .handled;
+    };
+    // Show new cwd
+    var cwd_buf: [256]u8 = undefined;
+    const cwd = std.posix.getcwd(&cwd_buf) catch "?";
+    ctx.out.print("\x1b[90m{s}\x1b[0m\n", .{cwd}) catch {};
+    ctx.out.flush() catch {};
+    return .handled;
+}
+
+fn cmdRun(ctx: *CommandCtx, arg: []const u8) DispatchResult {
+    if (arg.len == 0) {
+        Layout.goOutput(ctx.out, ctx.out_last.*);
+        ctx.out.writeAll("\x1b[90musage: /run <command>\x1b[0m\n") catch {};
+        ctx.out.flush() catch {};
+        return .handled;
+    }
+    Layout.goOutput(ctx.out, ctx.out_last.*);
+    const result = std.process.Child.run(.{
+        .allocator = ctx.shell.allocator,
+        .argv = &[_][]const u8{ "/bin/sh", "-c", arg },
+        .max_output_bytes = 64 * 1024,
+    }) catch {
+        ctx.out.writeAll("\x1b[31mexec failed\x1b[0m\n") catch {};
+        ctx.out.flush() catch {};
+        return .handled;
+    };
+    defer ctx.shell.allocator.free(result.stdout);
+    defer ctx.shell.allocator.free(result.stderr);
+    if (result.stdout.len > 0) ctx.out.writeAll(result.stdout) catch {};
+    if (result.stderr.len > 0) {
+        ctx.out.writeAll("\x1b[31m") catch {};
+        ctx.out.writeAll(result.stderr) catch {};
+        ctx.out.writeAll("\x1b[0m") catch {};
+    }
+    ctx.out.flush() catch {};
+    return .handled;
+}
+
+fn cmdCat(ctx: *CommandCtx, arg: []const u8) DispatchResult {
+    Layout.goOutput(ctx.out, ctx.out_last.*);
+    if (arg.len == 0) {
+        ctx.out.writeAll("\x1b[90musage: /cat <file>\x1b[0m\n") catch {};
+        ctx.out.flush() catch {};
+        return .handled;
+    }
+    const content = std.fs.cwd().readFileAlloc(ctx.shell.allocator, arg, 64 * 1024) catch {
+        ctx.out.print("\x1b[31mcan't read: {s}\x1b[0m\n", .{arg}) catch {};
+        ctx.out.flush() catch {};
+        return .handled;
+    };
+    defer ctx.shell.allocator.free(content);
+    // Show with line numbers and syntax coloring via markdown
+    ctx.out.print("\x1b[90m{s} ({d} bytes)\x1b[0m\n", .{ arg, content.len }) catch {};
+    // Determine extension for syntax hint
+    const ext_pos = std.mem.lastIndexOfScalar(u8, arg, '.');
+    const ext = if (ext_pos) |p| arg[p + 1 ..] else "";
+    if (ext.len > 0) {
+        ctx.out.print("\x1b[90m\xe2\x94\x82 {s}\x1b[0m\n", .{ext}) catch {};
+    }
+    // Show content with line numbers
+    var line_num: u32 = 1;
+    var start: usize = 0;
+    ctx.out.writeAll("\x1b[36m") catch {};
+    for (content, 0..) |ch, ci| {
+        if (ch == '\n' or ci == content.len - 1) {
+            const end = if (ch == '\n') ci else ci + 1;
+            const line = content[start..end];
+            ctx.out.print("\x1b[90m\xe2\x94\x82\x1b[2m{d:>4}\x1b[0m\x1b[36m {s}\n", .{ line_num, line }) catch {};
+            line_num += 1;
+            start = ci + 1;
+            if (line_num > 100) {
+                ctx.out.print("\x1b[90m  ... {d} more lines\x1b[0m\n", .{content.len - start}) catch {};
+                break;
+            }
+        }
+    }
+    ctx.out.writeAll("\x1b[0m") catch {};
+    ctx.out.flush() catch {};
+    return .handled;
+}
+
+fn cmdLs(ctx: *CommandCtx, arg: []const u8) DispatchResult {
+    Layout.goOutput(ctx.out, ctx.out_last.*);
+    const path = if (arg.len > 0) arg else ".";
+    const result = std.process.Child.run(.{
+        .allocator = ctx.shell.allocator,
+        .argv = &[_][]const u8{ "ls", "-la", "--color=always", path },
+        .max_output_bytes = 16 * 1024,
+    }) catch {
+        ctx.out.writeAll("\x1b[31mls failed\x1b[0m\n") catch {};
+        ctx.out.flush() catch {};
+        return .handled;
+    };
+    defer ctx.shell.allocator.free(result.stdout);
+    defer ctx.shell.allocator.free(result.stderr);
+    if (result.stdout.len > 0) ctx.out.writeAll(result.stdout) catch {};
+    ctx.out.flush() catch {};
+    return .handled;
+}
+
+fn cmdThink(ctx: *CommandCtx, arg: []const u8) DispatchResult {
+    Layout.goOutput(ctx.out, ctx.out_last.*);
+    const trimmed = std.mem.trim(u8, arg, " \t");
+    const budget: u32 = if (trimmed.len == 0 or std.mem.eql(u8, trimmed, "off") or std.mem.eql(u8, trimmed, "0"))
+        0
+    else if (std.mem.eql(u8, trimmed, "on") or std.mem.eql(u8, trimmed, "yes"))
+        4000
+    else if (std.mem.eql(u8, trimmed, "mega"))
+        10000
+    else if (std.mem.eql(u8, trimmed, "ultra"))
+        32000
+    else blk: {
+        // Parse as number
+        var val: u32 = 0;
+        for (trimmed) |c| {
+            if (c >= '0' and c <= '9') { val = val * 10 + (c - '0'); } else break;
+        }
+        break :blk if (val > 0) val else 4000;
+    };
+    ctx.shell.agent.queues.shared_thinking_budget.store(budget, .monotonic);
+    if (budget > 0) {
+        ctx.out.print("\x1b[33mthinking enabled\x1b[90m ({d}K tokens)\x1b[0m\n", .{budget / 1000}) catch {};
+    } else {
+        ctx.out.writeAll("\x1b[90mthinking disabled\x1b[0m\n") catch {};
+    }
+    ctx.out.flush() catch {};
+    return .handled;
+}
+
+fn cmdStatus(ctx: *CommandCtx, _: []const u8) DispatchResult {
+    Layout.goOutput(ctx.out, ctx.out_last.*);
+    // Model
+    ctx.out.print("  \x1b[90mmodel\x1b[0m     {s}\n", .{ctx.model_name}) catch {};
+    // Cost
+    ctx.out.print("  \x1b[90mcost\x1b[0m      {s}\n", .{if (ctx.cost_len.* > 0) ctx.cost_buf[0..ctx.cost_len.*] else "n/a"}) catch {};
+    // Context
+    const live_tokens = ctx.shell.agent.getTotalInputTokens();
+    if (live_tokens > 0) {
+        const ctx_max: u32 = 200_000;
+        const pct = @divTrunc(live_tokens * 100, ctx_max);
+        ctx.out.print("  \x1b[90mcontext\x1b[0m   {d}K / {d}K ({d}%)\n", .{ live_tokens / 1000, ctx_max / 1000, pct }) catch {};
+    }
+    // CWD
+    var cwd_buf: [256]u8 = undefined;
+    const cwd = std.posix.getcwd(&cwd_buf) catch "?";
+    ctx.out.print("  \x1b[90mcwd\x1b[0m       {s}\n", .{cwd}) catch {};
+    // Git branch
+    if (std.fs.cwd().openFile(".git/HEAD", .{})) |head| {
+        defer head.close();
+        var branch_buf: [128]u8 = undefined;
+        const n = head.read(&branch_buf) catch 0;
+        const content = std.mem.trim(u8, branch_buf[0..n], " \t\r\n");
+        if (std.mem.startsWith(u8, content, "ref: refs/heads/")) {
+            ctx.out.print("  \x1b[90mbranch\x1b[0m    \x1b[33m{s}\x1b[0m\n", .{content[16..]}) catch {};
+        }
+    } else |_| {}
+    // Thinking
+    const tb = ctx.shell.agent.queues.shared_thinking_budget.load(.monotonic);
+    if (tb > 0) {
+        ctx.out.print("  \x1b[90mthinking\x1b[0m  \x1b[33m{d}K tokens\x1b[0m\n", .{tb / 1000}) catch {};
+    }
+    // Agent status
+    const busy = ctx.shell.agent.isBusy();
+    ctx.out.print("  \x1b[90magent\x1b[0m     {s}\n", .{if (busy) "\x1b[33mbusy\x1b[0m" else "\x1b[32midle\x1b[0m"}) catch {};
+    ctx.historyNote("Status displayed");
     ctx.out.flush() catch {};
     return .handled;
 }
@@ -775,8 +1096,21 @@ fn cmdModel(ctx: *CommandCtx, arg: []const u8) DispatchResult {
         ctx.historyNote("Model switched");
         ctx.drawStatusElapsed();
     } else {
-        ctx.out.print("\x1b[1mCurrent model:\x1b[0m {s}\n", .{ctx.model_name}) catch {};
-        ctx.out.writeAll("\x1b[90mUsage: /model <large|medium|small|model-id>\x1b[0m\n") catch {};
+        // Show model list with current highlighted
+        const models = [_]struct { name: []const u8, alias: []const u8 }{
+            .{ .name = "opus", .alias = "large" },
+            .{ .name = "sonnet", .alias = "medium" },
+            .{ .name = "haiku", .alias = "small" },
+        };
+        for (models) |m| {
+            const is_current = std.mem.indexOf(u8, ctx.model_name, m.name) != null;
+            if (is_current) {
+                ctx.out.print("  \x1b[33m\xe2\x97\x8f {s}\x1b[90m ({s}) \xe2\x86\x90 active\x1b[0m\n", .{ m.name, m.alias }) catch {};
+            } else {
+                ctx.out.print("  \x1b[90m\xe2\x97\x8b {s} ({s})\x1b[0m\n", .{ m.name, m.alias }) catch {};
+            }
+        }
+        ctx.out.writeAll("\x1b[90m  /model <name> or ^T to cycle\x1b[0m\n") catch {};
         ctx.historyNote("Model info displayed");
     }
     ctx.out.flush() catch {};
@@ -785,25 +1119,72 @@ fn cmdModel(ctx: *CommandCtx, arg: []const u8) DispatchResult {
 
 fn cmdDiff(ctx: *CommandCtx, _: []const u8) DispatchResult {
     Layout.goOutput(ctx.out, ctx.out_last.*);
-    // Run git diff directly — no API call needed, saves tokens
-    const result = std.process.Child.run(.{
+    // Show staged changes
+    const staged = std.process.Child.run(.{
         .allocator = ctx.shell.allocator,
-        .argv = &[_][]const u8{ "git", "diff", "--stat", "--color=always" },
+        .argv = &[_][]const u8{ "git", "diff", "--cached", "--stat", "--color=always" },
         .max_output_bytes = 64 * 1024,
     }) catch {
         ctx.out.writeAll("\x1b[90mnot a git repository\x1b[0m\n") catch {};
         ctx.out.flush() catch {};
         return .handled;
     };
-    defer ctx.shell.allocator.free(result.stdout);
-    defer ctx.shell.allocator.free(result.stderr);
-    if (result.stdout.len > 0) {
-        ctx.out.writeAll(result.stdout) catch {};
-        ctx.historyNote("git diff --stat shown");
-    } else {
-        ctx.out.writeAll("\x1b[90mno changes\x1b[0m\n") catch {};
-        ctx.historyNote("No changes");
+    defer ctx.shell.allocator.free(staged.stdout);
+    defer ctx.shell.allocator.free(staged.stderr);
+    if (staged.stdout.len > 0) {
+        ctx.out.writeAll("\x1b[32mStaged:\x1b[0m\n") catch {};
+        ctx.out.writeAll(staged.stdout) catch {};
     }
+    // Show unstaged changes
+    const unstaged = std.process.Child.run(.{
+        .allocator = ctx.shell.allocator,
+        .argv = &[_][]const u8{ "git", "diff", "--stat", "--color=always" },
+        .max_output_bytes = 64 * 1024,
+    }) catch {
+        ctx.out.flush() catch {};
+        return .handled;
+    };
+    defer ctx.shell.allocator.free(unstaged.stdout);
+    defer ctx.shell.allocator.free(unstaged.stderr);
+    if (unstaged.stdout.len > 0) {
+        ctx.out.writeAll("\x1b[33mUnstaged:\x1b[0m\n") catch {};
+        ctx.out.writeAll(unstaged.stdout) catch {};
+    }
+    // Show untracked files
+    const untracked = std.process.Child.run(.{
+        .allocator = ctx.shell.allocator,
+        .argv = &[_][]const u8{ "git", "ls-files", "--others", "--exclude-standard" },
+        .max_output_bytes = 16 * 1024,
+    }) catch {
+        ctx.out.flush() catch {};
+        return .handled;
+    };
+    defer ctx.shell.allocator.free(untracked.stdout);
+    defer ctx.shell.allocator.free(untracked.stderr);
+    if (untracked.stdout.len > 0) {
+        ctx.out.writeAll("\x1b[31mUntracked:\x1b[0m\n") catch {};
+        // Show up to 10 untracked files
+        var uline_count: usize = 0;
+        var ustart: usize = 0;
+        for (untracked.stdout, 0..) |uc, ui| {
+            if (uc == '\n') {
+                if (uline_count < 10) {
+                    ctx.out.writeAll("  ") catch {};
+                    ctx.out.writeAll(untracked.stdout[ustart..ui]) catch {};
+                    ctx.out.writeByte('\n') catch {};
+                }
+                uline_count += 1;
+                ustart = ui + 1;
+            }
+        }
+        if (uline_count > 10) {
+            ctx.out.print("  \x1b[90m... and {d} more\x1b[0m\n", .{uline_count - 10}) catch {};
+        }
+    }
+    if (staged.stdout.len == 0 and unstaged.stdout.len == 0 and untracked.stdout.len == 0) {
+        ctx.out.writeAll("\x1b[90mno changes\x1b[0m\n") catch {};
+    }
+    ctx.historyNote("git diff shown");
     ctx.out.flush() catch {};
     return .handled;
 }
@@ -853,10 +1234,46 @@ fn cmdReview(ctx: *CommandCtx, _: []const u8) DispatchResult {
 
 fn cmdUndo(ctx: *CommandCtx, _: []const u8) DispatchResult {
     Layout.goOutput(ctx.out, ctx.out_last.*);
-    if (ctx.shell.agent.query("Undo the last file change. Run `git diff --name-only` to see what changed, then `git checkout -- <file>` for the most recently modified file. If there are staged changes, use `git checkout HEAD -- <file>`. Show what was undone.")) {
-        ctx.agent_active.* = true;
-        ctx.setStatus("undoing...");
+    // Direct git undo: checkout the most recently modified file
+    const diff_result = std.process.Child.run(.{
+        .allocator = ctx.shell.allocator,
+        .argv = &[_][]const u8{ "git", "diff", "--name-only" },
+        .max_output_bytes = 4096,
+    }) catch {
+        ctx.out.writeAll("\x1b[90mnot a git repository\x1b[0m\n") catch {};
+        ctx.out.flush() catch {};
+        return .handled;
+    };
+    defer ctx.shell.allocator.free(diff_result.stdout);
+    defer ctx.shell.allocator.free(diff_result.stderr);
+    if (diff_result.stdout.len == 0) {
+        ctx.out.writeAll("\x1b[90mno changes to undo\x1b[0m\n") catch {};
+        ctx.out.flush() catch {};
+        return .handled;
     }
+    // Get last file from the list (most recently modified is typically last)
+    const trimmed_out = std.mem.trimRight(u8, diff_result.stdout, "\n\r ");
+    const last_nl = std.mem.lastIndexOfScalar(u8, trimmed_out, '\n');
+    const last_file = if (last_nl) |nl| trimmed_out[nl + 1 ..] else trimmed_out;
+    if (last_file.len == 0) {
+        ctx.out.writeAll("\x1b[90mno changes to undo\x1b[0m\n") catch {};
+        ctx.out.flush() catch {};
+        return .handled;
+    }
+    // Checkout the file
+    const checkout_result = std.process.Child.run(.{
+        .allocator = ctx.shell.allocator,
+        .argv = &[_][]const u8{ "git", "checkout", "--", last_file },
+        .max_output_bytes = 1024,
+    }) catch {
+        ctx.out.writeAll("\x1b[31mundo failed\x1b[0m\n") catch {};
+        ctx.out.flush() catch {};
+        return .handled;
+    };
+    defer ctx.shell.allocator.free(checkout_result.stdout);
+    defer ctx.shell.allocator.free(checkout_result.stderr);
+    ctx.out.print("\x1b[32m\xe2\x9c\x93\x1b[0m reverted \x1b[4m{s}\x1b[0m\n", .{last_file}) catch {};
+    ctx.historyNote("Reverted file");
     ctx.out.flush() catch {};
     return .handled;
 }
@@ -1461,15 +1878,25 @@ fn cmdSessions(ctx: *CommandCtx, _: []const u8) DispatchResult {
 
 fn cmdConfig(ctx: *CommandCtx, _: []const u8) DispatchResult {
     Layout.goOutput(ctx.out, ctx.out_last.*);
-    ctx.out.print("  \x1b[90mmodel\x1b[0m     {s}\n", .{ctx.model_name}) catch {};
-    ctx.out.print("  \x1b[90mcost\x1b[0m      {s}\n", .{if (ctx.cost_len.* > 0) ctx.cost_buf[0..ctx.cost_len.*] else "n/a"}) catch {};
+    ctx.out.print("  \x1b[90mmodel\x1b[0m       {s}\n", .{ctx.model_name}) catch {};
     {
         var conf = agent_log.AgentConfig.load(ctx.shell.allocator);
         defer conf.deinit();
-        ctx.out.print("  \x1b[90mprovider\x1b[0m  {s}\n", .{conf.provider}) catch {};
+        ctx.out.print("  \x1b[90mprovider\x1b[0m    {s}\n", .{conf.provider}) catch {};
         if (conf.api_key.len > 8) {
-            ctx.out.print("  \x1b[90mapi key\x1b[0m   {s}...{s}\n", .{ conf.api_key[0..4], conf.api_key[conf.api_key.len - 4 ..] }) catch {};
+            ctx.out.print("  \x1b[90mapi key\x1b[0m     {s}...{s}\n", .{ conf.api_key[0..4], conf.api_key[conf.api_key.len - 4 ..] }) catch {};
+        } else if (conf.api_key.len > 0) {
+            ctx.out.print("  \x1b[90mapi key\x1b[0m     \x1b[32mset\x1b[0m\n", .{}) catch {};
         }
+        ctx.out.print("  \x1b[90mrouter\x1b[0m      {s}\n", .{if (conf.router_enabled) "\x1b[32menabled\x1b[0m" else "\x1b[90mdisabled\x1b[0m"}) catch {};
+        if (conf.completion_model.len > 0) {
+            ctx.out.print("  \x1b[90mcompletion\x1b[0m  \x1b[32m{s}\x1b[0m\n", .{conf.completion_model}) catch {};
+        }
+        ctx.out.print("  \x1b[90mauto-allow\x1b[0m  {s}\n", .{if (conf.auto_allow) "\x1b[33myes\x1b[0m" else "no"}) catch {};
+    }
+    const tb = ctx.shell.agent.queues.shared_thinking_budget.load(.monotonic);
+    if (tb > 0) {
+        ctx.out.print("  \x1b[90mthinking\x1b[0m    \x1b[33m{d}K tokens\x1b[0m\n", .{tb / 1000}) catch {};
     }
     ctx.historyNote("Config displayed");
     ctx.out.flush() catch {};
@@ -1624,8 +2051,14 @@ fn cmdGit(ctx: *CommandCtx, arg: []const u8) DispatchResult {
         &[_][]const u8{ "git", "push" }
     else if (std.mem.eql(u8, sub, "pl") or std.mem.eql(u8, sub, "pull"))
         &[_][]const u8{ "git", "pull" }
+    else if (std.mem.eql(u8, sub, "st") or std.mem.eql(u8, sub, "stash"))
+        &[_][]const u8{ "git", "stash" }
+    else if (std.mem.eql(u8, sub, "sp") or std.mem.eql(u8, sub, "pop"))
+        &[_][]const u8{ "git", "stash", "pop" }
+    else if (std.mem.eql(u8, sub, "r") or std.mem.eql(u8, sub, "reset"))
+        &[_][]const u8{ "git", "diff", "--cached", "--stat", "--color=always" }
     else {
-        ctx.out.writeAll("\x1b[90m/git shortcuts: s(tatus) d(iff) dd(full) l(og) b(ranch) a(dd) p(ush) pl(ull)\x1b[0m\n") catch {};
+        ctx.out.writeAll("\x1b[90m/git: s d dd l b a p pl st(ash) sp(pop) r(eset)\x1b[0m\n") catch {};
         ctx.out.flush() catch {};
         return .handled;
     };
@@ -1682,7 +2115,12 @@ fn cmdHelp(ctx: *CommandCtx, _: []const u8) DispatchResult {
         \\  \x1b[33m/diff\x1b[0m\x1b[90m ············· show git changes\x1b[0m
         \\  \x1b[33m/commit\x1b[0m [msg]\x1b[90m ····· commit with AI message\x1b[0m
         \\  \x1b[33m/review\x1b[0m\x1b[90m ··········· review session changes\x1b[0m
-        \\  \x1b[33m/undo\x1b[0m\x1b[90m ············· undo last file change\x1b[0m
+        \\  \x1b[33m/undo\x1b[0m\x1b[90m ············· revert last file change\x1b[0m
+        \\  \x1b[33m/pr\x1b[0m [title]\x1b[90m ········ create GitHub PR\x1b[0m
+        \\  \x1b[33m/run\x1b[0m <cmd>\x1b[90m ········ run shell command inline\x1b[0m
+        \\  \x1b[33m/cd\x1b[0m [path]\x1b[90m ········ change directory\x1b[0m
+        \\  \x1b[33m/ls\x1b[0m [path]\x1b[90m ········ list directory\x1b[0m
+        \\  \x1b[33m/cat\x1b[0m <file>\x1b[90m ······· view file with line numbers\x1b[0m
         \\  \x1b[33m/plan\x1b[0m <task>\x1b[90m ······ plan without executing\x1b[0m
         \\  \x1b[33m/spawn\x1b[0m <task>\x1b[90m ····· spawn worker subagent\x1b[0m
         \\  \x1b[33m/queue\x1b[0m <task>\x1b[90m ····· queue autonomous task\x1b[0m
@@ -1695,16 +2133,22 @@ fn cmdHelp(ctx: *CommandCtx, _: []const u8) DispatchResult {
         \\  \x1b[33m/effort\x1b[0m <level>\x1b[90m ··· low/medium/high\x1b[0m
         \\  \x1b[33m/git\x1b[0m <cmd>\x1b[90m ········ s d dd l b a p pl\x1b[0m
         \\  \x1b[33m/export\x1b[0m [file]\x1b[90m ···· save as markdown\x1b[0m
+        \\  \x1b[33m/think\x1b[0m [on/mega/ultra]\x1b[90m extended thinking\x1b[0m
+        \\  \x1b[33m/status\x1b[0m\x1b[90m ············ model, cost, context, cwd\x1b[0m
+        \\  \x1b[33m/new\x1b[0m\x1b[90m ··············· new session (clear)\x1b[0m
         \\
         \\\x1b[1mShortcuts\x1b[0m
         \\  \x1b[33m!command\x1b[0m\x1b[90m ·········· run shell command\x1b[0m
         \\  \x1b[33m!\x1b[0m\x1b[90m ················· drop to zish shell\x1b[0m
         \\  \x1b[33m?intent\x1b[0m\x1b[90m ··········· translate to command\x1b[0m
+        \\  \x1b[33m@file\x1b[0m\x1b[90m ············· include file contents\x1b[0m
         \\
         \\\x1b[1mKeys\x1b[0m
-        \\  \x1b[33mEnter\x1b[0m\x1b[90m submit\x1b[0m  \x1b[33mAlt+Enter\x1b[0m\x1b[90m newline\x1b[0m  \x1b[33mCtrl+C\x1b[0m\x1b[90m cancel\x1b[0m
-        \\  \x1b[33m^U/^F\x1b[0m\x1b[90m scroll up/down\x1b[0m  \x1b[33m^K/^N\x1b[0m\x1b[90m jump messages\x1b[0m
-        \\  \x1b[33mEsc\x1b[0m\x1b[90m vi mode\x1b[0m  \x1b[33mCtrl+D\x1b[0m\x1b[90m exit\x1b[0m  \x1b[33mRight\x1b[0m\x1b[90m accept ghost\x1b[0m
+        \\  \x1b[33mEnter\x1b[0m\x1b[90m submit\x1b[0m  \x1b[33m^J/Alt+Enter\x1b[0m\x1b[90m newline\x1b[0m  \x1b[33m^C\x1b[0m\x1b[90m cancel\x1b[0m
+        \\  \x1b[33m^A/^E\x1b[0m\x1b[90m home/end\x1b[0m  \x1b[33m^W\x1b[0m\x1b[90m del word\x1b[0m  \x1b[33mCtrl+←/→\x1b[0m\x1b[90m word\x1b[0m
+        \\  \x1b[33m↑/↓\x1b[0m\x1b[90m input history\x1b[0m  \x1b[33mCtrl+↑/↓\x1b[0m\x1b[90m jump messages\x1b[0m
+        \\  \x1b[33m^U/^F\x1b[0m\x1b[90m scroll\x1b[0m  \x1b[33m^B\x1b[0m\x1b[90m agents\x1b[0m  \x1b[33m^P\x1b[0m\x1b[90m think\x1b[0m  \x1b[33m^T\x1b[0m\x1b[90m model\x1b[0m
+        \\  \x1b[33mEsc\x1b[0m\x1b[90m vi mode\x1b[0m  \x1b[33m^D\x1b[0m\x1b[90m exit\x1b[0m  \x1b[33mRight\x1b[0m\x1b[90m accept ghost\x1b[0m
         \\
     ;
     ctx.out.writeAll(help_text) catch {};
@@ -1720,25 +2164,61 @@ fn cmdHelp(ctx: *CommandCtx, _: []const u8) DispatchResult {
 // ── Special prefix handlers ──
 
 fn cmdShellEscape(ctx: *CommandCtx, query: []const u8) DispatchResult {
-    ctx.out.print("\x1b[1;{d}r", .{ctx.term_rows.*}) catch {};
-    Layout.doExit(ctx.out, ctx.term_rows.*, ctx.input_height.*);
-    ctx.out.flush() catch {};
-
     const cmd = std.mem.trim(u8, query[1..], " ");
     if (cmd.len > 0) {
-        // Single command — execute and return
-        ctx.out.print("\x1b[90m$ {s}\x1b[0m\n", .{cmd}) catch {};
-        ctx.msg_history.appendSlice("\x1b[90m$ ");
+        // Single command — capture output for history (stay in TUI)
+        Layout.goOutput(ctx.out, ctx.out_last.*);
+        ctx.out.print("\x1b[90m\xe2\x96\xb6 {s}\x1b[0m\n", .{cmd}) catch {}; // ▶ prefix
+        ctx.msg_history.appendSlice("\x1b[90m\xe2\x96\xb6 ");
         ctx.msg_history.appendSlice(cmd);
         ctx.msg_history.appendSlice("\x1b[0m");
         ctx.msg_history.commitLine();
         ctx.out.flush() catch {};
-        ctx.shell.disableRawMode();
-        const exit_code = ctx.shell.executeCommand(cmd) catch 1;
-        _ = exit_code;
-        ctx.shell.enableRawMode() catch {};
+
+        const result = std.process.Child.run(.{
+            .allocator = ctx.shell.allocator,
+            .argv = &[_][]const u8{ "/bin/sh", "-c", cmd },
+            .max_output_bytes = 64 * 1024,
+        }) catch {
+            ctx.out.writeAll("\x1b[31mexec failed\x1b[0m\n") catch {};
+            ctx.out.flush() catch {};
+            // fall through to layout rebuild
+            ctx.msg_history.appendSlice("\x1b[31mexec failed\x1b[0m");
+            ctx.msg_history.commitLine();
+            return .handled; // don't need layout rebuild for captured output
+        };
+        defer ctx.shell.allocator.free(result.stdout);
+        defer ctx.shell.allocator.free(result.stderr);
+        // Show and capture stdout
+        if (result.stdout.len > 0) {
+            ctx.out.writeAll(result.stdout) catch {};
+            // Capture to history line by line
+            var start: usize = 0;
+            for (result.stdout, 0..) |sc, si| {
+                if (sc == '\n') {
+                    ctx.msg_history.appendSlice(result.stdout[start..si]);
+                    ctx.msg_history.commitLine();
+                    start = si + 1;
+                }
+            }
+            if (start < result.stdout.len) {
+                ctx.msg_history.appendSlice(result.stdout[start..]);
+                ctx.msg_history.commitLine();
+            }
+        }
+        // Show stderr in red
+        if (result.stderr.len > 0) {
+            ctx.out.writeAll("\x1b[31m") catch {};
+            ctx.out.writeAll(result.stderr) catch {};
+            ctx.out.writeAll("\x1b[0m") catch {};
+        }
+        ctx.out.flush() catch {};
+        // No need to rebuild layout — output stayed in scroll region
+        return .handled;
     } else {
-        // Bare "!" — drop to interactive shell
+        // Bare "!" — drop to interactive shell (exit TUI)
+        ctx.out.print("\x1b[1;{d}r", .{ctx.term_rows.*}) catch {};
+        Layout.doExit(ctx.out, ctx.term_rows.*, ctx.input_height.*);
         ctx.out.writeAll("\x1b[90m-- shell (type 'agent' to return)\x1b[0m\n") catch {};
         ctx.msg_history.appendSlice("\x1b[90m-- shell escape\x1b[0m");
         ctx.msg_history.commitLine();
@@ -1746,19 +2226,6 @@ fn cmdShellEscape(ctx: *CommandCtx, query: []const u8) DispatchResult {
         return .shell_escape;
     }
 
-    // Rebuild agent TUI layout
-    @atomicStore(bool, &ctx.shell.terminal_resized, false, .release);
-    ctx.term_rows.* = getTermRows();
-    ctx.term_cols.* = getTermCols();
-    // Push content up to make room for TUI
-    {
-        var si: u16 = 0;
-        while (si < ctx.term_rows.*) : (si += 1) ctx.out.writeByte('\n') catch {};
-    }
-    ctx.recalc();
-    Layout.repaintFromHistory(ctx.out, ctx.msg_history, ctx.out_last.*, ctx.scroll_offset.*);
-    ctx.out.flush() catch {};
-    return .handled;
 }
 
 fn cmdTranslate(ctx: *CommandCtx, query: []const u8) DispatchResult {

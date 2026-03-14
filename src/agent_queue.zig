@@ -124,6 +124,8 @@ pub const AgentQueues = struct {
     shared_input_tokens: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// shared max_tokens override (main thread writes via /effort, agent reads)
     shared_max_tokens: std.atomic.Value(u32) = std.atomic.Value(u32).init(0), // 0 = use default
+    /// shared thinking budget (main thread writes via think/megathink, agent reads)
+    shared_thinking_budget: std.atomic.Value(u32) = std.atomic.Value(u32).init(0), // 0 = disabled
 
     pub fn requestCancel(self: *AgentQueues) void {
         @atomicStore(bool, &self.cancel_requested, true, .release);

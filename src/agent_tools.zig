@@ -684,20 +684,62 @@ pub fn executeBash(allocator: std.mem.Allocator, queues: *AgentQueues, command: 
     const notif = std.fmt.bufPrint(&notif_buf, "Bash {s}", .{cmd}) catch cmd;
     _ = queues.output.push(.tool_call, notif);
 
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &[_][]const u8{ "/bin/sh", "-c", cmd },
-        .max_output_bytes = 65536,
-        .cwd = cwd,
-    }) catch |err| {
+    // Spawn child process with piped stdout for streaming
+    var child = std.process.Child.init(&[_][]const u8{ "/bin/sh", "-c", cmd }, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    child.stdin_behavior = .Ignore;
+    if (cwd) |c| child.cwd = c;
+    child.spawn() catch |err| {
         var errbuf: [128]u8 = undefined;
         const msg = std.fmt.bufPrint(&errbuf, "exec failed: {}", .{err}) catch "exec failed";
         return allocator.dupe(u8, msg);
     };
-    defer allocator.free(result.stderr);
 
-    _ = queues.output.push(.tool_done, result.stdout);
-    return result.stdout;
+    // Read stdout incrementally, send progress to main thread
+    var output: std.ArrayList(u8) = .{};
+    var read_buf: [4096]u8 = undefined;
+    const stdout_file = child.stdout.?;
+    while (true) {
+        const n = stdout_file.read(&read_buf) catch break;
+        if (n == 0) break;
+        output.appendSlice(allocator, read_buf[0..n]) catch break;
+        // Send last line as progress (tool_call updates status bar)
+        if (output.items.len > 0) {
+            // Find last newline for a clean preview
+            const items = output.items;
+            var last_nl = items.len;
+            while (last_nl > 0 and items[last_nl - 1] != '\n') : (last_nl -= 1) {}
+            if (last_nl > 0) {
+                var prev_nl = last_nl - 1;
+                while (prev_nl > 0 and items[prev_nl - 1] != '\n') : (prev_nl -= 1) {}
+                const preview = items[prev_nl .. last_nl - 1];
+                if (preview.len > 0 and preview.len < 200) {
+                    var status_buf: [256]u8 = undefined;
+                    const status = std.fmt.bufPrint(&status_buf, "Bash ({d} bytes)", .{items.len}) catch "";
+                    if (status.len > 0) _ = queues.output.push(.tool_call, status);
+                }
+            }
+        }
+    }
+
+    // Read stderr
+    var stderr_buf: [4096]u8 = undefined;
+    const stderr_n = if (child.stderr) |*se| se.read(&stderr_buf) catch 0 else 0;
+    if (stderr_n > 0) {
+        output.appendSlice(allocator, "\n") catch {};
+        output.appendSlice(allocator, stderr_buf[0..stderr_n]) catch {};
+    }
+
+    _ = child.wait() catch {};
+
+    const owned = output.toOwnedSlice(allocator) catch {
+        const empty = allocator.alloc(u8, 0) catch return error.OutOfMemory;
+        _ = queues.output.push(.tool_done, "");
+        return empty;
+    };
+    _ = queues.output.push(.tool_done, owned);
+    return @constCast(owned);
 }
 
 pub fn executeRead(allocator: std.mem.Allocator, queues: *AgentQueues, path: []const u8, offset: usize, limit: usize, cwd: ?[]const u8) ![]u8 {

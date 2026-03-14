@@ -2047,8 +2047,7 @@ fn drainAgentOutput(self: *Shell) !void {
             .error_msg => {
                 if (last_was_text) try writer.writeAll("\x1b[0m\n");
                 last_was_text = false;
-                try writer.writeAll("\x1b[31m");
-                try writer.writeAll("agent: ");
+                try writer.writeAll("\x1b[31m\xe2\x9c\x97 "); // ✗ prefix
                 try writer.writeAll(msg.slice());
                 try writer.writeAll("\x1b[0m\n");
             },
@@ -2068,9 +2067,9 @@ fn drainAgentOutput(self: *Shell) !void {
                 last_was_text = false;
                 self.agent_md.reset();
                 // Show confirmation prompt
-                try writer.writeAll("\x1b[33m");
+                try writer.writeAll("\x1b[33m\xe2\x9a\xa0 "); // ⚠ prefix
                 try writer.writeAll(msg.slice());
-                try writer.writeAll(" [y/n/a] \x1b[0m");
+                try writer.writeAll(" \x1b[90m[\x1b[32my\x1b[90m/\x1b[31mn\x1b[90m/\x1b[33ma\x1b[90mlways]\x1b[0m ");
                 try writer.flush();
                 // Read single keystroke (terminal is in raw mode)
                 var resp: [1]u8 = undefined;
