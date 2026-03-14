@@ -776,6 +776,7 @@ pub fn executeRead(allocator: std.mem.Allocator, queues: *AgentQueues, path: []c
         pw.print("\x1b[90m({d} more lines)\x1b[0m\n", .{lines_output - preview_max}) catch {};
     }
     _ = queues.output.push(.tool_done, preview_list.items);
+    preview_list.deinit(allocator);
     return result_list.toOwnedSlice(allocator) catch return error.OutOfMemory;
 }
 
@@ -830,6 +831,7 @@ pub fn executeWrite(allocator: std.mem.Allocator, queues: *AgentQueues, session_
         line_n += 1;
     }
     _ = queues.output.push(.tool_done, wdone_result.items);
+    wdone_result.deinit(allocator);
     var result_buf: [128]u8 = undefined;
     const result = std.fmt.bufPrint(&result_buf, "Wrote {d} bytes to {s}", .{ real_content.len, real_path }) catch "ok";
     return allocator.dupe(u8, result);
@@ -1361,6 +1363,7 @@ pub fn executeGlob(allocator: std.mem.Allocator, queues: *AgentQueues, pattern: 
         gpw.print("\x1b[90m({d} more files)\x1b[0m\n", .{match_count - gpm}) catch {};
     }
     _ = queues.output.push(.tool_done, glob_preview.items);
+    glob_preview.deinit(allocator);
     return result.stdout;
 }
 
@@ -1445,6 +1448,7 @@ pub fn executeGrep(allocator: std.mem.Allocator, queues: *AgentQueues, pattern: 
         gw.print("\x1b[90m({d} more matches)\x1b[0m\n", .{grep_count - gmax}) catch {};
     }
     _ = queues.output.push(.tool_done, grep_preview.items);
+    grep_preview.deinit(allocator);
     return result.stdout;
 }
 
