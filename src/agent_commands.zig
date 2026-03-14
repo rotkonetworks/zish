@@ -651,6 +651,7 @@ const commands = [_]Command{
     .{ .name = "/init", .has_arg = false, .handler = cmdInit },
     .{ .name = "/effort", .has_arg = true, .handler = cmdEffort },
     .{ .name = "/git", .has_arg = true, .handler = cmdGit },
+    .{ .name = "/export", .has_arg = true, .handler = cmdExport },
     .{ .name = "/help", .has_arg = false, .handler = cmdHelp },
     .{ .name = "help", .has_arg = false, .handler = cmdHelp },
 };
@@ -1549,6 +1550,52 @@ fn cmdEffort(ctx: *CommandCtx, arg: []const u8) DispatchResult {
     return .handled;
 }
 
+fn cmdExport(ctx: *CommandCtx, arg: []const u8) DispatchResult {
+    Layout.goOutput(ctx.out, ctx.out_last.*);
+    const filename = if (arg.len > 0) std.mem.trim(u8, arg, " ") else "conversation.md";
+
+    // Export visible history as markdown
+    const file = std.fs.cwd().createFile(filename, .{}) catch {
+        ctx.out.print("\x1b[31mcannot create {s}\x1b[0m\n", .{filename}) catch {};
+        ctx.out.flush() catch {};
+        return .handled;
+    };
+    defer file.close();
+
+    const hist = ctx.msg_history;
+    var i: u32 = 0;
+    while (i < hist.line_count) : (i += 1) {
+        if (hist.getLine(i)) |line| {
+            // Strip ANSI codes for clean markdown
+            var j: usize = 0;
+            while (j < line.len) {
+                if (line[j] == 0x1b and j + 1 < line.len and line[j + 1] == '[') {
+                    j += 2;
+                    while (j < line.len and (line[j] < 0x40 or line[j] > 0x7E)) j += 1;
+                    if (j < line.len) j += 1;
+                } else if (line[j] == 0x1b and j + 1 < line.len and (line[j + 1] == ']' or line[j + 1] == '7' or line[j + 1] == '8')) {
+                    // Skip OSC sequences and DEC save/restore
+                    j += 2;
+                    if (j >= 2 and line[j - 1] == ']') {
+                        while (j < line.len and line[j] != 0x1b and line[j] != 0x07) j += 1;
+                        if (j < line.len) j += 1;
+                        if (j < line.len and line[j] == '\\') j += 1;
+                    }
+                } else {
+                    file.writer().writeByte(line[j]) catch break;
+                    j += 1;
+                }
+            }
+            file.writer().writeByte('\n') catch break;
+        }
+    }
+
+    ctx.out.print("\x1b[90mexported to {s}\x1b[0m\n", .{filename}) catch {};
+    ctx.historyNote("Conversation exported");
+    ctx.out.flush() catch {};
+    return .handled;
+}
+
 fn cmdGit(ctx: *CommandCtx, arg: []const u8) DispatchResult {
     Layout.goOutput(ctx.out, ctx.out_last.*);
     const sub = if (arg.len > 0) std.mem.trim(u8, arg, " ") else "s";
@@ -1640,6 +1687,7 @@ fn cmdHelp(ctx: *CommandCtx, _: []const u8) DispatchResult {
         \\  \x1b[33m/init\x1b[0m\x1b[90m ············· generate CLAUDE.md\x1b[0m
         \\  \x1b[33m/effort\x1b[0m <level>\x1b[90m ··· low/medium/high\x1b[0m
         \\  \x1b[33m/git\x1b[0m <cmd>\x1b[90m ········ s d dd l b a p pl\x1b[0m
+        \\  \x1b[33m/export\x1b[0m [file]\x1b[90m ···· save as markdown\x1b[0m
         \\
         \\\x1b[1mShortcuts\x1b[0m
         \\  \x1b[33m!command\x1b[0m\x1b[90m ·········· run shell command\x1b[0m

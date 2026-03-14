@@ -4011,7 +4011,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                         "/review",  "/undo",     "/plan",     "/spawn",   "/queue",
                         "/agents",  "/tasks",    "/tree",     "/sessions", "/config",
                         "/search",  "/voice",    "/init",     "/effort",
-                        "/git",     "/help",
+                        "/git",     "/export",   "/help",
                     };
                     var matches: [16][]const u8 = undefined;
                     var match_count: u8 = 0;
