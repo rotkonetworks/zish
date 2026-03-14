@@ -2584,7 +2584,11 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
         pos += space;
         if (pos >= query_buf.len) break;
     }
-    if (!shell.agent.query(query_buf[0..pos])) {
+    const query_text = std.mem.trim(u8, query_buf[0..pos], " \t\r\n");
+    if (query_text.len == 0) {
+        return agentInteractive(shell);
+    }
+    if (!shell.agent.query(query_text)) {
         try out.writeAll("agent: busy, use 'agent stop' or Ctrl+G to cancel\n");
         try out.flush();
         return 1;
