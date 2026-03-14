@@ -3257,12 +3257,27 @@ fn agentInteractive(shell: *Shell) !u8 {
                     last_was_text = false;
                     const done_text = msg.slice();
                     if (done_text.len > 0) {
+                        // Check if output contains ANSI colors (diff preview from Edit tool)
+                        const has_ansi = std.mem.indexOf(u8, done_text, "\x1b[3") != null;
                         var line_count: usize = 1;
                         for (done_text) |dc| {
                             if (dc == '\n') line_count += 1;
                         }
-                        if (line_count == 1 and done_text.len < 60) {
-                            // Very short — show inline (to both screen + history)
+                        if (has_ansi) {
+                            // Colored output (edit diff) — show inline with colors preserved
+                            var line_start: usize = 0;
+                            for (done_text, 0..) |dc, di| {
+                                if (dc == '\n' or di == done_text.len - 1) {
+                                    const end = if (dc == '\n') di else di + 1;
+                                    const line = done_text[line_start..end];
+                                    try tee.writeAll("  ");
+                                    try tee.writeAll(line);
+                                    try tee.writeAll("\x1b[0m\n");
+                                    line_start = di + 1;
+                                }
+                            }
+                        } else if (line_count == 1 and done_text.len < 60) {
+                            // Very short — show inline
                             try tee.writeAll("  \x1b[90m");
                             linkify.writeLinked(tee, done_text) catch try tee.writeAll(done_text);
                             try tee.writeAll("\x1b[0m\n");
@@ -3270,11 +3285,9 @@ fn agentInteractive(shell: *Shell) !u8 {
                             // Compact on screen, full in history for scrollback
                             var info_buf: [64]u8 = undefined;
                             const info = std.fmt.bufPrint(&info_buf, "  \x1b[32m\xe2\x9c\x93\x1b[90m {d} lines\x1b[0m\n", .{line_count}) catch "  \x1b[32m\xe2\x9c\x93\x1b[0m\n";
-                            try out.writeAll(info); // screen only
-                            // Write full result to history (dim, for scrollback)
-                            msg_history.appendSlice("  \x1b[90m");
+                            try out.writeAll(info);
+                            msg_history.appendSlice("  ");
                             msg_history.appendSlice(done_text);
-                            msg_history.appendSlice("\x1b[0m");
                             msg_history.commitLine();
                         }
                     } else {
