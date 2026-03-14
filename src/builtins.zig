@@ -3342,7 +3342,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                                     if (tc >= '0' and tc <= '9') tok_val = tok_val * 10 + (tc - '0');
                                 }
                                 if (tok_val > 1000) {
-                                    cost_len = (std.fmt.bufPrint(&cost_buf, "{s} \xc2\xb7 {d}K tok", .{ cost_str, tok_val / 1000 }) catch cost_str).len;
+                                    cost_len = (std.fmt.bufPrint(&cost_buf, "{s} \xc2\xb7 {d}K/200K", .{ cost_str, tok_val / 1000 }) catch cost_str).len;
                                 } else {
                                     cost_len = @min(cost_str.len, cost_buf.len);
                                     @memcpy(cost_buf[0..cost_len], cost_str[0..cost_len]);
@@ -3476,8 +3476,17 @@ fn agentInteractive(shell: *Shell) !u8 {
             // Live token counter from agent thread
             const live_tokens = shell.agent.getTotalInputTokens();
             if (live_tokens > 1000) {
+                // Context window size depends on model
+                const ctx_limit: u32 = if (std.mem.indexOf(u8, model_name, "opus") != null) 200_000
+                    else if (std.mem.indexOf(u8, model_name, "sonnet") != null) 200_000
+                    else if (std.mem.indexOf(u8, model_name, "haiku") != null) 200_000
+                    else 200_000;
+                const pct = (live_tokens * 100) / ctx_limit;
                 var live_cost_buf: [32]u8 = undefined;
-                const live_cost = std.fmt.bufPrint(&live_cost_buf, "{d}K tok", .{live_tokens / 1000}) catch "";
+                const live_cost = if (pct > 0)
+                    std.fmt.bufPrint(&live_cost_buf, "{d}K/{d}K", .{ live_tokens / 1000, ctx_limit / 1000 }) catch ""
+                else
+                    std.fmt.bufPrint(&live_cost_buf, "{d}K tok", .{live_tokens / 1000}) catch "";
                 if (live_cost.len > 0) {
                     cost_len = @min(live_cost.len, cost_buf.len);
                     @memcpy(cost_buf[0..cost_len], live_cost[0..cost_len]);
