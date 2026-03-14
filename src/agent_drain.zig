@@ -143,16 +143,45 @@ pub const SimpleHandler = struct {
         try self.md.flush(self.writer);
         try self.writer.writeAll("\x1b[0m");
         self.md.reset();
-        try self.writer.writeAll("\x1b[1m\xe2\x97\x8f \x1b[0m\x1b[90m");
+        try self.writer.writeAll("\x1b[90m\xe2\x9a\xa1 "); // ⚡
         try self.writer.writeAll(data);
         try self.writer.writeAll("\x1b[0m\n");
     }
 
     pub fn onToolDone(self: *SimpleHandler, data: []const u8) !void {
         if (data.len > 0) {
-            try self.writer.writeAll("  \x1b[90m\xe2\x8e\xbf  ");
-            try self.writer.writeAll(data);
-            try self.writer.writeAll("\x1b[0m\n");
+            // Check for ANSI colors (edit diff)
+            const has_ansi = std.mem.indexOf(u8, data, "\x1b[3") != null;
+            if (has_ansi) {
+                // Show colored output inline
+                try self.writer.writeAll("  ");
+                try self.writer.writeAll(data);
+                try self.writer.writeAll("\x1b[0m\n");
+            } else {
+                // Count lines
+                var lc: usize = 1;
+                for (data) |dc| { if (dc == '\n') lc += 1; }
+                if (lc <= 8) {
+                    // Short: show inline
+                    var ls: usize = 0;
+                    for (data, 0..) |dc, di| {
+                        if (dc == '\n' or di == data.len - 1) {
+                            const end = if (dc == '\n') di else di + 1;
+                            try self.writer.writeAll("  \x1b[90m");
+                            try self.writer.writeAll(data[ls..end]);
+                            try self.writer.writeAll("\x1b[0m\n");
+                            ls = di + 1;
+                        }
+                    }
+                } else {
+                    // Long: compact
+                    var fmt_buf: [64]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&fmt_buf, "  \x1b[32m\xe2\x9c\x93\x1b[90m {d} lines\x1b[0m\n", .{lc}) catch "  \x1b[32m\xe2\x9c\x93\x1b[0m\n";
+                    try self.writer.writeAll(msg);
+                }
+            }
+        } else {
+            try self.writer.writeAll("  \x1b[32m\xe2\x9c\x93\x1b[0m\n");
         }
     }
 
@@ -184,9 +213,9 @@ pub const SimpleHandler = struct {
     }
 
     pub fn onRouterInfo(self: *SimpleHandler, data: []const u8) !void {
-        try self.writer.writeAll("\x1b[90m[");
-        try self.writer.writeAll(data);
-        try self.writer.writeAll("]\x1b[0m\n");
+        // Suppress router info in output (matches interactive mode)
+        _ = self;
+        _ = data;
     }
 
     pub fn onConfirmRequest(self: *SimpleHandler, _: []const u8) !void {
