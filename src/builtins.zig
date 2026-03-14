@@ -2920,7 +2920,7 @@ fn agentInteractive(shell: *Shell) !u8 {
     var status_row = term_rows;
 
     var edit_buf: editor.EditBuffer = .{};
-    var md: agent_mod.MarkdownRenderer = .{};
+    var md: agent_mod.MarkdownRenderer = .{ .term_width = term_cols };
     var last_was_text = false;
     var agent_active = false;
     var in_confirm = false;
@@ -3024,6 +3024,7 @@ fn agentInteractive(shell: *Shell) !u8 {
             @atomicStore(bool, &shell.terminal_resized, false, .release);
             term_rows = getTermRows();
             term_cols = getTermCols();
+            md.term_width = term_cols;
             // Full redraw: reset scroll region, clear, recalc layout, repaint from history
             out.print("\x1b[1;{d}r", .{term_rows}) catch {}; // full scroll region first
             out.writeAll("\x1b[H\x1b[2J") catch {}; // home + clear screen

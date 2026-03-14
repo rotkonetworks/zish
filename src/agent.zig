@@ -2273,6 +2273,9 @@ pub const MarkdownRenderer = struct {
     in_code_string: bool = false, // inside string literal in code block
     code_string_char: u8 = '"', // which quote char opened the string
     line_start: bool = true,
+    // Word wrap state
+    col: u16 = 0, // current column position
+    term_width: u16 = 80, // terminal width for word wrap
     // Pending characters from end of previous chunk (for cross-chunk ** and ``` detection)
     pending_stars: u8 = 0, // count of trailing * from previous chunk
     pending_backticks: u8 = 0, // count of trailing ` from previous chunk
@@ -2751,9 +2754,21 @@ pub const MarkdownRenderer = struct {
                 self.in_blockquote = false;
                 try writer.writeAll("\x1b[0m\n"); // full reset (italic + dim + color)
             } else {
-                try writer.writeByte(c);
+                // Word wrap for prose (not inside code blocks)
+                if (!self.in_code_block and c == ' ' and self.col >= self.term_width - 5) {
+                    try writer.writeByte('\n');
+                    self.col = 0;
+                    self.line_start = true;
+                } else {
+                    try writer.writeByte(c);
+                    if (c == '\n') {
+                        self.col = 0;
+                    } else {
+                        self.col += 1;
+                    }
+                }
             }
-            self.line_start = (c == '\n');
+            self.line_start = (c == '\n') or self.line_start;
             i += 1;
         }
     }
