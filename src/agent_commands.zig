@@ -707,11 +707,16 @@ fn cmdClear(ctx: *CommandCtx, _: []const u8) DispatchResult {
     ctx.query_start_ms.* = 0;
     ctx.status_len.* = 0;
     ctx.scroll_offset.* = 0;
-    Layout.goOutput(ctx.out, ctx.out_last.*);
-    ctx.out.writeAll("\x1b[90mconversation cleared\x1b[0m\n") catch {};
+    // Clear visible screen and history
     ctx.msg_history.* = .{};
-    ctx.historyNote("\x1b[90mconversation cleared\x1b[0m");
-    Layout.drawStatusBarSafe(ctx.out, ctx.status_row.*, ctx.term_rows.*, ctx.out_last.*, ctx.term_cols.*, ctx.model_name, ctx.cost_buf[0..ctx.cost_len.*], "");
+    ctx.cost_len.* = 0;
+    // Full screen clear + redraw layout
+    ctx.out.print("\x1b[1;{d}r", .{ctx.term_rows.*}) catch {};
+    ctx.out.writeAll("\x1b[H\x1b[2J") catch {};
+    ctx.recalc();
+    Layout.goOutput(ctx.out, ctx.out_last.*);
+    ctx.out.print("\x1b[90m{s} \xc2\xb7 cleared\x1b[0m\n", .{ctx.model_name}) catch {};
+    ctx.historyNote("\x1b[90mcleared\x1b[0m");
     ctx.out.flush() catch {};
     return .handled;
 }
