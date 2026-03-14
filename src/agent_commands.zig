@@ -717,11 +717,13 @@ fn cmdClear(ctx: *CommandCtx, _: []const u8) DispatchResult {
 }
 
 fn cmdCompact(ctx: *CommandCtx, _: []const u8) DispatchResult {
-    if (ctx.shell.agent.query("Please provide a brief summary of our conversation so far in 2-3 sentences, focusing on what was accomplished and any important context. Start with 'Summary:' and be concise.")) {
-        Layout.goOutput(ctx.out, ctx.out_last.*);
-        ctx.out.writeAll("\x1b[90mCompacting...\x1b[0m\n") catch {};
-        ctx.historyNote("\x1b[90mCompacting...\x1b[0m");
+    Layout.goOutput(ctx.out, ctx.out_last.*);
+    // Trigger actual context compaction via the agent's compact mechanism
+    if (ctx.shell.agent.query("/compact — Summarize our entire conversation concisely. Focus on: what was asked, what was done, key decisions, current state. This summary will replace the conversation history to free context. Be thorough but brief.")) {
+        ctx.out.writeAll("\x1b[90m\xe2\x9a\xa1 compacting context...\x1b[0m\n") catch {};
+        ctx.historyNote("\x1b[90m\xe2\x9a\xa1 compacting context...\x1b[0m");
         ctx.agent_active.* = true;
+        ctx.setStatus("compacting...");
     }
     ctx.out.flush() catch {};
     return .handled;
