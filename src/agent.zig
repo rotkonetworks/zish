@@ -1435,7 +1435,7 @@ const AgentThread = struct {
         self.compact_in_progress = true;
         defer self.compact_in_progress = false;
 
-        _ = self.queues.output.push(.tool_call, "Auto-compacting conversation (context getting large)...");
+        _ = self.queues.output.push(.tool_call, "compacting context...");
 
         // Build a summary request using the current history
         const compact_query =
@@ -1549,7 +1549,7 @@ const AgentThread = struct {
         self.total_input_tokens = 0;
         self.total_output_tokens = 0;
 
-        _ = self.queues.output.push(.tool_done, "Conversation compacted");
+        _ = self.queues.output.push(.tool_done, "context compacted");
     }
 
     /// Build a ToolContext for dispatching tools via agent_tools module
@@ -2270,6 +2270,8 @@ pub const MarkdownRenderer = struct {
     in_blockquote: bool = false,
     in_strikethrough: bool = false,
     in_italic: bool = false,
+    in_code_string: bool = false, // inside string literal in code block
+    code_string_char: u8 = '"', // which quote char opened the string
     line_start: bool = true,
     // Pending characters from end of previous chunk (for cross-chunk ** and ``` detection)
     pending_stars: u8 = 0, // count of trailing * from previous chunk
@@ -2293,16 +2295,13 @@ pub const MarkdownRenderer = struct {
                 // Code block fence split across chunks
                 if (!self.in_code_block) {
                     self.in_code_block = true;
-                    // Skip language identifier
                     var skip = i;
                     while (skip < text.len and text[skip] != '\n') : (skip += 1) {}
                     const lang = std.mem.trim(u8, text[i..skip], " \t\r");
                     if (lang.len > 0) {
-                        try writer.writeAll("\x1b[90m─── ");
+                        try writer.writeAll("\x1b[90m");
                         try writer.writeAll(lang);
-                        try writer.writeAll(" ───\x1b[0m\n");
-                    } else {
-                        try writer.writeAll("\x1b[90m──────────\x1b[0m\n");
+                        try writer.writeAll("\x1b[0m\n");
                     }
                     try writer.writeAll("\x1b[36m");
                     i = if (skip < text.len) skip + 1 else skip;
@@ -2310,7 +2309,6 @@ pub const MarkdownRenderer = struct {
                 } else {
                     self.in_code_block = false;
                     try writer.writeAll("\x1b[0m\n");
-                    try writer.writeAll("\x1b[90m──────────\x1b[0m\n");
                     while (i < text.len and text[i] != '\n') : (i += 1) {}
                     self.line_start = true;
                 }
@@ -2392,15 +2390,12 @@ pub const MarkdownRenderer = struct {
                         // Skip language identifier on same line
                         var skip = i + 3;
                         while (skip < text.len and text[skip] != '\n') : (skip += 1) {}
-                        // Print header bar
-                        // Extract lang name if present
+                        // Code block header
                         const lang = std.mem.trim(u8, text[i + 3 .. skip], " \t\r");
                         if (lang.len > 0) {
-                            try writer.writeAll("\x1b[90m─── ");
+                            try writer.writeAll("\x1b[90m");
                             try writer.writeAll(lang);
-                            try writer.writeAll(" ───\x1b[0m\n");
-                        } else {
-                            try writer.writeAll("\x1b[90m──────────\x1b[0m\n");
+                            try writer.writeAll("\x1b[0m\n");
                         }
                         try writer.writeAll("\x1b[36m"); // cyan for code
                         i = if (skip < text.len) skip + 1 else skip;
@@ -2409,7 +2404,6 @@ pub const MarkdownRenderer = struct {
                     } else {
                         self.in_code_block = false;
                         try writer.writeAll("\x1b[0m\n");
-                        try writer.writeAll("\x1b[90m──────────\x1b[0m\n");
                         i += 3;
                         // skip rest of line
                         while (i < text.len and text[i] != '\n') : (i += 1) {}
@@ -2441,9 +2435,42 @@ pub const MarkdownRenderer = struct {
                 }
             }
 
-            // Inside code blocks, just pass through (already colored)
+            // Inside code blocks — lightweight syntax coloring
             if (self.in_code_block) {
-                try writer.writeByte(c);
+                if (self.line_start) {
+                    // Diff coloring: +lines green, -lines red
+                    if (c == '+' and i + 1 < text.len and text[i + 1] != '+') {
+                        try writer.writeAll("\x1b[32m"); // green
+                    } else if (c == '-' and i + 1 < text.len and text[i + 1] != '-') {
+                        try writer.writeAll("\x1b[31m"); // red
+                    } else if (c == '@' and i + 1 < text.len and text[i + 1] == '@') {
+                        try writer.writeAll("\x1b[35m"); // magenta for @@ hunk headers
+                    }
+                }
+                // String literals: "..." or '...' — yellow
+                if ((c == '"' or c == '\'') and !self.in_code_string) {
+                    self.in_code_string = true;
+                    self.code_string_char = c;
+                    try writer.writeAll("\x1b[33m"); // yellow
+                    try writer.writeByte(c);
+                } else if (self.in_code_string and c == self.code_string_char) {
+                    try writer.writeByte(c);
+                    try writer.writeAll("\x1b[36m"); // back to cyan
+                    self.in_code_string = false;
+                } else if (c == '\n') {
+                    if (self.in_code_string) {
+                        try writer.writeAll("\x1b[36m");
+                        self.in_code_string = false;
+                    }
+                    try writer.writeAll("\x1b[36m"); // reset to cyan on newline
+                    try writer.writeByte(c);
+                } else {
+                    // Comments: // or # at line start
+                    if (self.line_start and (c == '#' or (c == '/' and i + 1 < text.len and text[i + 1] == '/'))) {
+                        try writer.writeAll("\x1b[90m"); // dim for comments
+                    }
+                    try writer.writeByte(c);
+                }
                 self.line_start = (c == '\n');
                 i += 1;
                 continue;
@@ -2567,9 +2594,9 @@ pub const MarkdownRenderer = struct {
                 }
                 // 3+ of the same char, followed by newline or end of text
                 if (hr_count >= 3 and (hr_j >= text.len or text[hr_j] == '\n')) {
-                    try writer.writeAll("\x1b[90m");
+                    try writer.writeAll("\x1b[2;90m"); // dim + gray
                     var hk: usize = 0;
-                    while (hk < 10) : (hk += 1) try writer.writeAll("\xe2\x94\x80");
+                    while (hk < 40) : (hk += 1) try writer.writeAll("\xe2\x94\x80");
                     try writer.writeAll("\x1b[0m\n");
                     i = hr_j;
                     if (i < text.len and text[i] == '\n') i += 1;
@@ -2595,13 +2622,23 @@ pub const MarkdownRenderer = struct {
                 }
             }
 
-            // List items at line start
-            if (self.line_start and (c == '-' or c == '*') and i + 1 < text.len and text[i + 1] == ' ') {
-                try writer.writeAll("\x1b[33m\xe2\x80\xa2\x1b[39m "); // yellow bullet, reset fg only
-                i += 2;
-                self.line_start = false;
-                continue;
+            // List items at line start (with optional indentation for nesting)
+            if (self.line_start and !self.in_code_block) {
+                // Check for indented list: spaces then - or *
+                var li = i;
+                var indent: usize = 0;
+                while (li < text.len and text[li] == ' ') : (li += 1) { indent += 1; }
+                if (li < text.len and (text[li] == '-' or text[li] == '*') and li + 1 < text.len and text[li + 1] == ' ') {
+                    // Render indent then bullet
+                    var sp: usize = 0;
+                    while (sp < indent) : (sp += 1) try writer.writeByte(' ');
+                    try writer.writeAll("\x1b[33m\xe2\x80\xa2\x1b[39m "); // yellow bullet
+                    i = li + 2;
+                    self.line_start = false;
+                    continue;
+                }
             }
+            // (non-indented bullets handled by the indented check above)
 
             // Numbered list at line start
             if (self.line_start and c >= '0' and c <= '9') {
@@ -2617,25 +2654,88 @@ pub const MarkdownRenderer = struct {
                 }
             }
 
-            // Links: [text](url) — show text in cyan, hide url
+            // Image links: ![alt](url) — show as dim placeholder
+            if (c == '!' and i + 1 < text.len and text[i + 1] == '[' and !self.in_code_block) {
+                var j = i + 2;
+                while (j < text.len and text[j] != ']' and text[j] != '\n') : (j += 1) {}
+                if (j < text.len and text[j] == ']' and j + 1 < text.len and text[j + 1] == '(') {
+                    var k = j + 2;
+                    while (k < text.len and text[k] != ')' and text[k] != '\n') : (k += 1) {}
+                    if (k < text.len and text[k] == ')') {
+                        const alt = text[i + 2 .. j];
+                        try writer.writeAll("\x1b[90m[image: ");
+                        if (alt.len > 0) try writer.writeAll(alt) else try writer.writeAll("image");
+                        try writer.writeAll("]\x1b[0m");
+                        i = k + 1;
+                        self.line_start = false;
+                        continue;
+                    }
+                }
+            }
+
+            // Table rows: | col | col | — render with dim pipes
+            if (self.line_start and c == '|' and !self.in_code_block) {
+                // Check if this looks like a table row (has at least one more |)
+                if (std.mem.indexOfScalarPos(u8, text, i + 1, '|')) |_| {
+                    // Check for separator row: |---|---|
+                    var is_sep = true;
+                    var si = i + 1;
+                    while (si < text.len and text[si] != '\n') : (si += 1) {
+                        if (text[si] != '-' and text[si] != '|' and text[si] != ' ' and text[si] != ':') {
+                            is_sep = false;
+                            break;
+                        }
+                    }
+                    if (is_sep) {
+                        // Skip separator row — visually replace with thin line
+                        try writer.writeAll("\x1b[2;90m──\x1b[0m\n");
+                        i = si;
+                        if (i < text.len and text[i] == '\n') i += 1;
+                        self.line_start = true;
+                        continue;
+                    }
+                    // Render table row: dim pipes, content in normal color
+                    while (i < text.len and text[i] != '\n') {
+                        if (text[i] == '|') {
+                            try writer.writeAll("\x1b[90m\xe2\x94\x82\x1b[0m"); // dim │
+                        } else {
+                            try writer.writeByte(text[i]);
+                        }
+                        i += 1;
+                    }
+                    if (i < text.len and text[i] == '\n') {
+                        try writer.writeByte('\n');
+                        i += 1;
+                    }
+                    self.line_start = true;
+                    continue;
+                }
+            }
+
+            // Links: [text](url) — clickable OSC 8 hyperlink in cyan
             if (c == '[' and !self.in_code_block and !self.in_inline_code) {
-                // Scan for closing ](
                 var j = i + 1;
                 while (j < text.len and text[j] != ']' and text[j] != '\n') : (j += 1) {}
                 if (j < text.len and text[j] == ']' and j + 1 < text.len and text[j + 1] == '(') {
-                    // Found ]( — scan for closing )
                     var k = j + 2;
                     while (k < text.len and text[k] != ')' and text[k] != '\n') : (k += 1) {}
                     if (k < text.len and text[k] == ')') {
                         const link_text = text[i + 1 .. j];
+                        const link_url = text[j + 2 .. k];
                         if (link_text.len > 0) {
-                            try writer.writeAll("\x1b[36m"); // cyan
-                            try writer.writeAll(link_text);
-                            if (self.in_bold) {
-                                try writer.writeAll("\x1b[39m\x1b[1m"); // reset fg + restore bold
-                            } else {
-                                try writer.writeAll("\x1b[39m"); // reset fg only
+                            // OSC 8 hyperlink: \e]8;;URL\e\\TEXT\e]8;;\e\\
+                            if (link_url.len > 0) {
+                                try writer.writeAll("\x1b]8;;");
+                                try writer.writeAll(link_url);
+                                try writer.writeAll("\x1b\\");
                             }
+                            try writer.writeAll("\x1b[4;36m"); // underline + cyan
+                            try writer.writeAll(link_text);
+                            try writer.writeAll("\x1b[24;39m"); // end underline + reset fg
+                            if (link_url.len > 0) {
+                                try writer.writeAll("\x1b]8;;\x1b\\"); // close OSC 8
+                            }
+                            if (self.in_bold) try writer.writeAll("\x1b[1m");
                             i = k + 1;
                             self.line_start = false;
                             continue;
@@ -2649,7 +2749,7 @@ pub const MarkdownRenderer = struct {
                 try writer.writeAll("\x1b[0m\n");
             } else if (c == '\n' and self.in_blockquote) {
                 self.in_blockquote = false;
-                try writer.writeAll("\x1b[23m\n"); // end italic
+                try writer.writeAll("\x1b[0m\n"); // full reset (italic + dim + color)
             } else {
                 try writer.writeByte(c);
             }
@@ -2673,12 +2773,12 @@ pub const MarkdownRenderer = struct {
             while (j < self.pending_stars) : (j += 1) try writer.writeByte('*');
             self.pending_stars = 0;
         }
-        // Close any active inline formatting to prevent terminal state leaks
-        if (self.in_bold) try writer.writeAll("\x1b[22m");
-        if (self.in_italic) try writer.writeAll("\x1b[23m");
-        if (self.in_strikethrough) try writer.writeAll("\x1b[29m");
-        if (self.in_header or self.in_blockquote) try writer.writeAll("\x1b[0m");
-        if (self.in_code_block or self.in_inline_code) try writer.writeAll("\x1b[39m");
+        // Full ANSI reset if any formatting was active — prevents terminal state leaks
+        if (self.in_bold or self.in_italic or self.in_strikethrough or
+            self.in_header or self.in_blockquote or self.in_code_block or self.in_inline_code)
+        {
+            try writer.writeAll("\x1b[0m");
+        }
     }
 
     pub fn reset(self: *MarkdownRenderer) void {
@@ -2697,6 +2797,9 @@ pub const AgentContext = struct {
     model_override: [64]u8 = undefined,
     model_override_len: u8 = 0,
     bulletin: *q.Bulletin,
+    pub fn getTotalInputTokens(self: *const AgentContext) u32 {
+        return self.queues.shared_input_tokens.load(.monotonic);
+    }
 
     pub fn init(allocator: std.mem.Allocator) AgentContext {
         const bulletin = allocator.create(q.Bulletin) catch @panic("OOM: bulletin");

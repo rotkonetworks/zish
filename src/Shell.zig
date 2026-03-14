@@ -17,6 +17,7 @@ const editor = @import("editor.zig");
 const vim = @import("vim.zig");
 const agent_mod = @import("agent.zig");
 const agent_log = @import("agent_log.zig");
+const audio = @import("audio.zig");
 
 // Re-export from input module (for compatibility)
 const VimMode = input_mod.VimMode;
@@ -273,6 +274,11 @@ agent: agent_mod.AgentContext,
 agent_output_active: bool = false,
 agent_md: agent_mod.MarkdownRenderer = .{},
 bulletin_cursor: usize = 0,
+
+// Voice mode state
+voice_active: bool = false,
+voice_capture: ?audio.Capture = null,
+voice_playback: ?audio.Playback = null,
 
 pub fn init(allocator: std.mem.Allocator) !*Shell {
     return initWithOptions(allocator, true);
@@ -2336,25 +2342,53 @@ fn handleExtendedEscapeSequence(stdin_fd: std.posix.fd_t, flags: usize) !Action 
     }
 
     // expect semicolon for modified keys
-    if (semicolon != ';') return .none;
+    if (semicolon != ';') {
+        // Not a modifier sequence — could be ESC[15~ (F5) etc.
+        // Consume until we hit a letter or ~ to drain the sequence
+        if (semicolon >= '0' and semicolon <= '9') {
+            while (true) {
+                result = std.posix.system.read(stdin_fd, &temp_buf, 1);
+                if (result <= 0) break;
+                if (temp_buf[0] == '~' or (temp_buf[0] >= 'A' and temp_buf[0] <= 'Z')) break;
+                if (temp_buf[0] >= 'a' and temp_buf[0] <= 'z') break;
+            }
+        }
+        return .none;
+    }
 
-    // read modifier (5 = Ctrl)
+    // read modifier: 2=Shift, 3=Alt, 5=Ctrl, 6=Ctrl+Shift, etc.
     result = std.posix.system.read(stdin_fd, &temp_buf, 1);
-    if (result <= 0 or temp_buf[0] != '5') return .none;
+    if (result <= 0) return .none;
+    const modifier = temp_buf[0];
 
-    // read direction key
+    // read direction key (always consume to prevent stray bytes)
     result = std.posix.system.read(stdin_fd, &temp_buf, 1);
     if (result <= 0) return .none;
 
-    return switch (temp_buf[0]) {
-        'C' => .{ .move_cursor = .{ .word_forward = .WORD } },      // Ctrl+Right
-        'D' => .{ .move_cursor = .{ .word_backward = .WORD } },     // Ctrl+Left
-        'A' => .{ .move_cursor = .to_line_start },                   // Ctrl+Up
-        'B' => .{ .move_cursor = .to_line_end },                     // Ctrl+Down
-        'H' => .{ .move_cursor = .to_line_start },                   // Ctrl+Home
-        'F' => .{ .move_cursor = .to_line_end },                     // Ctrl+End
-        else => .none,
-    };
+    if (modifier == '5' or modifier == '6') {
+        // Ctrl (or Ctrl+Shift)
+        return switch (temp_buf[0]) {
+            'C' => .{ .move_cursor = .{ .word_forward = .WORD } },      // Ctrl+Right
+            'D' => .{ .move_cursor = .{ .word_backward = .WORD } },     // Ctrl+Left
+            'A' => .{ .move_cursor = .to_line_start },                   // Ctrl+Up
+            'B' => .{ .move_cursor = .to_line_end },                     // Ctrl+Down
+            'H' => .{ .move_cursor = .to_line_start },                   // Ctrl+Home
+            'F' => .{ .move_cursor = .to_line_end },                     // Ctrl+End
+            else => .none,
+        };
+    } else if (modifier == '2') {
+        // Shift — treat same as unmodified arrows for now
+        return switch (temp_buf[0]) {
+            'C' => .{ .move_cursor = .{ .relative = 1 } },              // Shift+Right
+            'D' => .{ .move_cursor = .{ .relative = -1 } },             // Shift+Left
+            'A' => .{ .history_nav = .up },                               // Shift+Up
+            'B' => .{ .history_nav = .down },                             // Shift+Down
+            else => .none,
+        };
+    } else {
+        // Unknown modifier — consume and ignore
+        return .none;
+    }
 }
 
 fn handleBracketedPaste(stdin_fd: std.posix.fd_t, flags: usize) !Action {

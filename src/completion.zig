@@ -2539,7 +2539,20 @@ pub fn displayCompletions(self: *Shell) !void {
     const max_items = menu_lines * cols;
     const items_to_show = @min(self.completion_matches.items.len, max_items);
 
-    for (self.completion_matches.items[0..items_to_show], 0..) |match, i| {
+    // Scroll window to keep selected item visible
+    const start_item = if (self.completion_matches.items.len > items_to_show) blk: {
+        const half = items_to_show / 2;
+        if (self.completion_index < half) {
+            break :blk @as(usize, 0);
+        } else if (self.completion_index + half >= self.completion_matches.items.len) {
+            break :blk self.completion_matches.items.len - items_to_show;
+        } else {
+            break :blk self.completion_index - half;
+        }
+    } else 0;
+    const end_item = @min(start_item + items_to_show, self.completion_matches.items.len);
+
+    for (self.completion_matches.items[start_item..end_item], start_item..) |match, i| {
         const display_name = if (match.len > max_item_width) match[0 .. max_item_width - 1] else match;
         const truncated = match.len > max_item_width;
 
@@ -2564,8 +2577,9 @@ pub fn displayCompletions(self: *Shell) !void {
         }
     }
 
-    if (items_to_show < self.completion_matches.items.len) {
-        try self.stdout().print("... ({} more matches)\n", .{self.completion_matches.items.len - items_to_show});
+    const hidden = self.completion_matches.items.len - (end_item - start_item);
+    if (hidden > 0) {
+        try self.stdout().print("... ({} more matches)\n", .{hidden});
         self.completion_menu_lines += 1;
     }
 
@@ -2756,6 +2770,55 @@ pub fn updateCompletionHighlight(self: *Shell, old_index: usize) !void {
 
 /// Update ghost text suggestion based on current input.
 /// Searches history for a prefix match and stores the suffix in ghost_buf.
+/// Try to suggest a file path from CWD as ghost text.
+/// Returns true if a suggestion was found and set.
+fn ghostFileSuggestion(self: *Shell, partial: []const u8) bool {
+    // Split into directory and prefix
+    const last_slash = std.mem.lastIndexOfScalar(u8, partial, '/');
+    const dir_path = if (last_slash) |s| partial[0 .. s + 1] else "./";
+    const file_prefix = if (last_slash) |s| partial[s + 1 ..] else partial;
+
+    if (file_prefix.len == 0) return false;
+
+    // Open directory
+    const dir = if (dir_path[0] == '/')
+        std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return false
+    else
+        std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return false;
+
+    // Find first match
+    var iter = dir.iterate();
+    var best: [256]u8 = undefined;
+    var best_len: usize = 0;
+
+    while (iter.next() catch null) |entry| {
+        if (entry.name.len > file_prefix.len and
+            std.mem.startsWith(u8, entry.name, file_prefix))
+        {
+            const suffix = entry.name[file_prefix.len..];
+            if (best_len == 0 or entry.name.len < best_len + file_prefix.len) {
+                const n = @min(suffix.len, best.len);
+                @memcpy(best[0..n], suffix[0..n]);
+                best_len = n;
+                // Append / for directories
+                if (entry.kind == .directory and best_len < best.len) {
+                    best[best_len] = '/';
+                    best_len += 1;
+                }
+            }
+        }
+    }
+
+    if (best_len > 0) {
+        const n = @min(best_len, self.ghost_buf.len);
+        @memcpy(self.ghost_buf[0..n], best[0..n]);
+        self.ghost_len = n;
+        self.ghost_from_ctm = false;
+        return true;
+    }
+    return false;
+}
+
 pub fn updateGhostText(self: *Shell) void {
     self.ghost_len = 0;
 
@@ -2790,25 +2853,40 @@ pub fn updateGhostText(self: *Shell) void {
         self.ghost_infer_seq.store(new_seq, .release);
     }
 
-    // fast path: history-based suggestion
+    // Strategy 0: CWD-aware file path completion
+    // If user is typing a path-like thing (contains / or starts with . or after space)
+    if (cmd.len > 0) {
+        const last_space = std.mem.lastIndexOfScalar(u8, cmd, ' ');
+        const word_start = if (last_space) |s| s + 1 else 0;
+        const word = cmd[word_start..];
+        if (word.len >= 1 and (word[0] == '.' or word[0] == '/' or word[0] == '~')) {
+            // Try file path completion as ghost text
+            if (ghostFileSuggestion(self, word)) return;
+        }
+    }
+
+    // Strategy 1: frecency-ranked history prefix match
     const h = self.history orelse return;
     const items = h.entries.items;
+    const now_ts: u32 = @intCast(@min(@as(u64, @intCast(std.time.timestamp())), std.math.maxInt(u32)));
 
-    // Strategy 1: full prefix match (strongest signal)
     var best_idx: ?usize = null;
-    var best_freq: u16 = 0;
-    var best_ts: u32 = 0;
+    var best_score: f32 = 0;
     for (0..items.len) |i| {
         const idx = items.len - 1 - i;
         const entry = items[idx];
         const command = h.getCommand(entry);
         if (command.len > cmd.len and std.mem.startsWith(u8, command, cmd)) {
-            if (best_idx == null or entry.frequency > best_freq or
-                (entry.frequency == best_freq and entry.timestamp > best_ts))
-            {
+            // Frecency: frequency × recency_decay
+            // Decay halves every 24 hours of wall-clock time
+            const age_secs: f32 = @floatFromInt(if (now_ts > entry.timestamp) now_ts - entry.timestamp else 0);
+            const hours = age_secs / 3600.0;
+            const decay = @exp(-0.029 * hours); // half-life ~24h
+            const freq: f32 = @floatFromInt(@max(entry.frequency, 1));
+            const score = freq * decay;
+            if (best_idx == null or score > best_score) {
                 best_idx = idx;
-                best_freq = entry.frequency;
-                best_ts = entry.timestamp;
+                best_score = score;
             }
             if (i > 500) break;
         }

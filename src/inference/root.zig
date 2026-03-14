@@ -19,11 +19,16 @@ const std = @import("std");
 const posix = std.posix;
 
 pub const gguf = @import("gguf.zig");
+pub const gpu_mod = @import("gpu.zig");
 pub const math = @import("math.zig");
 pub const model = @import("model.zig");
 pub const tokenizer = @import("tokenizer.zig");
 pub const ctm = @import("ctm.zig");
 pub const autonomic = @import("autonomic.zig");
+pub const mel = @import("mel.zig");
+pub const pipe = @import("pipe.zig");
+pub const encoder = @import("encoder.zig");
+pub const whisper = @import("whisper.zig");
 
 const Allocator = std.mem.Allocator;
 const Token = tokenizer.Token;
@@ -265,6 +270,40 @@ fn childMain(req_fd: posix.fd_t, resp_fd: posix.fd_t, model_path: []const u8) vo
         ctm_layer_idx,
     );
     controller.restore(); // load persisted state from previous sessions
+
+    // ── Initialize GPU compute (graceful fallback to CPU) ──
+    // GPU is a composable service: weights in VRAM, matvec dispatched transparently.
+    // Child process isolates GPU resources — OS cleans up on exit.
+    {
+        const td_base = file.tensorData();
+        const td_size = file.file_size - file.tensor_data_offset;
+        if (gpu_mod.GpuContext.init(alloc, false)) |g| {
+            const gp = alloc.create(gpu_mod.GpuContext) catch null;
+            if (gp) |p| {
+                p.* = g;
+                if (p.vram_bytes >= td_size) {
+                    if (p.uploadWeights(td_base[0..td_size])) {
+                        transformer.setGpu(p, td_base);
+                        const name_len = std.mem.indexOfScalar(u8, &p.device_name, 0) orelse p.device_name.len;
+                        std.debug.print("[gpu] {s}: {}MB VRAM, {}MB weights uploaded\n", .{
+                            p.device_name[0..name_len],
+                            p.vram_bytes / (1024 * 1024),
+                            td_size / (1024 * 1024),
+                        });
+                    } else {
+                        p.deinit();
+                        alloc.destroy(p);
+                    }
+                } else {
+                    p.deinit();
+                    alloc.destroy(p);
+                }
+            } else {
+                var g2 = g;
+                g2.deinit();
+            }
+        }
+    }
 
     // Set request pipe to non-blocking for continuous inference polling
     const F_GETFL = 3;
@@ -652,6 +691,7 @@ pub const InferenceContext = struct {
     ctm_layer_idx: usize = 0,
     model_path: []const u8 = "",
     replay_buf: ctm.ReplayBuffer = .{},
+    gpu_ctx: ?*gpu_mod.GpuContext = null,
 
     /// Load a GGUF model file for inference with plasticity support.
     pub fn load(path: []const u8, alloc: Allocator) !InferenceContext {
@@ -693,6 +733,38 @@ pub const InferenceContext = struct {
             }
         }
 
+        // Try to initialize GPU compute (graceful fallback to CPU)
+        var gpu_ptr: ?*gpu_mod.GpuContext = null;
+        const td_base = file.tensorData();
+        const td_size = file.file_size - file.tensor_data_offset;
+        if (gpu_mod.GpuContext.init(alloc, false)) |g| {
+            const gp = alloc.create(gpu_mod.GpuContext) catch null;
+            if (gp) |p| {
+                p.* = g;
+                if (p.vram_bytes >= td_size) {
+                    if (p.uploadWeights(td_base[0..td_size])) {
+                        gpu_ptr = p;
+                        transformer.setGpu(p, td_base);
+                        const name_len = std.mem.indexOfScalar(u8, &p.device_name, 0) orelse p.device_name.len;
+                        std.debug.print("[gpu] {s}: {}MB VRAM, {}MB weights uploaded\n", .{
+                            p.device_name[0..name_len],
+                            p.vram_bytes / (1024 * 1024),
+                            td_size / (1024 * 1024),
+                        });
+                    } else {
+                        p.deinit();
+                        alloc.destroy(p);
+                    }
+                } else {
+                    p.deinit();
+                    alloc.destroy(p);
+                }
+            } else {
+                var g2 = g;
+                g2.deinit();
+            }
+        }
+
         return .{
             .file = file,
             .transformer = transformer,
@@ -701,10 +773,15 @@ pub const InferenceContext = struct {
             .alloc = alloc,
             .ctm_layer_idx = ctm_idx,
             .model_path = path,
+            .gpu_ctx = gpu_ptr,
         };
     }
 
     pub fn deinit(self: *InferenceContext) void {
+        if (self.gpu_ctx) |g| {
+            g.deinit();
+            self.alloc.destroy(g);
+        }
         self.tok.deinit();
         self.state.deinit();
         self.transformer.deinit();
@@ -748,6 +825,55 @@ pub const InferenceContext = struct {
         const cs = self.state.ctm_state orelse return .{};
         const blk = self.transformer.layers[self.ctm_layer_idx].ctm_block orelse return .{};
         return @constCast(blk).compactMemoryFull(cs, self.ctm_layer_idx, lr);
+    }
+
+    /// Benchmark: run N forward passes and report tokens/sec.
+    /// Returns {prefill_tps, generate_tps, gpu_active}.
+    pub fn bench(self: *InferenceContext, n_tokens: usize) struct { prefill_tps: f64, generate_tps: f64, gpu: bool } {
+        const prompt = "The quick brown fox jumps over the lazy dog and then";
+        const tokens = self.tok.encode(prompt, true, self.alloc) catch return .{ .prefill_tps = 0, .generate_tps = 0, .gpu = self.gpu_ctx != null };
+        defer self.alloc.free(tokens);
+
+        // Reset KV cache
+        self.reset();
+
+        // Prefill benchmark
+        var timer = std.time.Timer.start() catch return .{ .prefill_tps = 0, .generate_tps = 0, .gpu = self.gpu_ctx != null };
+        for (tokens, 0..) |t, i| {
+            _ = self.transformer.forward(&self.state, t, i);
+            if (i == 0) {
+                const first_ns = timer.read();
+                std.debug.print("[bench] first token: {d:.1}ms\n", .{@as(f64, @floatFromInt(first_ns)) / 1e6});
+            }
+        }
+        const prefill_ns = timer.read();
+        const prefill_tps = if (prefill_ns > 0) @as(f64, @floatFromInt(tokens.len)) * 1e9 / @as(f64, @floatFromInt(prefill_ns)) else 0;
+        std.debug.print("[bench] prefill {d} tokens in {d:.1}ms\n", .{ tokens.len, @as(f64, @floatFromInt(prefill_ns)) / 1e6 });
+
+        // Generation benchmark
+        var pos = tokens.len;
+        var next_tok = sampleToken(self.state.output, .{ .temperature = 0.0, .top_k = 0, .repetition_penalty = 1.0 }, &.{});
+
+        timer.reset();
+        for (0..n_tokens) |gen_i| {
+            if (next_tok == self.tok.eos_id) break;
+            _ = self.transformer.forward(&self.state, next_tok, pos);
+            pos += 1;
+            next_tok = sampleToken(self.state.output, .{ .temperature = 0.0, .top_k = 0, .repetition_penalty = 1.0 }, &.{});
+            if (gen_i == 0) {
+                const t1 = timer.read();
+                std.debug.print("[bench] gen token 1: {d:.1}ms\n", .{@as(f64, @floatFromInt(t1)) / 1e6});
+            }
+        }
+        const gen_ns = timer.read();
+        const actual_gen = pos - tokens.len;
+        const gen_tps = if (gen_ns > 0 and actual_gen > 0) @as(f64, @floatFromInt(actual_gen)) * 1e9 / @as(f64, @floatFromInt(gen_ns)) else 0;
+
+        return .{
+            .prefill_tps = prefill_tps,
+            .generate_tps = gen_tps,
+            .gpu = self.gpu_ctx != null,
+        };
     }
 
     /// Run dream diagnostics on current state. Returns per-tick convergence deltas.

@@ -33,6 +33,9 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.addImport("clap", clap.module("clap"));
 
+    // Link libc for dlopen/dlsym (GPU Vulkan compute)
+    exe.linkLibC();
+
     exe.root_module.addAnonymousImport("build.zig.zon", .{
         .root_source_file = b.path("build.zig.zon"),
     });

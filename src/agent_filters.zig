@@ -81,6 +81,8 @@ pub fn TokenTrackingFilter(comptime Inner: type) type {
             // Accumulate into session-lifetime counters
             ctx.total_input_tokens.* += resp.input_tokens;
             ctx.total_output_tokens.* += resp.output_tokens;
+            // Update shared atomic for live status bar display
+            ctx.queues.shared_input_tokens.store(ctx.total_input_tokens.*, .monotonic);
 
             if (resp.input_tokens > 0 or resp.output_tokens > 0) {
                 var usage_buf: [256]u8 = undefined;

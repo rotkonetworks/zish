@@ -120,6 +120,8 @@ pub const AgentQueues = struct {
     cancel_requested: bool = false,
     /// shared bulletin board — the commons (pointer, shared across all agent threads)
     bulletin: *Bulletin = undefined,
+    /// shared token counters (agent thread writes, main thread reads for status bar)
+    shared_input_tokens: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     pub fn requestCancel(self: *AgentQueues) void {
         @atomicStore(bool, &self.cancel_requested, true, .release);

@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const gguf = @import("gguf.zig");
+const gpu = @import("gpu.zig");
 const math = @import("math.zig");
 const ctm = @import("ctm.zig");
 
@@ -93,7 +94,7 @@ const Layer = struct {
 };
 
 /// Reference to quantized or float tensor data in mmap'd file.
-const TensorRef = union(enum) {
+pub const TensorRef = union(enum) {
     f32: []const f32,
     f16: []const f16,
     q8_0: []const math.Q80Block,
@@ -205,7 +206,7 @@ pub const State = struct {
             .k_cache = try a.alloc(f32, config.n_layers * config.max_seq_length * kv_dim),
             .v_cache = try a.alloc(f32, config.n_layers * config.max_seq_length * kv_dim),
             .quant_vec = try a.alloc(math.Q80Block, max_dim / 32),
-            .n_threads = @min(math.cpuCount(), 8),
+            .n_threads = @min(math.cpuCount(), 32),
             .x0 = try a.alloc(f32, config.dim),
             .ve_gate_out = try a.alloc(f32, config.n_kv_heads),
         };
@@ -255,6 +256,27 @@ pub const Transformer = struct {
     x0_lambdas: ?[]const f32 = null,
 
     arena: std.heap.ArenaAllocator,
+
+    // GPU compute service (optional — nil means CPU-only)
+    gpu_ctx: ?*gpu.GpuContext = null,
+    // Base pointer of tensor data in mmap — used to compute GPU buffer offsets
+    tensor_data_base: ?[*]const u8 = null,
+
+    /// Propagate GPU context to all sub-components (CTM blocks, etc.)
+    pub fn setGpu(self: *Transformer, g: *gpu.GpuContext, base: [*]const u8) void {
+        self.gpu_ctx = g;
+        self.tensor_data_base = base;
+        // Wire GPU into CTM blocks + their SynapseUNET
+        for (self.layers) |*layer| {
+            if (layer.ctm_block) |blk| {
+                const mb = @constCast(blk);
+                mb.gpu_ctx = g;
+                mb.tensor_data_base = base;
+                mb.synapses.gpu_ctx = g;
+                mb.synapses.tensor_data_base = base;
+            }
+        }
+    }
 
     pub fn initFromGGUF(file: *const gguf.GGUFFile, alloc: Allocator) !Transformer {
         const real_config = Config.fromGGUF(file);
@@ -473,10 +495,19 @@ pub const Transformer = struct {
             // Attention norm
             math.rmsNorm(state.work, state.input, layer.attn_norm);
 
-            // QKV projections
-            self.matmulTensor(state.q, layer.wq, state.work, dim, dim, state);
-            self.matmulTensor(state.k, layer.wk, state.work, kv_dim, dim, state);
-            self.matmulTensor(state.v, layer.wv, state.work, kv_dim, dim, state);
+            // QKV projections — batched: 3 matmuls, 1 GPU submit
+            if (!self.batchMatvecGpu(
+                state.work[0..dim],
+                &.{ state.q[0..dim], state.k[0..kv_dim], state.v[0..kv_dim] },
+                &.{ layer.wq, layer.wk, layer.wv },
+                &.{ dim, kv_dim, kv_dim },
+                dim,
+            )) {
+                // CPU fallback
+                self.matmulTensor(state.q, layer.wq, state.work, dim, dim, state);
+                self.matmulTensor(state.k, layer.wk, state.work, kv_dim, dim, state);
+                self.matmulTensor(state.v, layer.wv, state.work, kv_dim, dim, state);
+            }
 
             // Attention biases (Qwen2)
             if (layer.bq) |bq| math.add(state.q, state.q, bq);
@@ -559,8 +590,17 @@ pub const Transformer = struct {
 
                 // Run MLP
                 if (layer.w1 != null and layer.w2 != null and layer.w3 != null) {
-                    self.matmulTensor(state.hidden1, layer.w1.?, state.work, c.hidden_dim, dim, state);
-                    self.matmulTensor(state.hidden2, layer.w3.?, state.work, c.hidden_dim, dim, state);
+                    // Batch gate+up: 2 matmuls, 1 GPU submit
+                    if (!self.batchMatvecGpu(
+                        state.work[0..dim],
+                        &.{ state.hidden1[0..c.hidden_dim], state.hidden2[0..c.hidden_dim] },
+                        &.{ layer.w1.?, layer.w3.? },
+                        &.{ c.hidden_dim, c.hidden_dim },
+                        dim,
+                    )) {
+                        self.matmulTensor(state.hidden1, layer.w1.?, state.work, c.hidden_dim, dim, state);
+                        self.matmulTensor(state.hidden2, layer.w3.?, state.work, c.hidden_dim, dim, state);
+                    }
 
                     math.swiglu(state.hidden1);
                     math.elementProduct(state.hidden1, state.hidden1, state.hidden2);
@@ -576,6 +616,7 @@ pub const Transformer = struct {
                 }
 
                 // Run CTM on the same pre-norm input (state.work still holds it)
+                var ctm_timer = std.time.Timer.start() catch null;
                 ctm_block.forward(
                     state.work,
                     state.work2,
@@ -583,6 +624,10 @@ pub const Transformer = struct {
                     i,
                     state.ctm_scratch,
                 );
+                if (ctm_timer) |*t| {
+                    const ms = @as(f64, @floatFromInt(t.read())) / 1e6;
+                    if (n_tok < 2) std.debug.print("[fwd] layer {d} CTM: {d:.1}ms (gate={d:.3})\n", .{ i, ms, gate });
+                }
 
                 // Scale CTM output by gate
                 for (state.work2[0..dim]) |*v| v.* *= gate;
@@ -591,8 +636,17 @@ pub const Transformer = struct {
                 math.add(state.input, state.input, state.work2);
             } else if (layer.w1 != null and layer.w2 != null and layer.w3 != null) {
                 // Standard MLP (no CTM): SwiGLU(w1(x)) * w3(x), then w2
-                self.matmulTensor(state.hidden1, layer.w1.?, state.work, c.hidden_dim, dim, state);
-                self.matmulTensor(state.hidden2, layer.w3.?, state.work, c.hidden_dim, dim, state);
+                // Batch gate+up: 2 matmuls, 1 GPU submit
+                if (!self.batchMatvecGpu(
+                    state.work[0..dim],
+                    &.{ state.hidden1[0..c.hidden_dim], state.hidden2[0..c.hidden_dim] },
+                    &.{ layer.w1.?, layer.w3.? },
+                    &.{ c.hidden_dim, c.hidden_dim },
+                    dim,
+                )) {
+                    self.matmulTensor(state.hidden1, layer.w1.?, state.work, c.hidden_dim, dim, state);
+                    self.matmulTensor(state.hidden2, layer.w3.?, state.work, c.hidden_dim, dim, state);
+                }
 
                 math.swiglu(state.hidden1);
                 math.elementProduct(state.hidden1, state.hidden1, state.hidden2);
@@ -653,7 +707,8 @@ pub const Transformer = struct {
     }
 
     /// Matrix-vector multiply handling different quantization formats.
-    /// Q4_K/Q6_K use fused dot products (no intermediate dequant buffer).
+    /// F16 weights dispatch to GPU when available (VRAM bandwidth >> system RAM).
+    /// Q4_K/Q6_K use fused CPU dot products (no intermediate dequant buffer).
     /// Large matmuls are parallelized across CPU cores.
     fn matmulTensor(
         self: *const Transformer,
@@ -664,7 +719,6 @@ pub const Transformer = struct {
         cols: usize,
         state: *State,
     ) void {
-        _ = self;
         const n_threads = state.n_threads;
         switch (weights) {
             .f32 => |data| {
@@ -672,7 +726,20 @@ pub const Transformer = struct {
                 math.matmulParallel(out, rows, math.F32MatmulCtx, ctx, n_threads);
             },
             .f16 => |data| {
-                // Fused f16→f32 dot product per row — no intermediate buffer needed
+                // Try GPU path: F16 weights live in VRAM at known offset
+                if (self.gpu_ctx) |g| {
+                    if (self.tensor_data_base) |base| {
+                        const data_ptr: [*]const u8 = @ptrCast(data.ptr);
+                        const byte_offset = @intFromPtr(data_ptr) - @intFromPtr(base);
+                        const slot = gpu.WeightSlot{
+                            .offset = byte_offset,
+                            .rows = @intCast(rows),
+                            .cols = @intCast(cols),
+                        };
+                        if (g.matvec(x, out, slot)) return;
+                    }
+                }
+                // CPU fallback
                 const ctx = math.F16MatmulCtx{ .data = data, .x = x, .cols = cols };
                 math.matmulParallel(out, rows, math.F16MatmulCtx, ctx, n_threads);
             },
@@ -693,6 +760,59 @@ pub const Transformer = struct {
                 math.matmulParallel(out, rows, math.Q6KMatmulCtx, ctx, n_threads);
             },
         }
+    }
+
+    /// Batch multiple F16 matmuls sharing the same input into one GPU submit.
+    /// Returns true if GPU batch was used, false if caller should fall back to individual calls.
+    fn batchMatvecGpu(
+        self: *const Transformer,
+        input: []const f32,
+        outputs: []const []f32,
+        weights: []const TensorRef,
+        rows_list: []const usize,
+        cols: usize,
+    ) bool {
+        const g = self.gpu_ctx orelse return false;
+        const base = self.tensor_data_base orelse return false;
+
+        // All weights must be F16 for GPU batch
+        for (weights) |w| {
+            switch (w) {
+                .f16 => {},
+                else => return false,
+            }
+        }
+
+        if (!g.beginPass(input)) return false;
+
+        // Record all dispatches
+        var offsets: [8]u32 = undefined;
+        for (weights, 0..) |w, i| {
+            const data = switch (w) {
+                .f16 => |d| d,
+                else => unreachable,
+            };
+            const data_ptr: [*]const u8 = @ptrCast(data.ptr);
+            const byte_offset = @intFromPtr(data_ptr) - @intFromPtr(base);
+            const slot = gpu.WeightSlot{
+                .offset = byte_offset,
+                .rows = @intCast(rows_list[i]),
+                .cols = @intCast(cols),
+            };
+            offsets[i] = g.recordMatvec(slot) orelse {
+                // Abort batch
+                _ = g.endPass();
+                return false;
+            };
+        }
+
+        if (!g.endPass()) return false;
+
+        // Read all results
+        for (outputs, 0..) |out, i| {
+            g.readBatchOutput(offsets[i], out[0..rows_list[i]]);
+        }
+        return true;
     }
 
     fn doAttention(self: *const Transformer, state: *State, layer_idx: usize, n_token: usize) void {
@@ -765,23 +885,23 @@ fn applyRoPE(
     }
 }
 
-fn fmtBuf(buf: []u8, comptime fmt: []const u8, args: anytype) []const u8 {
+pub fn fmtBuf(buf: []u8, comptime fmt: []const u8, args: anytype) []const u8 {
     return std.fmt.bufPrint(buf, fmt, args) catch unreachable;
 }
 
-fn getF32Tensor(file: *const gguf.GGUFFile, td: [*]const u8, name: []const u8) []const f32 {
+pub fn getF32Tensor(file: *const gguf.GGUFFile, td: [*]const u8, name: []const u8) []const f32 {
     const ti = file.getTensorInfo(name) orelse @panic("Missing tensor");
     const ptr: [*]const f32 = @ptrCast(@alignCast(ti.getData(td)));
     return ptr[0..ti.numElements()];
 }
 
-fn tryGetF32Tensor(file: *const gguf.GGUFFile, td: [*]const u8, name: []const u8) ?[]const f32 {
+pub fn tryGetF32Tensor(file: *const gguf.GGUFFile, td: [*]const u8, name: []const u8) ?[]const f32 {
     const ti = file.getTensorInfo(name) orelse return null;
     const ptr: [*]const f32 = @ptrCast(@alignCast(ti.getData(td)));
     return ptr[0..ti.numElements()];
 }
 
-fn getTensorRef(file: *const gguf.GGUFFile, td: [*]const u8, name: []const u8) TensorRef {
+pub fn getTensorRef(file: *const gguf.GGUFFile, td: [*]const u8, name: []const u8) TensorRef {
     const ti = file.getTensorInfo(name) orelse @panic("Missing tensor");
     return TensorRef.fromTensor(ti, td);
 }
@@ -804,7 +924,7 @@ fn validateSyncIndices(indices: []const u32, dim: usize) bool {
     return true;
 }
 
-fn tryGetTensorRef(file: *const gguf.GGUFFile, td: [*]const u8, name: []const u8) ?TensorRef {
+pub fn tryGetTensorRef(file: *const gguf.GGUFFile, td: [*]const u8, name: []const u8) ?TensorRef {
     const ti = file.getTensorInfo(name) orelse return null;
     return TensorRef.fromTensor(ti, td);
 }

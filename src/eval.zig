@@ -1066,7 +1066,7 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
         const child_pid = std.os.linux.getpid();
         std.posix.setpgid(0, 0) catch {};
         if (is_tty) {
-            std.posix.tcsetpgrp(std.posix.STDIN_FILENO, child_pid) catch {};
+            jobs.tcsetpgrp(std.posix.STDIN_FILENO, child_pid) catch {};
         }
 
         // Build environment in child process (after fork, safe from parent interference)
@@ -1095,7 +1095,7 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     // take back terminal control
     if (is_tty) {
         const shell_pgid: std.posix.pid_t = @intCast(std.os.linux.syscall1(.getpgid, 0));
-        std.posix.tcsetpgrp(std.posix.STDIN_FILENO, shell_pgid) catch {};
+        jobs.tcsetpgrp(std.posix.STDIN_FILENO, shell_pgid) catch {};
     }
 
     if (std.posix.W.IFEXITED(result.status)) {

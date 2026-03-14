@@ -114,6 +114,230 @@ pub fn swiglu(x: []f32) void {
 }
 
 // ============================================================
+// GELU activation (encoder layers use this instead of SwiGLU)
+// ============================================================
+
+/// GELU: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+/// Fast approximation: x * sigmoid(1.702 * x)
+pub fn gelu(x: []f32) void {
+    const Vec = comptime Vect(f32);
+    const vl = comptime vectLen(Vec);
+    const chunks = x.len / vl;
+    const leftover = chunks * vl;
+    const ones: Vec = @splat(@as(f32, 1));
+    const scale: Vec = @splat(@as(f32, 1.702));
+
+    for (0..chunks) |i| {
+        const idx = i * vl;
+        const xs: Vec = x[idx..][0..vl].*;
+        const sig = ones / (ones + @exp(-scale * xs));
+        x[idx..][0..vl].* = xs * sig;
+    }
+    for (leftover..x.len) |i| {
+        const sig = 1.0 / (1.0 + std.math.exp(-1.702 * x[i]));
+        x[i] = x[i] * sig;
+    }
+}
+
+// ============================================================
+// Layer normalization (encoder uses LayerNorm, not RMSNorm)
+// ============================================================
+
+/// LayerNorm: out = ((x - mean) / sqrt(var + eps)) * weight + bias
+pub fn layerNorm(out: []f32, x: []const f32, weight: []const f32, bias: ?[]const f32, eps: f32) void {
+    std.debug.assert(x.len == weight.len and x.len == out.len);
+
+    const Vec = comptime Vect(f32);
+    const vl = comptime vectLen(Vec);
+    const chunks = x.len / vl;
+    const leftover = chunks * vl;
+    const n: f32 = @floatFromInt(x.len);
+
+    // mean
+    var sum: f32 = 0;
+    for (0..chunks) |i| {
+        const idx = i * vl;
+        const xs: Vec = x[idx..][0..vl].*;
+        sum += @reduce(.Add, xs);
+    }
+    for (leftover..x.len) |i| sum += x[i];
+    const mean = sum / n;
+
+    // variance
+    var var_sum: f32 = 0;
+    const mean_v: Vec = @splat(mean);
+    for (0..chunks) |i| {
+        const idx = i * vl;
+        const xs: Vec = x[idx..][0..vl].*;
+        const d = xs - mean_v;
+        var_sum += @reduce(.Add, d * d);
+    }
+    for (leftover..x.len) |i| {
+        const d = x[i] - mean;
+        var_sum += d * d;
+    }
+    const inv_std = 1.0 / std.math.sqrt(var_sum / n + eps);
+
+    // normalize + scale + shift
+    const inv_v: Vec = @splat(inv_std);
+    if (bias) |b| {
+        for (0..chunks) |i| {
+            const idx = i * vl;
+            const xs: Vec = x[idx..][0..vl].*;
+            const ws: Vec = weight[idx..][0..vl].*;
+            const bs: Vec = b[idx..][0..vl].*;
+            out[idx..][0..vl].* = (xs - mean_v) * inv_v * ws + bs;
+        }
+        for (leftover..x.len) |i| out[i] = (x[i] - mean) * inv_std * weight[i] + b[i];
+    } else {
+        for (0..chunks) |i| {
+            const idx = i * vl;
+            const xs: Vec = x[idx..][0..vl].*;
+            const ws: Vec = weight[idx..][0..vl].*;
+            out[idx..][0..vl].* = (xs - mean_v) * inv_v * ws;
+        }
+        for (leftover..x.len) |i| out[i] = (x[i] - mean) * inv_std * weight[i];
+    }
+}
+
+// ============================================================
+// 1D Convolution (for audio encoder frontend)
+// ============================================================
+
+/// Conv1D: out[t] = bias + Σ_k weight[k] * input[t*stride + k]
+/// input: [in_len, in_ch], weight: [out_ch, in_ch, kernel], bias: [out_ch]
+/// out: [out_len, out_ch] where out_len = (in_len - kernel) / stride + 1
+pub fn conv1d(
+    out: []f32,
+    input: []const f32,
+    weight: []const f32,
+    bias_: ?[]const f32,
+    in_len: usize,
+    in_ch: usize,
+    out_ch: usize,
+    kernel: usize,
+    stride: usize,
+) void {
+    const out_len = (in_len - kernel) / stride + 1;
+    for (0..out_len) |t| {
+        for (0..out_ch) |oc| {
+            var sum: f32 = if (bias_) |b| b[oc] else 0;
+            const w_base = oc * in_ch * kernel;
+            for (0..kernel) |k| {
+                const in_t = t * stride + k;
+                const w_off = w_base + k * in_ch;
+                // dot product over input channels
+                sum += dotProduct(
+                    weight[w_off..][0..in_ch],
+                    input[in_t * in_ch ..][0..in_ch],
+                );
+            }
+            out[t * out_ch + oc] = sum;
+        }
+    }
+}
+
+/// Conv2D: 2D convolution for audio encoder frontend.
+/// input: [H, W, in_ch] (height=time, width=freq, channels last)
+/// weight: [out_ch, in_ch, kH, kW] (PyTorch layout, stored row-major in GGUF)
+/// bias: [out_ch] optional
+/// out: [out_H, out_W, out_ch]
+/// Stride applied to both dimensions. Padding = (kernel-1)/2 (same-ish).
+pub fn conv2d(
+    out: []f32,
+    input: []const f32,
+    weight_f32: []const f32,
+    bias_: ?[]const f32,
+    in_h: usize,
+    in_w: usize,
+    in_ch: usize,
+    out_ch: usize,
+    kh: usize,
+    kw: usize,
+    stride_h: usize,
+    stride_w: usize,
+) void {
+    const pad_h = (kh - 1) / 2;
+    const pad_w = (kw - 1) / 2;
+    const out_h = (in_h + 2 * pad_h - kh) / stride_h + 1;
+    const out_w = (in_w + 2 * pad_w - kw) / stride_w + 1;
+
+    for (0..out_h) |oh| {
+        for (0..out_w) |ow| {
+            for (0..out_ch) |oc| {
+                var sum: f32 = if (bias_) |b| b[oc] else 0;
+                // weight layout: [out_ch, in_ch, kH, kW]
+                const w_oc = oc * in_ch * kh * kw;
+                for (0..kh) |fh| {
+                    const ih_s = oh * stride_h + fh;
+                    if (ih_s < pad_h or ih_s >= in_h + pad_h) continue;
+                    const ih = ih_s - pad_h;
+                    for (0..kw) |fw| {
+                        const iw_s = ow * stride_w + fw;
+                        if (iw_s < pad_w or iw_s >= in_w + pad_w) continue;
+                        const iw = iw_s - pad_w;
+                        // Accumulate over input channels
+                        const in_off = ih * in_w * in_ch + iw * in_ch;
+                        const w_off = w_oc + fh * kw * in_ch + fw * in_ch;
+                        // Small channel count — no SIMD needed for ic loop
+                        for (0..in_ch) |ic| {
+                            sum += weight_f32[w_off + ic] * input[in_off + ic];
+                        }
+                    }
+                }
+                out[oh * out_w * out_ch + ow * out_ch + oc] = sum;
+            }
+        }
+    }
+}
+
+/// Conv2D with f16 weights (dequantize on the fly).
+pub fn conv2dF16(
+    out: []f32,
+    input: []const f32,
+    weight_f16: []const f16,
+    bias_: ?[]const f32,
+    in_h: usize,
+    in_w: usize,
+    in_ch: usize,
+    out_ch: usize,
+    kh: usize,
+    kw: usize,
+    stride_h: usize,
+    stride_w: usize,
+) void {
+    const pad_h = (kh - 1) / 2;
+    const pad_w = (kw - 1) / 2;
+    const out_h = (in_h + 2 * pad_h - kh) / stride_h + 1;
+    const out_w = (in_w + 2 * pad_w - kw) / stride_w + 1;
+
+    for (0..out_h) |oh| {
+        for (0..out_w) |ow| {
+            for (0..out_ch) |oc| {
+                var sum: f32 = if (bias_) |b| b[oc] else 0;
+                const w_oc = oc * in_ch * kh * kw;
+                for (0..kh) |fh| {
+                    const ih_s = oh * stride_h + fh;
+                    if (ih_s < pad_h or ih_s >= in_h + pad_h) continue;
+                    const ih = ih_s - pad_h;
+                    for (0..kw) |fw| {
+                        const iw_s = ow * stride_w + fw;
+                        if (iw_s < pad_w or iw_s >= in_w + pad_w) continue;
+                        const iw = iw_s - pad_w;
+                        const in_off = ih * in_w * in_ch + iw * in_ch;
+                        const w_off = w_oc + fh * kw * in_ch + fw * in_ch;
+                        for (0..in_ch) |ic| {
+                            sum += @as(f32, @floatCast(weight_f16[w_off + ic])) * input[in_off + ic];
+                        }
+                    }
+                }
+                out[oh * out_w * out_ch + ow * out_ch + oc] = sum;
+            }
+        }
+    }
+}
+
+// ============================================================
 // Vector operations
 // ============================================================
 
@@ -486,8 +710,10 @@ pub fn dotQ6K(blocks: []const Q6KBlock, x: []const f32) f32 {
 // Multi-threaded matrix-vector multiply
 // ============================================================
 
+const MAX_THREADS = 32;
+
 /// Thread-parallel matmul: splits rows across threads.
-/// Works for any row-compute function via the MatmulJob abstraction.
+/// Uses a simple fork-join model with Thread.spawn/join.
 pub fn matmulParallel(
     out: []f32,
     rows: usize,
@@ -496,7 +722,6 @@ pub fn matmulParallel(
     n_threads: usize,
 ) void {
     if (n_threads <= 1 or rows < n_threads * 4) {
-        // Not worth threading for small matrices
         for (0..rows) |row| {
             out[row] = ctx.computeRow(row);
         }
@@ -507,20 +732,18 @@ pub fn matmulParallel(
     const rows_per_thread = rows / actual_threads;
     var threads: [MAX_THREADS]?std.Thread = [_]?std.Thread{null} ** MAX_THREADS;
 
-    // Spawn worker threads for all chunks except the last
     for (0..actual_threads - 1) |ti| {
         const start = ti * rows_per_thread;
         const end = (ti + 1) * rows_per_thread;
         threads[ti] = std.Thread.spawn(.{}, threadedRowCompute, .{ out, start, end, ctx }) catch null;
     }
 
-    // Run last chunk on calling thread (avoids spawn overhead)
+    // Last chunk on calling thread
     {
         const start = (actual_threads - 1) * rows_per_thread;
         threadedRowCompute(out, start, rows, ctx);
     }
 
-    // Join worker threads
     for (&threads) |*t| {
         if (t.*) |thread| {
             thread.join();
@@ -528,8 +751,6 @@ pub fn matmulParallel(
         }
     }
 }
-
-const MAX_THREADS = 8;
 
 fn threadedRowCompute(
     out: []f32,

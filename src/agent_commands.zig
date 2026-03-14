@@ -5,6 +5,7 @@ const editor = @import("editor.zig");
 const agent_log = @import("agent_log.zig");
 const agent_mod = @import("agent.zig");
 const router_mod = @import("agent_router.zig");
+const audio = @import("audio.zig");
 
 /// Result of a command dispatch — tells the caller what to do next.
 pub const DispatchResult = enum {
@@ -126,20 +127,14 @@ const truncateToCols = TermWidth.truncate;
 
 pub const Layout = struct {
     pub fn drawSeparator(w: anytype, row: u16, cols: u16, scroll_off: u32) void {
-        w.print("\x1b[{d};1H\x1b[2K\x1b[90m", .{row}) catch {};
+        w.print("\x1b[{d};1H\x1b[2K\x1b[2;90m", .{row}) catch {}; // dim + dark gray
+        _ = cols;
         if (scroll_off > 0) {
             var indicator_buf: [64]u8 = undefined;
-            const indicator = std.fmt.bufPrint(&indicator_buf, " \xe2\x86\x91 {d} lines ", .{scroll_off}) catch "";
-            const ind_cols = displayWidth(indicator);
-            const pad_left = (cols -| ind_cols) / 2;
-            var ci: u16 = 0;
-            while (ci < pad_left) : (ci += 1) w.writeAll("\xe2\x94\x80") catch {};
+            const indicator = std.fmt.bufPrint(&indicator_buf, "\xe2\x94\x80\xe2\x94\x80 \xe2\x86\x91 {d} lines \xe2\x94\x80\xe2\x94\x80", .{scroll_off}) catch "";
             w.writeAll(indicator) catch {};
-            ci += ind_cols;
-            while (ci < cols) : (ci += 1) w.writeAll("\xe2\x94\x80") catch {};
         } else {
-            var ci: u16 = 0;
-            while (ci < cols) : (ci += 1) w.writeAll("\xe2\x94\x80") catch {};
+            w.writeAll("\xe2\x94\x80\xe2\x94\x80") catch {}; // just a short dash, not full width
         }
         w.writeAll("\x1b[0m") catch {};
     }
@@ -162,12 +157,12 @@ pub const Layout = struct {
                 const line_text = ebuf.getLine(abs_line);
                 if (abs_line == 0) {
                     if (ebuf.vi_mode == .normal) {
-                        w.writeAll("\x1b[33m \xe2\x9d\xaf\x1b[0m  ") catch {};
+                        w.writeAll("\x1b[33m> \x1b[0m") catch {};
                     } else {
-                        w.writeAll("\x1b[34m \xe2\x9d\xaf\x1b[0m  ") catch {};
+                        w.writeAll("\x1b[90m> \x1b[0m") catch {};
                     }
                 } else {
-                    w.writeAll("    ") catch {};
+                    w.writeAll("  ") catch {};
                 }
                 w.writeAll(line_text) catch {};
             }
@@ -176,7 +171,7 @@ pub const Layout = struct {
         const byte_col = ebuf.currentCol();
         const line_start_byte = ebuf.cursor - byte_col;
         const cur_col = displayWidth(ebuf.text[line_start_byte..ebuf.cursor]);
-        const prefix_width: u16 = 4;
+        const prefix_width: u16 = 2;
         w.print("\x1b[{d};{d}H", .{ first_row + vis_line, prefix_width + cur_col + 1 }) catch {};
         if (ebuf.vi_mode == .normal) {
             w.writeAll("\x1b[2 q") catch {};
@@ -190,8 +185,9 @@ pub const Layout = struct {
     }
 
     pub fn drawStatusBarFull(w: anytype, row: u16, cols: u16, mdl: []const u8, cost: []const u8, status: []const u8, elapsed_ms: i64) void {
-        w.print("\x1b[{d};1H\x1b[2K\x1b[90;7m ", .{row}) catch {};
-        var display_cols: u16 = 1;
+        w.print("\x1b[{d};1H\x1b[2K\x1b[90m", .{row}) catch {};
+        var display_cols: u16 = 0;
+        // Model name
         const mdl_w = displayWidth(mdl);
         if (display_cols + mdl_w < cols) {
             w.writeAll(mdl) catch {};
@@ -201,10 +197,11 @@ pub const Layout = struct {
             w.writeAll(mdl[0..trunc]) catch {};
             display_cols = cols;
         }
+        // Status (highlighted)
         if (status.len > 0 and display_cols + 4 < cols) {
-            w.writeAll(" \xe2\x94\x82 ") catch {};
+            w.writeAll(" \xc2\xb7 ") catch {}; // · (middle dot separator)
             display_cols += 3;
-            w.writeAll("\x1b[0;93;7m") catch {};
+            w.writeAll("\x1b[33m") catch {}; // yellow for active status
             const sw = displayWidth(status);
             if (display_cols + sw < cols) {
                 w.writeAll(status) catch {};
@@ -214,32 +211,35 @@ pub const Layout = struct {
                 w.writeAll(status[0..trunc]) catch {};
                 display_cols = cols;
             }
-            w.writeAll("\x1b[90;7m") catch {};
+            w.writeAll("\x1b[90m") catch {}; // back to dim
         }
+        // Cost
         if (cost.len > 0 and display_cols + 4 < cols) {
-            w.writeAll(" \xe2\x94\x82 ") catch {};
+            w.writeAll(" \xc2\xb7 ") catch {};
             display_cols += 3;
             w.writeAll(cost) catch {};
             display_cols += displayWidth(cost);
         }
+        // Elapsed time
         if (elapsed_ms > 0 and display_cols + 6 < cols) {
             const secs = @divTrunc(elapsed_ms, 1000);
             var elapsed_buf: [32]u8 = undefined;
             const elapsed = if (secs >= 60)
-                std.fmt.bufPrint(&elapsed_buf, " {d}m {d:0>2}s", .{ @divTrunc(secs, 60), @mod(secs, 60) }) catch ""
+                std.fmt.bufPrint(&elapsed_buf, " {d}m{d:0>2}s", .{ @divTrunc(secs, 60), @mod(secs, 60) }) catch ""
             else
                 std.fmt.bufPrint(&elapsed_buf, " {d}s", .{secs}) catch "";
-            w.writeAll(" \xe2\x94\x82") catch {};
+            w.writeAll(" \xc2\xb7") catch {};
             display_cols += 2;
             w.writeAll(elapsed) catch {};
             display_cols += displayWidth(elapsed);
         }
-        if (display_cols + 19 <= cols) {
-            w.writeAll(" \xe2\x94\x82 ^D:exit \xe2\x94\x82 /help ") catch {};
-            display_cols += 19;
+        // Hints (only if room)
+        if (display_cols + 16 <= cols) {
+            w.writeAll(" \xc2\xb7 ^D:exit \xc2\xb7 /help") catch {};
+            display_cols += 16;
         }
-        while (display_cols < cols) : (display_cols += 1) w.writeByte(' ') catch {};
-        w.writeAll("\x1b[0m") catch {};
+        // Clear rest of line
+        w.writeAll("\x1b[K\x1b[0m") catch {};
     }
 
     pub fn drawInputSafe(w: anytype, first_row: u16, rows: u16, ebuf: *const editor.EditBuffer, streaming: bool) void {
@@ -637,6 +637,7 @@ const commands = [_]Command{
     .{ .name = "/config", .has_arg = false, .handler = cmdConfig },
     .{ .name = "/search", .has_arg = true, .handler = cmdSearch },
     .{ .name = "/s", .has_arg = true, .handler = cmdSearch },
+    .{ .name = "/voice", .has_arg = false, .handler = cmdVoice },
     .{ .name = "/help", .has_arg = false, .handler = cmdHelp },
     .{ .name = "help", .has_arg = false, .handler = cmdHelp },
 };
@@ -711,8 +712,8 @@ fn cmdCompact(ctx: *CommandCtx, _: []const u8) DispatchResult {
 
 fn cmdCost(ctx: *CommandCtx, _: []const u8) DispatchResult {
     Layout.goOutput(ctx.out, ctx.out_last.*);
-    ctx.out.print("\x1b[1mSession Cost:\x1b[0m {s}\n", .{if (ctx.cost_len.* > 0) ctx.cost_buf[0..ctx.cost_len.*] else "n/a"}) catch {};
-    ctx.out.print("\x1b[1mModel:\x1b[0m        {s}\n", .{ctx.model_name}) catch {};
+    ctx.out.print("  \x1b[90mcost\x1b[0m      {s}\n", .{if (ctx.cost_len.* > 0) ctx.cost_buf[0..ctx.cost_len.*] else "n/a"}) catch {};
+    ctx.out.print("  \x1b[90mmodel\x1b[0m     {s}\n", .{ctx.model_name}) catch {};
     ctx.historyNote("Session cost displayed");
     ctx.out.flush() catch {};
     return .handled;
@@ -1382,21 +1383,35 @@ fn cmdSessions(ctx: *CommandCtx, _: []const u8) DispatchResult {
         ctx.out.writeAll("\x1b[90mNo saved sessions.\x1b[0m\n") catch {};
     } else {
         const start = if (sessions_list.items.len > 10) sessions_list.items.len - 10 else 0;
+        const now_secs: u64 = @intCast(std.time.timestamp());
         for (sessions_list.items[start..]) |*info| {
             const epoch_secs: u64 = if (info.created > 0) @intCast(info.created) else 0;
-            const es = std.time.epoch.EpochSeconds{ .secs = epoch_secs };
-            const eday = es.getEpochDay();
-            const eyd = eday.calculateYearDay();
-            const emd = eyd.calculateMonthDay();
-            const eds = es.getDaySeconds();
-            ctx.out.print("  \x1b[33m{s}\x1b[0m  {d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}  {s}\n", .{
+            // Relative time
+            const age = if (now_secs > epoch_secs) now_secs - epoch_secs else 0;
+            var time_buf: [16]u8 = undefined;
+            const time_str = if (age < 60)
+                std.fmt.bufPrint(&time_buf, "{d}s ago", .{age}) catch "just now"
+            else if (age < 3600)
+                std.fmt.bufPrint(&time_buf, "{d}m ago", .{age / 60}) catch "recently"
+            else if (age < 86400)
+                std.fmt.bufPrint(&time_buf, "{d}h ago", .{age / 3600}) catch "today"
+            else
+                std.fmt.bufPrint(&time_buf, "{d}d ago", .{age / 86400}) catch "old";
+            // Shorten CWD: replace home with ~
+            const cwd = info.cwd();
+            const home = std.posix.getenv("HOME") orelse "";
+            var cwd_buf: [128]u8 = undefined;
+            const display_cwd = if (home.len > 0 and std.mem.startsWith(u8, cwd, home)) blk: {
+                const rest = cwd[home.len..];
+                cwd_buf[0] = '~';
+                const rlen = @min(rest.len, cwd_buf.len - 1);
+                @memcpy(cwd_buf[1..][0..rlen], rest[0..rlen]);
+                break :blk cwd_buf[0 .. rlen + 1];
+            } else cwd;
+            ctx.out.print("  \x1b[33m{s}\x1b[0m  \x1b[90m{s: <8}\x1b[0m  {s}\n", .{
                 @as([]const u8, &info.id),
-                eyd.year,
-                @intFromEnum(emd.month),
-                emd.day_index + 1,
-                eds.getHoursIntoDay(),
-                eds.getMinutesIntoHour(),
-                info.cwd(),
+                time_str,
+                display_cwd,
             }) catch {};
         }
     }
@@ -1407,14 +1422,14 @@ fn cmdSessions(ctx: *CommandCtx, _: []const u8) DispatchResult {
 
 fn cmdConfig(ctx: *CommandCtx, _: []const u8) DispatchResult {
     Layout.goOutput(ctx.out, ctx.out_last.*);
-    ctx.out.print("\x1b[1mModel:\x1b[0m    {s}\n", .{ctx.model_name}) catch {};
-    ctx.out.print("\x1b[1mCost:\x1b[0m     {s}\n", .{if (ctx.cost_len.* > 0) ctx.cost_buf[0..ctx.cost_len.*] else "n/a"}) catch {};
+    ctx.out.print("  \x1b[90mmodel\x1b[0m     {s}\n", .{ctx.model_name}) catch {};
+    ctx.out.print("  \x1b[90mcost\x1b[0m      {s}\n", .{if (ctx.cost_len.* > 0) ctx.cost_buf[0..ctx.cost_len.*] else "n/a"}) catch {};
     {
         var conf = agent_log.AgentConfig.load(ctx.shell.allocator);
         defer conf.deinit();
-        ctx.out.print("\x1b[1mProvider:\x1b[0m {s}\n", .{conf.provider}) catch {};
+        ctx.out.print("  \x1b[90mprovider\x1b[0m  {s}\n", .{conf.provider}) catch {};
         if (conf.api_key.len > 8) {
-            ctx.out.print("\x1b[1mAPI Key:\x1b[0m  {s}...{s}\n", .{ conf.api_key[0..4], conf.api_key[conf.api_key.len - 4 ..] }) catch {};
+            ctx.out.print("  \x1b[90mapi key\x1b[0m   {s}...{s}\n", .{ conf.api_key[0..4], conf.api_key[conf.api_key.len - 4 ..] }) catch {};
         }
     }
     ctx.historyNote("Config displayed");
@@ -1445,40 +1460,70 @@ fn cmdSearch(ctx: *CommandCtx, arg: []const u8) DispatchResult {
     return .handled;
 }
 
+fn cmdVoice(ctx: *CommandCtx, _: []const u8) DispatchResult {
+    const shell = ctx.shell;
+    Layout.goOutput(ctx.out, ctx.out_last.*);
+
+    if (shell.voice_active) {
+        // Stop voice mode
+        if (shell.voice_capture) |*cap| cap.stop();
+        if (shell.voice_playback) |*play| play.stop();
+        shell.voice_capture = null;
+        shell.voice_playback = null;
+        shell.voice_active = false;
+        ctx.out.writeAll("\x1b[33mvoice off\x1b[0m\n") catch {};
+        ctx.setStatus("voice off");
+    } else {
+        // Start voice mode
+        shell.voice_capture = audio.Capture.start(shell.allocator) catch |e| {
+            ctx.out.print("\x1b[31mmic failed: {}\x1b[0m\n", .{e}) catch {};
+            ctx.out.flush() catch {};
+            return .handled;
+        };
+        shell.voice_playback = audio.Playback.start(shell.allocator, 24000) catch |e| {
+            if (shell.voice_capture) |*cap| cap.stop();
+            shell.voice_capture = null;
+            ctx.out.print("\x1b[31mspeaker failed: {}\x1b[0m\n", .{e}) catch {};
+            ctx.out.flush() catch {};
+            return .handled;
+        };
+        shell.voice_active = true;
+        ctx.out.writeAll("\x1b[32mvoice on\x1b[0m — listening\n") catch {};
+        ctx.setStatus("voice on");
+    }
+    ctx.drawStatusElapsed();
+    ctx.out.flush() catch {};
+    return .handled;
+}
+
 fn cmdHelp(ctx: *CommandCtx, _: []const u8) DispatchResult {
     Layout.goOutput(ctx.out, ctx.out_last.*);
     const help_text =
-        \\\x1b[1mAgent Mode Commands:\x1b[0m
-        \\  \x1b[33mexit\x1b[0m / \x1b[33mquit\x1b[0m / \x1b[33mCtrl+D\x1b[0m  — leave agent mode
-        \\  \x1b[33mclear\x1b[0m                — reset conversation
-        \\  \x1b[33m/compact\x1b[0m             — summarize conversation
-        \\  \x1b[33m/cost\x1b[0m                — show session cost
-        \\  \x1b[33m/model\x1b[0m [name]        — show/switch model
-        \\  \x1b[33m/diff\x1b[0m                — show git changes
-        \\  \x1b[33m/commit\x1b[0m [msg]        — commit (AI message if no msg)
-        \\  \x1b[33m/review\x1b[0m              — review session changes
-        \\  \x1b[33m/undo\x1b[0m                — undo last file change
-        \\  \x1b[33m/plan\x1b[0m <task>          — plan without executing
-        \\  \x1b[33m/spawn\x1b[0m <task>         — spawn worker (full tools)
-        \\  \x1b[33m/queue\x1b[0m <task>         — queue autonomous task
-        \\  \x1b[33m/tree\x1b[0m                — agent tree view (vim nav)
-        \\  \x1b[33m/agents\x1b[0m              — agent tree view (alias)
-        \\  \x1b[33m/sessions\x1b[0m            — list recent sessions
-        \\  \x1b[33m/config\x1b[0m              — show configuration
-        \\  \x1b[33m/search\x1b[0m <pattern>    — search history (also /s)
-        \\  \x1b[33m/help\x1b[0m                — show this help
+        \\\x1b[1mCommands\x1b[0m
+        \\  \x1b[33m/compact\x1b[0m\x1b[90m ·········· summarize conversation\x1b[0m
+        \\  \x1b[33m/cost\x1b[0m\x1b[90m ············· show session cost\x1b[0m
+        \\  \x1b[33m/model\x1b[0m [name]\x1b[90m ····· show/switch model\x1b[0m
+        \\  \x1b[33m/diff\x1b[0m\x1b[90m ············· show git changes\x1b[0m
+        \\  \x1b[33m/commit\x1b[0m [msg]\x1b[90m ····· commit with AI message\x1b[0m
+        \\  \x1b[33m/review\x1b[0m\x1b[90m ··········· review session changes\x1b[0m
+        \\  \x1b[33m/undo\x1b[0m\x1b[90m ············· undo last file change\x1b[0m
+        \\  \x1b[33m/plan\x1b[0m <task>\x1b[90m ······ plan without executing\x1b[0m
+        \\  \x1b[33m/spawn\x1b[0m <task>\x1b[90m ····· spawn worker subagent\x1b[0m
+        \\  \x1b[33m/queue\x1b[0m <task>\x1b[90m ····· queue autonomous task\x1b[0m
+        \\  \x1b[33m/tree\x1b[0m\x1b[90m ············· agent tree view\x1b[0m
+        \\  \x1b[33m/sessions\x1b[0m\x1b[90m ········· list recent sessions\x1b[0m
+        \\  \x1b[33m/config\x1b[0m\x1b[90m ··········· show configuration\x1b[0m
+        \\  \x1b[33m/search\x1b[0m <pattern>\x1b[90m · search history\x1b[0m
+        \\  \x1b[33m/voice\x1b[0m\x1b[90m ············ toggle voice mode\x1b[0m
         \\
+        \\\x1b[1mShortcuts\x1b[0m
+        \\  \x1b[33m!command\x1b[0m\x1b[90m ·········· run shell command\x1b[0m
+        \\  \x1b[33m!\x1b[0m\x1b[90m ················· drop to zish shell\x1b[0m
+        \\  \x1b[33m?intent\x1b[0m\x1b[90m ··········· translate to command\x1b[0m
         \\
-        \\  \x1b[33m!command\x1b[0m             — run shell command (zish engine)
-        \\  \x1b[33m!\x1b[0m                    — drop to full zish shell
-        \\  \x1b[33m?intent\x1b[0m              — translate to shell command
-        \\
-        \\  \x1b[33mEnter\x1b[0m submits, \x1b[33mAlt+Enter\x1b[0m inserts newline.
-        \\  \x1b[33mPageUp/Down\x1b[0m scrolls through history.
-        \\  \x1b[33m^K/^N\x1b[0m jumps between messages.
-        \\  \x1b[33mCtrl+C\x1b[0m cancels when busy, clears/exits when idle.
-        \\  \x1b[33mEsc\x1b[0m enters vi normal mode (\x1b[33mi\x1b[0m to return to insert).
-        \\  \x1b[33mRight/End\x1b[0m accepts ghost text, \x1b[33mCtrl+Right\x1b[0m one word.
+        \\\x1b[1mKeys\x1b[0m
+        \\  \x1b[33mEnter\x1b[0m\x1b[90m submit\x1b[0m  \x1b[33mAlt+Enter\x1b[0m\x1b[90m newline\x1b[0m  \x1b[33mCtrl+C\x1b[0m\x1b[90m cancel\x1b[0m
+        \\  \x1b[33mPageUp/Down\x1b[0m\x1b[90m scroll\x1b[0m  \x1b[33mEsc\x1b[0m\x1b[90m vi mode\x1b[0m  \x1b[33mCtrl+D\x1b[0m\x1b[90m exit\x1b[0m
         \\
     ;
     ctx.out.writeAll(help_text) catch {};
@@ -1548,7 +1593,7 @@ fn cmdTranslate(ctx: *CommandCtx, query: []const u8) DispatchResult {
         if (ctx.shell.agent.query(prompt)) {
             ctx.agent_active.* = true;
             ctx.setStatus("translating...");
-            Layout.drawStatusBar(ctx.out, ctx.status_row.*, ctx.term_cols.*, ctx.model_name, ctx.cost_buf[0..ctx.cost_len.*], ctx.status_text[0..ctx.status_len.*]);
+            Layout.drawStatusBarSafe(ctx.out, ctx.status_row.*, ctx.term_rows.*, ctx.out_last.*, ctx.term_cols.*, ctx.model_name, ctx.cost_buf[0..ctx.cost_len.*], ctx.status_text[0..ctx.status_len.*]);
         }
     }
     ctx.out.flush() catch {};

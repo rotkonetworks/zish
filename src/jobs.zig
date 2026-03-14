@@ -2,6 +2,20 @@
 const std = @import("std");
 const posix = std.posix;
 
+/// tcsetpgrp via ioctl (workaround: Zig 0.15 std.c missing tcsetpgrp binding)
+pub fn tcsetpgrp(fd: posix.fd_t, pgrp: posix.pid_t) posix.TermioSetPgrpError!void {
+    const TIOCSPGRP = 0x5410;
+    const rc = std.os.linux.ioctl(fd, TIOCSPGRP, @intFromPtr(&pgrp));
+    switch (std.posix.errno(rc)) {
+        .SUCCESS => return,
+        .BADF => unreachable,
+        .INVAL => unreachable,
+        .NOTTY => return error.NotATerminal,
+        .PERM => return error.NotAPgrpMember,
+        else => |err| return std.posix.unexpectedErrno(err),
+    }
+}
+
 /// waitpid wrapper that retries on EINTR
 /// returns {.pid = 0, .status = 0} on ECHILD or other errors
 fn waitpidRetry(pid: posix.pid_t, flags: u32) struct { pid: posix.pid_t, status: u32 } {
@@ -362,7 +376,7 @@ pub const JobTable = struct {
     /// Put a job in the foreground
     pub fn putJobInForeground(self: *JobTable, job: *Job, cont: bool) !i32 {
         // give terminal control to the job's process group
-        posix.tcsetpgrp(self.shell_terminal, job.pgid) catch |err| {
+        tcsetpgrp(self.shell_terminal, job.pgid) catch |err| {
             std.debug.print("zish: tcsetpgrp to job failed: {}\n", .{err});
             return error.TerminalControlFailed;
         };
@@ -387,7 +401,7 @@ pub const JobTable = struct {
         const status = self.waitForJob(job);
 
         // put shell back in foreground - this must succeed
-        posix.tcsetpgrp(self.shell_terminal, self.shell_pgid) catch |err| {
+        tcsetpgrp(self.shell_terminal, self.shell_pgid) catch |err| {
             std.debug.print("zish: tcsetpgrp back to shell failed: {}\n", .{err});
             // try to continue anyway
         };
@@ -480,7 +494,7 @@ pub fn launchProcess(pid: posix.pid_t, pgid: posix.pid_t, foreground: bool, term
 
     // if foreground, give it the terminal
     if (foreground) {
-        posix.tcsetpgrp(terminal, actual_pgid) catch |err| {
+        tcsetpgrp(terminal, actual_pgid) catch |err| {
             std.debug.print("zish: tcsetpgrp failed: {}\n", .{err});
         };
     }

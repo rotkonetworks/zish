@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const math = @import("math.zig");
+const gpu_mod = @import("gpu.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -44,19 +45,75 @@ pub const SuperLinear = struct {
     n_neurons: usize, // N
 
     /// Compute: out[n, o] = sum_m(x[n, m] * w[m, o, n]) + b[n, o]
+    /// Parallelized across neurons (N), cache-friendly m-outer accumulation.
     pub fn forward(self: *const SuperLinear, x: []const f32, out: []f32) void {
+        const N = self.n_neurons;
+        const flops = N * self.out_dims * self.in_dims;
+        if (N >= 8 and flops >= 500_000) {
+            const max_threads = math.cpuCount();
+            const ideal = flops / 200_000;
+            const n_threads = @min(max_threads, @max(2, @min(ideal, N / 2)));
+            const NlmCtx = struct {
+                sl: *const SuperLinear,
+                xp: []const f32,
+                outp: []f32,
+                fn computeRange(ctx: @This(), start: usize, end: usize) void {
+                    ctx.sl.forwardRange(ctx.xp, ctx.outp, start, end);
+                }
+            };
+            const ctx = NlmCtx{ .sl = self, .xp = x, .outp = out };
+            // Split N across threads
+            const chunk = N / n_threads;
+            const remainder = N % n_threads;
+            var threads: [32]std.Thread = undefined;
+            var t_count: usize = 0;
+            var start: usize = 0;
+            for (0..n_threads) |t| {
+                const end = start + chunk + @as(usize, if (t < remainder) 1 else 0);
+                if (t < n_threads - 1) {
+                    threads[t_count] = std.Thread.spawn(.{}, struct {
+                        fn run(c: NlmCtx, s: usize, e: usize) void {
+                            c.computeRange(s, e);
+                        }
+                    }.run, .{ ctx, start, end }) catch {
+                        ctx.computeRange(start, end);
+                        start = end;
+                        continue;
+                    };
+                    t_count += 1;
+                } else {
+                    ctx.computeRange(start, end);
+                }
+                start = end;
+            }
+            for (threads[0..t_count]) |t| t.join();
+        } else {
+            self.forwardRange(x, out, 0, N);
+        }
+    }
+
+    /// Compute forward pass for neuron range [n_start, n_end).
+    /// Uses m-outer loop for cache-friendly weight access.
+    fn forwardRange(self: *const SuperLinear, x: []const f32, out: []f32, n_start: usize, n_end: usize) void {
         const M = self.in_dims;
         const O = self.out_dims;
         const N = self.n_neurons;
 
-        for (0..N) |n| {
-            for (0..O) |o| {
-                var sum: f32 = self.b[n * O + o];
-                for (0..M) |m| {
-                    // w is (M, O, N) row-major: w[m][o][n] = w[(m * O + o) * N + n]
-                    sum += x[n * M + m] * self.w[(m * O + o) * N + n];
+        // Initialize with bias
+        for (n_start..n_end) |n| {
+            const out_off = n * O;
+            @memcpy(out[out_off..][0..O], self.b[out_off..][0..O]);
+        }
+
+        // Accumulate: m-outer for sequential weight access
+        for (0..M) |m| {
+            const w_base = m * O * N;
+            for (n_start..n_end) |n| {
+                const xval = x[n * M + m];
+                const out_off = n * O;
+                for (0..O) |o| {
+                    out[out_off + o] += xval * self.w[w_base + o * N + n];
                 }
-                out[n * O + o] = sum;
             }
         }
     }
@@ -121,6 +178,28 @@ pub const SynapseUNET = struct {
     up_ln_bias: []const []const f32,
     half_k: usize,
 
+    // GPU compute (optional)
+    gpu_ctx: ?*gpu_mod.GpuContext = null,
+    tensor_data_base: ?[*]const u8 = null,
+
+    /// GPU-accelerated linear forward. Returns true if GPU was used.
+    /// Falls back to CPU for plastic weights (heap-allocated outside mmap region).
+    fn gpuLinearForward(self: *const SynapseUNET, out: []f32, input: []const f32, w: []const f32, rows: usize, cols: usize) bool {
+        const g = self.gpu_ctx orelse return false;
+        const base = self.tensor_data_base orelse return false;
+        const w_addr = @intFromPtr(w.ptr);
+        const base_addr = @intFromPtr(base);
+        if (w_addr < base_addr) return false; // plastic weight — not in VRAM
+        const w_off = w_addr - base_addr;
+        const w_end = w_off + rows * cols * @sizeOf(f32);
+        if (w_end > g.weight_buf.size) return false; // beyond uploaded region
+        return g.matvecF32(input, out, .{
+            .offset = w_off,
+            .rows = @intCast(rows),
+            .cols = @intCast(cols),
+        });
+    }
+
     /// Forward pass: x (2*D) -> out (D)
     /// scratch must be large enough for intermediate activations
     pub fn forward(self: *const SynapseUNET, x: []const f32, out: []f32, scratch: []f32) void {
@@ -157,26 +236,76 @@ pub const SynapseUNET = struct {
         if (self.half_k > 32) return; // safety: skip_offsets is fixed-size
         var skip_offsets: [32]usize = undefined;
         var skip_off: usize = 0;
-        for (0..self.half_k) |i| {
-            const in_d = self.down_in_dims[i];
-            const out_d = self.down_out_dims[i];
-            const w = self.down_weights[i];
 
-            // Linear: work_b[j] = sum_k(work_a[k] * w[j * in_d + k])
-            linearForward(work_b[0..out_d], work_a[0..in_d], w, out_d, in_d);
+        // Try GPU cascade for entire down path: all matmul+SiLU in one submit
+        const down_gpu = if (self.gpu_ctx) |g| blk: {
+            const base = self.tensor_data_base orelse break :blk false;
+            const base_addr = @intFromPtr(base);
 
-            // SiLU activation
-            for (work_b[0..out_d]) |*v| {
-                v.* = v.* / (1.0 + std.math.exp(-v.*));
+            // Build cascade steps
+            var steps: [32]gpu_mod.GpuContext.CascadeStep = undefined;
+            var all_in_vram = true;
+            for (0..self.half_k) |i| {
+                const w = self.down_weights[i];
+                const w_addr = @intFromPtr(w.ptr);
+                if (w_addr < base_addr) { all_in_vram = false; break; }
+                const w_off = w_addr - base_addr;
+                const w_end = w_off + self.down_out_dims[i] * self.down_in_dims[i] * @sizeOf(f32);
+                if (w_end > g.weight_buf.size) { all_in_vram = false; break; }
+                steps[i] = .{
+                    .weight_byte_offset = w_off,
+                    .rows = @intCast(self.down_out_dims[i]),
+                    .cols = @intCast(self.down_in_dims[i]),
+                    .silu = true,
+                };
             }
+            if (!all_in_vram) break :blk false;
 
-            // Save skip connection
-            skip_offsets[i] = skip_off;
-            @memcpy(scratch[skip_off..][0..out_d], work_b[0..out_d]);
-            skip_off += out_d;
+            // Set up skip output slices pointing into scratch
+            var skip_slices: [32][]f32 = undefined;
+            var soff: usize = 0;
+            for (0..self.half_k) |i| {
+                const d = self.down_out_dims[i];
+                skip_slices[i] = scratch[soff..][0..d];
+                skip_offsets[i] = soff;
+                soff += d;
+            }
+            skip_off = soff;
 
-            // Swap for next iteration
-            @memcpy(work_a[0..out_d], work_b[0..out_d]);
+            // Execute: one command buffer, one fence, 16 fused matmul+SiLU
+            if (g.cascadeF32(
+                x,
+                work_a[0..self.down_out_dims[self.half_k - 1]],
+                steps[0..self.half_k],
+                skip_slices[0..self.half_k],
+            )) {
+                break :blk true;
+            }
+            break :blk false;
+        } else false;
+
+        if (!down_gpu) {
+            // CPU fallback: sequential matmul + SiLU
+            for (0..self.half_k) |i| {
+                const in_d = self.down_in_dims[i];
+                const out_d = self.down_out_dims[i];
+                const w = self.down_weights[i];
+
+                linearForward(work_b[0..out_d], work_a[0..in_d], w, out_d, in_d);
+
+                // SiLU activation
+                for (work_b[0..out_d]) |*v| {
+                    v.* = v.* / (1.0 + std.math.exp(-v.*));
+                }
+
+                // Save skip connection
+                skip_offsets[i] = skip_off;
+                @memcpy(scratch[skip_off..][0..out_d], work_b[0..out_d]);
+                skip_off += out_d;
+
+                // Swap for next iteration
+                @memcpy(work_a[0..out_d], work_b[0..out_d]);
+            }
         }
 
         // Up path
@@ -201,8 +330,9 @@ pub const SynapseUNET = struct {
             const in_d = self.up_in_dims[i];
             const w = self.up_weights[i];
 
-            // Linear
-            linearForward(work_b[0..out_d], work_a[0..in_d], w, out_d, in_d);
+            // Linear — try GPU, fall back to SIMD CPU
+            if (!self.gpuLinearForward(work_b[0..out_d], work_a[0..in_d], w, out_d, in_d))
+                linearForward(work_b[0..out_d], work_a[0..in_d], w, out_d, in_d);
 
             // SiLU
             for (work_b[0..out_d]) |*v| {
@@ -219,14 +349,23 @@ pub const SynapseUNET = struct {
     }
 };
 
-/// Simple matrix-vector multiply: out[i] = sum_j(x[j] * w[i * cols + j])
+/// SIMD matrix-vector multiply, multi-threaded for large matrices.
 fn linearForward(out: []f32, x: []const f32, w: []const f32, rows: usize, cols: usize) void {
-    for (0..rows) |i| {
-        var sum: f32 = 0;
-        for (0..cols) |j| {
-            sum += x[j] * w[i * cols + j];
+    const ctx = math.F32MatmulCtx{ .data = w, .x = x, .cols = cols };
+    // Adaptive threading: scale thread count with matrix size.
+    // Each thread needs enough work to amortize spawn (~50µs).
+    // At ~1 GFLOP/s per core (SIMD f32 dot), 50K FLOPs ≈ 50µs.
+    const flops = rows * cols;
+    const max_threads = math.cpuCount();
+    if (rows >= 8 and flops >= 500_000) {
+        // Scale: 1 thread per ~200K FLOPs, min 2, max cpuCount
+        const ideal = flops / 200_000;
+        const n_threads = @min(max_threads, @max(2, @min(ideal, rows / 2)));
+        math.matmulParallel(out, rows, math.F32MatmulCtx, ctx, n_threads);
+    } else {
+        for (0..rows) |i| {
+            out[i] = ctx.computeRow(i);
         }
-        out[i] = sum;
     }
 }
 
@@ -438,6 +577,29 @@ pub const CTMBlock = struct {
     c_proj_base_norm: f32 = 0,
     up_base_norm: f32 = 0,
 
+    // GPU compute service (optional — set by model init)
+    gpu_ctx: ?*gpu_mod.GpuContext = null,
+    tensor_data_base: ?[*]const u8 = null,
+
+    /// GPU-accelerated SuperLinear forward. Returns true if GPU was used.
+    fn gpuNlmForward(self: *const CTMBlock, nlm: *const SuperLinear, input: []const f32, output: []f32) bool {
+        const g = self.gpu_ctx orelse return false;
+        const base = self.tensor_data_base orelse return false;
+        const w_addr = @intFromPtr(nlm.w.ptr);
+        const base_addr = @intFromPtr(base);
+        if (w_addr < base_addr) return false;
+        const w_off = w_addr - base_addr;
+        return g.superlinear(
+            input,
+            output,
+            nlm.b,
+            @intCast(nlm.n_neurons),
+            @intCast(nlm.in_dims),
+            @intCast(nlm.out_dims),
+            .{ .offset = w_off, .rows = @intCast(nlm.n_neurons), .cols = @intCast(nlm.in_dims) },
+        );
+    }
+
     /// Run CTM forward pass for one token.
     /// Input: x (D-dim vector from attention output)
     /// Output: written to out (D-dim)
@@ -512,9 +674,41 @@ pub const CTMBlock = struct {
         const unet_scratch = scratch[unet_scratch_off..];
 
         // Precompute keys and values from input (constant across ticks)
-        linearForward(attn_k, x, self.attn_k_proj_w, D, D);
+        // Batch K+V projections: 2 × D×D matmuls, 1 GPU submit
+        const kv_gpu = if (self.gpu_ctx) |g| blk: {
+            const base = self.tensor_data_base orelse break :blk false;
+            const base_addr = @intFromPtr(base);
+            const k_addr = @intFromPtr(self.attn_k_proj_w.ptr);
+            const v_addr = @intFromPtr(self.attn_v_proj_w.ptr);
+            if (k_addr < base_addr or v_addr < base_addr) break :blk false;
+            const k_off = k_addr - base_addr;
+            const v_off = v_addr - base_addr;
+            if (!g.beginPassF32(x[0..D])) break :blk false;
+            const k_dst = g.recordMatvecF32(.{ .offset = k_off, .rows = @intCast(D), .cols = @intCast(D) }) orelse {
+                _ = g.endPass();
+                break :blk false;
+            };
+            const v_dst = g.recordMatvecF32(.{ .offset = v_off, .rows = @intCast(D), .cols = @intCast(D) }) orelse {
+                _ = g.endPass();
+                break :blk false;
+            };
+            if (!g.endPass()) break :blk false;
+            g.readBatchOutput(k_dst, attn_k);
+            g.readBatchOutput(v_dst, attn_v);
+            break :blk true;
+        } else false;
+
+        if (!kv_gpu) {
+            linearForward(attn_k, x, self.attn_k_proj_w, D, D);
+            linearForward(attn_v, x, self.attn_v_proj_w, D, D);
+        }
         qkNorm(attn_k_norm, attn_k, D);
-        linearForward(attn_v, x, self.attn_v_proj_w, D, D);
+
+        // Timing accumulators (only first tick is timed for profiling)
+        var t_attn_ns: u64 = 0;
+        var t_unet_ns: u64 = 0;
+        var t_nlm_ns: u64 = 0;
+        var t_sync_ns: u64 = 0;
 
         // K thinking iterations
         for (0..K) |k| {
@@ -525,6 +719,7 @@ pub const CTMBlock = struct {
             }
 
             // 2. Cross-attention: query from sync, key/value from input
+            var tick_timer = std.time.Timer.start() catch null;
             linearForward(attn_q, synch_readout, self.attn_q_proj_w, D, n_synch);
             qkNorm(attn_q_norm, attn_q, D);
 
@@ -536,6 +731,7 @@ pub const CTMBlock = struct {
                 const score = attn_q_norm[i] * attn_k_norm[i] / scale;
                 obs[i] = score * attn_v[i];
             }
+            if (tick_timer) |*t| { t_attn_ns += t.read(); t.reset(); }
 
             if (debug_ctm) {
                 var obs_nan: usize = 0;
@@ -557,6 +753,7 @@ pub const CTMBlock = struct {
                 synapse_in[D + i] = state[i] + tick_emb[i];
             }
             self.synapses.forward(synapse_in, synapse_out, unet_scratch);
+            if (tick_timer) |*t| { t_unet_ns += t.read(); t.reset(); }
 
             if (debug_ctm) {
                 var syn_nan: usize = 0;
@@ -584,15 +781,16 @@ pub const CTMBlock = struct {
             }
 
             // 5. NLM1: trace (D, M) -> GLU -> (D, hidden)
-            self.nlm1.forward(trace, nlm1_out_buf);
+            if (!self.gpuNlmForward(&self.nlm1, trace, nlm1_out_buf))
+                self.nlm1.forward(trace, nlm1_out_buf);
             glu(nlm1_out_buf, D, 2 * hidden);
 
-            // (nlm1 debug removed for brevity)
-
             // 6. NLM2: (D, hidden) -> GLU -> (D, 1) -> squeeze -> (D)
-            self.nlm2.forward(nlm1_out_buf[0 .. D * hidden], nlm2_out_buf);
+            if (!self.gpuNlmForward(&self.nlm2, nlm1_out_buf[0 .. D * hidden], nlm2_out_buf))
+                self.nlm2.forward(nlm1_out_buf[0 .. D * hidden], nlm2_out_buf);
             glu(nlm2_out_buf, D, 2);
             for (0..D) |d| state[d] = nlm2_out_buf[d * 2];
+            if (tick_timer) |*t| { t_nlm_ns += t.read(); t.reset(); }
 
             if (debug_ctm) {
                 var state_nan: usize = 0;
@@ -624,6 +822,18 @@ pub const CTMBlock = struct {
                 sync.alpha_act[s] = r_act[s] * sync.alpha_act[s] + pp_act;
                 sync.beta_act[s] = r_act[s] * sync.beta_act[s] + dopamine;
             }
+            if (tick_timer) |*t| { t_sync_ns += t.read(); t.reset(); }
+        }
+
+        // Profile output (first call only)
+        if (t_attn_ns > 0) {
+            std.debug.print("[ctm] K={d} attn:{d:.0}ms unet:{d:.0}ms nlm:{d:.0}ms sync:{d:.0}ms\n", .{
+                K,
+                @as(f64, @floatFromInt(t_attn_ns)) / 1e6,
+                @as(f64, @floatFromInt(t_unet_ns)) / 1e6,
+                @as(f64, @floatFromInt(t_nlm_ns)) / 1e6,
+                @as(f64, @floatFromInt(t_sync_ns)) / 1e6,
+            });
         }
 
         // Capture last state for compact_memory (if buffer provided)

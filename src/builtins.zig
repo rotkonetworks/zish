@@ -6,6 +6,8 @@ const parser = @import("parser.zig");
 const input_mod = @import("input.zig");
 const BindableAction = input_mod.BindableAction;
 const editor = @import("editor.zig");
+const audio_mod = @import("audio.zig");
+const linkify = @import("linkify.zig");
 
 // directory stack for pushd/popd
 var dir_stack: std.ArrayList([]const u8) = undefined;
@@ -2438,6 +2440,48 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
         return 0;
     }
 
+    // agent bench — benchmark local inference (GPU vs CPU)
+    if (std.mem.eql(u8, subcmd, "bench")) {
+        const inference = @import("inference/root.zig");
+        var cfg = agent_log.AgentConfig.load(shell.allocator);
+        defer cfg.deinit();
+
+        const model_path = if (cfg.router_local_model.len > 0) cfg.router_local_model else blk: {
+            try out.writeAll("agent bench: no local model configured (set router_local_model in ~/.zish/agent.json)\n");
+            try out.flush();
+            break :blk "";
+        };
+        if (model_path.len == 0) return 0;
+
+        try out.print("Loading model: {s}\n", .{model_path});
+        try out.flush();
+
+        var ctx = inference.InferenceContext.load(model_path, shell.allocator) catch |e| {
+            try out.print("Failed to load model: {}\n", .{e});
+            try out.flush();
+            return 1;
+        };
+        defer ctx.deinit();
+
+        const info = ctx.modelInfo();
+        try out.print("Model: {s} ({} layers, dim={}, vocab={})\n", .{ info.arch, info.layers, info.dim, info.vocab });
+        try out.print("GPU: {s}\n", .{if (ctx.gpu_ctx != null) "active" else "CPU only"});
+        try out.flush();
+
+        // Benchmark (no warmup — first token time is interesting)
+        const n: usize = 16;
+        try out.print("Benchmarking {} tokens...\n", .{n});
+        try out.flush();
+        const result = ctx.bench(n);
+
+        try out.print("\n\x1b[1mResults:\x1b[0m\n", .{});
+        try out.print("  Prefill:  {d:.1} tokens/sec\n", .{result.prefill_tps});
+        try out.print("  Generate: {d:.1} tokens/sec\n", .{result.generate_tps});
+        try out.print("  Backend:  {s}\n", .{if (result.gpu) "GPU (Vulkan)" else "CPU"});
+        try out.flush();
+        return 0;
+    }
+
     // agent clear
     if (std.mem.eql(u8, subcmd, "clear")) {
         // stop and restart agent to clear conversation
@@ -2881,6 +2925,15 @@ fn agentInteractive(shell: *Shell) !u8 {
     var agent_active = false;
     var in_confirm = false;
     var cursor_at: enum { output, input } = .output;
+    var voice_was_speaking = false;
+    var voice_silence_start: i64 = 0; // timestamp when speech stopped
+    const voice_silence_timeout: i64 = 800; // ms of silence before auto-submit
+    // Audio accumulation buffer: up to 30 seconds @ 16kHz mono
+    var voice_audio_buf: [16000 * 30]i16 = undefined;
+    var voice_audio_len: usize = 0;
+    // TTS text accumulation buffer: collect response text for voice output
+    var tts_buf: [8192]u8 = undefined;
+    var tts_len: usize = 0;
 
     // ? translation mode — captures response to pre-fill input
     var translate_mode = false;
@@ -2942,17 +2995,17 @@ fn agentInteractive(shell: *Shell) !u8 {
     // Print header in scroll region
     Layout.goOutput(out, out_last);
     if (was_running) {
-        try out.print("\x1b[1;34m-- agent \x1b[0m\x1b[90m{s} (continuing)\x1b[0m\n", .{model_name});
+        try out.print("\x1b[90m{s} \xc2\xb7 continuing\x1b[0m\n", .{model_name});
     } else {
-        try out.print("\x1b[1;34m-- agent \x1b[0m\x1b[90m{s}\x1b[0m\n", .{model_name});
+        try out.print("\x1b[90m{s} \xc2\xb7 /help for commands\x1b[0m\n", .{model_name});
     }
     // Capture header in history
     {
         var hdr_buf: [128]u8 = undefined;
         const hdr = if (was_running)
-            std.fmt.bufPrint(&hdr_buf, "\x1b[1;34m-- agent \x1b[0m\x1b[90m{s} (continuing)\x1b[0m", .{model_name}) catch ""
+            std.fmt.bufPrint(&hdr_buf, "\x1b[90m{s} \xc2\xb7 continuing\x1b[0m", .{model_name}) catch ""
         else
-            std.fmt.bufPrint(&hdr_buf, "\x1b[1;34m-- agent \x1b[0m\x1b[90m{s}\x1b[0m", .{model_name}) catch "";
+            std.fmt.bufPrint(&hdr_buf, "\x1b[90m{s} \xc2\xb7 /help for commands\x1b[0m", .{model_name}) catch "";
         msg_history.appendSlice(hdr);
         msg_history.commitLine();
     }
@@ -2979,20 +3032,118 @@ fn agentInteractive(shell: *Shell) !u8 {
             try out.flush();
         }
 
-        // When idle, move cursor to input area
+        // When idle, move cursor to input area (once, not every loop iteration)
         if (!agent_active and !in_confirm and cursor_at == .output) {
             Layout.drawInput(out, input_first_row, input_height, &edit_buf);
             cursor_at = .input;
+            // Also redraw separator in case scroll state changed
+            Layout.drawSeparator(out, sep_row, term_cols, scroll_offset);
             try out.flush();
         }
 
-        // Poll stdin with timeout (fast when streaming, slow when idle)
-        var poll_fds = [_]std.posix.pollfd{.{
-            .fd = std.posix.STDIN_FILENO,
-            .events = std.posix.POLL.IN,
-            .revents = 0,
-        }};
-        const poll_n = std.posix.poll(&poll_fds, if (agent_active) @as(i32, 20) else @as(i32, 100)) catch 0;
+        // Poll stdin (and mic if voice active) with timeout
+        var poll_fds: [2]std.posix.pollfd = .{
+            .{
+                .fd = std.posix.STDIN_FILENO,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            },
+            .{
+                .fd = if (shell.voice_capture) |cap| cap.stdout_fd else -1,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            },
+        };
+        const n_poll_fds: u32 = if (shell.voice_active and shell.voice_capture != null) 2 else 1;
+        const poll_n = std.posix.poll(poll_fds[0..n_poll_fds], if (agent_active) @as(i32, 20) else @as(i32, 100)) catch 0;
+
+        // ── Read mic audio if available ──
+        if (n_poll_fds > 1 and (poll_fds[1].revents & std.posix.POLL.IN) != 0) {
+            if (shell.voice_capture) |*cap| {
+            var mic_buf: [1600]i16 = undefined; // 100ms @ 16kHz
+            const n_samples = cap.read(&mic_buf);
+            if (n_samples > 0) {
+                const speaking = audio_mod.detectVoice(mic_buf[0..n_samples], 500_000);
+                if (speaking) {
+                    // Accumulate audio
+                    const avail = voice_audio_buf.len - voice_audio_len;
+                    const copy_n = @min(n_samples, avail);
+                    if (copy_n > 0) {
+                        @memcpy(voice_audio_buf[voice_audio_len..][0..copy_n], mic_buf[0..copy_n]);
+                        voice_audio_len += copy_n;
+                    }
+                    voice_silence_start = 0; // reset silence timer
+                    if (!voice_was_speaking) {
+                        // Speech started
+                        const s = "listening...";
+                        @memcpy(status_text[0..s.len], s);
+                        status_len = s.len;
+                        Layout.drawStatusBarSafeElapsed(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], 0);
+                    }
+                } else if (voice_was_speaking and voice_audio_len > 0) {
+                    // Speech just stopped — start silence timer
+                    if (voice_silence_start == 0) {
+                        voice_silence_start = std.time.milliTimestamp();
+                        // Also buffer the trailing silence (some ASR models need it)
+                        const avail = voice_audio_buf.len - voice_audio_len;
+                        const copy_n = @min(n_samples, avail);
+                        if (copy_n > 0) {
+                            @memcpy(voice_audio_buf[voice_audio_len..][0..copy_n], mic_buf[0..copy_n]);
+                            voice_audio_len += copy_n;
+                        }
+                    }
+                }
+                voice_was_speaking = speaking;
+            }
+            } // voice_capture null check
+        }
+
+        // ── Voice silence timeout → submit to ASR ──
+        if (voice_silence_start > 0 and voice_audio_len > 1600) { // at least 100ms of audio
+            const elapsed = std.time.milliTimestamp() - voice_silence_start;
+            if (elapsed >= voice_silence_timeout) {
+                // Transcribe accumulated audio
+                const s = "transcribing...";
+                @memcpy(status_text[0..s.len], s);
+                status_len = s.len;
+                Layout.drawStatusBarSafeElapsed(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], 0);
+                try out.flush();
+
+                // Write audio to temp WAV file, run curl to ASR endpoint
+                const text = voiceTranscribe(shell.allocator, voice_audio_buf[0..voice_audio_len]);
+                voice_audio_len = 0;
+                voice_silence_start = 0;
+
+                if (text) |transcribed| {
+                    defer shell.allocator.free(transcribed);
+                    if (transcribed.len > 0) {
+                        // Show what was heard
+                        Layout.goOutput(out, out_last);
+                        try out.print("\x1b[36m> {s}\x1b[0m\n", .{transcribed});
+                        msg_history.appendSlice("\x1b[36m> ");
+                        msg_history.appendSlice(transcribed);
+                        msg_history.appendSlice("\x1b[0m");
+                        msg_history.commitLine();
+                        cursor_at = .output;
+
+                        // Send to agent
+                        if (shell.agent.query(transcribed)) {
+                            agent_active = true;
+                            query_start_ms = std.time.milliTimestamp();
+                            const thinking = "thinking...";
+                            @memcpy(status_text[0..thinking.len], thinking);
+                            status_len = thinking.len;
+                        }
+                    }
+                } else {
+                    const vs = "voice on";
+                    @memcpy(status_text[0..vs.len], vs);
+                    status_len = vs.len;
+                }
+                Layout.drawStatusBarSafeElapsed(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0);
+                try out.flush();
+            }
+        }
 
         // ── Drain agent output queue ──
         var got_output = false;
@@ -3020,15 +3171,24 @@ fn agentInteractive(shell: *Shell) !u8 {
 
             switch (msg.kind) {
                 .text_delta => {
-                    // Update status to "responding" on first text
-                    if (!last_was_text and status_len != 0) {
-                        const resp = "responding";
-                        @memcpy(status_text[0..resp.len], resp);
-                        status_len = resp.len;
-                        Layout.drawStatusBarSafeElapsed(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0);
+                    // Hide cursor during streaming for clean appearance
+                    if (!last_was_text) {
+                        try out.writeAll("\x1b[?25l"); // hide cursor
+                        status_len = 0; // clear "thinking..." — let spinner stop
                     }
                     try md.render(tee, msg.slice());
+                    try out.flush(); // flush each delta for smooth streaming
                     last_was_text = true;
+                    // capture text for voice TTS output
+                    if (shell.voice_active) {
+                        const s = msg.slice();
+                        const avail = tts_buf.len - tts_len;
+                        const n = @min(s.len, avail);
+                        if (n > 0) {
+                            @memcpy(tts_buf[tts_len..][0..n], s[0..n]);
+                            tts_len += n;
+                        }
+                    }
                     // capture text for ? translation
                     if (translate_mode) {
                         const s = msg.slice();
@@ -3043,14 +3203,13 @@ fn agentInteractive(shell: *Shell) !u8 {
                 .tool_call => {
                     if (last_was_text) {
                         try md.flush(tee);
-                        try tee.writeAll("\x1b[0m\n");
+                        try tee.writeAll("\x1b[0m");
                     }
                     md.reset();
                     last_was_text = false;
                     const tool_text = msg.slice();
                     // Update status bar with tool name
                     {
-                        // Extract tool name (up to '(' or space)
                         const paren = std.mem.indexOfScalar(u8, tool_text, '(') orelse tool_text.len;
                         const name_end = @min(paren, std.mem.indexOfScalar(u8, tool_text, ' ') orelse tool_text.len);
                         const slen = @min(name_end, status_text.len);
@@ -3058,15 +3217,37 @@ fn agentInteractive(shell: *Shell) !u8 {
                         status_len = slen;
                         Layout.drawStatusBarSafeElapsed(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0);
                     }
-                    // ● ToolName(args) — Claude Code style
-                    try tee.writeAll("\x1b[1m\xe2\x97\x8f \x1b[0m\x1b[90m");
-                    // Truncate to terminal width (UTF-8 safe)
-                    const max_w: usize = if (term_cols > 4) term_cols - 4 else term_cols;
-                    const dw = displayWidth(tool_text);
-                    if (dw > max_w) {
-                        const trunc = truncateToCols(tool_text, max_w);
-                        try tee.writeAll(tool_text[0..trunc]);
-                        try tee.writeAll("\xe2\x80\xa6");
+                    // ⚡ ToolName args — compact indicator with clickable paths
+                    try tee.writeAll("\n\x1b[90m\xe2\x9a\xa1 ");
+                    // Find tool name and path argument
+                    const space_pos = std.mem.indexOfScalar(u8, tool_text, ' ');
+                    if (space_pos) |sp| {
+                        const tool_name = tool_text[0..sp];
+                        const tool_args = std.mem.trim(u8, tool_text[sp + 1 ..], " ");
+                        try tee.writeAll(tool_name);
+                        try tee.writeAll(" ");
+                        // If args start with /, make it a clickable file link
+                        if (tool_args.len > 0 and tool_args[0] == '/') {
+                            const path_end = std.mem.indexOfScalar(u8, tool_args, ' ') orelse tool_args.len;
+                            const path = tool_args[0..path_end];
+                            try tee.writeAll("\x1b]8;;file://");
+                            try tee.writeAll(path);
+                            try tee.writeAll("\x1b\\\x1b[4m"); // OSC 8 + underline
+                            try tee.writeAll(path);
+                            try tee.writeAll("\x1b[24m\x1b]8;;\x1b\\"); // end underline + close OSC 8
+                            if (path_end < tool_args.len) try tee.writeAll(tool_args[path_end..]);
+                        } else {
+                            const max_w: usize = if (term_cols > 4) term_cols - 4 else term_cols;
+                            const dw = displayWidth(tool_args);
+                            if (dw + displayWidth(tool_name) + 3 > max_w) {
+                                const avail = max_w -| (displayWidth(tool_name) + 3);
+                                const trunc = truncateToCols(tool_args, avail);
+                                try tee.writeAll(tool_args[0..trunc]);
+                                try tee.writeAll("\xe2\x80\xa6");
+                            } else {
+                                try tee.writeAll(tool_args);
+                            }
+                        }
                     } else {
                         try tee.writeAll(tool_text);
                     }
@@ -3074,56 +3255,30 @@ fn agentInteractive(shell: *Shell) !u8 {
                 },
                 .tool_done => {
                     last_was_text = false;
-                    // Show result summary with ⎿ connector
                     const done_text = msg.slice();
                     if (done_text.len > 0) {
-                        // Count lines
                         var line_count: usize = 1;
                         for (done_text) |dc| {
                             if (dc == '\n') line_count += 1;
                         }
-                        if (line_count <= 3) {
-                            // Short result — show inline
-                            var line_start: usize = 0;
-                            for (done_text, 0..) |dc, di| {
-                                if (dc == '\n' or di == done_text.len - 1) {
-                                    const end = if (dc == '\n') di else di + 1;
-                                    const line = done_text[line_start..end];
-                                    const max_lw: usize = if (term_cols > 6) term_cols - 6 else term_cols;
-                                    try tee.writeAll("  \x1b[90m\xe2\x8e\xbf  ");
-                                    const ldw = displayWidth(line);
-                                    if (ldw > max_lw) {
-                                        const lt = truncateToCols(line, max_lw);
-                                        try tee.writeAll(line[0..lt]);
-                                        try tee.writeAll("\xe2\x80\xa6");
-                                    } else {
-                                        try tee.writeAll(line);
-                                    }
-                                    try tee.writeAll("\x1b[0m\n");
-                                    line_start = di + 1;
-                                }
-                            }
-                        } else {
-                            // Long result — show first line + summary
-                            const first_nl = std.mem.indexOfScalar(u8, done_text, '\n') orelse done_text.len;
-                            const max_lw: usize = if (term_cols > 6) term_cols - 6 else term_cols;
-                            try tee.writeAll("  \x1b[90m\xe2\x8e\xbf  ");
-                            const first_line = done_text[0..first_nl];
-                            const fldw = displayWidth(first_line);
-                            if (fldw > max_lw) {
-                                const flt = truncateToCols(first_line, max_lw);
-                                try tee.writeAll(first_line[0..flt]);
-                                try tee.writeAll("\xe2\x80\xa6");
-                            } else {
-                                try tee.writeAll(first_line);
-                            }
+                        if (line_count == 1 and done_text.len < 60) {
+                            // Very short — show inline (to both screen + history)
+                            try tee.writeAll("  \x1b[90m");
+                            linkify.writeLinked(tee, done_text) catch try tee.writeAll(done_text);
                             try tee.writeAll("\x1b[0m\n");
-                            var more_buf: [64]u8 = undefined;
-                            const more = std.fmt.bufPrint(&more_buf, "  \x1b[90m\xe2\x8e\xbf  ({d} more lines)\x1b[0m\n", .{line_count - 1}) catch "";
-                            try tee.writeAll(more);
+                        } else {
+                            // Compact on screen, full in history for scrollback
+                            var info_buf: [64]u8 = undefined;
+                            const info = std.fmt.bufPrint(&info_buf, "  \x1b[32m\xe2\x9c\x93\x1b[90m {d} lines\x1b[0m\n", .{line_count}) catch "  \x1b[32m\xe2\x9c\x93\x1b[0m\n";
+                            try out.writeAll(info); // screen only
+                            // Write full result to history (dim, for scrollback)
+                            msg_history.appendSlice("  \x1b[90m");
+                            msg_history.appendSlice(done_text);
+                            msg_history.appendSlice("\x1b[0m");
+                            msg_history.commitLine();
                         }
                     } else {
-                        try tee.writeAll("  \x1b[90m\xe2\x8e\xbf  \xe2\x9c\x93\x1b[0m\n");
+                        try tee.writeAll("  \x1b[32m\xe2\x9c\x93\x1b[0m\n");
                     }
                     // Back to thinking after tool completes
                     const thinking = "thinking...";
@@ -3138,24 +3293,45 @@ fn agentInteractive(shell: *Shell) !u8 {
                         try tee.writeAll("\x1b[0m\n");
                     }
                     last_was_text = false;
-                    try tee.print("\x1b[31m{s}\x1b[0m\n", .{msg.slice()});
+                    try tee.writeAll("\x1b[31m");
+                    linkify.writeLinked(tee, msg.slice()) catch try tee.writeAll(msg.slice());
+                    try tee.writeAll("\x1b[0m\n");
                 },
                 .usage_info => {
-                    // Parse cost/free from usage_info for status bar
+                    // Parse cost + token totals from usage_info for status bar
+                    // Format: "tokens: N↑ N↓ | total: N↑ N↓ ($X.XX)" or "(free)"
                     const usage_text = msg.slice();
                     if (std.mem.indexOf(u8, usage_text, "(free)") != null) {
                         const free = "free";
                         @memcpy(cost_buf[0..free.len], free);
                         cost_len = free.len;
                     } else if (std.mem.indexOf(u8, usage_text, "($")) |dollar_pos| {
-                        const cost_start = dollar_pos + 1; // skip '('
+                        const cost_start = dollar_pos + 1;
                         if (std.mem.indexOfScalarPos(u8, usage_text, cost_start, ')')) |paren_end| {
                             const cost_str = usage_text[cost_start..paren_end];
-                            cost_len = @min(cost_str.len, cost_buf.len);
-                            @memcpy(cost_buf[0..cost_len], cost_str[0..cost_len]);
+                            // Also grab total tokens: find "total: N↑"
+                            if (std.mem.indexOf(u8, usage_text, "total: ")) |total_pos| {
+                                // Parse total input tokens for compact display
+                                const tok_start = total_pos + 7;
+                                const tok_end = std.mem.indexOfScalarPos(u8, usage_text, tok_start, '\xe2') orelse tok_start;
+                                const tok_str = usage_text[tok_start..tok_end];
+                                // Format: "$0.05 · 12K tok"
+                                var tok_val: u32 = 0;
+                                for (tok_str) |tc| {
+                                    if (tc >= '0' and tc <= '9') tok_val = tok_val * 10 + (tc - '0');
+                                }
+                                if (tok_val > 1000) {
+                                    cost_len = (std.fmt.bufPrint(&cost_buf, "{s} \xc2\xb7 {d}K tok", .{ cost_str, tok_val / 1000 }) catch cost_str).len;
+                                } else {
+                                    cost_len = @min(cost_str.len, cost_buf.len);
+                                    @memcpy(cost_buf[0..cost_len], cost_str[0..cost_len]);
+                                }
+                            } else {
+                                cost_len = @min(cost_str.len, cost_buf.len);
+                                @memcpy(cost_buf[0..cost_len], cost_str[0..cost_len]);
+                            }
                         }
                     }
-                    // Update status bar with new cost
                     Layout.drawStatusBarSafeElapsed(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0);
                     if (last_was_text) {
                         try md.flush(tee);
@@ -3165,13 +3341,8 @@ fn agentInteractive(shell: *Shell) !u8 {
                     }
                 },
                 .router_info => {
-                    if (last_was_text) {
-                        try md.flush(tee);
-                        md.reset();
-                        try tee.writeAll("\x1b[0m\n");
-                    }
+                    // Don't print router info in output — show in status bar only
                     last_was_text = false;
-                    try tee.print("\x1b[90m[{s}]\x1b[0m\n", .{msg.slice()});
                     // Extract tier from summary "agent -> small (low cost)"
                     const info = msg.slice();
                     if (std.mem.indexOf(u8, info, "-> ")) |arrow| {
@@ -3188,11 +3359,22 @@ fn agentInteractive(shell: *Shell) !u8 {
                         try md.flush(tee);
                         try tee.writeAll("\x1b[0m\n");
                     }
+                    try out.writeAll("\x1b[?25h"); // show cursor
                     last_was_text = false;
                     md.reset();
                     agent_active = false;
                     query_start_ms = 0;
-                    // Clear status indicator
+                    // Voice TTS: speak the response
+                    if (shell.voice_active and tts_len > 0) {
+                        const speaking_s = "speaking...";
+                        @memcpy(status_text[0..speaking_s.len], speaking_s);
+                        status_len = speaking_s.len;
+                        Layout.drawStatusBarSafe(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len]);
+                        try out.flush();
+                        voiceSpeak(shell.allocator, tts_buf[0..tts_len]);
+                        tts_len = 0;
+                    }
+                    // Show done indicator briefly in status
                     status_len = 0;
                     Layout.drawStatusBarSafe(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], "");
                     msg_history.commitLine(); // flush any partial line
@@ -3227,11 +3409,10 @@ fn agentInteractive(shell: *Shell) !u8 {
                     md.reset();
                     in_confirm = true;
                     // Render confirm prompt in input area (outside scroll region)
-                    out.writeAll("\x1b[s") catch {};
                     out.print("\x1b[1;{d}r", .{term_rows}) catch {};
-                    try out.print("\x1b[{d};1H\x1b[2K\x1b[33m{s} [y/n/a] \x1b[0m", .{ input_first_row, msg.slice() });
+                    try out.print("\x1b[{d};1H\x1b[2K{s} \x1b[90m[\x1b[32my\x1b[90m/\x1b[31mn\x1b[90m/\x1b[33ma\x1b[90mlways]\x1b[0m ", .{ input_first_row, msg.slice() });
                     out.print("\x1b[1;{d}r", .{out_last}) catch {};
-                    out.writeAll("\x1b[u") catch {};
+                    // Leave cursor at confirm prompt (don't restore to output)
                     cursor_at = .input;
                 },
                 .confirm_response, .add_task, .spawn_worker, .agent_status_req,
@@ -3251,6 +3432,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                 .cancel => {
                     try md.flush(tee);
                     md.reset();
+                    try out.writeAll("\x1b[?25h"); // show cursor
                     msg_history.commitLine();
                     agent_active = false;
                     translate_mode = false;
@@ -3261,14 +3443,37 @@ fn agentInteractive(shell: *Shell) !u8 {
             }
         }
         if (got_output) {
-            // Refresh input area while keeping output cursor position
-            if (cursor_at == .output) {
-                Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, true, out_last, term_rows);
+            // Only refresh input area on layout-changing events (done/tool boundaries)
+            // Skip during text_delta streaming to avoid cursor flicker
+            if (cursor_at == .output and !agent_active) {
+                Layout.drawInputSafeFull(out, input_first_row, input_height, &edit_buf, false, out_last, term_rows);
             }
             try out.flush();
         } else if (agent_active and query_start_ms > 0) {
-            // Refresh status bar with updated elapsed time even when no output
-            Layout.drawStatusBarSafeElapsed(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], std.time.milliTimestamp() - query_start_ms);
+            const elapsed = std.time.milliTimestamp() - query_start_ms;
+
+            // Live token counter from agent thread
+            const live_tokens = shell.agent.getTotalInputTokens();
+            if (live_tokens > 1000) {
+                var live_cost_buf: [32]u8 = undefined;
+                const live_cost = std.fmt.bufPrint(&live_cost_buf, "{d}K tok", .{live_tokens / 1000}) catch "";
+                if (live_cost.len > 0) {
+                    cost_len = @min(live_cost.len, cost_buf.len);
+                    @memcpy(cost_buf[0..cost_len], live_cost[0..cost_len]);
+                }
+            }
+
+            // Animate spinner in status text while waiting
+            const spinner = [_][]const u8{ "\xe2\xa0\x8b", "\xe2\xa0\x99", "\xe2\xa0\xb9", "\xe2\xa0\xb8", "\xe2\xa0\xbc", "\xe2\xa0\xb4", "\xe2\xa0\xa6", "\xe2\xa0\xa7", "\xe2\xa0\x87", "\xe2\xa0\x8f" }; // braille spinner
+            const frame_idx: usize = @intCast(@mod(@divTrunc(elapsed, 100), 10));
+            const spin = spinner[frame_idx];
+            var spin_status: [68]u8 = undefined;
+            @memcpy(spin_status[0..spin.len], spin);
+            spin_status[spin.len] = ' ';
+            const rest = @min(status_len, spin_status.len - spin.len - 1);
+            @memcpy(spin_status[spin.len + 1 ..][0..rest], status_text[0..rest]);
+            const spin_len = spin.len + 1 + rest;
+            Layout.drawStatusBarSafeElapsed(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], spin_status[0..spin_len], elapsed);
             try out.flush();
         }
 
@@ -3310,8 +3515,8 @@ fn agentInteractive(shell: *Shell) !u8 {
                         msg_history.appendSlice("\x1b[0m");
                     }
                     msg_history.commitLine(); // commit partial streamed line
-                    try out.writeAll("\n\x1b[33m>cancelled\x1b[0m\n");
-                    msg_history.appendSlice("\x1b[33m>cancelled\x1b[0m");
+                    try out.writeAll("\n\x1b[90m(cancelled)\x1b[0m\n");
+                    msg_history.appendSlice("\x1b[90m(cancelled)\x1b[0m");
                     msg_history.commitLine();
                     try md.flush(out);
                     md.reset();
@@ -3688,7 +3893,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                         "/compact", "/cost",     "/model",    "/diff",    "/commit",
                         "/review",  "/undo",     "/plan",     "/spawn",   "/queue",
                         "/agents",  "/tasks",    "/tree",     "/sessions", "/config",
-                        "/search",  "/help",
+                        "/search",  "/voice",    "/help",
                     };
                     var matches: [16][]const u8 = undefined;
                     var match_count: u8 = 0;
@@ -3930,7 +4135,6 @@ fn agentInteractive(shell: *Shell) !u8 {
 
                             // Send to agent — always queues, never blocks
                             if (!shell.agent.query(query)) {
-                                Layout.goOutput(out, out_last);
                                 try out.writeAll("\x1b[31mqueue full, try again\x1b[0m\n");
                                 msg_history.appendSlice("\x1b[31mqueue full, try again\x1b[0m");
                                 msg_history.commitLine();
@@ -4419,4 +4623,101 @@ fn renderLogLine(out: anytype, md: *agent_mod.MarkdownRenderer, line: []const u8
     } else if (std.mem.eql(u8, entry_type, "d")) {
         try out.writeAll("\x1b[90m  ───\x1b[0m\n");
     }
+}
+
+// ── Voice TTS: speak text via remote TTS endpoint ──
+
+/// Send text to TTS endpoint, pipe audio to paplay.
+/// Blocks until playback complete (or errors out).
+fn voiceSpeak(alloc: std.mem.Allocator, text: []const u8) void {
+    // Strip markdown/ANSI from text for cleaner TTS
+    var clean_buf: [8192]u8 = undefined;
+    var clean_len: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        // Skip ANSI escape sequences
+        if (text[i] == '\x1b' and i + 1 < text.len and text[i + 1] == '[') {
+            while (i < text.len and text[i] != 'm') : (i += 1) {}
+            i += 1;
+            continue;
+        }
+        // Skip markdown: **, *, ```, #
+        if (text[i] == '*' or text[i] == '`' or (text[i] == '#' and (i == 0 or text[i - 1] == '\n'))) {
+            i += 1;
+            continue;
+        }
+        if (clean_len < clean_buf.len) {
+            clean_buf[clean_len] = text[i];
+            clean_len += 1;
+        }
+        i += 1;
+    }
+    if (clean_len == 0) return;
+
+    // JSON-escape the text (escape " and \ and newlines)
+    var escaped_buf: [16384]u8 = undefined;
+    var esc_len: usize = 0;
+    for (clean_buf[0..clean_len]) |c| {
+        if (esc_len + 2 >= escaped_buf.len) break;
+        switch (c) {
+            '"' => { escaped_buf[esc_len] = '\\'; esc_len += 1; escaped_buf[esc_len] = '"'; esc_len += 1; },
+            '\\' => { escaped_buf[esc_len] = '\\'; esc_len += 1; escaped_buf[esc_len] = '\\'; esc_len += 1; },
+            '\n' => { escaped_buf[esc_len] = '\\'; esc_len += 1; escaped_buf[esc_len] = 'n'; esc_len += 1; },
+            '\r' => { escaped_buf[esc_len] = '\\'; esc_len += 1; escaped_buf[esc_len] = 'r'; esc_len += 1; },
+            else => { escaped_buf[esc_len] = c; esc_len += 1; },
+        }
+    }
+
+    // Build JSON request body
+    var json_buf: [16384]u8 = undefined;
+    const json = std.fmt.bufPrint(&json_buf,
+        \\{{"text":"{s}","speaker":"ryan","language":"english"}}
+    , .{escaped_buf[0..esc_len]}) catch return;
+
+    // curl to TTS endpoint → raw WAV → pipe to paplay
+    // Two-step: curl gets WAV, then paplay plays it
+    var child = std.process.Child.init(
+        &.{
+            "sh", "-c",
+            "curl -sS --max-time 60 -X POST -H 'Content-Type: application/json' " ++
+                "-d @- http://localhost:8888/synthesize -o /tmp/zish_tts.wav < /dev/stdin && " ++
+                "paplay --format=s16le --rate=24000 --channels=1 --raw /tmp/zish_tts.wav",
+        },
+        alloc,
+    );
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+
+    child.spawn() catch return;
+    if (child.stdin) |stdin| {
+        stdin.writeAll(json) catch {};
+        stdin.close();
+        child.stdin = null;
+    }
+    _ = child.wait() catch {};
+}
+
+// ── Voice transcription via ASR endpoint ──
+
+// ── Whisper ASR: local model loaded once, stays warm ──
+
+const whisper_mod = @import("inference/whisper.zig");
+
+/// Lazy-loaded whisper model (loaded on first /voice, stays in memory).
+var whisper_model: ?whisper_mod.WhisperModel = null;
+
+fn getWhisperModel(alloc: std.mem.Allocator) ?*const whisper_mod.WhisperModel {
+    if (whisper_model != null) return &whisper_model.?;
+    whisper_model = whisper_mod.WhisperModel.load(
+        "/home/alice/.zish/models/ggml-tiny.en.bin",
+        alloc,
+    ) catch return null;
+    return &whisper_model.?;
+}
+
+/// Transcribe audio using local whisper model (pure Zig, no subprocess).
+fn voiceTranscribe(alloc: std.mem.Allocator, samples: []const i16) ?[]u8 {
+    const model = getWhisperModel(alloc) orelse return null;
+    return model.transcribe(alloc, samples) catch return null;
 }
