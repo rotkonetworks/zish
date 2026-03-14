@@ -209,26 +209,50 @@ fn childMain(req_fd: posix.fd_t, resp_fd: posix.fd_t, model_path: []const u8) vo
     // Use page allocator in child (simple, no fragmentation concerns since we exit)
     const alloc = std.heap.page_allocator;
 
+    // Debug log for diagnosing model load failures
+    const dbg = std.fs.createFileAbsolute("/tmp/zish_inference.log", .{ .truncate = true }) catch null;
+    defer if (dbg) |f| f.close();
+
+    const logMsg = struct {
+        fn write(f: ?std.fs.File, msg: []const u8) void {
+            if (f) |file| file.writeAll(msg) catch {};
+        }
+    }.write;
+
+    logMsg(dbg, "Loading model: ");
+    logMsg(dbg, model_path);
+    logMsg(dbg, "\n");
+
     // Load model
-    var file = gguf.GGUFFile.open(model_path, alloc) catch {
+    var file = gguf.GGUFFile.open(model_path, alloc) catch |err| {
+        logMsg(dbg, "FAIL: gguf open: ");
+        logMsg(dbg, @errorName(err));
+        logMsg(dbg, "\n");
         sendError(resp_fd);
         return;
     };
+    logMsg(dbg, "GGUF OK\n");
 
     var transformer = model.Transformer.initFromGGUF(&file, alloc) catch {
+        logMsg(dbg, "FAIL: transformer init\n");
         sendError(resp_fd);
         return;
     };
+    logMsg(dbg, "Transformer OK\n");
 
     var state = model.State.init(alloc, transformer.config) catch {
+        logMsg(dbg, "FAIL: state init\n");
         sendError(resp_fd);
         return;
     };
+    logMsg(dbg, "State OK\n");
 
     var tok = tokenizer.Tokenizer.initFromGGUF(&file, alloc) catch {
+        logMsg(dbg, "FAIL: tokenizer init\n");
         sendError(resp_fd);
         return;
     };
+    logMsg(dbg, "Tokenizer OK\n");
 
     var ctm_layer_idx: usize = 0;
 

@@ -145,7 +145,7 @@ pub const MetadataKV = struct {
 };
 
 pub const GGUFHeader = struct {
-    const magic_num: u32 = 0x46475547; // GGUF spec magic
+    const magic_num: u32 = 0x46554747; // "GGUF" little-endian
 
     version: u32,
     tensor_count: u64,
