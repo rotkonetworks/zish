@@ -2936,6 +2936,44 @@ pub fn updateGhostText(self: *Shell) void {
             self.ghost_from_ctm = false;
         }
     }
+
+    // Strategy 3: common command subcommand suggestions
+    if (cmd.len >= 4) {
+        const suggestions = [_]struct { prefix: []const u8, completion: []const u8 }{
+            .{ .prefix = "git c", .completion = "ommit" },
+            .{ .prefix = "git s", .completion = "tatus" },
+            .{ .prefix = "git p", .completion = "ush" },
+            .{ .prefix = "git pu", .completion = "ll" },
+            .{ .prefix = "git d", .completion = "iff" },
+            .{ .prefix = "git l", .completion = "og --oneline" },
+            .{ .prefix = "git a", .completion = "dd" },
+            .{ .prefix = "git ch", .completion = "eckout" },
+            .{ .prefix = "git b", .completion = "ranch" },
+            .{ .prefix = "git m", .completion = "erge" },
+            .{ .prefix = "git r", .completion = "ebase" },
+            .{ .prefix = "git st", .completion = "ash" },
+            .{ .prefix = "docker p", .completion = "s" },
+            .{ .prefix = "docker r", .completion = "un" },
+            .{ .prefix = "docker b", .completion = "uild" },
+            .{ .prefix = "docker c", .completion = "ompose" },
+            .{ .prefix = "zig b", .completion = "uild" },
+            .{ .prefix = "zig t", .completion = "est" },
+            .{ .prefix = "cargo b", .completion = "uild" },
+            .{ .prefix = "cargo t", .completion = "est" },
+            .{ .prefix = "cargo r", .completion = "un" },
+            .{ .prefix = "make i", .completion = "nstall" },
+            .{ .prefix = "sudo m", .completion = "ake install" },
+        };
+        for (&suggestions) |s| {
+            if (std.mem.startsWith(u8, cmd, s.prefix) and cmd.len == s.prefix.len) {
+                const n = @min(s.completion.len, self.ghost_buf.len);
+                @memcpy(self.ghost_buf[0..n], s.completion[0..n]);
+                self.ghost_len = n;
+                self.ghost_from_ctm = false;
+                return;
+            }
+        }
+    }
 }
 
 /// Start the ghost inference background thread (called when completion_model is configured).
