@@ -3092,13 +3092,40 @@ fn ghostInferThread(ctx: anytype) void {
         var input_buf: [512]u8 = undefined;
         @memcpy(input_buf[0..ilen], shell.ghost_infer_input[0..ilen]);
 
-        // run inference with shell completion prompt framing
+        // run inference with context-aware prompt
         if (!server.isAlive()) {
             server = inference.ForkServer.spawn(model_path) catch break;
         }
-        // Frame as shell completion: "$ git st" -> model completes "atus"
-        var prompt_buf: [640]u8 = undefined;
-        const prompt = std.fmt.bufPrint(&prompt_buf, "$ {s}", .{input_buf[0..ilen]}) catch continue;
+        // Build prompt with context: recent history + cwd + current input
+        // More characters typed = more context we can provide
+        var prompt_buf: [2048]u8 = undefined;
+        var ppos: usize = 0;
+
+        // Add recent command history for context (last 3-5 commands)
+        if (shell.history) |h| {
+            const n_hist = @min(h.entries.items.len, if (ilen > 10) @as(usize, 5) else 3);
+            const start = h.entries.items.len - n_hist;
+            for (h.entries.items[start..]) |entry| {
+                const hcmd = h.getCommand(entry);
+                if (hcmd.len > 0 and ppos + hcmd.len + 4 < prompt_buf.len - 256) {
+                    @memcpy(prompt_buf[ppos..][0..2], "$ ");
+                    ppos += 2;
+                    @memcpy(prompt_buf[ppos..][0..hcmd.len], hcmd);
+                    ppos += hcmd.len;
+                    prompt_buf[ppos] = '\n';
+                    ppos += 1;
+                }
+            }
+        }
+
+        // Add current input as the line to complete
+        if (ppos + ilen + 3 < prompt_buf.len) {
+            @memcpy(prompt_buf[ppos..][0..2], "$ ");
+            ppos += 2;
+            @memcpy(prompt_buf[ppos..][0..ilen], input_buf[0..ilen]);
+            ppos += ilen;
+        }
+        const prompt = prompt_buf[0..ppos];
 
         // Debug log
         const dbg2 = std.fs.openFileAbsolute("/tmp/zish_inference.log", .{ .mode = .write_only }) catch null;
