@@ -254,6 +254,9 @@ ghost_last_result_seq: u32 = 0, // last result seq we consumed (non-atomic, main
 ghost_infer_thread: ?std.Thread = null,
 ghost_infer_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+// agent continue: loaded conversation context to send as first message
+continue_context: ?[]const u8 = null,
+
 // git info display (set via .zishrc: set git_prompt on)
 show_git_info: bool = false,
 

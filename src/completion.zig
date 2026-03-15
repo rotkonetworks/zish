@@ -2821,12 +2821,6 @@ fn ghostFileSuggestion(self: *Shell, partial: []const u8) bool {
 }
 
 pub fn updateGhostText(self: *Shell) void {
-    // Log rejection if ghost text was visible and user typed something else
-    if (self.ghost_len > 0 and self.ghost_from_ctm) {
-        if (self.edit_buf.len > 0) {
-            rejectGhostText(self);
-        }
-    }
     self.ghost_len = 0;
 
     if (!self.opt_autosuggestion) return;

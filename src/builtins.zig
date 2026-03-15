@@ -2347,8 +2347,77 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
         arg_start = 3;
     }
 
-    // agent c / agent continue — re-enter interactive mode (same as bare agent)
+    // agent c / agent continue — resume most recent session for this directory
     if (std.mem.eql(u8, subcmd, "c") or std.mem.eql(u8, subcmd, "continue")) {
+        // Find most recent session for current cwd
+        var cwd_buf: [256]u8 = undefined;
+        const cwd = std.posix.getcwd(&cwd_buf) catch "";
+
+        var sessions: std.ArrayList(agent_log.SessionInfo) = .{};
+        defer sessions.deinit(shell.allocator);
+        agent_log.listSessions(shell.allocator, &sessions) catch {};
+
+        // Find latest session matching current directory
+        var best: ?*const agent_log.SessionInfo = null;
+        for (sessions.items) |*s| {
+            if (std.mem.eql(u8, s.cwd(), cwd)) {
+                if (best == null or s.created > best.?.created) {
+                    best = s;
+                }
+            }
+        }
+
+        if (best) |session| {
+            // Load conversation from this session into agent history
+            var base_buf: [512]u8 = undefined;
+            const base = agent_log.getBaseDir(&base_buf) orelse "";
+            var conv_path_buf: [512]u8 = undefined;
+            const conv_path = std.fmt.bufPrint(&conv_path_buf, "{s}/sessions/{s}/conversation.jsonl", .{ base, session.id }) catch "";
+
+            if (conv_path.len > 0) {
+                const content = std.fs.cwd().readFileAlloc(shell.allocator, conv_path, 4 * 1024 * 1024) catch null;
+                if (content) |data| {
+                    defer shell.allocator.free(data);
+
+                    // Build a summary of the previous conversation
+                    var summary: std.ArrayList(u8) = .{};
+                    defer summary.deinit(shell.allocator);
+                    summary.appendSlice(shell.allocator, "Continue from our previous session. Here's what we discussed:\n\n") catch {};
+
+                    var n_loaded: u32 = 0;
+                    var line_iter = std.mem.splitScalar(u8, data, '\n');
+                    while (line_iter.next()) |line| {
+                        if (line.len < 10) continue;
+                        const role_str = agent_log.jsonExtractStr(line, "role") orelse continue;
+                        const msg_text = agent_log.jsonExtractStr(line, "content") orelse continue;
+                        if (msg_text.len == 0) continue;
+
+                        if (std.mem.eql(u8, role_str, "user")) {
+                            summary.appendSlice(shell.allocator, "User: ") catch {};
+                        } else if (std.mem.eql(u8, role_str, "assistant")) {
+                            summary.appendSlice(shell.allocator, "Assistant: ") catch {};
+                        } else continue;
+
+                        const mlen = @min(msg_text.len, 500);
+                        summary.appendSlice(shell.allocator, msg_text[0..mlen]) catch {};
+                        if (msg_text.len > 500) summary.appendSlice(shell.allocator, "...") catch {};
+                        summary.appendSlice(shell.allocator, "\n\n") catch {};
+                        n_loaded += 1;
+
+                        // Cap at ~3KB to avoid huge context
+                        if (summary.items.len > 3000) break;
+                    }
+
+                    if (n_loaded > 0) {
+                        // Store summary — agentInteractive will send it as first message
+                        shell.continue_context = shell.allocator.dupe(u8, summary.items) catch null;
+                        try out.print("\x1b[90mResumed session {s} ({d} messages)\x1b[0m\n", .{ session.id, n_loaded });
+                        try out.flush();
+                    }
+                }
+            }
+        }
+
         return agentInteractive(shell);
     }
 
@@ -2973,6 +3042,13 @@ fn agentInteractive(shell: *Shell) !u8 {
         try out.flush();
         return 1;
     };
+
+    // If we have context from `agent continue`, send it as first message
+    if (shell.continue_context) |ctx| {
+        _ = shell.agent.query(ctx);
+        shell.allocator.free(ctx);
+        shell.continue_context = null;
+    }
 
     var cfg = agent_log.AgentConfig.load(shell.allocator);
     var model_buf: [64]u8 = undefined;
