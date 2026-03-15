@@ -413,7 +413,7 @@ fn handleRequestWithDopamine(
     tok_: *const tokenizer.Tokenizer,
     prompt: []const u8,
     max_tokens: u16,
-    temperature: f32,
+    _temperature: f32,
     pos: *usize,
     recent_ring: *[64]tokenizer.Token,
     recent_count: *usize,
@@ -421,11 +421,14 @@ fn handleRequestWithDopamine(
     surprise_threshold: f32,
     alloc: std.mem.Allocator,
 ) ![]u8 {
+    _ = _temperature; // temperatures are fixed per-candidate now
+
     // Tokenize prompt
     const tokens = try tok_.encode(prompt, false, alloc);
     defer alloc.free(tokens);
 
     // Prefill prompt tokens — tracking surprise
+    var prefill_timer = std.time.Timer.start() catch null;
     var total_surprise: f32 = 0;
     for (tokens) |t| {
         _ = transformer.forward(state, t, pos.*);
@@ -440,47 +443,147 @@ fn handleRequestWithDopamine(
             total_surprise += surprise;
         }
     }
+    const prefill_ns = if (prefill_timer) |*t| t.read() else 0;
 
-    const params = SampleParams{
-        .temperature = temperature,
-        .top_k = if (temperature > 0) 40 else 0,
-        .repetition_penalty = if (temperature > 0) 1.1 else 1.0,
-    };
+    // Save KV cache state after prefill for multi-candidate generation
+    const saved_pos = pos.*;
+    const saved_recent_count = recent_count.*;
+    const dim = transformer.config.dim;
+    var saved_input: [2048]f32 = undefined;
+    @memcpy(saved_input[0..dim], state.input[0..dim]);
+    // Save logits (output from last prefill token — needed for first sample)
+    var saved_output: [65536]f32 = undefined;
+    const vocab_size = transformer.config.vocab_size;
+    @memcpy(saved_output[0..vocab_size], state.output[0..vocab_size]);
 
-    var next_tok: tokenizer.Token = sampleToken(state.output, params, recent_ring[0..@min(recent_count.*, 64)]);
+    // Generate N candidates with different temperatures, keep highest log-prob
+    const N_CAND: usize = 4;
+    const temps = [N_CAND]f32{ 0.0, 0.3, 0.5, 0.8 };
 
-    var output_tokens: std.ArrayList(tokenizer.Token) = .{};
-    defer output_tokens.deinit(alloc);
+    var best_tokens: std.ArrayList(tokenizer.Token) = .{};
+    defer best_tokens.deinit(alloc);
+    var best_score: f32 = -std.math.inf(f32);
 
-    for (0..max_tokens) |_| {
-        if (next_tok == tok_.eos_id) break;
-        output_tokens.append(alloc, next_tok) catch return error.OutOfMemory;
+    // Save KV cache region that generation will overwrite (positions saved_pos..saved_pos+max_tokens)
+    const kv_dim = (dim * transformer.config.n_kv_heads) / transformer.config.n_heads;
+    const kv_save_len = @as(usize, max_tokens) * kv_dim * transformer.config.n_layers;
+    const kv_save_k = alloc.alloc(f32, kv_save_len) catch null;
+    const kv_save_v = alloc.alloc(f32, kv_save_len) catch null;
+    defer if (kv_save_k) |s| alloc.free(s);
+    defer if (kv_save_v) |s| alloc.free(s);
 
-        recent_ring[recent_count.* % 64] = next_tok;
-        recent_count.* += 1;
+    // Snapshot the KV cache entries that generation will overwrite
+    if (kv_save_k != null and kv_save_v != null) {
+        for (0..transformer.config.n_layers) |li| {
+            const layer_off = li * transformer.config.max_seq_length * kv_dim;
+            const save_off = li * @as(usize, max_tokens) * kv_dim;
+            for (0..@as(usize, max_tokens)) |ti| {
+                const cache_pos = (saved_pos + ti) % transformer.config.max_seq_length;
+                const src = layer_off + cache_pos * kv_dim;
+                const dst = save_off + ti * kv_dim;
+                @memcpy(kv_save_k.?[dst..][0..kv_dim], state.k_cache[src..][0..kv_dim]);
+                @memcpy(kv_save_v.?[dst..][0..kv_dim], state.v_cache[src..][0..kv_dim]);
+            }
+        }
+    }
 
-        _ = transformer.forward(state, next_tok, pos.*);
-        pos.* += 1;
+    for (0..N_CAND) |ci| {
+        // Restore state to post-prefill
+        pos.* = saved_pos;
+        recent_count.* = saved_recent_count;
+        @memcpy(state.input[0..dim], saved_input[0..dim]);
+        @memcpy(state.output[0..vocab_size], saved_output[0..vocab_size]);
 
-        // Track dopamine during generation
-        if (state.ctm_state) |cs| {
-            const surprise = computeSurprise(state.output, next_tok);
-            cs.updateDopamine(surprise);
-            total_surprise += surprise;
+        // Restore KV cache for generation region
+        if (kv_save_k != null and kv_save_v != null) {
+            for (0..transformer.config.n_layers) |li| {
+                const layer_off = li * transformer.config.max_seq_length * kv_dim;
+                const save_off = li * @as(usize, max_tokens) * kv_dim;
+                for (0..@as(usize, max_tokens)) |ti| {
+                    const cache_pos = (saved_pos + ti) % transformer.config.max_seq_length;
+                    const src = save_off + ti * kv_dim;
+                    const dst = layer_off + cache_pos * kv_dim;
+                    @memcpy(state.k_cache[dst..][0..kv_dim], kv_save_k.?[src..][0..kv_dim]);
+                    @memcpy(state.v_cache[dst..][0..kv_dim], kv_save_v.?[src..][0..kv_dim]);
+                }
+            }
         }
 
-        const lb = @min(recent_count.*, 64);
-        next_tok = sampleToken(state.output, params, recent_ring[0..lb]);
+        const t_val = temps[ci];
+        const params = SampleParams{
+            .temperature = t_val,
+            .top_k = if (t_val > 0) 40 else 0,
+            .repetition_penalty = if (t_val > 0) 1.1 else 1.0,
+        };
+
+        var next_tok: tokenizer.Token = sampleToken(state.output, params, recent_ring[0..@min(recent_count.*, 64)]);
+
+        var cand: std.ArrayList(tokenizer.Token) = .{};
+        var score: f32 = 0;
+
+        for (0..max_tokens) |_| {
+            if (next_tok == tok_.eos_id) break;
+            cand.append(alloc, next_tok) catch break;
+
+            recent_ring[recent_count.* % 64] = next_tok;
+            recent_count.* += 1;
+
+            _ = transformer.forward(state, next_tok, pos.*);
+            pos.* += 1;
+
+            // Accumulate log-probability
+            var max_logit: f32 = -std.math.inf(f32);
+            for (state.output[0..vocab_size]) |l| if (l > max_logit) { max_logit = l; };
+            var sum_exp: f32 = 0;
+            for (state.output[0..vocab_size]) |l| sum_exp += std.math.exp(l - max_logit);
+            score += state.output[@intCast(next_tok)] - max_logit - @log(sum_exp);
+
+            if (state.ctm_state) |cs| {
+                const surprise = computeSurprise(state.output, next_tok);
+                cs.updateDopamine(surprise);
+                total_surprise += surprise;
+            }
+
+            const lb = @min(recent_count.*, 64);
+            next_tok = sampleToken(state.output, params, recent_ring[0..lb]);
+        }
+
+        if (cand.items.len > 0 and score > best_score) {
+            best_score = score;
+            best_tokens.clearRetainingCapacity();
+            best_tokens.appendSlice(alloc, cand.items) catch {};
+        }
+        cand.deinit(alloc);
+    }
+
+    const total_ns = if (prefill_timer) |*t| t.read() else 0;
+
+    // Log timing
+    {
+        const dbg = std.fs.openFileAbsolute("/tmp/zish_inference.log", .{ .mode = .write_only }) catch null;
+        if (dbg) |f| {
+            defer f.close();
+            f.seekFromEnd(0) catch {};
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "timing: prefill={d}ms/{d}tok gen={d}ms/{d}tok x{d}\n", .{
+                prefill_ns / std.time.ns_per_ms,
+                tokens.len,
+                (total_ns - prefill_ns) / std.time.ns_per_ms,
+                best_tokens.items.len,
+                N_CAND,
+            }) catch "?";
+            f.writeAll(msg) catch {};
+        }
     }
 
     // Store in replay buffer if surprising enough
-    const n_total = tokens.len + output_tokens.items.len;
+    const n_total = tokens.len + best_tokens.items.len;
     if (n_total > 0) {
         const mean_surprise = total_surprise / @as(f32, @floatFromInt(n_total));
         replay_buf.push(tokens, mean_surprise, surprise_threshold);
     }
 
-    return tok_.decodeAll(output_tokens.items, alloc);
+    return tok_.decodeAll(best_tokens.items, alloc);
 }
 
 /// Derive a sibling path by replacing extension.
@@ -577,6 +680,8 @@ fn handleRequest(
     pos.* = 0;
     recent_count.* = 0;
 
+    var timer = std.time.Timer.start() catch null;
+
     // Prefill prompt tokens
     for (tokens) |t| {
         _ = transformer.forward(state, t, pos.*);
@@ -584,6 +689,8 @@ fn handleRequest(
         recent_ring[recent_count.* % 64] = t;
         recent_count.* += 1;
     }
+
+    const prefill_ns = if (timer) |*t| t.read() else 0;
 
     const params = SampleParams{
         .temperature = temperature,
@@ -611,6 +718,25 @@ fn handleRequest(
 
         const lb = @min(recent_count.*, 64);
         next_tok = sampleToken(state.output, params, recent_ring[0..lb]);
+    }
+
+    const total_ns = if (timer) |*t| t.read() else 0;
+
+    // Log timing
+    {
+        const dbg = std.fs.openFileAbsolute("/tmp/zish_inference.log", .{ .mode = .write_only }) catch null;
+        if (dbg) |f| {
+            defer f.close();
+            f.seekFromEnd(0) catch {};
+            var buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "timing: prefill={d}ms ({d} toks) gen={d}ms ({d} toks)\n", .{
+                prefill_ns / std.time.ns_per_ms,
+                tokens.len,
+                (total_ns - prefill_ns) / std.time.ns_per_ms,
+                output_tokens.items.len,
+            }) catch "?";
+            f.writeAll(msg) catch {};
+        }
     }
 
     return tok_.decodeAll(output_tokens.items, alloc);
