@@ -848,6 +848,172 @@ pub const Transformer = struct {
         return true;
     }
 
+    /// Batch prefill: process all prompt tokens through the transformer in one pass.
+    /// Fills the KV cache for positions 0..n_tokens-1. Returns logits for the last token.
+    /// Uses CPU-only math (no GPU dispatch overhead — faster for small models with many tokens).
+    pub fn prefillBatch(self: *const Transformer, state: *State, tokens: []const i64, alloc: std.mem.Allocator) ![]f32 {
+        @setFloatMode(.optimized);
+
+        const c = self.config;
+        const dim = c.dim;
+        const kv_dim = (c.dim * c.n_kv_heads) / c.n_heads;
+        const head_size = c.dim / c.n_heads;
+        const n_tok = tokens.len;
+        if (n_tok == 0) return state.output;
+
+        // Allocate batch buffers: [n_tok][dim] for embeddings/hidden states
+        const x = try alloc.alloc(f32, n_tok * dim); // hidden states for all tokens
+        defer alloc.free(x);
+
+        // Look up all embeddings
+        for (0..n_tok) |t| {
+            self.applyEmbedding(x[t * dim ..][0..dim], tokens[t]);
+        }
+
+        // Per-token Q, K, V buffers
+        const q_buf = try alloc.alloc(f32, n_tok * dim);
+        defer alloc.free(q_buf);
+        const k_buf = try alloc.alloc(f32, n_tok * kv_dim);
+        defer alloc.free(k_buf);
+        const v_buf = try alloc.alloc(f32, n_tok * kv_dim);
+        defer alloc.free(v_buf);
+        const attn_out_buf = try alloc.alloc(f32, n_tok * dim);
+        defer alloc.free(attn_out_buf);
+
+        for (0..c.n_layers) |li| {
+            const layer = self.layers[li];
+            const layer_offset = li * c.max_seq_length * kv_dim;
+
+            // Compute Q, K, V for all tokens (CPU matmul, no GPU dispatch overhead)
+            for (0..n_tok) |t| {
+                const inp = x[t * dim ..][0..dim];
+                const qi = q_buf[t * dim ..][0..dim];
+                const ki = k_buf[t * kv_dim ..][0..kv_dim];
+                const vi = v_buf[t * kv_dim ..][0..kv_dim];
+
+                // Norm (skip if not present)
+                if (layer.attn_norm) |norm| {
+                    math.rmsNorm(state.work, inp, norm);
+                } else {
+                    @memcpy(state.work[0..dim], inp);
+                }
+
+                // QKV projections (CPU path — avoids GPU dispatch overhead)
+                self.matmulTensor(qi, layer.wq, state.work, dim, dim, state);
+                self.matmulTensor(ki, layer.wk, state.work, kv_dim, dim, state);
+                self.matmulTensor(vi, layer.wv, state.work, kv_dim, dim, state);
+
+                // Biases
+                if (layer.bq) |bq| math.add(qi, qi, bq);
+                if (layer.bk) |bk| math.add(ki, ki, bk);
+                if (layer.bv) |bv| math.add(vi, vi, bv);
+
+                // RoPE
+                applyRoPE(qi, state.sin, state.cos, c.n_heads, head_size, t, c.rope_sequential);
+                applyRoPE(ki, state.sin, state.cos, c.n_kv_heads, head_size, t, c.rope_sequential);
+
+                // Store in KV cache
+                const cache_pos = t % c.max_seq_length;
+                @memcpy(state.k_cache[layer_offset + cache_pos * kv_dim ..][0..kv_dim], ki);
+                @memcpy(state.v_cache[layer_offset + cache_pos * kv_dim ..][0..kv_dim], vi);
+            }
+
+            // Causal attention for all tokens
+            const scale = std.math.sqrt(@as(f32, @floatFromInt(head_size)));
+            const kv_mul = c.n_heads / c.n_kv_heads;
+
+            for (0..n_tok) |t| {
+                const qi = q_buf[t * dim ..][0..dim];
+                const aout = attn_out_buf[t * dim ..][0..dim];
+                @memset(aout, 0);
+
+                for (0..c.n_heads) |head| {
+                    const query = qi[head * head_size ..][0..head_size];
+                    const base = layer_offset + (head / kv_mul) * head_size;
+
+                    // Compute attention scores over positions 0..t
+                    var max_score: f32 = -std.math.inf(f32);
+                    for (0..t + 1) |p| {
+                        const cp = p % c.max_seq_length;
+                        const key = state.k_cache[base + cp * kv_dim ..][0..head_size];
+                        const s = math.dotProduct(query, key) / scale;
+                        state.attention[p] = s;
+                        if (s > max_score) max_score = s;
+                    }
+
+                    // Softmax
+                    var sum: f32 = 0;
+                    for (0..t + 1) |p| {
+                        const e = std.math.exp(state.attention[p] - max_score);
+                        state.attention[p] = e;
+                        sum += e;
+                    }
+                    const inv_sum = 1.0 / sum;
+                    for (0..t + 1) |p| state.attention[p] *= inv_sum;
+
+                    // Weighted sum of values
+                    const head_out = aout[head * head_size ..][0..head_size];
+                    for (0..t + 1) |p| {
+                        const cp = p % c.max_seq_length;
+                        const val = state.v_cache[base + cp * kv_dim ..][0..head_size];
+                        const a = state.attention[p];
+                        for (0..head_size) |j| head_out[j] += a * val[j];
+                    }
+                }
+
+                // Output projection
+                self.matmulTensor(state.work2, layer.wo, aout, dim, dim, state);
+
+                // Residual
+                const xi = x[t * dim ..][0..dim];
+                math.add(xi, xi, state.work2);
+            }
+
+            // MLP for all tokens
+            for (0..n_tok) |t| {
+                const xi = x[t * dim ..][0..dim];
+
+                if (layer.ffn_norm) |norm| {
+                    math.rmsNorm(state.work, xi, norm);
+                } else {
+                    @memcpy(state.work[0..dim], xi);
+                }
+
+                if (layer.w2 != null and (layer.w1 != null or layer.w3 != null)) {
+                    if (layer.w1 != null and layer.w3 != null) {
+                        // SwiGLU
+                        self.matmulTensor(state.hidden1, layer.w1.?, state.work, c.hidden_dim, dim, state);
+                        self.matmulTensor(state.hidden2, layer.w3.?, state.work, c.hidden_dim, dim, state);
+                        for (0..c.hidden_dim) |j| {
+                            state.hidden1[j] = (state.hidden1[j] / (1.0 + std.math.exp(-state.hidden1[j]))) * state.hidden2[j];
+                        }
+                    } else {
+                        // ReLU²
+                        const up = layer.w3 orelse layer.w1.?;
+                        self.matmulTensor(state.hidden1, up, state.work, c.hidden_dim, dim, state);
+                        for (state.hidden1[0..c.hidden_dim]) |*v| {
+                            const r = @max(v.*, 0);
+                            v.* = r * r;
+                        }
+                    }
+                    self.matmulTensor(state.work2, layer.w2.?, state.hidden1, dim, c.hidden_dim, state);
+                    math.add(xi, xi, state.work2);
+                }
+            }
+        }
+
+        // Copy last token's hidden state to state.input for subsequent generation
+        @memcpy(state.input[0..dim], x[(n_tok - 1) * dim ..][0..dim]);
+
+        // Output norm + classifier for last token only
+        if (self.norm) |norm| {
+            math.rmsNorm(state.input, state.input, norm);
+        }
+        self.matmulTensor(state.output, self.classifier, state.input, c.vocab_size, dim, state);
+
+        return state.output;
+    }
+
     fn doAttention(self: *const Transformer, state: *State, layer_idx: usize, n_token: usize) void {
         const c = self.config;
         const head_size = c.dim / c.n_heads;

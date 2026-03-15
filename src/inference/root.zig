@@ -427,22 +427,43 @@ fn handleRequestWithDopamine(
     const tokens = try tok_.encode(prompt, false, alloc);
     defer alloc.free(tokens);
 
-    // Prefill prompt tokens — tracking surprise
+    // Batch prefill — process all prompt tokens in one pass (no per-token GPU dispatch)
     var prefill_timer = std.time.Timer.start() catch null;
     var total_surprise: f32 = 0;
-    for (tokens) |t| {
-        _ = transformer.forward(state, t, pos.*);
-        pos.* += 1;
-        recent_ring[recent_count.* % 64] = t;
-        recent_count.* += 1;
 
-        // Update dopamine from prefill
-        if (state.ctm_state) |cs| {
-            const surprise = computeSurprise(state.output, t);
-            cs.updateDopamine(surprise);
-            total_surprise += surprise;
+    // Reset position for fresh context
+    pos.* = 0;
+    recent_count.* = 0;
+
+    if (tokens.len > 1) {
+        // Batch prefill: all tokens at once through transformer
+        _ = transformer.prefillBatch(state, tokens, alloc) catch {
+            // Fallback to sequential prefill
+            for (tokens) |t| {
+                _ = transformer.forward(state, t, pos.*);
+                pos.* += 1;
+                recent_ring[recent_count.* % 64] = t;
+                recent_count.* += 1;
+            }
+            const prefill_ns = if (prefill_timer) |*t| t.read() else 0;
+            _ = prefill_ns;
+            // Skip to generation (can't easily break out, so just continue below)
+        };
+        pos.* = tokens.len;
+        for (tokens) |t| {
+            recent_ring[recent_count.* % 64] = t;
+            recent_count.* += 1;
+        }
+    } else {
+        // Single token — use regular forward
+        for (tokens) |t| {
+            _ = transformer.forward(state, t, pos.*);
+            pos.* += 1;
+            recent_ring[recent_count.* % 64] = t;
+            recent_count.* += 1;
         }
     }
+
     const prefill_ns = if (prefill_timer) |*t| t.read() else 0;
 
     // Save KV cache state after prefill for multi-candidate generation
