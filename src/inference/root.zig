@@ -69,6 +69,10 @@ pub const ForkServer = struct {
             posix.close(req_pipe[1]); // parent's write end
             posix.close(resp_pipe[0]); // parent's read end
 
+            // Auto-terminate when parent dies (prevents zombie/orphan VRAM leaks)
+            const PR_SET_PDEATHSIG = 1;
+            _ = std.os.linux.prctl(@intCast(PR_SET_PDEATHSIG), @as(usize, std.os.linux.SIG.TERM), 0, 0, 0);
+
             // Redirect stdout/stderr to /dev/null so inference noise
             // doesn't corrupt the terminal
             const devnull = posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0) catch posix.exit(1);
