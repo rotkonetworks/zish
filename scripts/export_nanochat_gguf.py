@@ -128,8 +128,9 @@ def main():
                 vocab_tokens.append(t)
             except:
                 vocab_tokens.append('')
-            # Score = token length (prefer longer matches in greedy tokenizer)
-            vocab_scores.append(float(len(vocab_tokens[-1])))
+            # Score = token rank (= token ID). Lower rank = earlier BPE merge.
+            # This is critical: tiktoken BPE merges pairs by lowest rank of their concatenation.
+            vocab_scores.append(float(i))
         print(f"Tokenizer: {real_vocab_size} tokens, BOS={bos_id}")
     except Exception as e:
         print(f"Warning: could not load tokenizer: {e}")
