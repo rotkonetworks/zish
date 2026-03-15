@@ -2356,10 +2356,15 @@ pub fn exitCompletionMode(self: *Shell) void {
 
     // clear the completion menu if displayed
     if (self.completion_displayed and self.completion_menu_lines > 0) {
-        // Use absolute positioning to clear menu area (no relative moves that desync)
+        // Save cursor, move past command area, clear everything below, restore
         self.stdout().writeAll("\x1b" ++ "7") catch {}; // DECSC
-        const menu_row = self.term_view.term.rows_owned + 1;
-        self.stdout().print("\x1b[{d};1H\x1b[J", .{menu_row}) catch {}; // go to menu row, clear below
+        const cmd_rows = self.term_view.term.rows_owned;
+        const cursor_row = self.term_view.term.row;
+        const rows_below = if (cmd_rows > cursor_row + 1) cmd_rows - cursor_row - 1 else 0;
+        if (rows_below > 0) {
+            self.stdout().print("\x1b[{d}B", .{rows_below}) catch {};
+        }
+        self.stdout().writeAll("\r\n\x1b[J") catch {}; // move to menu area + clear
         self.stdout().writeAll("\x1b" ++ "8") catch {}; // DECRC
         self.stdout().flush() catch {};
     }
