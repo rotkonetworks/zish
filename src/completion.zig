@@ -3060,133 +3060,78 @@ pub fn startGhostInference(self: *Shell, model_path: []const u8) void {
 }
 
 fn ghostInferThread(ctx: anytype) void {
+    const ghost_svc = @import("ghost_service.zig");
+
     const shell = ctx.shell;
     const model_path = ctx.path[0..ctx.path_len];
     const alloc = shell.allocator;
 
     // Spawn ForkServer for inference
-    const inference = @import("inference/root.zig");
-    var server = inference.ForkServer.spawn(model_path) catch {
+    const infer = @import("inference/root.zig");
+    var server = infer.ForkServer.spawn(model_path) catch {
         alloc.destroy(ctx);
         return;
     };
     defer server.shutdown();
     alloc.destroy(ctx);
 
+    // Initialize pipeline context
+    var ghost_ctx = ghost_svc.GhostCtx{
+        .current_seq = &shell.ghost_infer_seq,
+        .server = &server,
+        .model_path = model_path,
+        .last_cmd = &.{},
+        .last_cmd_len = 0,
+        .prompt_buf = undefined,
+        .result_buf = undefined,
+        .allocator = alloc,
+    };
+
     var last_seq: u32 = 0;
 
+    // Poll/debounce loop — scheduling only, pipeline handles transformation
     while (!shell.ghost_infer_stop.load(.monotonic)) {
-        // wait for new request
         const seq = shell.ghost_infer_seq.load(.acquire);
         if (seq == last_seq) {
-            std.Thread.sleep(20 * std.time.ns_per_ms); // 20ms poll
+            std.Thread.sleep(20 * std.time.ns_per_ms);
             continue;
         }
         last_seq = seq;
 
-        // debounce: wait 100ms for input to stabilize before expensive inference
+        // Debounce: wait for input to stabilize
         std.Thread.sleep(100 * std.time.ns_per_ms);
         if (shell.ghost_infer_seq.load(.monotonic) != seq) continue;
 
-        // read input
+        // Read input
         const ilen = shell.ghost_infer_input_len.load(.monotonic);
         if (ilen == 0 or ilen > 512) continue;
         var input_buf: [512]u8 = undefined;
         @memcpy(input_buf[0..ilen], shell.ghost_infer_input[0..ilen]);
 
-        // run inference with context-aware prompt
-        if (!server.isAlive()) {
-            server = inference.ForkServer.spawn(model_path) catch break;
-        }
-        // Build prompt with context: recent history + cwd + current input
-        // More characters typed = more context we can provide
-        var prompt_buf: [2048]u8 = undefined;
-        var ppos: usize = 0;
-
-        // Add last command from history for context (keep prompt short for speed)
+        // Update context with latest history command
         if (shell.history) |h| {
             if (h.entries.items.len > 0) {
                 const hcmd = h.getCommand(h.entries.items[h.entries.items.len - 1]);
-                if (hcmd.len > 0 and hcmd.len < 60 and ppos + hcmd.len + 4 < prompt_buf.len - 128) {
-                    @memcpy(prompt_buf[ppos..][0..2], "$ ");
-                    ppos += 2;
-                    const clen = @min(hcmd.len, 50);
-                    @memcpy(prompt_buf[ppos..][0..clen], hcmd[0..clen]);
-                    ppos += clen;
-                    prompt_buf[ppos] = '\n';
-                    ppos += 1;
-                }
+                ghost_ctx.last_cmd = hcmd;
+                ghost_ctx.last_cmd_len = hcmd.len;
             }
         }
 
-        // Add current input as the line to complete
-        if (ppos + ilen + 3 < prompt_buf.len) {
-            @memcpy(prompt_buf[ppos..][0..2], "$ ");
-            ppos += 2;
-            @memcpy(prompt_buf[ppos..][0..ilen], input_buf[0..ilen]);
-            ppos += ilen;
+        // Run the composable pipeline: staleness >> prompt >> infer >> sanitize
+        const signal = ghost_svc.pipeline(&ghost_ctx, .{
+            .input = .{ .text = input_buf[0..ilen], .seq = seq },
+        });
+
+        // Publish result to editor thread via atomics
+        switch (signal) {
+            .completion => |c| {
+                const n = c.len;
+                @memcpy(shell.ghost_infer_result[0..n], c.buf[0..n]);
+                shell.ghost_infer_result_len.store(n, .monotonic);
+                shell.ghost_infer_result_seq.store(c.seq, .release);
+            },
+            else => {}, // stale, idle — nothing to publish
         }
-        const prompt = prompt_buf[0..ppos];
-
-        // Debug log
-        const dbg2 = std.fs.openFileAbsolute("/tmp/zish_inference.log", .{ .mode = .write_only }) catch null;
-        if (dbg2) |f| {
-            f.seekFromEnd(0) catch {};
-            f.writeAll("generate: ") catch {};
-            f.writeAll(prompt) catch {};
-            f.writeAll("\n") catch {};
-            f.close();
-        }
-
-        const result = server.generate(prompt, 8, 0.0, alloc) catch |err| {
-            const dbg3 = std.fs.openFileAbsolute("/tmp/zish_inference.log", .{ .mode = .write_only }) catch null;
-            if (dbg3) |f| {
-                f.seekFromEnd(0) catch {};
-                f.writeAll("generate FAILED: ") catch {};
-                f.writeAll(@errorName(err)) catch {};
-                f.writeAll("\n") catch {};
-                f.close();
-            }
-            continue;
-        };
-        defer alloc.free(result);
-
-        // Debug: log result
-        {
-            const dbg4 = std.fs.openFileAbsolute("/tmp/zish_inference.log", .{ .mode = .write_only }) catch null;
-            if (dbg4) |f| {
-                f.seekFromEnd(0) catch {};
-                var lenbuf: [32]u8 = undefined;
-                const lenstr = std.fmt.bufPrint(&lenbuf, "result len={d}: ", .{result.len}) catch "?";
-                f.writeAll(lenstr) catch {};
-                if (result.len > 0) f.writeAll(result[0..@min(result.len, 100)]) catch {};
-                f.writeAll("\n") catch {};
-                f.close();
-            }
-        }
-
-        // check if still current
-        if (shell.ghost_infer_seq.load(.monotonic) != seq) continue;
-
-        // Sanitize: only printable ASCII
-        var clean_len: u32 = 0;
-        var consecutive_junk: u8 = 0;
-        for (result) |rc| {
-            if (rc == '\n' or rc == '\r') break;
-            if (rc >= 0x20 and rc <= 0x7E) {
-                if (clean_len < 512) {
-                    shell.ghost_infer_result[clean_len] = rc;
-                    clean_len += 1;
-                }
-                consecutive_junk = 0;
-            } else {
-                consecutive_junk += 1;
-                if (consecutive_junk > 2) break;
-            }
-        }
-        const rlen = clean_len;
-        shell.ghost_infer_result_len.store(rlen, .monotonic);
-        shell.ghost_infer_result_seq.store(seq, .release);
     }
 }
 
