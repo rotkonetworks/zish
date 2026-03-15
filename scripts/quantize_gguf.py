@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# WARNING: The Q4_K nibble packing layout in this script is broken.
+# The low/high nibble assignment in the weight bytes does not match the
+# llama.cpp / GGML reference implementation. Models quantized with this
+# script will produce garbage when loaded by conforming GGUF readers.
+# Do not use for production models until the nibble layout is fixed.
 """Quantize a byte-level shell completion model to Q4_K GGUF.
 
 Q4_K format (per block of 256 elements):

@@ -850,7 +850,7 @@ pub const Transformer = struct {
 
     /// Batch prefill: process all prompt tokens through the transformer in one pass.
     /// Fills the KV cache for positions 0..n_tokens-1. Returns logits for the last token.
-    /// Uses CPU-only math (no GPU dispatch overhead — faster for small models with many tokens).
+    /// Processes all tokens sequentially through matmulTensor (same backend as forward()).
     pub fn prefillBatch(self: *const Transformer, state: *State, tokens: []const i64, alloc: std.mem.Allocator) ![]f32 {
         @setFloatMode(.optimized);
 

@@ -64,7 +64,6 @@ pub const GhostCtx = struct {
     model_path: []const u8,
     /// Last history command (for context building)
     last_cmd: []const u8,
-    last_cmd_len: usize,
     /// Working buffers (reused across invocations)
     prompt_buf: [2048]u8,
     result_buf: [512]u8,
@@ -115,8 +114,8 @@ pub fn promptBuilder(ctx: *GhostCtx, signal: GhostSignal) GhostSignal {
             var ppos: usize = 0;
 
             // Add last history command for context
-            if (ctx.last_cmd_len > 0 and ctx.last_cmd_len < 60) {
-                const clen = @min(ctx.last_cmd_len, 50);
+            if (ctx.last_cmd.len > 0 and ctx.last_cmd.len < 60) {
+                const clen = @min(ctx.last_cmd.len, 50);
                 ctx.prompt_buf[ppos] = '$';
                 ctx.prompt_buf[ppos + 1] = ' ';
                 ppos += 2;

@@ -3081,7 +3081,6 @@ fn ghostInferThread(ctx: anytype) void {
         .server = &server,
         .model_path = model_path,
         .last_cmd = &.{},
-        .last_cmd_len = 0,
         .prompt_buf = undefined,
         .result_buf = undefined,
         .allocator = alloc,
@@ -3113,7 +3112,6 @@ fn ghostInferThread(ctx: anytype) void {
             if (h.entries.items.len > 0) {
                 const hcmd = h.getCommand(h.entries.items[h.entries.items.len - 1]);
                 ghost_ctx.last_cmd = hcmd;
-                ghost_ctx.last_cmd_len = hcmd.len;
             }
         }
 

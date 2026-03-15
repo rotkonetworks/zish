@@ -437,22 +437,23 @@ fn handleRequestWithDopamine(
 
     if (tokens.len > 1) {
         // Batch prefill: all tokens at once through transformer
+        var batch_ok = true;
         _ = transformer.prefillBatch(state, tokens, alloc) catch {
             // Fallback to sequential prefill
+            batch_ok = false;
             for (tokens) |t| {
                 _ = transformer.forward(state, t, pos.*);
                 pos.* += 1;
                 recent_ring[recent_count.* % 64] = t;
                 recent_count.* += 1;
             }
-            const prefill_ns = if (prefill_timer) |*t| t.read() else 0;
-            _ = prefill_ns;
-            // Skip to generation (can't easily break out, so just continue below)
         };
-        pos.* = tokens.len;
-        for (tokens) |t| {
-            recent_ring[recent_count.* % 64] = t;
-            recent_count.* += 1;
+        if (batch_ok) {
+            pos.* = tokens.len;
+            for (tokens) |t| {
+                recent_ring[recent_count.* % 64] = t;
+                recent_count.* += 1;
+            }
         }
     } else {
         // Single token — use regular forward
@@ -470,28 +471,31 @@ fn handleRequestWithDopamine(
     const saved_pos = pos.*;
     const saved_recent_count = recent_count.*;
     const dim = transformer.config.dim;
-    var saved_input: [2048]f32 = undefined;
-    @memcpy(saved_input[0..dim], state.input[0..dim]);
+    const saved_input = try alloc.alloc(f32, dim);
+    defer alloc.free(saved_input);
+    @memcpy(saved_input, state.input[0..dim]);
     // Save logits (output from last prefill token — needed for first sample)
-    var saved_output: [65536]f32 = undefined;
     const vocab_size = transformer.config.vocab_size;
-    @memcpy(saved_output[0..vocab_size], state.output[0..vocab_size]);
+    const saved_output = try alloc.alloc(f32, vocab_size);
+    defer alloc.free(saved_output);
+    @memcpy(saved_output, state.output[0..vocab_size]);
 
     // Generate N candidates with different temperatures, keep highest log-prob
-    const N_CAND: usize = 4;
-    const temps = [N_CAND]f32{ 0.0, 0.3, 0.5, 0.8 };
-
-    var best_tokens: std.ArrayList(tokenizer.Token) = .{};
-    defer best_tokens.deinit(alloc);
-    var best_score: f32 = -std.math.inf(f32);
-
-    // Save KV cache region that generation will overwrite (positions saved_pos..saved_pos+max_tokens)
     const kv_dim = (dim * transformer.config.n_kv_heads) / transformer.config.n_heads;
     const kv_save_len = @as(usize, max_tokens) * kv_dim * transformer.config.n_layers;
     const kv_save_k = alloc.alloc(f32, kv_save_len) catch null;
     const kv_save_v = alloc.alloc(f32, kv_save_len) catch null;
     defer if (kv_save_k) |s| alloc.free(s);
     defer if (kv_save_v) |s| alloc.free(s);
+
+    // Fall back to single candidate if KV cache save failed (can't restore between candidates)
+    const N_CAND: usize = if (kv_save_k != null and kv_save_v != null) 4 else 1;
+    const all_temps = [4]f32{ 0.0, 0.3, 0.5, 0.8 };
+    const temps = all_temps[0..N_CAND];
+
+    var best_tokens: std.ArrayList(tokenizer.Token) = .{};
+    defer best_tokens.deinit(alloc);
+    var best_score: f32 = -std.math.inf(f32);
 
     // Snapshot the KV cache entries that generation will overwrite
     if (kv_save_k != null and kv_save_v != null) {
@@ -512,8 +516,8 @@ fn handleRequestWithDopamine(
         // Restore state to post-prefill
         pos.* = saved_pos;
         recent_count.* = saved_recent_count;
-        @memcpy(state.input[0..dim], saved_input[0..dim]);
-        @memcpy(state.output[0..vocab_size], saved_output[0..vocab_size]);
+        @memcpy(state.input[0..dim], saved_input);
+        @memcpy(state.output[0..vocab_size], saved_output);
 
         // Restore KV cache for generation region
         if (kv_save_k != null and kv_save_v != null) {
@@ -540,7 +544,7 @@ fn handleRequestWithDopamine(
         var next_tok: tokenizer.Token = sampleToken(state.output, params, recent_ring[0..@min(recent_count.*, 64)]);
 
         var cand: std.ArrayList(tokenizer.Token) = .{};
-        var score: f32 = 0;
+        var total_logprob: f32 = 0;
 
         for (0..max_tokens) |_| {
             if (next_tok == tok_.eos_id) break;
@@ -552,12 +556,21 @@ fn handleRequestWithDopamine(
             _ = transformer.forward(state, next_tok, pos.*);
             pos.* += 1;
 
-            // Accumulate log-probability
+            // Compute log-probability of this token
             var max_logit: f32 = -std.math.inf(f32);
             for (state.output[0..vocab_size]) |l| if (l > max_logit) { max_logit = l; };
             var sum_exp: f32 = 0;
             for (state.output[0..vocab_size]) |l| sum_exp += std.math.exp(l - max_logit);
-            score += state.output[@intCast(next_tok)] - max_logit - @log(sum_exp);
+            const tok_logprob = state.output[@intCast(next_tok)] - max_logit - @log(sum_exp);
+            total_logprob += tok_logprob;
+
+            // Early termination: stop when model becomes uncertain.
+            // In shell, confident short completions beat uncertain long ones.
+            // Stop at word boundaries (space, quote, slash) when confidence drops.
+            const byte: u8 = @intCast(next_tok & 0xFF);
+            const at_boundary = (byte == ' ' or byte == '"' or byte == '\'' or byte == '/' or byte == '|' or byte == ';');
+            if (tok_logprob < -2.0 and at_boundary) break; // uncertain at word boundary
+            if (tok_logprob < -4.0) break; // very uncertain anywhere
 
             if (state.ctm_state) |cs| {
                 const surprise = computeSurprise(state.output, next_tok);
@@ -569,8 +582,13 @@ fn handleRequestWithDopamine(
             next_tok = sampleToken(state.output, params, recent_ring[0..lb]);
         }
 
-        if (cand.items.len > 0 and score > best_score) {
-            best_score = score;
+        // Score by average log-prob per token (normalizes for length)
+        // This prefers shorter confident completions over longer uncertain ones
+        const n_cand_tok: f32 = @floatFromInt(@max(cand.items.len, 1));
+        const avg_score = total_logprob / n_cand_tok;
+
+        if (cand.items.len > 0 and avg_score > best_score) {
+            best_score = avg_score;
             best_tokens.clearRetainingCapacity();
             best_tokens.appendSlice(alloc, cand.items) catch {};
         }
