@@ -736,6 +736,7 @@ const commands = [_]Command{
     .{ .name = "/clear", .has_arg = false, .handler = cmdClear },
     .{ .name = "/status", .has_arg = false, .handler = cmdStatus },
     .{ .name = "/think", .has_arg = true, .handler = cmdThink },
+    .{ .name = "/paste", .has_arg = false, .handler = cmdPaste },
     .{ .name = "/help", .has_arg = false, .handler = cmdHelp },
     .{ .name = "help", .has_arg = false, .handler = cmdHelp },
 };
@@ -775,6 +776,53 @@ pub fn dispatch(ctx: *CommandCtx, raw_query: []const u8) DispatchResult {
 }
 
 // ── Handler implementations ──
+
+fn cmdPaste(ctx: *CommandCtx, _: []const u8) DispatchResult {
+    // Grab clipboard image via xclip and save to /tmp
+    const alloc = ctx.shell.allocator;
+    var ts_buf: [32]u8 = undefined;
+    const ts: u64 = @bitCast(std.time.timestamp());
+    const filename = std.fmt.bufPrint(&ts_buf, "/tmp/zish_paste_{d}.png", .{ts}) catch "/tmp/zish_paste.png";
+
+    // Run xclip to extract image from clipboard
+    const result = std.process.Child.run(.{
+        .allocator = alloc,
+        .argv = &.{ "xclip", "-selection", "clipboard", "-t", "image/png", "-o" },
+    }) catch {
+        Layout.goOutput(ctx.out, ctx.out_last.*);
+        ctx.out.writeAll("\x1b[31mError: xclip not found. Install: pacman -S xclip\x1b[0m\n") catch {};
+        return .handled;
+    };
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+
+    if (result.stdout.len < 8) {
+        Layout.goOutput(ctx.out, ctx.out_last.*);
+        ctx.out.writeAll("\x1b[33mNo image in clipboard\x1b[0m\n") catch {};
+        return .handled;
+    }
+
+    // Write to file
+    const file = std.fs.cwd().createFile(filename, .{}) catch {
+        Layout.goOutput(ctx.out, ctx.out_last.*);
+        ctx.out.writeAll("\x1b[31mFailed to write file\x1b[0m\n") catch {};
+        return .handled;
+    };
+    file.writeAll(result.stdout) catch {};
+    file.close();
+
+    // Insert @file mention into the edit buffer so next query includes the image
+    var mention_buf: [64]u8 = undefined;
+    const mention = std.fmt.bufPrint(&mention_buf, "@{s} ", .{filename}) catch "";
+    _ = ctx.edit_buf.insertSlice(mention);
+
+    Layout.goOutput(ctx.out, ctx.out_last.*);
+    var msg_buf: [128]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, "\x1b[32mPasted image: {s} ({d} bytes)\x1b[0m\n", .{ filename, result.stdout.len }) catch "";
+    ctx.out.writeAll(msg) catch {};
+
+    return .handled;
+}
 
 fn cmdExit(ctx: *CommandCtx, _: []const u8) DispatchResult {
     if (ctx.agent_active.*) ctx.shell.agent.cancel();
