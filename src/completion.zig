@@ -2456,14 +2456,18 @@ pub fn displayCompletions(self: *Shell) !void {
     const term_height = self.terminal_height;
     const max_menu_height = if (term_height > 3) term_height - 3 else 1;
 
-    // Save cursor, then position at the row below command area
-    // Use absolute positioning to avoid \n scroll desync
+    // Save cursor, move to end of command area, clear below, write menu
     try self.stdout().writeAll("\x1b" ++ "7"); // DECSC
-    const cmd_rows = self.term_view.term.rows_owned;
-    const menu_start_row = cmd_rows + 1; // row right below command
 
-    // Clear everything below command area first
-    try self.stdout().print("\x1b[{d};1H\x1b[J", .{menu_start_row});
+    // Move cursor to the end of the command area (past all owned rows)
+    const cmd_rows = self.term_view.term.rows_owned;
+    const cursor_row = self.term_view.term.row;
+    const rows_below = if (cmd_rows > cursor_row + 1) cmd_rows - cursor_row - 1 else 0;
+    if (rows_below > 0) {
+        try self.stdout().print("\x1b[{d}B", .{rows_below});
+    }
+    // Move to column 1, then one line down into the menu area
+    try self.stdout().writeAll("\r\n\x1b[J"); // CR + LF + clear below
 
     if (term_width < 80) {
         const items_to_show = @min(self.completion_matches.items.len, max_menu_height);
@@ -2481,20 +2485,18 @@ pub fn displayCompletions(self: *Shell) !void {
         const end_idx = @min(start_idx + items_to_show, self.completion_matches.items.len);
 
         for (self.completion_matches.items[start_idx..end_idx], start_idx..) |match, mi| {
-            const row = menu_start_row + (mi - start_idx);
-            try self.stdout().print("\x1b[{d};1H", .{row});
             if (mi == self.completion_index and self.completion_index < self.completion_matches.items.len) {
-                try self.stdout().print("{f}{s}{f}", .{ tty.Style.reverse, match, tty.Style.reset });
+                try self.stdout().print("{f}{s}{f}\r\n", .{ tty.Style.reverse, match, tty.Style.reset });
             } else {
-                try self.stdout().print("{s}", .{match});
+                try self.stdout().print("{s}\r\n", .{match});
             }
         }
 
         if (end_idx < self.completion_matches.items.len) {
-            try self.stdout().print("\x1b[{d};1H... ({} more)", .{ menu_start_row + items_to_show, self.completion_matches.items.len - end_idx });
+            try self.stdout().print("... ({} more)\r\n", .{self.completion_matches.items.len - end_idx});
             self.completion_menu_lines = items_to_show + 1;
         } else if (start_idx > 0) {
-            try self.stdout().print("\x1b[{d};1H... ({} hidden above)", .{ menu_start_row + items_to_show, start_idx });
+            try self.stdout().print("... ({} hidden above)\r\n", .{start_idx});
             self.completion_menu_lines = items_to_show + 1;
         } else {
             self.completion_menu_lines = items_to_show;
@@ -2536,10 +2538,8 @@ pub fn displayCompletions(self: *Shell) !void {
     } else 0;
     const end_item = @min(start_item + items_to_show, self.completion_matches.items.len);
 
-    // Draw items using absolute row positioning (no \n scrolling)
-    var current_row: usize = menu_start_row;
+    // Draw items in columns, using \r\n for line breaks
     var col_pos: usize = 0;
-    try self.stdout().print("\x1b[{d};1H", .{current_row});
 
     for (self.completion_matches.items[start_item..end_item], start_item..) |match, i| {
         const display_name = if (match.len > max_item_width) match[0 .. max_item_width - 1] else match;
@@ -2560,18 +2560,17 @@ pub fn displayCompletions(self: *Shell) !void {
         while (j < padding) : (j += 1) try self.stdout().writeByte(' ');
 
         col_pos += 1;
-        if (col_pos >= cols or i - start_item == items_to_show - 1) {
-            current_row += 1;
+        if (col_pos >= cols) {
+            try self.stdout().writeAll("\r\n");
             col_pos = 0;
-            if (i - start_item < items_to_show - 1) {
-                try self.stdout().print("\x1b[{d};1H", .{current_row});
-            }
         }
     }
+    // End last row if not already ended
+    if (col_pos > 0) try self.stdout().writeAll("\r\n");
 
     const hidden = self.completion_matches.items.len - (end_item - start_item);
     if (hidden > 0) {
-        try self.stdout().print("\x1b[{d};1H... ({} more matches)", .{ current_row, hidden });
+        try self.stdout().print("... ({} more matches)\r\n", .{hidden});
         self.completion_menu_lines += 1;
     }
 
