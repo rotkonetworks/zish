@@ -2585,8 +2585,12 @@ pub fn displayCompletions(self: *Shell) !void {
     self.completion_displayed = true;
 }
 
-// Log accepted completion pairs to ~/.zish/completion_log.jsonl for CTM training data.
-// Format: {"ctx":"command text before cursor","pfx":"typed prefix","cmp":"full completion","ts":unix_timestamp}
+// Log accepted/rejected completions to ~/.zish/completion_log.jsonl for training.
+// Accepted: user pressed Tab/Right to accept ghost text → positive signal
+// Rejected: user typed a different character while ghost text was visible → negative signal
+// Format: {"ctx":"text","pfx":"prefix","cmp":"completion","src":"ghost_ctm","act":"accept|reject","ts":N}
+// This data enables Libratus-style counterfactual regret training:
+// the model learns from its mistakes by seeing what the user actually typed.
 const CompletionSource = enum { tab, ghost_history, ghost_ctm, history_menu };
 
 fn logCompletionWith(cmd: []const u8, word_start: usize, prefix: []const u8, completion: []const u8, source: CompletionSource) void {
@@ -2817,6 +2821,12 @@ fn ghostFileSuggestion(self: *Shell, partial: []const u8) bool {
 }
 
 pub fn updateGhostText(self: *Shell) void {
+    // Log rejection if ghost text was visible and user typed something else
+    if (self.ghost_len > 0 and self.ghost_from_ctm) {
+        if (self.edit_buf.len > 0) {
+            rejectGhostText(self);
+        }
+    }
     self.ghost_len = 0;
 
     if (!self.opt_autosuggestion) return;
@@ -3152,6 +3162,43 @@ pub fn stopGhostInference(self: *Shell) void {
         t.join();
         self.ghost_infer_thread = null;
     }
+}
+
+/// Log a ghost text rejection — user typed a character instead of accepting.
+/// This is the counterfactual signal: model predicted X, user did Y.
+pub fn rejectGhostText(self: *Shell) void {
+    if (self.ghost_len == 0) return;
+    if (!self.ghost_from_ctm) return; // only log model predictions, not history matches
+
+    const cmd = self.edit_buf.slice();
+    const ghost = self.ghost_buf[0..self.ghost_len];
+
+    // Log: context = current input, predicted = ghost, actual = what user typed next
+    logRejection(cmd, ghost);
+    self.ghost_len = 0;
+}
+
+fn logRejection(cmd: []const u8, predicted: []const u8) void {
+    var path_buf: [512]u8 = undefined;
+    const home = std.process.getEnvVarOwned(std.heap.page_allocator, "HOME") catch return;
+    defer std.heap.page_allocator.free(home);
+    const path = std.fmt.bufPrint(&path_buf, "{s}/.zish/ghost_rejections.jsonl", .{home}) catch return;
+
+    const file = std.fs.cwd().openFile(path, .{ .mode = .write_only }) catch |e| switch (e) {
+        error.FileNotFound => std.fs.cwd().createFile(path, .{}) catch return,
+        else => return,
+    };
+    defer file.close();
+    file.seekFromEnd(0) catch return;
+
+    const ts: u64 = @bitCast(std.time.timestamp());
+    var buf: [2048]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "{{\"ctx\":\"{s}\",\"predicted\":\"{s}\",\"ts\":{d}}}\n", .{
+        cmd[0..@min(cmd.len, 200)],
+        predicted[0..@min(predicted.len, 100)],
+        ts,
+    }) catch return;
+    file.writeAll(line) catch {};
 }
 
 /// Accept ghost text — append it to the edit buffer.
