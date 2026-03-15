@@ -253,6 +253,7 @@ fn childMain(req_fd: posix.fd_t, resp_fd: posix.fd_t, model_path: []const u8) vo
         return;
     };
     logMsg(dbg, "Tokenizer OK\n");
+    logMsg(dbg, "CTM init...\n");
 
     var ctm_layer_idx: usize = 0;
 
@@ -295,9 +296,10 @@ fn childMain(req_fd: posix.fd_t, resp_fd: posix.fd_t, model_path: []const u8) vo
     );
     controller.restore(); // load persisted state from previous sessions
 
+    logMsg(dbg, "Controller OK\n");
+
     // ── Initialize GPU compute (graceful fallback to CPU) ──
-    // GPU is a composable service: weights in VRAM, matvec dispatched transparently.
-    // Child process isolates GPU resources — OS cleans up on exit.
+    logMsg(dbg, "GPU init...\n");
     {
         const td_base = file.tensorData();
         const td_size = file.file_size - file.tensor_data_offset;
@@ -308,17 +310,14 @@ fn childMain(req_fd: posix.fd_t, resp_fd: posix.fd_t, model_path: []const u8) vo
                 if (p.vram_bytes >= td_size) {
                     if (p.uploadWeights(td_base[0..td_size])) {
                         transformer.setGpu(p, td_base);
-                        const name_len = std.mem.indexOfScalar(u8, &p.device_name, 0) orelse p.device_name.len;
-                        std.debug.print("[gpu] {s}: {}MB VRAM, {}MB weights uploaded\n", .{
-                            p.device_name[0..name_len],
-                            p.vram_bytes / (1024 * 1024),
-                            td_size / (1024 * 1024),
-                        });
+                        logMsg(dbg, "GPU OK\n");
                     } else {
+                        logMsg(dbg, "GPU upload failed\n");
                         p.deinit();
                         alloc.destroy(p);
                     }
                 } else {
+                    logMsg(dbg, "GPU VRAM too small\n");
                     p.deinit();
                     alloc.destroy(p);
                 }
@@ -326,6 +325,8 @@ fn childMain(req_fd: posix.fd_t, resp_fd: posix.fd_t, model_path: []const u8) vo
                 var g2 = g;
                 g2.deinit();
             }
+        } else {
+            logMsg(dbg, "GPU init failed (no Vulkan?)\n");
         }
     }
 
