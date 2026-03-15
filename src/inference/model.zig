@@ -32,6 +32,8 @@ pub const Config = struct {
     logit_softcap: f32 = 0,
     /// Number of input channels for VE gate linear projection (default 32).
     ve_gate_channels: usize = 32,
+    /// RoPE layout: false = interleaved pairs (0,1),(2,3) (Llama), true = sequential halves (0,d/2),(1,d/2+1) (GPT-NeoX)
+    rope_sequential: bool = false,
 
     pub fn fromGGUF(file: *const gguf.GGUFFile) Config {
         const arch = file.getString("general.architecture") orelse "llama";
@@ -51,6 +53,8 @@ pub const Config = struct {
             .qk_scale = file.getF32(archKey(arch, "attention.qk_scale")) orelse 1.0,
             .logit_softcap = file.getF32(archKey(arch, "logit_softcap")) orelse 0,
             .ve_gate_channels = file.getU32(archKey(arch, "ve_gate_channels")) orelse 32,
+            // nanochat uses GPT-NeoX style sequential RoPE (first half / second half)
+            .rope_sequential = std.mem.eql(u8, arch, "nanochat"),
         };
     }
 };
@@ -558,8 +562,8 @@ pub const Transformer = struct {
             }
 
             // RoPE
-            applyRoPE(state.q, state.sin, state.cos, c.n_heads, head_size, n_tok);
-            applyRoPE(state.k, state.sin, state.cos, c.n_kv_heads, head_size, n_tok);
+            applyRoPE(state.q, state.sin, state.cos, c.n_heads, head_size, n_tok, c.rope_sequential);
+            applyRoPE(state.k, state.sin, state.cos, c.n_kv_heads, head_size, n_tok, c.rope_sequential);
 
             // Post-QK-norm scaling: sharpens attention patterns
             if (c.qk_scale != 1.0) {
@@ -897,19 +901,40 @@ fn applyRoPE(
     n_heads: usize,
     head_size: usize,
     n: usize,
+    sequential: bool,
 ) void {
     const base = n * head_size / 2;
+    const half = head_size / 2;
     for (0..n_heads) |hi| {
-        var hd: usize = 0;
-        while (hd < head_size) : (hd += 2) {
-            const ii = base + (hd / 2);
-            const vi = hi * head_size + hd;
-            const v0 = vector[vi];
-            const v1 = vector[vi + 1];
-            const m_cos = cos[ii];
-            const m_sin = sin[ii];
-            vector[vi] = v0 * m_cos - v1 * m_sin;
-            vector[vi + 1] = v0 * m_sin + v1 * m_cos;
+        const head_off = hi * head_size;
+        if (sequential) {
+            // PyTorch cat([x[::2]*cos - x[1::2]*sin, x[::2]*sin + x[1::2]*cos])
+            // Read from interleaved even/odd, write to sequential first/second half.
+            // Must use temp buffer because output positions overlap input positions.
+            var tmp: [256]f32 = undefined; // max head_size we'll see
+            @memcpy(tmp[0..head_size], vector[head_off..][0..head_size]);
+            for (0..half) |i| {
+                const ii = base + i;
+                const v0 = tmp[2 * i]; // even element
+                const v1 = tmp[2 * i + 1]; // odd element
+                const m_cos = cos[ii];
+                const m_sin = sin[ii];
+                vector[head_off + i] = v0 * m_cos - v1 * m_sin;
+                vector[head_off + half + i] = v0 * m_sin + v1 * m_cos;
+            }
+        } else {
+            // Llama style: interleaved pairs (0,1), (2,3), output stays interleaved
+            var hd: usize = 0;
+            while (hd < head_size) : (hd += 2) {
+                const ii = base + (hd / 2);
+                const vi = head_off + hd;
+                const v0 = vector[vi];
+                const v1 = vector[vi + 1];
+                const m_cos = cos[ii];
+                const m_sin = sin[ii];
+                vector[vi] = v0 * m_cos - v1 * m_sin;
+                vector[vi + 1] = v0 * m_sin + v1 * m_cos;
+            }
         }
     }
 }

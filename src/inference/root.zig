@@ -567,8 +567,9 @@ fn handleRequest(
     recent_count: *usize,
     alloc: std.mem.Allocator,
 ) ![]u8 {
-    // Tokenize prompt with BOS for fresh context
-    const tokens = try tok_.encode(prompt, true, alloc);
+    // Tokenize prompt — skip BOS for byte-level models (vocab_size <= 256)
+    const add_bos = tok_.vocab_size > 256;
+    const tokens = try tok_.encode(prompt, add_bos, alloc);
     defer alloc.free(tokens);
 
     // Reset position for each completion request (independent contexts)
@@ -629,8 +630,9 @@ fn generateTokens(
     temperature: f32,
     alloc: Allocator,
 ) ![]u8 {
-    // Tokenize
-    const tokens = try tok.encode(prompt, true, alloc);
+    // Tokenize — skip BOS for byte-level models
+    const add_bos = tok.vocab_size > 256;
+    const tokens = try tok.encode(prompt, add_bos, alloc);
     defer alloc.free(tokens);
 
     // Prefill
