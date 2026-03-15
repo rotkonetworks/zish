@@ -679,6 +679,16 @@ pub fn run(self: *Shell) !void {
     {
         var cfg = agent_log.AgentConfig.load(self.allocator);
         defer cfg.deinit();
+        // Debug: log model loading
+        {
+            const f = std.fs.createFileAbsolute("/tmp/zish_inference.log", .{ .truncate = true }) catch null;
+            if (f) |file| {
+                file.writeAll("completion_model=") catch {};
+                file.writeAll(if (cfg.completion_model.len > 0) cfg.completion_model else "(empty)") catch {};
+                file.writeAll("\n") catch {};
+                file.close();
+            }
+        }
         if (cfg.completion_model.len > 0) {
             // expand ~ to home directory
             var path_buf: [512]u8 = undefined;

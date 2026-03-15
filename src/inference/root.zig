@@ -567,11 +567,15 @@ fn handleRequest(
     recent_count: *usize,
     alloc: std.mem.Allocator,
 ) ![]u8 {
-    // Tokenize prompt
-    const tokens = try tok_.encode(prompt, false, alloc); // no BOS — continuing context
+    // Tokenize prompt with BOS for fresh context
+    const tokens = try tok_.encode(prompt, true, alloc);
     defer alloc.free(tokens);
 
-    // Prefill prompt tokens into the warm context
+    // Reset position for each completion request (independent contexts)
+    pos.* = 0;
+    recent_count.* = 0;
+
+    // Prefill prompt tokens
     for (tokens) |t| {
         _ = transformer.forward(state, t, pos.*);
         pos.* += 1;

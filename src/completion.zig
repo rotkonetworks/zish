@@ -3099,15 +3099,48 @@ fn ghostInferThread(ctx: anytype) void {
         // Frame as shell completion: "$ git st" -> model completes "atus"
         var prompt_buf: [640]u8 = undefined;
         const prompt = std.fmt.bufPrint(&prompt_buf, "$ {s}", .{input_buf[0..ilen]}) catch continue;
-        const result = server.generate(prompt, 12, 0.0, alloc) catch continue;
+
+        // Debug log
+        const dbg2 = std.fs.openFileAbsolute("/tmp/zish_inference.log", .{ .mode = .write_only }) catch null;
+        if (dbg2) |f| {
+            f.seekFromEnd(0) catch {};
+            f.writeAll("generate: ") catch {};
+            f.writeAll(prompt) catch {};
+            f.writeAll("\n") catch {};
+            f.close();
+        }
+
+        const result = server.generate(prompt, 12, 0.0, alloc) catch |err| {
+            const dbg3 = std.fs.openFileAbsolute("/tmp/zish_inference.log", .{ .mode = .write_only }) catch null;
+            if (dbg3) |f| {
+                f.seekFromEnd(0) catch {};
+                f.writeAll("generate FAILED: ") catch {};
+                f.writeAll(@errorName(err)) catch {};
+                f.writeAll("\n") catch {};
+                f.close();
+            }
+            continue;
+        };
         defer alloc.free(result);
+
+        // Debug: log result
+        {
+            const dbg4 = std.fs.openFileAbsolute("/tmp/zish_inference.log", .{ .mode = .write_only }) catch null;
+            if (dbg4) |f| {
+                f.seekFromEnd(0) catch {};
+                var lenbuf: [32]u8 = undefined;
+                const lenstr = std.fmt.bufPrint(&lenbuf, "result len={d}: ", .{result.len}) catch "?";
+                f.writeAll(lenstr) catch {};
+                if (result.len > 0) f.writeAll(result[0..@min(result.len, 100)]) catch {};
+                f.writeAll("\n") catch {};
+                f.close();
+            }
+        }
 
         // check if still current
         if (shell.ghost_infer_seq.load(.monotonic) != seq) continue;
 
-        // Sanitize: only keep printable ASCII, stop at newline or control chars
-        // Strict filter: only printable ASCII (0x20-0x7E) + common shell chars
-        // Reject any non-ASCII (UTF-8 multibyte) to avoid garbage from undertrained models
+        // Sanitize: only printable ASCII
         var clean_len: u32 = 0;
         var consecutive_junk: u8 = 0;
         for (result) |rc| {
@@ -3120,7 +3153,7 @@ fn ghostInferThread(ctx: anytype) void {
                 consecutive_junk = 0;
             } else {
                 consecutive_junk += 1;
-                if (consecutive_junk > 2) break; // 3+ non-ASCII = garbage, stop
+                if (consecutive_junk > 2) break;
             }
         }
         const rlen = clean_len;

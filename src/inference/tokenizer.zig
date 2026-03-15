@@ -186,93 +186,68 @@ pub const Tokenizer = struct {
         return tokens.toOwnedSlice(alloc) catch return error.OutOfMemory;
     }
 
-    /// BPE encoding: start with characters, iteratively merge.
+    /// tiktoken-compatible BPE encoding.
+    /// Uses scores as ranks: repeatedly merge the adjacent pair whose
+    /// concatenation has the lowest rank (score) in the vocabulary.
     fn encodeBPE(self: *const Tokenizer, text: []const u8, tokens: *std.ArrayList(Token), alloc: Allocator) !void {
-        // Start with byte-level tokens (each byte gets its own token)
-        // For GPT-style BPE, look up each byte
-        var parts: std.ArrayList([]const u8) = .{};
-        defer parts.deinit(alloc);
+        if (text.len == 0) return;
 
-        // Split into initial tokens (bytes or unicode chars)
-        var pos: usize = 0;
-        while (pos < text.len) {
-            // Try to find the longest matching token from current position
-            var best_len: usize = 1;
-            var best_tok: ?Token = null;
-
-            // Try decreasing lengths
-            const max_look = @min(text.len - pos, 32);
-            var try_len = max_look;
-            while (try_len >= 1) : (try_len -= 1) {
-                const candidate = text[pos..][0..try_len];
-                if (self.token_map.get(candidate)) |tok| {
-                    best_len = try_len;
-                    best_tok = tok;
-                    break;
-                }
-            }
-
-            if (best_tok) |tok| {
-                tokens.append(alloc, tok) catch return error.OutOfMemory;
-                pos += best_len;
-            } else {
-                // Fallback: look for byte token like <0xAB>
-                var byte_buf: [8]u8 = undefined;
-                const byte_str = std.fmt.bufPrint(&byte_buf, "<0x{X:0>2}>", .{text[pos]}) catch unreachable;
-                if (self.token_map.get(byte_str)) |tok| {
-                    tokens.append(alloc, tok) catch return error.OutOfMemory;
-                } else {
-                    // Skip unknown byte
-                }
-                pos += 1;
-            }
+        // Start with individual bytes — each byte maps to token 0-255
+        // (tiktoken's first 256 ranks are individual bytes)
+        const Piece = struct { start: u16, len: u16 };
+        var pieces = try alloc.alloc(Piece, text.len);
+        defer alloc.free(pieces);
+        var n_pieces: usize = text.len;
+        for (0..text.len) |i| {
+            pieces[i] = .{ .start = @intCast(i), .len = 1 };
         }
 
-        // Now apply BPE merges iteratively
-        if (self.merges) |merge_list| {
-            var changed = true;
-            while (changed) {
-                changed = false;
-                if (tokens.items.len < 2) break;
+        // Iteratively merge the pair with lowest rank
+        while (n_pieces >= 2) {
+            // Find best pair to merge (lowest rank of concatenation)
+            var best_rank: f32 = std.math.inf(f32);
+            var best_idx: usize = 0;
+            var found = false;
 
-                // Find the highest-priority merge (lowest merge index)
-                var best_merge_idx: usize = merge_list.len;
-                var best_pos: usize = 0;
+            for (0..n_pieces - 1) |i| {
+                // Build concatenated bytes for pieces[i] + pieces[i+1]
+                const a_start = pieces[i].start;
+                const a_len = pieces[i].len;
+                const b_len = pieces[i + 1].len;
+                const total_len = a_len + b_len;
+                if (total_len > 64) continue; // skip impossibly long merges
 
-                var i: usize = 0;
-                while (i + 1 < tokens.items.len) : (i += 1) {
-                    const a_str = self.decode(tokens.items[i]) orelse continue;
-                    const b_str = self.decode(tokens.items[i + 1]) orelse continue;
-
-                    // Find this pair in merges
-                    for (0..merge_list.len) |mi| {
-                        if (mi >= best_merge_idx) break; // can't improve
-                        const merge = merge_list[mi];
-                        if (std.mem.eql(u8, merge.a, a_str) and std.mem.eql(u8, merge.b, b_str)) {
-                            best_merge_idx = mi;
-                            best_pos = i;
-                            break;
-                        }
-                    }
-                }
-
-                if (best_merge_idx < merge_list.len) {
-                    // Merge tokens at best_pos and best_pos+1
-                    const merge = merge_list[best_merge_idx];
-                    // Find the merged token
-                    var merged_buf: [256]u8 = undefined;
-                    const merged_len = merge.a.len + merge.b.len;
-                    @memcpy(merged_buf[0..merge.a.len], merge.a);
-                    @memcpy(merged_buf[merge.a.len..][0..merge.b.len], merge.b);
-                    const merged = merged_buf[0..merged_len];
-
-                    if (self.token_map.get(merged)) |merged_tok| {
-                        tokens.items[best_pos] = merged_tok;
-                        _ = tokens.orderedRemove(best_pos + 1);
-                        changed = true;
+                const merged = text[a_start..][0..total_len];
+                // Look up rank of merged sequence
+                if (self.token_map.get(merged)) |tok| {
+                    const rank = self.scores[@intCast(tok)];
+                    if (rank < best_rank) {
+                        best_rank = rank;
+                        best_idx = i;
+                        found = true;
                     }
                 }
             }
+
+            if (!found) break; // no more merges possible
+
+            // Merge pieces[best_idx] and pieces[best_idx+1]
+            pieces[best_idx].len += pieces[best_idx + 1].len;
+            // Shift remaining pieces left
+            var j = best_idx + 1;
+            while (j + 1 < n_pieces) : (j += 1) {
+                pieces[j] = pieces[j + 1];
+            }
+            n_pieces -= 1;
+        }
+
+        // Convert pieces to token IDs
+        for (0..n_pieces) |i| {
+            const piece = text[pieces[i].start..][0..pieces[i].len];
+            if (self.token_map.get(piece)) |tok| {
+                tokens.append(alloc, tok) catch return error.OutOfMemory;
+            }
+            // else: unknown piece, skip (shouldn't happen with byte-level base vocab)
         }
     }
 
