@@ -231,7 +231,8 @@ def export_gguf(model, output_path, fp16=True):
     # Build tensor infos
     tensor_infos = []
     for name, tensor in tensor_map.items():
-        data = tensor.numpy() if tensor.dtype == torch.float32 else tensor.numpy().view(np.uint16)
+        t_cpu = tensor.cpu()
+        data = t_cpu.numpy() if t_cpu.dtype == torch.float32 else t_cpu.numpy().view(np.uint16)
         t_type = GGML_TYPE_F32 if tensor.dtype == torch.float32 else GGML_TYPE_F16
         tensor_infos.append((name, tensor.shape, t_type, data.tobytes()))
 
