@@ -250,6 +250,7 @@ ghost_infer_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0), // incre
 ghost_infer_result: [512]u8 = undefined, // inference result
 ghost_infer_result_len: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 ghost_infer_result_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0), // seq of completed result
+ghost_last_result_seq: u32 = 0, // last result seq we consumed (non-atomic, main thread only)
 ghost_infer_thread: ?std.Thread = null,
 ghost_infer_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 

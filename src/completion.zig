@@ -2827,21 +2827,24 @@ pub fn updateGhostText(self: *Shell) void {
     if (self.completion_mode) return;
 
     // check for CTM inference result (non-blocking)
-    const cur_seq = self.ghost_infer_seq.load(.monotonic);
-    const res_seq = self.ghost_infer_result_seq.load(.acquire); // acquire: sync with background thread's release store
-    if (res_seq == cur_seq and res_seq > 0) {
+    // Accept any result (even from older seq) as long as it was generated for
+    // a prefix of the current input. This prevents results being discarded
+    // when the user types faster than inference can complete.
+    const res_seq = self.ghost_infer_result_seq.load(.acquire);
+    if (res_seq > 0 and res_seq != self.ghost_last_result_seq) {
         const rlen = self.ghost_infer_result_len.load(.monotonic);
         if (rlen > 0) {
             const n = @min(rlen, self.ghost_buf.len);
             @memcpy(self.ghost_buf[0..n], self.ghost_infer_result[0..n]);
             self.ghost_len = n;
             self.ghost_from_ctm = true;
-            return; // CTM result takes priority
+            self.ghost_last_result_seq = res_seq;
+            // Don't return — still submit new request for updated input
         }
     }
 
-    // submit new CTM inference request if model configured
-    // thread checks staleness — discards result if user typed more during inference
+    // submit new inference request on every keystroke
+    const cur_seq = self.ghost_infer_seq.load(.monotonic);
     if (self.ghost_infer_thread != null and cmd.len <= self.ghost_infer_input.len) {
         const new_seq = cur_seq +% 1;
         const len: u32 = @intCast(cmd.len);
