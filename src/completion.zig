@@ -3103,17 +3103,16 @@ fn ghostInferThread(ctx: anytype) void {
         var prompt_buf: [2048]u8 = undefined;
         var ppos: usize = 0;
 
-        // Add recent command history for context (last 3-5 commands)
+        // Add last command from history for context (keep prompt short for speed)
         if (shell.history) |h| {
-            const n_hist = @min(h.entries.items.len, if (ilen > 10) @as(usize, 5) else 3);
-            const start = h.entries.items.len - n_hist;
-            for (h.entries.items[start..]) |entry| {
-                const hcmd = h.getCommand(entry);
-                if (hcmd.len > 0 and ppos + hcmd.len + 4 < prompt_buf.len - 256) {
+            if (h.entries.items.len > 0) {
+                const hcmd = h.getCommand(h.entries.items[h.entries.items.len - 1]);
+                if (hcmd.len > 0 and hcmd.len < 60 and ppos + hcmd.len + 4 < prompt_buf.len - 128) {
                     @memcpy(prompt_buf[ppos..][0..2], "$ ");
                     ppos += 2;
-                    @memcpy(prompt_buf[ppos..][0..hcmd.len], hcmd);
-                    ppos += hcmd.len;
+                    const clen = @min(hcmd.len, 50);
+                    @memcpy(prompt_buf[ppos..][0..clen], hcmd[0..clen]);
+                    ppos += clen;
                     prompt_buf[ppos] = '\n';
                     ppos += 1;
                 }
@@ -3139,7 +3138,7 @@ fn ghostInferThread(ctx: anytype) void {
             f.close();
         }
 
-        const result = server.generate(prompt, 12, 0.0, alloc) catch |err| {
+        const result = server.generate(prompt, 8, 0.0, alloc) catch |err| {
             const dbg3 = std.fs.openFileAbsolute("/tmp/zish_inference.log", .{ .mode = .write_only }) catch null;
             if (dbg3) |f| {
                 f.seekFromEnd(0) catch {};
