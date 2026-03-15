@@ -2356,17 +2356,11 @@ pub fn exitCompletionMode(self: *Shell) void {
 
     // clear the completion menu if displayed
     if (self.completion_displayed and self.completion_menu_lines > 0) {
-        // Move to one row below command area and clear everything below.
-        // Use save/restore cursor to return to original position.
-        // Avoid \n which can scroll the terminal and desync term.row.
-        self.stdout().writeAll("\x1b" ++ "7") catch {};
-        const cmd_rows = self.term_view.term.rows_owned;
-        const cursor_row = self.term_view.term.row;
-        const rows_to_menu = cmd_rows -| cursor_row;
-        if (rows_to_menu > 0) {
-            self.stdout().print("\x1b[{d}B", .{rows_to_menu}) catch {};
-        }
-        self.stdout().writeAll("\x1b[J\x1b" ++ "8") catch {};
+        // Use absolute positioning to clear menu area (no relative moves that desync)
+        self.stdout().writeAll("\x1b" ++ "7") catch {}; // DECSC
+        const menu_row = self.term_view.term.rows_owned + 1;
+        self.stdout().print("\x1b[{d};1H\x1b[J", .{menu_row}) catch {}; // go to menu row, clear below
+        self.stdout().writeAll("\x1b" ++ "8") catch {}; // DECRC
         self.stdout().flush() catch {};
     }
 
@@ -2462,18 +2456,16 @@ pub fn displayCompletions(self: *Shell) !void {
     const term_height = self.terminal_height;
     const max_menu_height = if (term_height > 3) term_height - 3 else 1;
 
-    // save cursor position; move to bottom of command area before writing menu
-    try self.stdout().writeAll("\x1b" ++ "7"); // DECSC (more reliable than SCO)
+    // Save cursor, then position at the row below command area
+    // Use absolute positioning to avoid \n scroll desync
+    try self.stdout().writeAll("\x1b" ++ "7"); // DECSC
     const cmd_rows = self.term_view.term.rows_owned;
-    const cursor_row = self.term_view.term.row;
-    const rows_below_cursor = if (cmd_rows > cursor_row + 1) cmd_rows - cursor_row - 1 else 0;
-    if (rows_below_cursor > 0) {
-        try self.stdout().print("\x1b[{d}B", .{rows_below_cursor});
-    }
+    const menu_start_row = cmd_rows + 1; // row right below command
+
+    // Clear everything below command area first
+    try self.stdout().print("\x1b[{d};1H\x1b[J", .{menu_start_row});
 
     if (term_width < 80) {
-        try self.stdout().writeByte('\n');
-
         const items_to_show = @min(self.completion_matches.items.len, max_menu_height);
         const start_idx = if (self.completion_matches.items.len > items_to_show) blk: {
             const half_window = items_to_show / 2;
@@ -2488,32 +2480,31 @@ pub fn displayCompletions(self: *Shell) !void {
 
         const end_idx = @min(start_idx + items_to_show, self.completion_matches.items.len);
 
-        for (self.completion_matches.items[start_idx..end_idx], start_idx..) |match, i| {
-            if (i == self.completion_index and self.completion_index < self.completion_matches.items.len) {
-                try self.stdout().print("{f}{s}{f}\n", .{ tty.Style.reverse, match, tty.Style.reset });
+        for (self.completion_matches.items[start_idx..end_idx], start_idx..) |match, mi| {
+            const row = menu_start_row + (mi - start_idx);
+            try self.stdout().print("\x1b[{d};1H", .{row});
+            if (mi == self.completion_index and self.completion_index < self.completion_matches.items.len) {
+                try self.stdout().print("{f}{s}{f}", .{ tty.Style.reverse, match, tty.Style.reset });
             } else {
-                try self.stdout().print("{s}\n", .{match});
+                try self.stdout().print("{s}", .{match});
             }
         }
 
         if (end_idx < self.completion_matches.items.len) {
-            try self.stdout().print("... ({} more)\n", .{self.completion_matches.items.len - end_idx});
+            try self.stdout().print("\x1b[{d};1H... ({} more)", .{ menu_start_row + items_to_show, self.completion_matches.items.len - end_idx });
             self.completion_menu_lines = items_to_show + 1;
         } else if (start_idx > 0) {
-            try self.stdout().print("... ({} hidden above)\n", .{start_idx});
+            try self.stdout().print("\x1b[{d};1H... ({} hidden above)", .{ menu_start_row + items_to_show, start_idx });
             self.completion_menu_lines = items_to_show + 1;
         } else {
             self.completion_menu_lines = items_to_show;
         }
 
-        // restore cursor to command line position
-        try self.stdout().writeAll("\x1b" ++ "8");
+        try self.stdout().writeAll("\x1b" ++ "8"); // DECRC
         try self.stdout().flush();
         self.completion_displayed = true;
         return;
     }
-
-    try self.stdout().writeByte('\n');
 
     const max_item_width: usize = 30;
     var max_len: usize = 0;
@@ -2527,13 +2518,12 @@ pub fn displayCompletions(self: *Shell) !void {
     const cols = @max(1, effective_width / col_width);
 
     const total_menu_lines = (self.completion_matches.items.len + cols - 1) / cols;
-    const menu_lines = @min(total_menu_lines, max_menu_height);
-    self.completion_menu_lines = menu_lines;
+    const menu_lines_count = @min(total_menu_lines, max_menu_height);
+    self.completion_menu_lines = menu_lines_count;
 
-    const max_items = menu_lines * cols;
+    const max_items = menu_lines_count * cols;
     const items_to_show = @min(self.completion_matches.items.len, max_items);
 
-    // Scroll window to keep selected item visible
     const start_item = if (self.completion_matches.items.len > items_to_show) blk: {
         const half = items_to_show / 2;
         if (self.completion_index < half) {
@@ -2545,6 +2535,11 @@ pub fn displayCompletions(self: *Shell) !void {
         }
     } else 0;
     const end_item = @min(start_item + items_to_show, self.completion_matches.items.len);
+
+    // Draw items using absolute row positioning (no \n scrolling)
+    var current_row: usize = menu_start_row;
+    var col_pos: usize = 0;
+    try self.stdout().print("\x1b[{d};1H", .{current_row});
 
     for (self.completion_matches.items[start_item..end_item], start_item..) |match, i| {
         const display_name = if (match.len > max_item_width) match[0 .. max_item_width - 1] else match;
@@ -2562,22 +2557,25 @@ pub fn displayCompletions(self: *Shell) !void {
         const actual_len = if (truncated) max_item_width else match.len;
         const padding = col_width - actual_len;
         var j: usize = 0;
-        while (j < padding) : (j += 1) {
-            try self.stdout().writeByte(' ');
-        }
+        while (j < padding) : (j += 1) try self.stdout().writeByte(' ');
 
-        if ((i + 1) % cols == 0 or i == items_to_show - 1) {
-            try self.stdout().writeByte('\n');
+        col_pos += 1;
+        if (col_pos >= cols or i - start_item == items_to_show - 1) {
+            current_row += 1;
+            col_pos = 0;
+            if (i - start_item < items_to_show - 1) {
+                try self.stdout().print("\x1b[{d};1H", .{current_row});
+            }
         }
     }
 
     const hidden = self.completion_matches.items.len - (end_item - start_item);
     if (hidden > 0) {
-        try self.stdout().print("... ({} more matches)\n", .{hidden});
+        try self.stdout().print("\x1b[{d};1H... ({} more matches)", .{ current_row, hidden });
         self.completion_menu_lines += 1;
     }
 
-    // restore cursor to command line position
+    // Restore cursor to command line
     try self.stdout().writeAll("\x1b" ++ "8");
     try self.stdout().flush();
     self.completion_displayed = true;
