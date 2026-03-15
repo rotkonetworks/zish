@@ -564,13 +564,15 @@ fn handleRequestWithDopamine(
             const tok_logprob = state.output[@intCast(next_tok)] - max_logit - @log(sum_exp);
             total_logprob += tok_logprob;
 
-            // Early termination: stop when model becomes uncertain.
-            // In shell, confident short completions beat uncertain long ones.
-            // Stop at word boundaries (space, quote, slash) when confidence drops.
-            const byte: u8 = @intCast(next_tok & 0xFF);
-            const at_boundary = (byte == ' ' or byte == '"' or byte == '\'' or byte == '/' or byte == '|' or byte == ';');
-            if (tok_logprob < -2.0 and at_boundary) break; // uncertain at word boundary
-            if (tok_logprob < -4.0) break; // very uncertain anywhere
+            // Early termination (greedy candidate only): stop when uncertain.
+            // Sampled candidates (t>0) naturally have lower per-token log-prob,
+            // so early stopping would kill them immediately.
+            if (t_val == 0) {
+                const byte: u8 = @intCast(next_tok & 0xFF);
+                const at_boundary = (byte == ' ' or byte == '"' or byte == '\'' or byte == '/' or byte == '|' or byte == ';');
+                if (tok_logprob < -2.0 and at_boundary) break;
+                if (tok_logprob < -4.0) break;
+            }
 
             if (state.ctm_state) |cs| {
                 const surprise = computeSurprise(state.output, next_tok);

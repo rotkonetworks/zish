@@ -3124,6 +3124,15 @@ fn ghostInferThread(ctx: anytype) void {
         switch (signal) {
             .completion => |c| {
                 const n = c.len;
+                // Debug log
+                const dbg = std.fs.openFileAbsolute("/tmp/zish_inference.log", .{ .mode = .write_only }) catch null;
+                if (dbg) |f| {
+                    f.seekFromEnd(0) catch {};
+                    f.writeAll("ghost: ") catch {};
+                    f.writeAll(c.buf[0..n]) catch {};
+                    f.writeAll("\n") catch {};
+                    f.close();
+                }
                 @memcpy(shell.ghost_infer_result[0..n], c.buf[0..n]);
                 shell.ghost_infer_result_len.store(n, .monotonic);
                 shell.ghost_infer_result_seq.store(c.seq, .release);
