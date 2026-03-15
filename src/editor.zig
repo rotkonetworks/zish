@@ -680,8 +680,9 @@ pub const TermView = struct {
         const cont_marker_len: u16 = 2; // "│ "
 
         // compute cursor position in content
-        var cursor_row: u16 = 0;
-        var cursor_col: u16 = prompt_visible_len;
+        // Account for prompt wrapping across multiple rows
+        var cursor_row: u16 = if (w > 0) prompt_visible_len / w else 0;
+        var cursor_col: u16 = if (w > 0) prompt_visible_len % w else prompt_visible_len;
 
         for (text[0..buf.cursor]) |c| {
             if (c == '\n') {
@@ -711,8 +712,9 @@ pub const TermView = struct {
         _ = self.emit(prompt);
 
         // track rendering position as we emit
-        var render_row: u16 = 0;
-        var render_col: u16 = prompt_visible_len;
+        // Account for prompt wrapping across multiple rows
+        var render_row: u16 = if (w > 0) prompt_visible_len / w else 0;
+        var render_col: u16 = if (w > 0) prompt_visible_len % w else prompt_visible_len;
 
         // emit content with syntax highlighting and continuation markers
         var hl = SyntaxHighlighter{};
