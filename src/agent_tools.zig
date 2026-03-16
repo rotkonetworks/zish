@@ -701,6 +701,19 @@ pub fn executeBash(allocator: std.mem.Allocator, queues: *AgentQueues, command: 
     var read_buf: [4096]u8 = undefined;
     const stdout_file = child.stdout.?;
     while (true) {
+        // Check for cancellation — kill child process if user pressed Ctrl+C
+        if (queues.checkCancel()) {
+            _ = child.kill() catch {};
+            break;
+        }
+        // Poll stdout with 200ms timeout to allow cancel checks between reads
+        var poll_fds = [_]std.posix.pollfd{.{
+            .fd = stdout_file.handle,
+            .events = 1, // POLLIN
+            .revents = 0,
+        }};
+        const poll_n = std.posix.poll(&poll_fds, 200) catch break;
+        if (poll_n == 0) continue; // timeout — loop back to check cancel
         const n = stdout_file.read(&read_buf) catch break;
         if (n == 0) break;
         output.appendSlice(allocator, read_buf[0..n]) catch break;
