@@ -580,6 +580,7 @@ pub fn classifyWithModel(
             resp_len += n;
         }
     }
+    if (child.stdout) |*s| { s.close(); child.stdout = null; }
     _ = child.wait() catch {};
 
     if (resp_len == 0) return null;
