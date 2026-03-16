@@ -664,6 +664,7 @@ fn tryKillCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bo
             if (n == 0) break;
             total += n;
         }
+        if (child.stdout) |*s| { s.close(); child.stdout = null; }
         _ = child.wait() catch {};
 
         var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 32);
@@ -985,6 +986,7 @@ fn tryDockerCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !
         if (n == 0) break;
         total += n;
     }
+    if (child.stdout) |*s| { s.close(); child.stdout = null; }
     _ = child.wait() catch {};
 
     var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 32);
@@ -1693,6 +1695,7 @@ fn parseSubcmdsFromHelp(self: *Shell, base_cmd: []const u8) !void {
         if (n == 0) break;
         total_read += n;
     }
+    if (child.stdout) |*s| { s.close(); child.stdout = null; }
     _ = child.wait() catch {};
 
     // parse subcommands: lines starting with 2+ spaces followed by a word (no dash prefix)
@@ -1852,7 +1855,7 @@ fn parseFlagsFromHelp(self: *Shell, command: []const u8) !void {
     var desc_pos: usize = 0;
     var count: usize = 0;
 
-    // read help output and parse flags
+    // read help output and parse flags (cap at 16K to avoid OOM)
     var read_buf: [16384]u8 = undefined;
     var total_read: usize = 0;
     while (total_read < read_buf.len) {
@@ -1861,6 +1864,13 @@ fn parseFlagsFromHelp(self: *Shell, command: []const u8) !void {
         total_read += n;
     }
 
+    // Close stdout pipe before wait — prevents deadlock if child produced
+    // more output than our buffer (child blocks on write, wait blocks on child).
+    if (child.stdout) |*s| {
+        s.close();
+        child.stdout = null;
+    }
+    if (child.stdout) |*s| { s.close(); child.stdout = null; }
     _ = child.wait() catch {};
 
     // parse flags from help text — extract flag + description
@@ -1958,6 +1968,7 @@ fn augmentFlagsFromMan(self: *Shell, command: []const u8, count: usize, desc_pos
         if (n == 0) break;
         total_read += n;
     }
+    if (child.stdout) |*s| { s.close(); child.stdout = null; }
     _ = child.wait() catch {};
 
     if (total_read == 0) return;
