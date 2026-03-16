@@ -2343,7 +2343,8 @@ fn escapeSequenceAction(self: *Shell) !Action {
 /// consume remaining bytes of an escape sequence until terminator (letter or ~)
 fn consumeEscapeSequence(stdin_fd: std.posix.fd_t) void {
     var buf: [1]u8 = undefined;
-    while (true) {
+    var iterations: u8 = 0;
+    while (iterations < 32) : (iterations += 1) {
         const n = std.posix.system.read(stdin_fd, &buf, 1);
         if (n <= 0) break;
         const c = buf[0];

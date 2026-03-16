@@ -685,9 +685,17 @@ pub fn executeBash(allocator: std.mem.Allocator, queues: *AgentQueues, command: 
     _ = queues.output.push(.tool_call, notif);
 
     // Spawn child process with piped stdout for streaming
-    var child = std.process.Child.init(&[_][]const u8{ "/bin/sh", "-c", cmd }, allocator);
+    // Redirect stderr to stdout via shell to prevent deadlock:
+    // if child fills the stderr pipe buffer before stdout, the stdout read
+    // loop blocks waiting for data while the child blocks writing to stderr.
+    var redir_buf: [8256]u8 = undefined;
+    const redir_cmd = std.fmt.bufPrint(&redir_buf, "{{ {s} ; }} 2>&1", .{cmd}) catch cmd;
+
+    var child = std.process.Child.init(&[_][]const u8{
+        "/bin/sh", "-c", redir_cmd,
+    }, allocator);
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
+    child.stderr_behavior = .Ignore; // merged into stdout via 2>&1
     child.stdin_behavior = .Ignore;
     if (cwd) |c| child.cwd = c;
     child.spawn() catch |err| {
@@ -736,14 +744,7 @@ pub fn executeBash(allocator: std.mem.Allocator, queues: *AgentQueues, command: 
         }
     }
 
-    // Read stderr
-    var stderr_buf: [4096]u8 = undefined;
-    const stderr_n = if (child.stderr) |*se| se.read(&stderr_buf) catch 0 else 0;
-    if (stderr_n > 0) {
-        output.appendSlice(allocator, "\n") catch {};
-        output.appendSlice(allocator, stderr_buf[0..stderr_n]) catch {};
-    }
-
+    // stderr is merged into stdout via 2>&1, no separate read needed
     _ = child.wait() catch {};
 
     const owned = output.toOwnedSlice(allocator) catch {
