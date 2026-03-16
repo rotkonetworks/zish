@@ -113,6 +113,8 @@ pub fn getStatus(allocator: std.mem.Allocator) ?GitStatus {
     var buf: [4096]u8 = undefined;
     const len = stdout.readAll(&buf) catch return null;
 
+    // Close pipe before wait — prevents deadlock if output exceeds buffer
+    if (child.stdout) |*s| { s.close(); child.stdout = null; }
     _ = child.wait() catch return null;
 
     // parse porcelain output
