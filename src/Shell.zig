@@ -568,7 +568,7 @@ fn buildPrompt(self: *Shell, buf: *[256]u8) PromptInfo {
 
     // calculate visible length (mode indicator is 3-4 chars visible)
     const mode_visible: u16 = if (self.vi.mode == .visual_line) 4 else 3;
-    const rest_visible = @as(u16, @intCast(user.len + 1 + hostname.len + 1 + display_path.len + 3)); // @ + space + " $ "
+    const rest_visible = @as(u16, @intCast(user.len + 1 + hostname.len + 1 + display_path.len + 4)); // @ + space-before-path + path + " $ " (3 chars)
 
     return .{
         .slice = buf[0..len.len],

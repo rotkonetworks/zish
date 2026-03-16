@@ -680,25 +680,17 @@ pub const TermView = struct {
         const cont_marker_len: u16 = 2; // "│ "
 
         // compute cursor position in content
-        // Start by simulating the prompt's column usage (may wrap)
+        // Prompt may wrap: simulate column advancement matching terminal behavior.
+        // Terminal wraps: writing char at col w-1 advances cursor to col w,
+        // which is a "pending wrap" — next char goes to col 0 of next row.
         var cursor_row: u16 = 0;
-        var cursor_col: u16 = 0;
+        var cursor_col: u16 = prompt_visible_len;
+        // Handle prompt wrapping
         if (w > 0) {
-            // Walk through prompt columns to track wrapping
-            var remaining = prompt_visible_len;
-            while (remaining > 0) {
-                const space_on_line = w - cursor_col;
-                if (remaining >= space_on_line) {
-                    remaining -= space_on_line;
-                    cursor_row += 1;
-                    cursor_col = 0;
-                } else {
-                    cursor_col += remaining;
-                    remaining = 0;
-                }
+            while (cursor_col >= w) {
+                cursor_col -= w;
+                cursor_row += 1;
             }
-        } else {
-            cursor_col = prompt_visible_len;
         }
 
         for (text[0..buf.cursor]) |c| {
@@ -708,8 +700,8 @@ pub const TermView = struct {
             } else {
                 cursor_col += 1;
                 if (w > 0 and cursor_col >= w) {
+                    cursor_col -= w;
                     cursor_row += 1;
-                    cursor_col = 0;
                 }
             }
         }
@@ -729,24 +721,13 @@ pub const TermView = struct {
         _ = self.emit(prompt);
 
         // track rendering position as we emit
-        // Simulate prompt wrapping to get initial render position
         var render_row: u16 = 0;
-        var render_col: u16 = 0;
+        var render_col: u16 = prompt_visible_len;
         if (w > 0) {
-            var remaining = prompt_visible_len;
-            while (remaining > 0) {
-                const space_on_line = w - render_col;
-                if (remaining >= space_on_line) {
-                    remaining -= space_on_line;
-                    render_row += 1;
-                    render_col = 0;
-                } else {
-                    render_col += remaining;
-                    remaining = 0;
-                }
+            while (render_col >= w) {
+                render_col -= w;
+                render_row += 1;
             }
-        } else {
-            render_col = prompt_visible_len;
         }
 
         // emit content with syntax highlighting and continuation markers
@@ -774,6 +755,7 @@ pub const TermView = struct {
                 hl.feed(self, c);
                 render_col += 1;
                 if (w > 0 and render_col >= w) {
+                    render_col -= w;
                     render_row += 1;
                     render_col = 0;
                 }
@@ -791,8 +773,8 @@ pub const TermView = struct {
                 _ = self.emitByte(c);
                 render_col += 1;
                 if (w > 0 and render_col >= w) {
+                    render_col -= w;
                     render_row += 1;
-                    render_col = 0;
                 }
             }
             _ = self.emit("\x1b[0m");
