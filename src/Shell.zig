@@ -429,6 +429,7 @@ pub fn deinit(self: *Shell) void {
     // stop agent thread so it can clean up
     self.agent.stop();
 
+    if (self.continue_context) |ctx| self.allocator.free(ctx);
     self.allocator.free(self.clipboard);
     self.allocator.free(self.search_buffer);
     self.allocator.free(self.stdout().buffer);

@@ -3172,6 +3172,21 @@ pub fn rejectGhostText(self: *Shell) void {
     self.ghost_len = 0;
 }
 
+fn writeJsonEscapedToFile(file: std.fs.File, s: []const u8) void {
+    for (s) |c| {
+        switch (c) {
+            '"' => file.writeAll("\\\"") catch return,
+            '\\' => file.writeAll("\\\\") catch return,
+            '\n' => file.writeAll("\\n") catch return,
+            '\r' => file.writeAll("\\r") catch return,
+            '\t' => file.writeAll("\\t") catch return,
+            else => if (c < 0x20) {} else {
+                file.writeAll(&.{c}) catch return;
+            },
+        }
+    }
+}
+
 fn logRejection(cmd: []const u8, predicted: []const u8) void {
     var path_buf: [512]u8 = undefined;
     const home = std.process.getEnvVarOwned(std.heap.page_allocator, "HOME") catch return;
@@ -3186,13 +3201,15 @@ fn logRejection(cmd: []const u8, predicted: []const u8) void {
     file.seekFromEnd(0) catch return;
 
     const ts: u64 = @bitCast(std.time.timestamp());
-    var buf: [2048]u8 = undefined;
-    const line = std.fmt.bufPrint(&buf, "{{\"ctx\":\"{s}\",\"predicted\":\"{s}\",\"ts\":{d}}}\n", .{
-        cmd[0..@min(cmd.len, 200)],
-        predicted[0..@min(predicted.len, 100)],
-        ts,
-    }) catch return;
-    file.writeAll(line) catch {};
+
+    // Write JSON manually with proper string escaping
+    file.writeAll("{\"ctx\":\"") catch return;
+    writeJsonEscapedToFile(file, cmd[0..@min(cmd.len, 200)]);
+    file.writeAll("\",\"predicted\":\"") catch return;
+    writeJsonEscapedToFile(file, predicted[0..@min(predicted.len, 100)]);
+    var ts_buf: [32]u8 = undefined;
+    const ts_str = std.fmt.bufPrint(&ts_buf, "\",\"ts\":{d}}}\n", .{ts}) catch return;
+    file.writeAll(ts_str) catch {};
 }
 
 /// Accept ghost text — append it to the edit buffer.

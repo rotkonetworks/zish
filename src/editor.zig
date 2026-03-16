@@ -732,6 +732,14 @@ pub const TermView = struct {
                 }
                 byte_pos += 1;
             }
+            // If we stopped inside an escape sequence, finish consuming it
+            // to avoid emitting a broken sequence that corrupts terminal state
+            while (in_esc and byte_pos < prompt.len) {
+                if ((prompt[byte_pos] >= 'A' and prompt[byte_pos] <= 'Z') or
+                    (prompt[byte_pos] >= 'a' and prompt[byte_pos] <= 'z'))
+                    in_esc = false;
+                byte_pos += 1;
+            }
             _ = self.emit(prompt[0..byte_pos]);
             _ = self.emit("\x1b[0m.. ");
             prompt_visible_len = vis + 3; // ".. " = 3 chars
