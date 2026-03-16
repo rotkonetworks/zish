@@ -694,7 +694,7 @@ pub const TermView = struct {
                 // (pending wrap). Next char triggers actual wrap to col 0 of next line.
                 // We track this as: col reaches w → stays at w (pending).
                 // Col exceeds w → actual wrap happened.
-                if (w > 0 and cursor_col > w) {
+                if (w > 0 and cursor_col >= w) {
                     cursor_col -= w;
                     cursor_row += 1;
                 }
@@ -775,7 +775,7 @@ pub const TermView = struct {
             } else {
                 hl.feed(self, c);
                 render_col += 1;
-                if (w > 0 and render_col > w) {
+                if (w > 0 and render_col >= w) {
                     render_col -= w;
                     render_row += 1;
                     render_col = 0;
@@ -793,7 +793,7 @@ pub const TermView = struct {
                 if (c == '\n') break; // only show first line of ghost
                 _ = self.emitByte(c);
                 render_col += 1;
-                if (w > 0 and render_col > w) {
+                if (w > 0 and render_col >= w) {
                     render_col -= w;
                     render_row += 1;
                 }
