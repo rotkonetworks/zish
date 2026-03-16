@@ -653,10 +653,11 @@ pub const TermView = struct {
         self: *Self,
         buf: *const EditBuffer,
         prompt: []const u8,
-        prompt_visible_len: u16,
+        prompt_visible_len_arg: u16,
     ) !void {
         // dynamic size check
         self.updateSize();
+        var prompt_visible_len = prompt_visible_len_arg;
 
         const text = buf.slice();
         var hash = std.hash.Wyhash.hash(0, text);
@@ -711,8 +712,32 @@ pub const TermView = struct {
         // and avoids disturbing soft-wrap metadata on individual lines
         _ = self.emit("\x1b[J");
 
-        // emit prompt
-        _ = self.emit(prompt);
+        // emit prompt — truncate if wider than terminal to prevent wrapping
+        // (prompt wrapping breaks all cursor tracking due to terminal deferred-wrap)
+        if (w > 0 and prompt_visible_len >= w) {
+            // Truncate: find byte position where visible chars reach w-4 (leave room for ".. ")
+            const max_vis = w - 4;
+            var vis: u16 = 0;
+            var byte_pos: usize = 0;
+            var in_esc = false;
+            while (byte_pos < prompt.len and vis < max_vis) {
+                if (prompt[byte_pos] == 0x1b) {
+                    in_esc = true;
+                } else if (in_esc) {
+                    if ((prompt[byte_pos] >= 'A' and prompt[byte_pos] <= 'Z') or
+                        (prompt[byte_pos] >= 'a' and prompt[byte_pos] <= 'z'))
+                        in_esc = false;
+                } else {
+                    vis += 1;
+                }
+                byte_pos += 1;
+            }
+            _ = self.emit(prompt[0..byte_pos]);
+            _ = self.emit("\x1b[0m.. ");
+            prompt_visible_len = vis + 3; // ".. " = 3 chars
+        } else {
+            _ = self.emit(prompt);
+        }
 
         // track rendering position as we emit
         var render_row: u16 = 0;
