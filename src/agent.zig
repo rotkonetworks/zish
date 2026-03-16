@@ -2020,14 +2020,18 @@ const AgentThread = struct {
             }
         }
 
-        // Check for curl errors
+        // Check for curl errors (read first 1K, then close pipe to prevent deadlock)
         if (child.stderr) |*stderr_pipe| {
             var err_out: [1024]u8 = undefined;
             const err_n = stderr_pipe.read(&err_out) catch 0;
+            stderr_pipe.close();
+            child.stderr = null;
             if (err_n > 0) {
                 _ = self.queues.output.push(.error_msg, err_out[0..err_n]);
             }
         }
+        // Close stdout pipe before wait in case child still has pending output
+        if (child.stdout) |*s| { s.close(); child.stdout = null; }
 
         _ = child.wait() catch {};
 
