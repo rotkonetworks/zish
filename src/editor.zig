@@ -680,18 +680,8 @@ pub const TermView = struct {
         const cont_marker_len: u16 = 2; // "│ "
 
         // compute cursor position in content
-        // Prompt may wrap: simulate column advancement matching terminal behavior.
-        // Terminal wraps: writing char at col w-1 advances cursor to col w,
-        // which is a "pending wrap" — next char goes to col 0 of next row.
         var cursor_row: u16 = 0;
         var cursor_col: u16 = prompt_visible_len;
-        // Handle prompt wrapping
-        if (w > 0) {
-            while (cursor_col >= w) {
-                cursor_col -= w;
-                cursor_row += 1;
-            }
-        }
 
         for (text[0..buf.cursor]) |c| {
             if (c == '\n') {
@@ -699,7 +689,11 @@ pub const TermView = struct {
                 cursor_col = cont_marker_len;
             } else {
                 cursor_col += 1;
-                if (w > 0 and cursor_col >= w) {
+                // Terminal wraps: after writing char at col w-1, cursor is at col w
+                // (pending wrap). Next char triggers actual wrap to col 0 of next line.
+                // We track this as: col reaches w → stays at w (pending).
+                // Col exceeds w → actual wrap happened.
+                if (w > 0 and cursor_col > w) {
                     cursor_col -= w;
                     cursor_row += 1;
                 }
@@ -723,12 +717,6 @@ pub const TermView = struct {
         // track rendering position as we emit
         var render_row: u16 = 0;
         var render_col: u16 = prompt_visible_len;
-        if (w > 0) {
-            while (render_col >= w) {
-                render_col -= w;
-                render_row += 1;
-            }
-        }
 
         // emit content with syntax highlighting and continuation markers
         var hl = SyntaxHighlighter{};
@@ -754,7 +742,7 @@ pub const TermView = struct {
             } else {
                 hl.feed(self, c);
                 render_col += 1;
-                if (w > 0 and render_col >= w) {
+                if (w > 0 and render_col > w) {
                     render_col -= w;
                     render_row += 1;
                     render_col = 0;
@@ -772,7 +760,7 @@ pub const TermView = struct {
                 if (c == '\n') break; // only show first line of ghost
                 _ = self.emitByte(c);
                 render_col += 1;
-                if (w > 0 and render_col >= w) {
+                if (w > 0 and render_col > w) {
                     render_col -= w;
                     render_row += 1;
                 }
