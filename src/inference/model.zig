@@ -930,6 +930,7 @@ pub const Transformer = struct {
                 for (0..c.n_heads) |head| {
                     const query = qi[head * head_size ..][0..head_size];
                     const base = layer_offset + (head / kv_mul) * head_size;
+                    const att = state.attention[head * c.max_seq_length ..];
 
                     // Compute attention scores over positions 0..t
                     var max_score: f32 = -std.math.inf(f32);
@@ -937,26 +938,26 @@ pub const Transformer = struct {
                         const cp = p % c.max_seq_length;
                         const key = state.k_cache[base + cp * kv_dim ..][0..head_size];
                         const s = math.dotProduct(query, key) / scale;
-                        state.attention[p] = s;
+                        att[p] = s;
                         if (s > max_score) max_score = s;
                     }
 
                     // Softmax
                     var sum: f32 = 0;
                     for (0..t + 1) |p| {
-                        const e = std.math.exp(state.attention[p] - max_score);
-                        state.attention[p] = e;
+                        const e = std.math.exp(att[p] - max_score);
+                        att[p] = e;
                         sum += e;
                     }
                     const inv_sum = 1.0 / sum;
-                    for (0..t + 1) |p| state.attention[p] *= inv_sum;
+                    for (0..t + 1) |p| att[p] *= inv_sum;
 
                     // Weighted sum of values
                     const head_out = aout[head * head_size ..][0..head_size];
                     for (0..t + 1) |p| {
                         const cp = p % c.max_seq_length;
                         const val = state.v_cache[base + cp * kv_dim ..][0..head_size];
-                        const a = state.attention[p];
+                        const a = att[p];
                         for (0..head_size) |j| head_out[j] += a * val[j];
                     }
                 }
@@ -1077,7 +1078,8 @@ fn applyRoPE(
             // PyTorch cat([x[::2]*cos - x[1::2]*sin, x[::2]*sin + x[1::2]*cos])
             // Read from interleaved even/odd, write to sequential first/second half.
             // Must use temp buffer because output positions overlap input positions.
-            var tmp: [256]f32 = undefined; // max head_size we'll see
+            var tmp: [512]f32 = undefined; // covers head_size up to 512 (GPT-4 class)
+            if (head_size > tmp.len) unreachable; // safety: model too large for stack buffer
             @memcpy(tmp[0..head_size], vector[head_off..][0..head_size]);
             for (0..half) |i| {
                 const ii = base + i;
