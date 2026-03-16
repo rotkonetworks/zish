@@ -680,9 +680,26 @@ pub const TermView = struct {
         const cont_marker_len: u16 = 2; // "│ "
 
         // compute cursor position in content
-        // Account for prompt wrapping across multiple rows
-        var cursor_row: u16 = if (w > 0) prompt_visible_len / w else 0;
-        var cursor_col: u16 = if (w > 0) prompt_visible_len % w else prompt_visible_len;
+        // Start by simulating the prompt's column usage (may wrap)
+        var cursor_row: u16 = 0;
+        var cursor_col: u16 = 0;
+        if (w > 0) {
+            // Walk through prompt columns to track wrapping
+            var remaining = prompt_visible_len;
+            while (remaining > 0) {
+                const space_on_line = w - cursor_col;
+                if (remaining >= space_on_line) {
+                    remaining -= space_on_line;
+                    cursor_row += 1;
+                    cursor_col = 0;
+                } else {
+                    cursor_col += remaining;
+                    remaining = 0;
+                }
+            }
+        } else {
+            cursor_col = prompt_visible_len;
+        }
 
         for (text[0..buf.cursor]) |c| {
             if (c == '\n') {
@@ -712,9 +729,25 @@ pub const TermView = struct {
         _ = self.emit(prompt);
 
         // track rendering position as we emit
-        // Account for prompt wrapping across multiple rows
-        var render_row: u16 = if (w > 0) prompt_visible_len / w else 0;
-        var render_col: u16 = if (w > 0) prompt_visible_len % w else prompt_visible_len;
+        // Simulate prompt wrapping to get initial render position
+        var render_row: u16 = 0;
+        var render_col: u16 = 0;
+        if (w > 0) {
+            var remaining = prompt_visible_len;
+            while (remaining > 0) {
+                const space_on_line = w - render_col;
+                if (remaining >= space_on_line) {
+                    remaining -= space_on_line;
+                    render_row += 1;
+                    render_col = 0;
+                } else {
+                    render_col += remaining;
+                    remaining = 0;
+                }
+            }
+        } else {
+            render_col = prompt_visible_len;
+        }
 
         // emit content with syntax highlighting and continuation markers
         var hl = SyntaxHighlighter{};
