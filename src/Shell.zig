@@ -423,6 +423,10 @@ pub fn deinit(self: *Shell) void {
     // cleanup traps
     self.traps.deinit();
 
+    // Null out global pointer BEFORE freeing — prevents signal handler
+    // from dereferencing freed memory if SIGWINCH arrives during shutdown.
+    @atomicStore(?*Shell, &global_shell, null, .release);
+
     // stop ghost inference thread
     completion_mod.stopGhostInference(self);
 

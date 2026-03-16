@@ -1517,11 +1517,10 @@ const AgentThread = struct {
                 }
                 self.history.count += 2;
             } else {
-                // Drop oldest 2 to make room
+                // Drop oldest 2 (before summary), overwrite [0] and [1] below.
+                // Messages [2..count] stay in place, count unchanged.
                 self.allocator.free(self.history.messages[0].content[0..self.history.messages[0].alloc_len]);
                 self.allocator.free(self.history.messages[1].content[0..self.history.messages[1].alloc_len]);
-                std.mem.copyForwards(Message, self.history.messages[2..self.history.count], self.history.messages[2..self.history.count]);
-                // Shift is a no-op here, just overwrite [0] and [1]
             }
         }
 
