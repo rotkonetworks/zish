@@ -587,7 +587,8 @@ pub const GpuContext = struct {
 
         const rows = slot.rows;
         const dst_offset = self.batch_output_cursor;
-        const output_end: u64 = @intCast((dst_offset + rows) * @sizeOf(f32));
+        // Check output bounds in u64 to prevent u32 overflow
+        const output_end: u64 = (@as(u64, dst_offset) + @as(u64, rows)) * @sizeOf(f32);
         if (output_end > 1024 * 1024) return null;
 
         if (dst_offset > 0) {
@@ -742,7 +743,7 @@ pub const GpuContext = struct {
         const rows = slot.rows;
         const cols = slot.cols;
         const dst_offset = self.batch_output_cursor;
-        const output_end: u64 = @intCast((dst_offset + rows) * @sizeOf(f32));
+        const output_end: u64 = (@as(u64, dst_offset) + @as(u64, rows)) * @sizeOf(f32);
         if (output_end > 1024 * 1024) return null; // exceeds output_buf
 
         // Compute → compute barrier (previous dispatch may have written to output_buf)

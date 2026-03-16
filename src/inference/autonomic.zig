@@ -585,6 +585,7 @@ fn computeSurprise(logits: []f32, token: Token) f32 {
     for (logits) |l| {
         sum_exp += std.math.exp(l - max_logit);
     }
+    if (sum_exp <= 0) return 0; // all -inf logits → no surprise
 
     const target_logit = logits[@intCast(token)];
     const log_prob = (target_logit - max_logit) - @log(sum_exp);

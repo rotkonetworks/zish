@@ -2558,8 +2558,8 @@ pub fn displayCompletions(self: *Shell) !void {
     var col_pos: usize = 0;
 
     for (self.completion_matches.items[start_item..end_item], start_item..) |match, i| {
-        const display_name = if (match.len > max_item_width) match[0 .. max_item_width - 1] else match;
-        const truncated = match.len > max_item_width;
+        const display_name = if (max_item_width > 1 and match.len > max_item_width) match[0 .. max_item_width - 1] else match;
+        const truncated = max_item_width > 0 and match.len > max_item_width;
 
         if (i == self.completion_index and self.completion_index < self.completion_matches.items.len) {
             try self.stdout().print("{f}{s}", .{ tty.Style.reverse, display_name });
