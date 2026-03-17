@@ -680,37 +680,14 @@ pub const TermView = struct {
         const w = self.term.width;
         const cont_marker_len: u16 = 2; // "│ "
 
-        // compute cursor position in content
-        var cursor_row: u16 = 0;
-        var cursor_col: u16 = prompt_visible_len;
-
-        for (text[0..buf.cursor]) |c| {
-            if (c == '\n') {
-                cursor_row += 1;
-                cursor_col = cont_marker_len;
-            } else {
-                cursor_col += 1;
-                // Terminal wraps: after writing char at col w-1, cursor is at col w
-                // (pending wrap). Next char triggers actual wrap to col 0 of next line.
-                // We track this as: col reaches w → stays at w (pending).
-                // Col exceeds w → actual wrap happened.
-                if (w > 0 and cursor_col >= w) {
-                    cursor_col -= w;
-                    cursor_row += 1;
-                }
-            }
+        // Move to the start of our editing region (row 0 of prompt).
+        // Use rows_owned from PREVIOUS render to know how far up to go.
+        // This is more reliable than tracking cursor_row because rows_owned
+        // is set after each successful render.
+        if (self.term.rows_owned > 1) {
+            _ = self.emitCSI("{d}A", .{self.term.rows_owned - 1});
         }
-
-        // move to start of our region
-        if (self.term.row > 0) {
-            _ = self.emitCSI("{d}A", .{self.term.row});
-        }
-        _ = self.emit("\r");
-
-        // clear from start of our region to end of screen
-        // this is simpler and more reliable than per-line clearing,
-        // and avoids disturbing soft-wrap metadata on individual lines
-        _ = self.emit("\x1b[J");
+        _ = self.emit("\r\x1b[J"); // go to col 0, clear everything below
 
         // emit prompt — truncate if wider than terminal to prevent wrapping
         // (prompt wrapping breaks all cursor tracking due to terminal deferred-wrap)
@@ -804,13 +781,34 @@ pub const TermView = struct {
         // clear any leftover content after our text
         _ = self.emit("\x1b[J");
 
-        // Track render end position, then move to cursor
-        self.term.row = render_row;
-        self.term.col = render_col;
-        self.moveTo(cursor_row, cursor_col);
-        // moveTo updates self.term.row/col to cursor position
+        // Compute cursor position (same column tracking as render)
+        var cursor_row: u16 = 0;
+        var cursor_col: u16 = prompt_visible_len;
+        for (text[0..buf.cursor]) |c| {
+            if (c == '\n') {
+                cursor_row += 1;
+                cursor_col = cont_marker_len;
+            } else {
+                cursor_col += 1;
+                if (w > 0 and cursor_col >= w) {
+                    cursor_col -= w;
+                    cursor_row += 1;
+                }
+            }
+        }
+
+        // Move cursor from render_end to cursor position
+        // Move up from render_row to cursor_row
+        if (render_row > cursor_row) {
+            _ = self.emitCSI("{d}A", .{render_row - cursor_row});
+        }
+        // Move to correct column: CR then forward
+        _ = self.emit("\r");
+        if (cursor_col > 0) _ = self.emitCSI("{d}C", .{cursor_col});
 
         self.term.rows_owned = render_row + 1;
+        self.term.row = cursor_row; // not used for movement anymore, but keep for finishLine
+        self.term.col = cursor_col;
         self.last_hash = hash;
         self.last_cursor = buf.cursor;
 
