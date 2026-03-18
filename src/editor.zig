@@ -797,27 +797,15 @@ pub const TermView = struct {
             }
         }
 
-        // Terminal pending wrap correction:
-        // When content ends exactly at column w, the terminal cursor is in
-        // "pending wrap" state — it appears at col w of the current row, NOT
-        // at col 0 of the next row. Our >= w check overcounts by 1 row.
-        // Apply the same correction to both render and cursor positions.
-        const pending_render = (render_col == 0 and render_row > 0);
-        const actual_render_row = if (pending_render) render_row - 1 else render_row;
-
-        const pending_cursor = (cursor_col == 0 and cursor_row > 0 and buf.cursor == buf.len);
-        const actual_cursor_row = if (pending_cursor) cursor_row - 1 else cursor_row;
-        const actual_cursor_col = if (pending_cursor) w else cursor_col;
-
         // Move cursor from render_end to cursor position
-        if (actual_render_row > actual_cursor_row) {
-            _ = self.emitCSI("{d}A", .{actual_render_row - actual_cursor_row});
+        if (render_row > cursor_row) {
+            _ = self.emitCSI("{d}A", .{render_row - cursor_row});
         }
         // Move to correct column: CR then forward
         _ = self.emit("\r");
-        if (actual_cursor_col > 0) _ = self.emitCSI("{d}C", .{actual_cursor_col});
+        if (cursor_col > 0) _ = self.emitCSI("{d}C", .{cursor_col});
 
-        self.term.rows_owned = actual_render_row + 1;
+        self.term.rows_owned = render_row + 1;
         self.term.row = cursor_row; // not used for movement anymore, but keep for finishLine
         self.term.col = cursor_col;
         self.last_hash = hash;
