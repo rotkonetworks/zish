@@ -728,9 +728,16 @@ pub const TermView = struct {
         var render_row: u16 = 0;
         var render_col: u16 = prompt_visible_len;
 
+        // Cap rendering to avoid scrolling past terminal bottom.
+        // Terminal height - 1 gives us room for the cursor line.
+        const max_render_rows: u16 = if (self.term.height > 2) self.term.height - 1 else 10;
+
         // emit content with syntax highlighting and continuation markers
         var hl = SyntaxHighlighter{};
         for (text) |c| {
+            // Stop emitting if we'd scroll past terminal bottom
+            if (render_row >= max_render_rows) break;
+
             // flush buffer if getting full (leave room for escape sequences)
             if (self.out_len > RENDER_BUF_SIZE - 256) {
                 try self.flush();
@@ -738,7 +745,6 @@ pub const TermView = struct {
             if (c == '\n') {
                 hl.flushWord(self);
                 _ = self.emit(Color.reset);
-                // clear to end of line before newline to avoid trailing artifacts
                 self.clearToEOL();
                 _ = self.emitByte('\n');
                 _ = self.emit(Color.gray);
@@ -746,7 +752,7 @@ pub const TermView = struct {
                 _ = self.emit(Color.reset);
                 _ = self.emitByte(' ');
                 hl.at_line_start = true;
-                hl.first_word = true; // new line = new command context
+                hl.first_word = true;
                 render_row += 1;
                 render_col = cont_marker_len;
             } else {
@@ -796,6 +802,9 @@ pub const TermView = struct {
                 }
             }
         }
+
+        // Clamp cursor row to rendered area
+        if (cursor_row > render_row) cursor_row = render_row;
 
         // Move cursor from render_end to cursor position
         if (render_row > cursor_row) {
