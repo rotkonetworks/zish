@@ -573,7 +573,7 @@ fn buildPrompt(self: *Shell, buf: *[256]u8) PromptInfo {
 
     // calculate visible length (mode indicator is 3-4 chars visible)
     const mode_visible: u16 = if (self.vi.mode == .visual_line) 4 else 3;
-    const rest_raw = user.len + 1 + hostname.len + 1 + display_path.len + 5; // @ + space-before-path + " $ " (3 chars including trailing space)
+    const rest_raw = user.len + 1 + hostname.len + 1 + display_path.len + 3; // +1(@) +1(space-before-path) +3(" $ ")
     const rest_visible: u16 = if (rest_raw > 250) 250 else @intCast(rest_raw);
 
     return .{
