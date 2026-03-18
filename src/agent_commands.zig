@@ -147,6 +147,16 @@ pub const Layout = struct {
     }
 
     pub fn drawInput(w: anytype, first_row: u16, rows: u16, ebuf: *const editor.EditBuffer) void {
+        // Move to first row, clear all input rows
+        w.print("\x1b[{d};1H", .{first_row}) catch {};
+        var ci: u16 = 0;
+        while (ci < rows) : (ci += 1) {
+            w.writeAll("\x1b[2K") catch {};
+            if (ci + 1 < rows) w.writeAll("\n") catch {};
+        }
+        // Back to first row
+        w.print("\x1b[{d};1H", .{first_row}) catch {};
+
         const line_count = ebuf.lineCount();
         const cur_line: u16 = blk: {
             var cl: u16 = 0;
@@ -155,35 +165,61 @@ pub const Layout = struct {
             }
             break :blk cl;
         };
-        const scroll_start: u16 = if (cur_line >= rows) cur_line - rows + 1 else 0;
-        var line_i: u16 = 0;
-        while (line_i < rows) : (line_i += 1) {
-            w.print("\x1b[{d};1H\x1b[2K", .{first_row + line_i}) catch {};
-            const abs_line = scroll_start + line_i;
-            if (abs_line < line_count) {
-                const line_text = ebuf.getLine(abs_line);
-                if (abs_line == 0) {
-                    if (ebuf.vi_mode == .normal) {
-                        w.writeAll("\x1b[33m> \x1b[0m") catch {};
-                    } else {
-                        w.writeAll("\x1b[90m> \x1b[0m") catch {};
-                    }
-                    // Show placeholder when empty
-                    if (ebuf.len == 0 and ebuf.vi_mode == .insert) {
-                        w.writeAll("\x1b[2;90mAsk anything, / for commands\x1b[0m") catch {};
-                    }
-                } else {
-                    w.writeAll("\x1b[90m\xc2\xb7 \x1b[0m") catch {}; // · continuation
-                }
-                w.writeAll(line_text) catch {};
+
+        // For visual-row scrolling: count visual rows per logical line
+        // and find which visual row range to display
+        const scroll_start: u16 = if (cur_line >= line_count) 0 else 0; // simplified: show from top
+
+        // Emit lines sequentially — let terminal handle wrapping naturally
+        var vis_rows_used: u16 = 0;
+        var cursor_vis_row: u16 = 0;
+        var line_idx: u16 = 0;
+        var text_pos: usize = 0;
+
+        while (line_idx < line_count and vis_rows_used < rows) : (line_idx += 1) {
+            const abs_line = scroll_start + line_idx;
+            if (abs_line >= line_count) break;
+
+            if (vis_rows_used > 0) {
+                w.writeAll("\r\n") catch {};
             }
+
+            // Emit prefix
+            if (abs_line == 0) {
+                if (ebuf.vi_mode == .normal) {
+                    w.writeAll("\x1b[33m> \x1b[0m") catch {};
+                } else {
+                    w.writeAll("\x1b[90m> \x1b[0m") catch {};
+                }
+                if (ebuf.len == 0 and ebuf.vi_mode == .insert) {
+                    w.writeAll("\x1b[2;90mAsk anything, / for commands\x1b[0m") catch {};
+                }
+            } else {
+                w.writeAll("\x1b[90m\xc2\xb7 \x1b[0m") catch {};
+            }
+
+            // Track cursor visual row
+            if (abs_line == cur_line) {
+                cursor_vis_row = vis_rows_used;
+            }
+
+            // Emit line text (terminal handles wrapping)
+            const line_text = ebuf.getLine(abs_line);
+            w.writeAll(line_text) catch {};
+
+            vis_rows_used += 1;
+            text_pos += line_text.len + 1; // +1 for newline
         }
-        const vis_line = cur_line - scroll_start;
+
+        // Position cursor: find the byte column within the cursor's line
         const byte_col = ebuf.currentCol();
         const line_start_byte = ebuf.cursor - byte_col;
         const cur_col = displayWidth(ebuf.text[line_start_byte..ebuf.cursor]);
         const prefix_width: u16 = 2;
-        w.print("\x1b[{d};{d}H", .{ first_row + vis_line, prefix_width + cur_col + 1 }) catch {};
+
+        // Use absolute positioning for cursor row, accounting for visual wrapping
+        w.print("\x1b[{d};{d}H", .{ first_row + cursor_vis_row, prefix_width + cur_col + 1 }) catch {};
+
         if (ebuf.vi_mode == .normal) {
             w.writeAll("\x1b[2 q") catch {};
         } else {
