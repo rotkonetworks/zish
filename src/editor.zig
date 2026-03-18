@@ -681,9 +681,19 @@ pub const TermView = struct {
         const cont_marker_len: u16 = 2; // "│ "
 
         // Move to the start of our editing region (row 0 of prompt).
-        // Use rows_owned from PREVIOUS render to know how far up to go.
-        // This is more reliable than tracking cursor_row because rows_owned
-        // is set after each successful render.
+        // rows_owned tracks how many rows the PREVIOUS render used.
+        // The cursor is currently at the END of the previous render's content.
+        // We need to move up from the cursor position to row 0 of our region.
+        //
+        // rows_owned - 1 is the correct amount because:
+        // - rows_owned = N means we occupied rows 0..N-1
+        // - cursor is somewhere in rows 0..N-1 (at most row N-1)
+        // - moving up N-1 from row N-1 gets us to row 0
+        //
+        // Edge: on the FIRST render after content grows (new wrap), rows_owned
+        // is from the PREVIOUS (smaller) render. The cursor hasn't moved down
+        // yet because we haven't rendered the new content. So rows_owned is
+        // correct — it reflects where the cursor actually is.
         if (self.term.rows_owned > 1) {
             _ = self.emitCSI("{d}A", .{self.term.rows_owned - 1});
         }
@@ -728,15 +738,16 @@ pub const TermView = struct {
         var render_row: u16 = 0;
         var render_col: u16 = prompt_visible_len;
 
-        // Cap rendering to avoid scrolling past terminal bottom.
-        // Terminal height - 1 gives us room for the cursor line.
-        const max_render_rows: u16 = if (self.term.height > 2) self.term.height - 1 else 10;
+        // Don't cap rendering — let content wrap freely. The rows_owned tracking
+        // handles re-render positioning correctly even when content wraps past
+        // the terminal bottom (terminal scrolls, but our tracking stays in sync
+        // because we always start from where the cursor IS, not where we think
+        // the prompt WAS).
 
         // emit content with syntax highlighting and continuation markers
         var hl = SyntaxHighlighter{};
         for (text) |c| {
-            // Stop emitting if we'd scroll past terminal bottom
-            if (render_row >= max_render_rows) break;
+            // No render cap — content can wrap freely past terminal bottom.
 
             // flush buffer if getting full (leave room for escape sequences)
             if (self.out_len > RENDER_BUF_SIZE - 256) {
