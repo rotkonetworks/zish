@@ -147,16 +147,24 @@ pub const Layout = struct {
     }
 
     pub fn drawInput(w: anytype, first_row: u16, rows: u16, ebuf: *const editor.EditBuffer) void {
-        // Move to first row, clear all input rows
-        w.print("\x1b[{d};1H", .{first_row}) catch {};
-        var ci: u16 = 0;
-        while (ci < rows) : (ci += 1) {
-            w.writeAll("\x1b[2K") catch {};
-            if (ci + 1 < rows) w.writeAll("\n") catch {};
-        }
-        // Back to first row
-        w.print("\x1b[{d};1H", .{first_row}) catch {};
+        // Get terminal width for visual row calculations
+        var ws: std.posix.winsize = undefined;
+        const C: u16 = if (std.posix.system.ioctl(1, std.posix.T.IOCGWINSZ, @intFromPtr(&ws)) == 0)
+            (if (ws.col > 0) ws.col else 80)
+        else
+            80;
+        const prefix: u16 = 2; // "> " or "· "
 
+        // Helper: visual rows for a line of given display width
+        const visRows = struct {
+            fn f(text_width: u16, pfx: u16, cols: u16) u16 {
+                if (cols == 0) return 1;
+                const total = pfx + text_width;
+                return if (total == 0) 1 else @intCast((total + cols - 1) / cols);
+            }
+        };
+
+        // Step 1: Compute visual layout for all logical lines
         const line_count = ebuf.lineCount();
         const cur_line: u16 = blk: {
             var cl: u16 = 0;
@@ -166,59 +174,108 @@ pub const Layout = struct {
             break :blk cl;
         };
 
-        // For visual-row scrolling: count visual rows per logical line
-        // and find which visual row range to display
-        const scroll_start: u16 = if (cur_line >= line_count) 0 else 0; // simplified: show from top
-
-        // Emit lines sequentially — let terminal handle wrapping naturally
-        var vis_rows_used: u16 = 0;
-        var cursor_vis_row: u16 = 0;
-        var line_idx: u16 = 0;
-        var text_pos: usize = 0;
-
-        while (line_idx < line_count and vis_rows_used < rows) : (line_idx += 1) {
-            const abs_line = scroll_start + line_idx;
-            if (abs_line >= line_count) break;
-
-            if (vis_rows_used > 0) {
-                w.writeAll("\r\n") catch {};
-            }
-
-            // Emit prefix
-            if (abs_line == 0) {
-                if (ebuf.vi_mode == .normal) {
-                    w.writeAll("\x1b[33m> \x1b[0m") catch {};
-                } else {
-                    w.writeAll("\x1b[90m> \x1b[0m") catch {};
-                }
-                if (ebuf.len == 0 and ebuf.vi_mode == .insert) {
-                    w.writeAll("\x1b[2;90mAsk anything, / for commands\x1b[0m") catch {};
-                }
-            } else {
-                w.writeAll("\x1b[90m\xc2\xb7 \x1b[0m") catch {};
-            }
-
-            // Track cursor visual row
-            if (abs_line == cur_line) {
-                cursor_vis_row = vis_rows_used;
-            }
-
-            // Emit line text (terminal handles wrapping)
-            const line_text = ebuf.getLine(abs_line);
-            w.writeAll(line_text) catch {};
-
-            vis_rows_used += 1;
-            text_pos += line_text.len + 1; // +1 for newline
-        }
-
-        // Position cursor: find the byte column within the cursor's line
+        // Find cursor's absolute visual row and column
         const byte_col = ebuf.currentCol();
         const line_start_byte = ebuf.cursor - byte_col;
-        const cur_col = displayWidth(ebuf.text[line_start_byte..ebuf.cursor]);
-        const prefix_width: u16 = 2;
+        const cur_col_width = displayWidth(ebuf.text[line_start_byte..ebuf.cursor]);
+        const cursor_total_col = prefix + cur_col_width;
+        var cursor_vrow_in_line: u16 = if (C > 0) @intCast(cursor_total_col / C) else 0;
+        var cursor_col_in_row: u16 = if (C > 0) @intCast(cursor_total_col % C) else cursor_total_col;
+        // Pending wrap correction: if cursor lands exactly at col 0 of next row,
+        // terminal cursor is actually at col C of previous row (pending wrap state)
+        if (C > 0 and cursor_col_in_row == 0 and cursor_vrow_in_line > 0) {
+            cursor_vrow_in_line -= 1;
+            cursor_col_in_row = C;
+        }
 
-        // Use absolute positioning for cursor row, accounting for visual wrapping
-        w.print("\x1b[{d};{d}H", .{ first_row + cursor_vis_row, prefix_width + cur_col + 1 }) catch {};
+        // Compute cursor's absolute visual row
+        var cursor_abs_vrow: u16 = cursor_vrow_in_line;
+        for (0..cur_line) |li| {
+            const lt = ebuf.getLine(@intCast(li));
+            cursor_abs_vrow += visRows.f(@intCast(displayWidth(lt)), prefix, C);
+        }
+
+        // Step 2: Compute scroll offset so cursor is visible
+        var scroll_vrow: u16 = 0;
+        if (cursor_abs_vrow >= rows) {
+            scroll_vrow = cursor_abs_vrow - rows + 1;
+        }
+
+        // Step 3: Clear the viewport
+        var ci: u16 = 0;
+        while (ci < rows) : (ci += 1) {
+            w.print("\x1b[{d};1H\x1b[2K", .{first_row + ci}) catch {};
+        }
+
+        // Step 4: Render visible visual rows
+        // Walk through logical lines, skipping visual rows until scroll_vrow,
+        // then render until viewport is full.
+        var abs_vrow: u16 = 0; // current absolute visual row
+        var viewport_vrow: u16 = 0; // rows written to viewport so far
+
+        for (0..line_count) |li| {
+            if (viewport_vrow >= rows) break;
+
+            const line_text = ebuf.getLine(@intCast(li));
+            const line_width: u16 = @intCast(displayWidth(line_text));
+            const line_vrows = visRows.f(line_width, prefix, C);
+
+            // Check if any part of this line is visible
+            if (abs_vrow + line_vrows <= scroll_vrow) {
+                abs_vrow += line_vrows;
+                continue; // entirely above viewport
+            }
+
+            // This line is (partially) visible
+            // Which visual row within this line is the first visible one?
+            const skip_vrows: u16 = if (scroll_vrow > abs_vrow) scroll_vrow - abs_vrow else 0;
+            const show_vrows = @min(line_vrows - skip_vrows, rows - viewport_vrow);
+
+            // Compute byte range to display: skip_vrows visual rows of content
+            const skip_chars: usize = if (skip_vrows > 0)
+                @as(usize, (C - prefix)) + @as(usize, skip_vrows - 1) * @as(usize, C)
+            else
+                0;
+
+            // Position at the viewport row
+            w.print("\x1b[{d};1H", .{first_row + viewport_vrow}) catch {};
+
+            // Emit prefix (only on first visual row of this logical line)
+            if (skip_vrows == 0) {
+                if (li == 0) {
+                    if (ebuf.vi_mode == .normal) {
+                        w.writeAll("\x1b[33m> \x1b[0m") catch {};
+                    } else {
+                        w.writeAll("\x1b[90m> \x1b[0m") catch {};
+                    }
+                    if (ebuf.len == 0 and ebuf.vi_mode == .insert) {
+                        w.writeAll("\x1b[2;90mAsk anything, / for commands\x1b[0m") catch {};
+                    }
+                } else {
+                    w.writeAll("\x1b[90m\xc2\xb7 \x1b[0m") catch {};
+                }
+            }
+
+            // Compute how many chars to show
+            const avail_chars: usize = @as(usize, show_vrows) * @as(usize, C) -
+                (if (skip_vrows == 0) @as(usize, prefix) else 0);
+
+            // Emit the visible portion of the line
+            if (skip_chars < line_text.len) {
+                const end = @min(skip_chars + avail_chars, line_text.len);
+                w.writeAll(line_text[skip_chars..end]) catch {};
+            }
+
+            viewport_vrow += show_vrows;
+            abs_vrow += line_vrows;
+        }
+
+        // Step 5: Position cursor
+        const cursor_viewport_row = cursor_abs_vrow -| scroll_vrow;
+        w.print("\x1b[{d};{d}H", .{
+            first_row + @min(cursor_viewport_row, rows -| 1),
+            cursor_col_in_row + 1,
+        }) catch {};
 
         if (ebuf.vi_mode == .normal) {
             w.writeAll("\x1b[2 q") catch {};
