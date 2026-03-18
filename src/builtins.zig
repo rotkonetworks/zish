@@ -3058,24 +3058,21 @@ fn agentInteractive(shell: *Shell) !u8 {
     @memcpy(model_name, model_src[0..mlen]);
     cfg.deinit();
 
-    // Compute visual line count for input area (accounts for terminal width wrapping)
+    // Compute visual line count for input area (accounts for terminal width wrapping).
+    // Matches drawInput's visRows logic exactly.
     const visualInputHeight = struct {
         fn f(ebuf: *const editor.EditBuffer, cols: u16) u16 {
-            if (cols == 0) return @min(ebuf.lineCount(), 5);
-            const prefix: u16 = 2; // "╰─>" or "· " prefix width
+            const lc = ebuf.lineCount();
+            if (cols == 0) return @min(lc, 5);
+            const prefix: u16 = 2; // "> " or "· " prefix width
             var vis_rows: u16 = 0;
-            var line_start: usize = 0;
-            var line_idx: u16 = 0;
-            for (ebuf.text[0..ebuf.len], 0..) |c, i| {
-                if (c == '\n' or i == ebuf.len - 1) {
-                    const line_len: u16 = @intCast(if (c == '\n') i - line_start else i + 1 - line_start);
-                    const total = prefix + line_len;
-                    vis_rows += if (total == 0) 1 else (total + cols - 1) / cols;
-                    line_start = i + 1;
-                    line_idx += 1;
-                }
+            for (0..lc) |li| {
+                const line = ebuf.getLine(@intCast(li));
+                const lw: u16 = agent_commands.TermWidth.width(line);
+                const total = prefix + lw;
+                vis_rows += if (total == 0) 1 else (total + cols - 1) / cols;
             }
-            if (ebuf.len == 0) vis_rows = 1;
+            if (vis_rows == 0) vis_rows = 1;
             return @min(vis_rows, 5);
         }
     };
