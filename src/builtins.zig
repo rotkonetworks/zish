@@ -3058,10 +3058,32 @@ fn agentInteractive(shell: *Shell) !u8 {
     @memcpy(model_name, model_src[0..mlen]);
     cfg.deinit();
 
+    // Compute visual line count for input area (accounts for terminal width wrapping)
+    const visualInputHeight = struct {
+        fn f(ebuf: *const editor.EditBuffer, cols: u16) u16 {
+            if (cols == 0) return @min(ebuf.lineCount(), 5);
+            const prefix: u16 = 2; // "╰─>" or "· " prefix width
+            var vis_rows: u16 = 0;
+            var line_start: usize = 0;
+            var line_idx: u16 = 0;
+            for (ebuf.text[0..ebuf.len], 0..) |c, i| {
+                if (c == '\n' or i == ebuf.len - 1) {
+                    const line_len: u16 = @intCast(if (c == '\n') i - line_start else i + 1 - line_start);
+                    const total = prefix + line_len;
+                    vis_rows += if (total == 0) 1 else (total + cols - 1) / cols;
+                    line_start = i + 1;
+                    line_idx += 1;
+                }
+            }
+            if (ebuf.len == 0) vis_rows = 1;
+            return @min(vis_rows, 5);
+        }
+    };
+
     // ── TUI State ──
     var term_rows = getTermRows();
     var term_cols = getTermCols();
-    var input_height: u16 = 1; // dynamic: min(editbuf.lineCount(), 5)
+    var input_height: u16 = 1; // dynamic: accounts for visual wrapping
     const fixed_rows: u16 = 2; // separator + status bar
 
     // Layout computation
@@ -3736,7 +3758,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                             _ = edit_buf.insertSlice("!");
                             _ = edit_buf.insertSlice(cmd_line);
                             // Recalculate input height for pre-filled content
-                            const new_h: u16 = @min(edit_buf.lineCount(), 5);
+                            const new_h: u16 = visualInputHeight.f(&edit_buf, term_cols);
                             if (new_h != input_height) {
                                 input_height = new_h;
                                 recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
@@ -3999,7 +4021,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                     while (di > 0) : (di -= 1) {
                         _ = edit_buf.deleteForward();
                     }
-                    const new_h: u16 = @min(edit_buf.lineCount(), 5);
+                    const new_h: u16 = visualInputHeight.f(&edit_buf, term_cols);
                     if (new_h != input_height) {
                         input_height = new_h;
                         recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
@@ -4278,7 +4300,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                     },
                     .alt_enter => {
                         if (edit_buf.insert('\n')) {
-                            const new_h: u16 = @min(edit_buf.lineCount(), 5);
+                            const new_h: u16 = visualInputHeight.f(&edit_buf, term_cols);
                             if (new_h != input_height) {
                                 input_height = new_h;
                                 recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
@@ -4290,7 +4312,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                     },
                     .delete => {
                         if (edit_buf.deleteForward()) {
-                            const new_h: u16 = @min(edit_buf.lineCount(), 5);
+                            const new_h: u16 = visualInputHeight.f(&edit_buf, term_cols);
                             if (new_h != input_height) {
                                 input_height = new_h;
                                 recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
@@ -4307,7 +4329,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                             const result = applyTuiBindableAction(ba, &edit_buf, shell);
                             if (result != .none) {
                                 if (result == .modified) {
-                                    const new_h: u16 = @min(edit_buf.lineCount(), 5);
+                                    const new_h: u16 = visualInputHeight.f(&edit_buf, term_cols);
                                     if (new_h != input_height) {
                                         input_height = new_h;
                                         recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
@@ -4350,7 +4372,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                         if (pasted) {
                             // Switch to insert mode if in vi normal
                             edit_buf.vi_mode = .insert;
-                            const new_h: u16 = @min(edit_buf.lineCount(), 5);
+                            const new_h: u16 = visualInputHeight.f(&edit_buf, term_cols);
                             if (new_h != input_height) {
                                 input_height = new_h;
                                 recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
@@ -4515,7 +4537,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                     else => { need_redraw = false; },
                 }
                 if (need_redraw) {
-                    const new_h: u16 = @min(edit_buf.lineCount(), 5);
+                    const new_h: u16 = visualInputHeight.f(&edit_buf, term_cols);
                     if (new_h != input_height) {
                         input_height = new_h;
                         recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
@@ -4530,7 +4552,7 @@ fn agentInteractive(shell: *Shell) !u8 {
             // Ctrl+J (0x0A) — insert newline
             if (byte[0] == 0x0A) {
                 if (edit_buf.insert('\n')) {
-                    const new_h: u16 = @min(edit_buf.lineCount(), 5);
+                    const new_h: u16 = visualInputHeight.f(&edit_buf, term_cols);
                     if (new_h != input_height) {
                         input_height = new_h;
                         recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
@@ -4879,7 +4901,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                     continue;
                 }
                 if (edit_buf.delete()) {
-                    const new_h: u16 = @min(edit_buf.lineCount(), 5);
+                    const new_h: u16 = visualInputHeight.f(&edit_buf, term_cols);
                     if (new_h != input_height) {
                         input_height = new_h;
                         recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
@@ -4905,7 +4927,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                     const result = applyTuiBindableAction(ba, &edit_buf, shell);
                     if (result != .none) {
                         if (result == .modified) {
-                            const new_h: u16 = @min(edit_buf.lineCount(), 5);
+                            const new_h: u16 = visualInputHeight.f(&edit_buf, term_cols);
                             if (new_h != input_height) {
                                 input_height = new_h;
                                 recalcLayout.f(out, term_rows, term_cols, input_height, &out_last, &sep_row, &input_first_row, &status_row, &edit_buf, model_name, cost_buf[0..cost_len], scroll_offset, status_text[0..status_len]);
