@@ -681,21 +681,10 @@ pub const TermView = struct {
         const cont_marker_len: u16 = 2; // "│ "
 
         // Move to the start of our editing region (row 0 of prompt).
-        // rows_owned tracks how many rows the PREVIOUS render used.
-        // The cursor is currently at the END of the previous render's content.
-        // We need to move up from the cursor position to row 0 of our region.
-        //
-        // rows_owned - 1 is the correct amount because:
-        // - rows_owned = N means we occupied rows 0..N-1
-        // - cursor is somewhere in rows 0..N-1 (at most row N-1)
-        // - moving up N-1 from row N-1 gets us to row 0
-        //
-        // Edge: on the FIRST render after content grows (new wrap), rows_owned
-        // is from the PREVIOUS (smaller) render. The cursor hasn't moved down
-        // yet because we haven't rendered the new content. So rows_owned is
-        // correct — it reflects where the cursor actually is.
-        if (self.term.rows_owned > 1) {
-            _ = self.emitCSI("{d}A", .{self.term.rows_owned - 1});
+        // self.term.row tracks the cursor's row from the PREVIOUS render.
+        // Move up by that many rows to get to the prompt start.
+        if (self.term.row > 0) {
+            _ = self.emitCSI("{d}A", .{self.term.row});
         }
         _ = self.emit("\r\x1b[J"); // go to col 0, clear everything below
 
