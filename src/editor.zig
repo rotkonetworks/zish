@@ -653,11 +653,10 @@ pub const TermView = struct {
         self: *Self,
         buf: *const EditBuffer,
         prompt: []const u8,
-        prompt_visible_len_arg: u16,
+        prompt_visible_len: u16,
     ) !void {
         // dynamic size check
         self.updateSize();
-        var prompt_visible_len = prompt_visible_len_arg;
 
         const text = buf.slice();
         var hash = std.hash.Wyhash.hash(0, text);
@@ -674,71 +673,45 @@ pub const TermView = struct {
             return;
         }
 
-        // Note: cursor hide/show removed — caused flicker in normal shell mode
-        // Agent mode handles cursor visibility separately via \x1b[?25l/h
-
         const w = self.term.width;
         const cont_marker_len: u16 = 2; // "│ "
 
-        // Move to the start of our editing region (row 0 of prompt).
-        // self.term.row tracks the cursor's row from the PREVIOUS render.
-        // Move up by that many rows to get to the prompt start.
+        // compute cursor position in content
+        var cursor_row: u16 = 0;
+        var cursor_col: u16 = prompt_visible_len;
+
+        for (text[0..buf.cursor]) |c| {
+            if (c == '\n') {
+                cursor_row += 1;
+                cursor_col = cont_marker_len;
+            } else {
+                cursor_col += 1;
+                if (w > 0 and cursor_col >= w) {
+                    cursor_row += 1;
+                    cursor_col = 0;
+                }
+            }
+        }
+
+        // move to start of our region
         if (self.term.row > 0) {
             _ = self.emitCSI("{d}A", .{self.term.row});
         }
-        _ = self.emit("\r\x1b[J"); // go to col 0, clear everything below
+        _ = self.emit("\r");
 
-        // emit prompt — truncate if wider than terminal to prevent wrapping
-        // (prompt wrapping breaks all cursor tracking due to terminal deferred-wrap)
-        if (w > 0 and prompt_visible_len >= w) {
-            // Truncate: find byte position where visible chars reach w-4 (leave room for ".. ")
-            const max_vis = w - 4;
-            var vis: u16 = 0;
-            var byte_pos: usize = 0;
-            var in_esc = false;
-            while (byte_pos < prompt.len and vis < max_vis) {
-                if (prompt[byte_pos] == 0x1b) {
-                    in_esc = true;
-                } else if (in_esc) {
-                    if ((prompt[byte_pos] >= 'A' and prompt[byte_pos] <= 'Z') or
-                        (prompt[byte_pos] >= 'a' and prompt[byte_pos] <= 'z'))
-                        in_esc = false;
-                } else {
-                    vis += 1;
-                }
-                byte_pos += 1;
-            }
-            // If we stopped inside an escape sequence, finish consuming it
-            // to avoid emitting a broken sequence that corrupts terminal state
-            while (in_esc and byte_pos < prompt.len) {
-                if ((prompt[byte_pos] >= 'A' and prompt[byte_pos] <= 'Z') or
-                    (prompt[byte_pos] >= 'a' and prompt[byte_pos] <= 'z'))
-                    in_esc = false;
-                byte_pos += 1;
-            }
-            _ = self.emit(prompt[0..byte_pos]);
-            _ = self.emit("\x1b[0m.. ");
-            prompt_visible_len = vis + 3; // ".. " = 3 chars
-        } else {
-            _ = self.emit(prompt);
-        }
+        // clear from start of our region to end of screen
+        _ = self.emit("\x1b[J");
+
+        // emit prompt
+        _ = self.emit(prompt);
 
         // track rendering position as we emit
         var render_row: u16 = 0;
         var render_col: u16 = prompt_visible_len;
 
-        // Don't cap rendering — let content wrap freely. The rows_owned tracking
-        // handles re-render positioning correctly even when content wraps past
-        // the terminal bottom (terminal scrolls, but our tracking stays in sync
-        // because we always start from where the cursor IS, not where we think
-        // the prompt WAS).
-
         // emit content with syntax highlighting and continuation markers
         var hl = SyntaxHighlighter{};
         for (text) |c| {
-            // No render cap — content can wrap freely past terminal bottom.
-
-            // flush buffer if getting full (leave room for escape sequences)
             if (self.out_len > RENDER_BUF_SIZE - 256) {
                 try self.flush();
             }
@@ -759,7 +732,6 @@ pub const TermView = struct {
                 hl.feed(self, c);
                 render_col += 1;
                 if (w > 0 and render_col >= w) {
-                    render_col -= w;
                     render_row += 1;
                     render_col = 0;
                 }
@@ -773,12 +745,12 @@ pub const TermView = struct {
             _ = self.emit("\x1b[90m"); // dim gray
             for (self.ghost_text) |c| {
                 if (self.out_len > RENDER_BUF_SIZE - 64) break;
-                if (c == '\n') break; // only show first line of ghost
+                if (c == '\n') break;
                 _ = self.emitByte(c);
                 render_col += 1;
                 if (w > 0 and render_col >= w) {
-                    render_col -= w;
                     render_row += 1;
+                    render_col = 0;
                 }
             }
             _ = self.emit("\x1b[0m");
@@ -787,27 +759,10 @@ pub const TermView = struct {
         // clear any leftover content after our text
         _ = self.emit("\x1b[J");
 
-        // Compute cursor position (same column tracking as render)
-        var cursor_row: u16 = 0;
-        var cursor_col: u16 = prompt_visible_len;
-        for (text[0..buf.cursor]) |c| {
-            if (c == '\n') {
-                cursor_row += 1;
-                cursor_col = cont_marker_len;
-            } else {
-                cursor_col += 1;
-                if (w > 0 and cursor_col >= w) {
-                    cursor_row += 1;
-                    cursor_col = 0;
-                }
-            }
-        }
-
         // Track render end position, then move to cursor
         self.term.row = render_row;
         self.term.col = render_col;
         self.moveTo(cursor_row, cursor_col);
-        // moveTo updates self.term.row/col to cursor position
 
         self.term.rows_owned = render_row + 1;
         self.last_hash = hash;
