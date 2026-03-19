@@ -571,14 +571,24 @@ fn buildPrompt(self: *Shell, buf: *[256]u8) PromptInfo {
         exit_str,
     }) catch return .{ .slice = "$ ", .visible_len = 2 };
 
-    // calculate visible length (mode indicator is 3-4 chars visible)
-    const mode_visible: u16 = if (self.vi.mode == .visual_line) 4 else 3;
-    const rest_raw = user.len + 1 + hostname.len + 1 + display_path.len + 3; // +1(@) +1(space-before-path) +3(" $ ")
-    const rest_visible: u16 = if (rest_raw > 250) 250 else @intCast(rest_raw);
+    // Calculate visible length by walking the formatted string and stripping ANSI escapes.
+    // This is always correct regardless of how many color codes or special chars are in the prompt.
+    const formatted = buf[0..len.len];
+    var visible: u16 = 0;
+    var in_esc = false;
+    for (formatted) |c| {
+        if (c == 0x1b) {
+            in_esc = true;
+        } else if (in_esc) {
+            if ((c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z')) in_esc = false;
+        } else {
+            visible += 1;
+        }
+    }
 
     return .{
-        .slice = buf[0..len.len],
-        .visible_len = mode_visible + 1 + rest_visible + branch_visible + exit_visible, // +1 for space after mode
+        .slice = formatted,
+        .visible_len = visible,
     };
 }
 
