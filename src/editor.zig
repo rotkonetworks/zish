@@ -673,6 +673,9 @@ pub const TermView = struct {
             return;
         }
 
+        // Note: cursor hide/show removed — caused flicker in normal shell mode
+        // Agent mode handles cursor visibility separately via \x1b[?25l/h
+
         const w = self.term.width;
         const cont_marker_len: u16 = 2; // "│ "
 
@@ -700,10 +703,39 @@ pub const TermView = struct {
         _ = self.emit("\r");
 
         // clear from start of our region to end of screen
+        // this is simpler and more reliable than per-line clearing,
+        // and avoids disturbing soft-wrap metadata on individual lines
         _ = self.emit("\x1b[J");
 
-        // emit prompt
-        _ = self.emit(prompt);
+        // emit prompt — truncate if wider than terminal to prevent wrapping
+        if (w > 0 and prompt_visible_len >= w) {
+            const max_vis = w -| 4;
+            var vis: u16 = 0;
+            var byte_pos: usize = 0;
+            var in_esc = false;
+            while (byte_pos < prompt.len and vis < max_vis) {
+                if (prompt[byte_pos] == 0x1b) {
+                    in_esc = true;
+                } else if (in_esc) {
+                    if ((prompt[byte_pos] >= 'A' and prompt[byte_pos] <= 'Z') or
+                        (prompt[byte_pos] >= 'a' and prompt[byte_pos] <= 'z'))
+                        in_esc = false;
+                } else {
+                    vis += 1;
+                }
+                byte_pos += 1;
+            }
+            while (in_esc and byte_pos < prompt.len) {
+                if ((prompt[byte_pos] >= 'A' and prompt[byte_pos] <= 'Z') or
+                    (prompt[byte_pos] >= 'a' and prompt[byte_pos] <= 'z'))
+                    in_esc = false;
+                byte_pos += 1;
+            }
+            _ = self.emit(prompt[0..byte_pos]);
+            _ = self.emit("\x1b[0m.. ");
+        } else {
+            _ = self.emit(prompt);
+        }
 
         // track rendering position as we emit
         var render_row: u16 = 0;
@@ -712,12 +744,14 @@ pub const TermView = struct {
         // emit content with syntax highlighting and continuation markers
         var hl = SyntaxHighlighter{};
         for (text) |c| {
+            // flush buffer if getting full (leave room for escape sequences)
             if (self.out_len > RENDER_BUF_SIZE - 256) {
                 try self.flush();
             }
             if (c == '\n') {
                 hl.flushWord(self);
                 _ = self.emit(Color.reset);
+                // clear to end of line before newline to avoid trailing artifacts
                 self.clearToEOL();
                 _ = self.emitByte('\n');
                 _ = self.emit(Color.gray);
@@ -725,7 +759,7 @@ pub const TermView = struct {
                 _ = self.emit(Color.reset);
                 _ = self.emitByte(' ');
                 hl.at_line_start = true;
-                hl.first_word = true;
+                hl.first_word = true; // new line = new command context
                 render_row += 1;
                 render_col = cont_marker_len;
             } else {
@@ -745,7 +779,7 @@ pub const TermView = struct {
             _ = self.emit("\x1b[90m"); // dim gray
             for (self.ghost_text) |c| {
                 if (self.out_len > RENDER_BUF_SIZE - 64) break;
-                if (c == '\n') break;
+                if (c == '\n') break; // only show first line of ghost
                 _ = self.emitByte(c);
                 render_col += 1;
                 if (w > 0 and render_col >= w) {
@@ -759,45 +793,11 @@ pub const TermView = struct {
         // clear any leftover content after our text
         _ = self.emit("\x1b[J");
 
-        // DEBUG: log render state
-        {
-            const dbg = std.fs.createFileAbsolute("/tmp/zish_render.log", .{ .truncate = true }) catch null;
-            if (dbg) |f| {
-                defer f.close();
-                var dbuf: [256]u8 = undefined;
-                const msg = std.fmt.bufPrint(&dbuf, "w={d} plen={d} textlen={d} cursor={d} render=({d},{d}) cursor=({d},{d}) term.row={d}\n", .{
-                    w, prompt_visible_len, text.len, buf.cursor, render_row, render_col, cursor_row, cursor_col, self.term.row,
-                }) catch "";
-                f.writeAll(msg) catch {};
-            }
-        }
-
-        // Track render end position, then move to cursor.
-        // Pending-wrap: if render ends at col 0 from a wrap, the terminal
-        // cursor is actually at the END of the previous row (pending wrap
-        // state), not at col 0 of the new row. Tell moveTo the TRUE position.
-        if (render_col == 0 and render_row > 0) {
-            self.term.row = render_row - 1;
-            self.term.col = w; // at the right edge (pending)
-        } else {
-            self.term.row = render_row;
-            self.term.col = render_col;
-        }
+        // Track render end position, then move to cursor
+        self.term.row = render_row;
+        self.term.col = render_col;
         self.moveTo(cursor_row, cursor_col);
-
-        // DEBUG: log AFTER moveTo
-        {
-            const dbg2 = std.fs.openFileAbsolute("/tmp/zish_render.log", .{ .mode = .write_only }) catch null;
-            if (dbg2) |f| {
-                defer f.close();
-                f.seekFromEnd(0) catch {};
-                var dbuf2: [256]u8 = undefined;
-                const msg2 = std.fmt.bufPrint(&dbuf2, "AFTER moveTo: term.row={d} term.col={d} rows_owned={d}\n", .{
-                    self.term.row, self.term.col, render_row + 1,
-                }) catch "";
-                f.writeAll(msg2) catch {};
-            }
-        }
+        // moveTo updates self.term.row/col to cursor position
 
         self.term.rows_owned = render_row + 1;
         self.last_hash = hash;
