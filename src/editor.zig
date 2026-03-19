@@ -785,11 +785,23 @@ pub const TermView = struct {
         // clear any leftover content after our text
         _ = self.emit("\x1b[J");
 
-        // Track render end position, then move to cursor
-        self.term.row = render_row;
-        self.term.col = render_col;
-        self.moveTo(cursor_row, cursor_col);
-        // moveTo updates self.term.row/col to cursor position
+        // Track render end position, then move to cursor.
+        // Pending-wrap: when content fills exactly N*w columns, render_col=0
+        // but the terminal cursor is at col w of row N-1 (hasn't wrapped yet).
+        // moveTo needs the TRUE position to compute relative movement.
+        if (render_col == 0 and render_row > 0) {
+            self.term.row = render_row - 1;
+            self.term.col = w;
+        } else {
+            self.term.row = render_row;
+            self.term.col = render_col;
+        }
+        // Same for cursor target when at exact fill
+        if (cursor_col == 0 and cursor_row > 0 and buf.cursor == buf.len) {
+            self.moveTo(cursor_row - 1, w);
+        } else {
+            self.moveTo(cursor_row, cursor_col);
+        }
 
         self.term.rows_owned = render_row + 1;
         self.last_hash = hash;
