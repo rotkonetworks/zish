@@ -797,26 +797,19 @@ pub const TermView = struct {
             } else {
                 cursor_col += 1;
                 if (w > 0 and cursor_col >= w) {
-                    cursor_col -= w;
                     cursor_row += 1;
+                    cursor_col = 0;
                 }
             }
         }
 
-        // Clamp cursor row to rendered area
-        if (cursor_row > render_row) cursor_row = render_row;
-
-        // Move cursor from render_end to cursor position
-        if (render_row > cursor_row) {
-            _ = self.emitCSI("{d}A", .{render_row - cursor_row});
-        }
-        // Move to correct column: CR then forward
-        _ = self.emit("\r");
-        if (cursor_col > 0) _ = self.emitCSI("{d}C", .{cursor_col});
+        // Track render end position, then move to cursor
+        self.term.row = render_row;
+        self.term.col = render_col;
+        self.moveTo(cursor_row, cursor_col);
+        // moveTo updates self.term.row/col to cursor position
 
         self.term.rows_owned = render_row + 1;
-        self.term.row = cursor_row; // not used for movement anymore, but keep for finishLine
-        self.term.col = cursor_col;
         self.last_hash = hash;
         self.last_cursor = buf.cursor;
 
