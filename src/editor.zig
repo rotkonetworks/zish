@@ -759,10 +759,45 @@ pub const TermView = struct {
         // clear any leftover content after our text
         _ = self.emit("\x1b[J");
 
-        // Track render end position, then move to cursor
-        self.term.row = render_row;
-        self.term.col = render_col;
+        // DEBUG: log render state
+        {
+            const dbg = std.fs.createFileAbsolute("/tmp/zish_render.log", .{ .truncate = true }) catch null;
+            if (dbg) |f| {
+                defer f.close();
+                var dbuf: [256]u8 = undefined;
+                const msg = std.fmt.bufPrint(&dbuf, "w={d} plen={d} textlen={d} cursor={d} render=({d},{d}) cursor=({d},{d}) term.row={d}\n", .{
+                    w, prompt_visible_len, text.len, buf.cursor, render_row, render_col, cursor_row, cursor_col, self.term.row,
+                }) catch "";
+                f.writeAll(msg) catch {};
+            }
+        }
+
+        // Track render end position, then move to cursor.
+        // Pending-wrap: if render ends at col 0 from a wrap, the terminal
+        // cursor is actually at the END of the previous row (pending wrap
+        // state), not at col 0 of the new row. Tell moveTo the TRUE position.
+        if (render_col == 0 and render_row > 0) {
+            self.term.row = render_row - 1;
+            self.term.col = w; // at the right edge (pending)
+        } else {
+            self.term.row = render_row;
+            self.term.col = render_col;
+        }
         self.moveTo(cursor_row, cursor_col);
+
+        // DEBUG: log AFTER moveTo
+        {
+            const dbg2 = std.fs.openFileAbsolute("/tmp/zish_render.log", .{ .mode = .write_only }) catch null;
+            if (dbg2) |f| {
+                defer f.close();
+                f.seekFromEnd(0) catch {};
+                var dbuf2: [256]u8 = undefined;
+                const msg2 = std.fmt.bufPrint(&dbuf2, "AFTER moveTo: term.row={d} term.col={d} rows_owned={d}\n", .{
+                    self.term.row, self.term.col, render_row + 1,
+                }) catch "";
+                f.writeAll(msg2) catch {};
+            }
+        }
 
         self.term.rows_owned = render_row + 1;
         self.last_hash = hash;
