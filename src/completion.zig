@@ -207,14 +207,43 @@ pub fn handleTabCompletion(self: *Shell) !void {
         var d = std.fs.cwd().openDir(check_path, .{}) catch break :blk word;
         d.close();
 
-        // it's a directory - insert / into buffer and update effective_word
+        // Before auto-inserting /, check if sibling entries also match this prefix.
+        // e.g. typing "papi" with both "papi/" and "papi-console/" should show menu,
+        // not descend into papi/.
+        const has_siblings = blk2: {
+            const parent_dir = if (std.mem.lastIndexOf(u8, check_path, "/")) |slash|
+                check_path[0..slash]
+            else
+                ".";
+            const basename = if (std.mem.lastIndexOf(u8, word, "/")) |slash|
+                word[slash + 1 ..]
+            else
+                word;
+            var pd = std.fs.cwd().openDir(parent_dir, .{ .iterate = true }) catch break :blk2 false;
+            defer pd.close();
+            var it = pd.iterate();
+            var sibling_count: u8 = 0;
+            while (it.next() catch null) |entry| {
+                if (entry.name.len > basename.len and std.mem.startsWith(u8, entry.name, basename)) {
+                    sibling_count += 1;
+                    if (sibling_count > 0) break :blk2 true;
+                }
+            }
+            break :blk2 false;
+        };
+
+        if (has_siblings) {
+            // Don't descend — let the parent directory completion find both matches
+            break :blk word;
+        }
+
+        // Only match: insert / and descend into the directory
         self.edit_buf.cursor = @intCast(word_end);
         _ = self.edit_buf.insertSlice("/");
         effective_word_end = word_end + 1;
         inserted_slash = true;
-        self.skip_next_slash = true; // skip if user types / right after
+        self.skip_next_slash = true;
 
-        // append / conceptually for pattern matching
         if (word.len + 1 < expanded_word_buf.len) {
             @memcpy(expanded_word_buf[0..word.len], word);
             expanded_word_buf[word.len] = '/';
