@@ -707,35 +707,8 @@ pub const TermView = struct {
         // and avoids disturbing soft-wrap metadata on individual lines
         _ = self.emit("\x1b[J");
 
-        // emit prompt — truncate if wider than terminal to prevent wrapping
-        if (w > 0 and prompt_visible_len >= w) {
-            const max_vis = w -| 4;
-            var vis: u16 = 0;
-            var byte_pos: usize = 0;
-            var in_esc = false;
-            while (byte_pos < prompt.len and vis < max_vis) {
-                if (prompt[byte_pos] == 0x1b) {
-                    in_esc = true;
-                } else if (in_esc) {
-                    if ((prompt[byte_pos] >= 'A' and prompt[byte_pos] <= 'Z') or
-                        (prompt[byte_pos] >= 'a' and prompt[byte_pos] <= 'z'))
-                        in_esc = false;
-                } else {
-                    vis += 1;
-                }
-                byte_pos += 1;
-            }
-            while (in_esc and byte_pos < prompt.len) {
-                if ((prompt[byte_pos] >= 'A' and prompt[byte_pos] <= 'Z') or
-                    (prompt[byte_pos] >= 'a' and prompt[byte_pos] <= 'z'))
-                    in_esc = false;
-                byte_pos += 1;
-            }
-            _ = self.emit(prompt[0..byte_pos]);
-            _ = self.emit("\x1b[0m.. ");
-        } else {
-            _ = self.emit(prompt);
-        }
+        // emit prompt
+        _ = self.emit(prompt);
 
         // track rendering position as we emit
         var render_row: u16 = 0;
@@ -793,10 +766,24 @@ pub const TermView = struct {
         // clear any leftover content after our text
         _ = self.emit("\x1b[J");
 
-        // Track render end position, then move to cursor
-        self.term.row = render_row;
-        self.term.col = render_col;
-        self.moveTo(cursor_row, cursor_col);
+        // Track render end position, then move to cursor.
+        // When render ends at col 0 from a wrap (exact fill), the terminal
+        // cursor is at the END of the previous row (pending wrap), not at
+        // col 0 of the new row. Tell moveTo the true position so it
+        // computes correct relative movement.
+        if (render_col == 0 and render_row > 0) {
+            self.term.row = render_row - 1;
+            self.term.col = w;
+        } else {
+            self.term.row = render_row;
+            self.term.col = render_col;
+        }
+        // Same correction for cursor target
+        if (cursor_col == 0 and cursor_row > 0 and buf.cursor == buf.len) {
+            self.moveTo(cursor_row - 1, w);
+        } else {
+            self.moveTo(cursor_row, cursor_col);
+        }
         // moveTo updates self.term.row/col to cursor position
 
         self.term.rows_owned = render_row + 1;
