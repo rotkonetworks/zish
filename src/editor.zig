@@ -758,12 +758,6 @@ pub const TermView = struct {
                 hl.feed(self, c);
                 render_col += 1;
                 if (w > 0 and render_col >= w) {
-                    // Force terminal to wrap by emitting CR+LF.
-                    // Without this, the terminal may be in pending-wrap
-                    // state (cursor at col w, hasn't moved to next line).
-                    // By forcing the wrap, we sync our tracking with
-                    // the terminal's actual cursor position.
-                    _ = self.emit("\r\n");
                     render_row += 1;
                     render_col = 0;
                 }
@@ -781,7 +775,6 @@ pub const TermView = struct {
                 _ = self.emitByte(c);
                 render_col += 1;
                 if (w > 0 and render_col >= w) {
-                    _ = self.emit("\r\n");
                     render_row += 1;
                     render_col = 0;
                 }
@@ -792,10 +785,19 @@ pub const TermView = struct {
         // clear any leftover content after our text
         _ = self.emit("\x1b[J");
 
-        // Track render end position, then move to cursor
-        self.term.row = render_row;
-        self.term.col = render_col;
-        self.moveTo(cursor_row, cursor_col);
+        // Track render end position, then move to cursor.
+        // Deferred wrap: after writing exactly w chars on a line, the terminal
+        // cursor stays at col w-1 of the current row. It does NOT advance to
+        // the next row until the next character is written. So when our tracking
+        // shows render_col=0 from a >= w wrap, the terminal is actually 1 row behind.
+        // Use the ACTUAL terminal row for moveTo's relative calculation.
+        const actual_render_row = if (render_col == 0 and render_row > 0) render_row - 1 else render_row;
+        self.term.row = actual_render_row;
+        self.term.col = if (render_col == 0 and render_row > 0) w else render_col;
+        // For cursor target: same correction when cursor is at exact fill
+        const actual_cursor_row = if (cursor_col == 0 and cursor_row > 0 and buf.cursor == buf.len) cursor_row - 1 else cursor_row;
+        const actual_cursor_col = if (cursor_col == 0 and cursor_row > 0 and buf.cursor == buf.len) w else cursor_col;
+        self.moveTo(actual_cursor_row, actual_cursor_col);
 
         self.term.rows_owned = render_row + 1;
         self.last_hash = hash;
