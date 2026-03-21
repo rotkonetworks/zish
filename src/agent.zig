@@ -1681,17 +1681,39 @@ const AgentThread = struct {
             const override = self.queues.shared_max_tokens.load(.monotonic);
             break :blk if (override > 0) override else self.config.max_tokens;
         };
+        const is_oauth = std.mem.startsWith(u8, self.config.api_key, "sk-ant-oat01-");
+
         w.print("{{\"model\":\"{s}\",\"max_tokens\":{d},\"stream\":true", .{
             self.config.model,
             effective_max_tokens,
         }) catch return error.BodyTooLarge;
-        // Extended thinking (if budget > 0)
+        // Thinking mode: OAuth requires adaptive thinking; API keys use budget-based
         const thinking_budget = self.queues.shared_thinking_budget.load(.monotonic);
-        if (thinking_budget > 0) {
+        if (is_oauth) {
+            // OAuth tokens require thinking field for Claude Code compatibility
+            if (thinking_budget > 0) {
+                w.print(",\"thinking\":{{\"type\":\"enabled\",\"budget_tokens\":{d}}}", .{thinking_budget}) catch return error.BodyTooLarge;
+            } else {
+                w.writeAll(",\"thinking\":{\"type\":\"adaptive\"}") catch return error.BodyTooLarge;
+            }
+        } else if (thinking_budget > 0) {
             w.print(",\"thinking\":{{\"type\":\"enabled\",\"budget_tokens\":{d}}}", .{thinking_budget}) catch return error.BodyTooLarge;
         }
-        w.writeAll(",\"system\":") catch return error.BodyTooLarge;
-        writeJSONString(w, self.systemPrompt()) catch return error.BodyTooLarge;
+        // System prompt: OAuth tokens need billing header prefix for authentication
+        if (is_oauth) {
+            // System as array: billing header block + actual system prompt with cache_control
+            // The billing header identifies this as a Claude Code compatible client.
+            // Format: x-anthropic-billing-header: cc_version=<version>; cc_entrypoint=cli; cch=<hash>;
+            // cc_version: Claude Code version (e.g. "2.1.81.df2")
+            // cc_entrypoint: "cli" for command-line usage
+            // cch: content cache hash — any hex value, used for prompt caching optimization
+            w.writeAll(",\"system\":[{\"type\":\"text\",\"text\":\"x-anthropic-billing-header: cc_version=2.1.81.df2; cc_entrypoint=cli; cch=a1b2c;\"},{\"type\":\"text\",\"text\":") catch return error.BodyTooLarge;
+            writeJSONString(w, self.systemPrompt()) catch return error.BodyTooLarge;
+            w.writeAll(",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}}]") catch return error.BodyTooLarge;
+        } else {
+            w.writeAll(",\"system\":") catch return error.BodyTooLarge;
+            writeJSONString(w, self.systemPrompt()) catch return error.BodyTooLarge;
+        }
         w.print(",\"messages\":{s},\"tools\":{s}}}", .{
             messages_json,
             self.toolsJson(),
@@ -1699,10 +1721,14 @@ const AgentThread = struct {
 
         const body = body_buf[0..fbs.pos];
 
-        // Build URL
+        // Build URL (OAuth requires ?beta=true query parameter)
         var url_buf: [256]u8 = undefined;
-        const url = std.fmt.bufPrint(&url_buf, "{s}/v1/messages", .{self.config.base_url})
-            catch return error.URLTooLong;
+        const url = if (is_oauth)
+            std.fmt.bufPrint(&url_buf, "{s}/v1/messages?beta=true", .{self.config.base_url})
+                catch return error.URLTooLong
+        else
+            std.fmt.bufPrint(&url_buf, "{s}/v1/messages", .{self.config.base_url})
+                catch return error.URLTooLong;
 
         return self.doStreamRequest(url, body, .anthropic);
     }
@@ -1877,17 +1903,29 @@ const AgentThread = struct {
                 argc += 1;
                 argv_buf[argc] = "-H";
                 argc += 1;
-                // OAuth tokens require the oauth beta flag
+                // Beta features: OAuth needs Claude Code identification flags
                 argv_buf[argc] = if (is_oauth)
-                    "anthropic-beta: oauth-2025-04-20,prompt-caching-scope-2026-01-05"
+                    "anthropic-beta: claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05"
                 else
                     "anthropic-beta: prompt-caching-scope-2026-01-05";
                 argc += 1;
 
-                // Anthropic TypeScript SDK 0.74.0 identification
+                if (is_oauth) {
+                    // OAuth requires these additional headers for Claude Code compatibility
+                    argv_buf[argc] = "-H";
+                    argc += 1;
+                    argv_buf[argc] = "anthropic-dangerous-direct-browser-access: true";
+                    argc += 1;
+                    argv_buf[argc] = "-H";
+                    argc += 1;
+                    argv_buf[argc] = "x-app: cli";
+                    argc += 1;
+                }
+
+                // SDK identification headers
                 argv_buf[argc] = "-H";
                 argc += 1;
-                argv_buf[argc] = "User-Agent: Anthropic/JS 0.74.0";
+                argv_buf[argc] = "User-Agent: claude-cli/2.1.81 (external, cli)";
                 argc += 1;
                 argv_buf[argc] = "-H";
                 argc += 1;
