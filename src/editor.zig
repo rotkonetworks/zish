@@ -456,10 +456,14 @@ pub const SyntaxHighlighter = struct {
     fn handleWord(self: *Self, out: *TermView, c: u8) void {
         switch (c) {
             'a'...'z', 'A'...'Z', '_', '-', '.', '/', '0'...'9' => {
-                if (self.word_len < 127) {
-                    self.word_buf[self.word_len] = c;
-                    self.word_len += 1;
+                if (self.word_len >= 127) {
+                    // Buffer full — flush current word and start fresh.
+                    // Without this, chars are silently dropped, causing
+                    // render_col to desync from actual terminal position.
+                    self.flushWord(out);
                 }
+                self.word_buf[self.word_len] = c;
+                self.word_len += 1;
             },
             else => {
                 self.flushWord(out);
@@ -785,19 +789,27 @@ pub const TermView = struct {
         // clear any leftover content after our text
         _ = self.emit("\x1b[J");
 
-        // Track render end position, then move to cursor.
-        // Deferred wrap: after writing exactly w chars on a line, the terminal
-        // cursor stays at col w-1 of the current row. It does NOT advance to
-        // the next row until the next character is written. So when our tracking
-        // shows render_col=0 from a >= w wrap, the terminal is actually 1 row behind.
-        // Use the ACTUAL terminal row for moveTo's relative calculation.
-        const actual_render_row = if (render_col == 0 and render_row > 0) render_row - 1 else render_row;
-        self.term.row = actual_render_row;
-        self.term.col = if (render_col == 0 and render_row > 0) w else render_col;
-        // For cursor target: same correction when cursor is at exact fill
-        const actual_cursor_row = if (cursor_col == 0 and cursor_row > 0 and buf.cursor == buf.len) cursor_row - 1 else cursor_row;
-        const actual_cursor_col = if (cursor_col == 0 and cursor_row > 0 and buf.cursor == buf.len) w else cursor_col;
-        self.moveTo(actual_cursor_row, actual_cursor_col);
+        // Debug log (append)
+        {
+            const dbg = std.fs.openFileAbsolute("/tmp/zish_render.log", .{ .mode = .write_only }) catch
+                std.fs.createFileAbsolute("/tmp/zish_render.log", .{}) catch null;
+            if (dbg) |f| {
+                defer f.close();
+                f.seekFromEnd(0) catch {};
+                var dbuf: [256]u8 = undefined;
+                const msg = std.fmt.bufPrint(&dbuf, "w={d} pl={d} tl={d} cur={d} rr={d} rc={d} cr={d} cc={d} tr={d} hash={x}\n", .{
+                    w, prompt_visible_len, text.len, buf.cursor,
+                    render_row, render_col, cursor_row, cursor_col,
+                    self.term.row, hash,
+                }) catch "";
+                f.writeAll(msg) catch {};
+            }
+        }
+
+        // Track render end position, then move to cursor
+        self.term.row = render_row;
+        self.term.col = render_col;
+        self.moveTo(cursor_row, cursor_col);
 
         self.term.rows_owned = render_row + 1;
         self.last_hash = hash;
