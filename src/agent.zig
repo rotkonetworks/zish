@@ -2308,22 +2308,50 @@ pub fn unescapeJSONPublic(src: []const u8, dest: []u8) ?[]const u8 {
 
 fn writeJSONString(w: anytype, s: []const u8) !void {
     try w.writeByte('"');
-    for (s) |c| {
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
         switch (c) {
-            '"' => try w.writeAll("\\\""),
-            '\\' => try w.writeAll("\\\\"),
-            '\n' => try w.writeAll("\\n"),
-            '\r' => try w.writeAll("\\r"),
-            '\t' => try w.writeAll("\\t"),
+            '"' => { try w.writeAll("\\\""); i += 1; },
+            '\\' => { try w.writeAll("\\\\"); i += 1; },
+            '\n' => { try w.writeAll("\\n"); i += 1; },
+            '\r' => { try w.writeAll("\\r"); i += 1; },
+            '\t' => { try w.writeAll("\\t"); i += 1; },
             else => {
                 if (c < 0x20) {
-                    // escape control characters as \u00XX
+                    // Escape control characters as \u00XX
                     try w.writeAll("\\u00");
                     const hex = "0123456789abcdef";
                     try w.writeByte(hex[c >> 4]);
                     try w.writeByte(hex[c & 0x0f]);
-                } else {
+                    i += 1;
+                } else if (c < 0x80) {
+                    // ASCII: always valid UTF-8
                     try w.writeByte(c);
+                    i += 1;
+                } else {
+                    // Multi-byte UTF-8: validate sequence, replace invalid bytes
+                    const seq_len: usize = if (c >= 0xF0 and i + 3 < s.len) 4
+                        else if (c >= 0xE0 and i + 2 < s.len) 3
+                        else if (c >= 0xC0 and i + 1 < s.len) 2
+                        else 0;
+                    if (seq_len > 0) {
+                        // Check continuation bytes (must be 10xxxxxx)
+                        var valid = true;
+                        for (1..seq_len) |j| {
+                            if (s[i + j] & 0xC0 != 0x80) { valid = false; break; }
+                        }
+                        if (valid) {
+                            try w.writeAll(s[i..][0..seq_len]);
+                            i += seq_len;
+                        } else {
+                            // Invalid sequence — skip byte
+                            i += 1;
+                        }
+                    } else {
+                        // Invalid lead byte or truncated — skip
+                        i += 1;
+                    }
                 }
             },
         }
