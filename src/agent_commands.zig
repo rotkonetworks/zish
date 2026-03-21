@@ -830,6 +830,9 @@ const commands = [_]Command{
     .{ .name = "/status", .has_arg = false, .handler = cmdStatus },
     .{ .name = "/think", .has_arg = true, .handler = cmdThink },
     .{ .name = "/paste", .has_arg = false, .handler = cmdPaste },
+    .{ .name = "/consult", .has_arg = true, .handler = cmdConsult },
+    .{ .name = "/meeting", .has_arg = true, .handler = cmdMeeting },
+    .{ .name = "/team", .has_arg = false, .handler = cmdTeam },
     .{ .name = "/help", .has_arg = false, .handler = cmdHelp },
     .{ .name = "help", .has_arg = false, .handler = cmdHelp },
 };
@@ -869,6 +872,165 @@ pub fn dispatch(ctx: *CommandCtx, raw_query: []const u8) DispatchResult {
 }
 
 // ── Handler implementations ──
+
+fn cmdConsult(ctx: *CommandCtx, arg: []const u8) DispatchResult {
+    const personas = @import("personas.zig");
+
+    // Parse: /consult <persona> <question>
+    const space = std.mem.indexOfScalar(u8, arg, ' ') orelse {
+        Layout.goOutput(ctx.out, ctx.out_last.*);
+        ctx.out.writeAll("\x1b[33mUsage: /consult <persona> <question>\x1b[0m\n") catch {};
+        ctx.out.writeAll("\x1b[90mPersonas: hdevalence micay redshiftzero deidrec rphmeier karpathy ryansolid isislovecruft\x1b[0m\n") catch {};
+        return .handled;
+    };
+
+    const persona_name = arg[0..space];
+    const question = std.mem.trimLeft(u8, arg[space + 1 ..], " ");
+
+    const persona = personas.Persona.fromName(persona_name) orelse {
+        Layout.goOutput(ctx.out, ctx.out_last.*);
+        ctx.out.print("\x1b[31mUnknown persona: {s}\x1b[0m\n", .{persona_name}) catch {};
+        return .handled;
+    };
+
+    // Check rate limit
+    const rl = &ctx.shell.agent.bulletin.rate_limit;
+    const util = rl.maxUtil();
+    if (util > 60) {
+        Layout.goOutput(ctx.out, ctx.out_last.*);
+        ctx.out.print("\x1b[33mRate limit at {d}% — try again later\x1b[0m\n", .{util}) catch {};
+        return .handled;
+    }
+
+    // Build prompt with persona's system prompt prefix
+    var prompt_buf: [4096]u8 = undefined;
+    const prompt = std.fmt.bufPrint(&prompt_buf, "[Consulting {s} {s}]\n\nContext: {s}\n\n{s}", .{
+        persona.emoji(),
+        persona.name(),
+        persona.systemPrompt()[0..@min(persona.systemPrompt().len, 200)],
+        question,
+    }) catch question;
+
+    // Spawn as subagent with persona's tool access
+    Layout.goOutput(ctx.out, ctx.out_last.*);
+    ctx.out.print("\x1b[90m{s} Consulting {s} ({s})...\x1b[0m\n", .{ persona.emoji(), persona.name(), persona.role() }) catch {};
+
+    // Send to agent — the query includes the persona context
+    if (!ctx.shell.agent.query(prompt)) {
+        ctx.out.writeAll("\x1b[31mQueue full\x1b[0m\n") catch {};
+    }
+
+    return .handled;
+}
+
+fn cmdMeeting(ctx: *CommandCtx, arg: []const u8) DispatchResult {
+    const personas = @import("personas.zig");
+
+    // Parse: /meeting <type> [topic]
+    const trimmed = std.mem.trim(u8, arg, " ");
+    if (trimmed.len == 0) {
+        Layout.goOutput(ctx.out, ctx.out_last.*);
+        ctx.out.writeAll("\x1b[33mUsage: /meeting <type> [topic]\x1b[0m\n") catch {};
+        ctx.out.writeAll("\x1b[90mTypes: review, architecture, security, ml, frontend, standup\x1b[0m\n") catch {};
+        return .handled;
+    }
+
+    const space = std.mem.indexOfScalar(u8, trimmed, ' ');
+    const type_name = if (space) |s| trimmed[0..s] else trimmed;
+    const topic = if (space) |s| std.mem.trimLeft(u8, trimmed[s + 1 ..], " ") else "Review current work";
+
+    const meeting = personas.MeetingType.fromName(type_name) orelse {
+        Layout.goOutput(ctx.out, ctx.out_last.*);
+        ctx.out.print("\x1b[31mUnknown meeting type: {s}\x1b[0m\n", .{type_name}) catch {};
+        return .handled;
+    };
+
+    // Check rate limit headroom
+    const rl = &ctx.shell.agent.bulletin.rate_limit;
+    const util = rl.maxUtil();
+    if (util > meeting.maxUtilization()) {
+        Layout.goOutput(ctx.out, ctx.out_last.*);
+        ctx.out.print("\x1b[33mRate limit at {d}% — {s} meeting needs <{d}%\x1b[0m\n", .{
+            util,
+            meeting.name(),
+            meeting.maxUtilization(),
+        }) catch {};
+        return .handled;
+    }
+
+    // List attendees
+    const attendees = meeting.attendees();
+    Layout.goOutput(ctx.out, ctx.out_last.*);
+    ctx.out.print("\x1b[1m{s} Meeting: {s}\x1b[0m\n", .{ meeting.name(), topic }) catch {};
+    ctx.out.writeAll("\x1b[90mAttendees: ") catch {};
+    for (attendees) |p| {
+        ctx.out.print("{s} {s}  ", .{ p.emoji(), p.name() }) catch {};
+    }
+    ctx.out.writeAll("\x1b[0m\n") catch {};
+
+    // Build a combined prompt that asks for each persona's perspective
+    var prompt_buf: [4096]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&prompt_buf);
+    const w = fbs.writer();
+    w.print("TEAM MEETING: {s}\nTopic: {s}\n\n", .{ meeting.name(), topic }) catch {};
+    w.writeAll("Please provide feedback from EACH of these team perspectives:\n\n") catch {};
+    for (attendees) |p| {
+        w.print("## {s} {s} ({s})\n{s}\n\n", .{
+            p.emoji(),
+            p.name(),
+            p.role(),
+            p.systemPrompt()[0..@min(p.systemPrompt().len, 150)],
+        }) catch {};
+    }
+    w.writeAll("For each persona, give their specific feedback on the topic. Be concise — 2-3 sentences per persona.\n") catch {};
+
+    const prompt = prompt_buf[0..fbs.pos];
+
+    if (!ctx.shell.agent.query(prompt)) {
+        ctx.out.writeAll("\x1b[31mQueue full\x1b[0m\n") catch {};
+    }
+
+    return .handled;
+}
+
+fn cmdTeam(ctx: *CommandCtx, _: []const u8) DispatchResult {
+    const personas = @import("personas.zig");
+
+    Layout.goOutput(ctx.out, ctx.out_last.*);
+    ctx.out.writeAll("\x1b[1mAgent Team\x1b[0m\n") catch {};
+
+    // Show rate limit status
+    const rl = &ctx.shell.agent.bulletin.rate_limit;
+    const util = rl.maxUtil();
+    const in_flight = rl.in_flight.load(.acquire);
+    const max_c = rl.max_concurrent.load(.acquire);
+    ctx.out.print("\x1b[90mRate limit: {d}% | In-flight: {d}/{d}", .{ util, in_flight, max_c }) catch {};
+    if (util > 50) {
+        ctx.out.writeAll(" \x1b[33m(throttled)") catch {};
+    }
+    ctx.out.writeAll("\x1b[0m\n\n") catch {};
+
+    // List personas
+    inline for (0..personas.Persona.COUNT) |i| {
+        const p: personas.Persona = @enumFromInt(i);
+        ctx.out.print("{s} \x1b[1m{s}\x1b[0m \x1b[90m({s}) — {s} tools, {s}\x1b[0m\n", .{
+            p.emoji(),
+            p.name(),
+            p.role(),
+            if (p.fullTools()) "full" else "read-only",
+            switch (p.modelTier()) {
+                .opus => "opus",
+                .sonnet => "sonnet",
+                .haiku => "haiku",
+            },
+        }) catch {};
+    }
+
+    ctx.out.writeAll("\n\x1b[90mCommands: /consult <persona> <question> | /meeting <type> [topic] | /team\x1b[0m\n") catch {};
+    ctx.out.writeAll("\x1b[90mMeetings: review, architecture, security, ml, frontend, standup\x1b[0m\n") catch {};
+
+    return .handled;
+}
 
 fn cmdPaste(ctx: *CommandCtx, _: []const u8) DispatchResult {
     // Grab clipboard image via xclip and save to /tmp

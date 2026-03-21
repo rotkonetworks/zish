@@ -216,11 +216,52 @@ pub const RateLimitState = struct {
     util_7d: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     /// API returned "exceeded" status
     exceeded: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Concurrent in-flight API requests (shared across ALL agent threads)
+    in_flight: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    /// Max concurrent requests (adjusted by utilization)
+    max_concurrent: std.atomic.Value(u8) = std.atomic.Value(u8).init(2),
 
     pub fn update(self: *RateLimitState, h5: u8, d7: u8, is_exceeded: bool) void {
         self.util_5h.store(h5, .release);
         self.util_7d.store(d7, .release);
         self.exceeded.store(is_exceeded, .release);
+        // Adjust max concurrent based on utilization
+        const util = @max(h5, d7);
+        const max_c: u8 = if (is_exceeded) 0 else if (util > 80) 1 else if (util > 50) 2 else if (util > 30) 3 else 4;
+        self.max_concurrent.store(max_c, .release);
+    }
+
+    /// Acquire a request slot. Blocks until a slot is available or cancelled.
+    /// Returns false if rate limit exceeded (caller should not proceed).
+    pub fn acquire(self: *RateLimitState) bool {
+        if (self.exceeded.load(.acquire)) return false;
+
+        // Spin-wait for a slot (with backoff)
+        var attempts: u16 = 0;
+        while (attempts < 300) : (attempts += 1) { // max ~30s wait
+            const current = self.in_flight.load(.acquire);
+            const max_c = self.max_concurrent.load(.acquire);
+            if (max_c == 0) return false; // exceeded
+            if (current < max_c) {
+                // Try to claim a slot
+                if (self.in_flight.cmpxchgWeak(current, current + 1, .acq_rel, .monotonic) == null) {
+                    return true; // got a slot
+                }
+                continue; // CAS failed, retry immediately
+            }
+            // No slots — backoff
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+        }
+        return false; // timeout
+    }
+
+    /// Release a request slot after API call completes.
+    pub fn release(self: *RateLimitState) void {
+        const prev = self.in_flight.fetchSub(1, .release);
+        if (prev == 0) {
+            // Underflow guard — shouldn't happen but don't wrap to 255
+            self.in_flight.store(0, .release);
+        }
     }
 
     pub fn maxUtil(self: *const RateLimitState) u8 {

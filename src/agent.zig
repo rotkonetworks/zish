@@ -1687,17 +1687,14 @@ const AgentThread = struct {
             self.config.model,
             effective_max_tokens,
         }) catch return error.BodyTooLarge;
-        // Thinking mode: OAuth requires adaptive thinking; API keys use budget-based
+        // Thinking mode: adaptive only works on opus models.
+        // For OAuth, we need the thinking field but must match the model's capability.
         const thinking_budget = self.queues.shared_thinking_budget.load(.monotonic);
-        if (is_oauth) {
-            // OAuth tokens require thinking field for Claude Code compatibility
-            if (thinking_budget > 0) {
-                w.print(",\"thinking\":{{\"type\":\"enabled\",\"budget_tokens\":{d}}}", .{thinking_budget}) catch return error.BodyTooLarge;
-            } else {
-                w.writeAll(",\"thinking\":{\"type\":\"adaptive\"}") catch return error.BodyTooLarge;
-            }
-        } else if (thinking_budget > 0) {
+        const model_supports_thinking = std.mem.indexOf(u8, self.config.model, "opus") != null;
+        if (thinking_budget > 0 and model_supports_thinking) {
             w.print(",\"thinking\":{{\"type\":\"enabled\",\"budget_tokens\":{d}}}", .{thinking_budget}) catch return error.BodyTooLarge;
+        } else if (is_oauth and model_supports_thinking) {
+            w.writeAll(",\"thinking\":{\"type\":\"adaptive\"}") catch return error.BodyTooLarge;
         }
         // System prompt: OAuth tokens need billing header prefix for authentication
         if (is_oauth) {
@@ -1854,6 +1851,15 @@ const AgentThread = struct {
         var has_tool_call = false;
         var resp_input_tokens: u32 = 0;
         var resp_output_tokens: u32 = 0;
+
+        // Acquire rate limit slot — blocks until a concurrent request slot is available.
+        // This prevents all subagents from hammering the API simultaneously.
+        if (!self.queues.bulletin.rate_limit.acquire()) {
+            self.allocator.free(text_buf);
+            _ = self.queues.output.push(.error_msg, "Rate limit — waiting for cooldown");
+            return error.RateLimited;
+        }
+        defer self.queues.bulletin.rate_limit.release();
 
         // Build curl command with headers
         var argv_buf: [50][]const u8 = undefined;
