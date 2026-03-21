@@ -207,11 +207,33 @@ pub const Post = struct {
     }
 };
 
+/// Shared rate limit state — updated from API response headers, read by all agents.
+/// Placed on Bulletin because it's already the process-wide shared structure.
+pub const RateLimitState = struct {
+    /// 5-hour utilization as percentage 0-100
+    util_5h: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    /// 7-day utilization as percentage 0-100
+    util_7d: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    /// API returned "exceeded" status
+    exceeded: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    pub fn update(self: *RateLimitState, h5: u8, d7: u8, is_exceeded: bool) void {
+        self.util_5h.store(h5, .release);
+        self.util_7d.store(d7, .release);
+        self.exceeded.store(is_exceeded, .release);
+    }
+
+    pub fn maxUtil(self: *const RateLimitState) u8 {
+        return @max(self.util_5h.load(.acquire), self.util_7d.load(.acquire));
+    }
+};
+
 /// Lock-free broadcast log. Many producers (CAS on tail), many readers (each tracks own cursor).
 /// Old posts are overwritten when the ring wraps — readers that fall behind lose history.
 pub const Bulletin = struct {
     slots: [BULLETIN_CAPACITY]Post = [_]Post{.{}} ** BULLETIN_CAPACITY,
     tail: usize = 0, // atomic: next write position (monotonically increasing)
+    rate_limit: RateLimitState = .{},
 
     /// Post a message to the bulletin. Thread-safe (CAS loop).
     pub fn post(self: *Bulletin, kind: PostKind, author: []const u8, depth: u8, text: []const u8) void {

@@ -1863,6 +1863,10 @@ const AgentThread = struct {
         argc += 1;
         argv_buf[argc] = "-sS"; // silent but show errors
         argc += 1;
+        argv_buf[argc] = "-D";
+        argc += 1;
+        argv_buf[argc] = "/dev/stderr"; // dump response headers to stderr for rate limit parsing
+        argc += 1;
         argv_buf[argc] = "-N"; // no-buffer (for streaming)
         argc += 1;
         argv_buf[argc] = "--max-time";
@@ -2058,14 +2062,25 @@ const AgentThread = struct {
             }
         }
 
-        // Check for curl errors (read first 1K, then close pipe to prevent deadlock)
+        // Read stderr: contains response headers (from -D /dev/stderr) + curl errors.
+        // Parse rate limit headers, then report remaining content as errors.
         if (child.stderr) |*stderr_pipe| {
-            var err_out: [1024]u8 = undefined;
+            var err_out: [4096]u8 = undefined;
             const err_n = stderr_pipe.read(&err_out) catch 0;
             stderr_pipe.close();
             child.stderr = null;
             if (err_n > 0) {
-                _ = self.queues.output.push(.error_msg, err_out[0..err_n]);
+                const stderr_data = err_out[0..err_n];
+                // Parse rate limit utilization from response headers
+                parseRateLimitHeaders(self.queues.bulletin, stderr_data);
+                // Only report non-header content as errors (after the blank line)
+                if (std.mem.indexOf(u8, stderr_data, "\r\n\r\n")) |end| {
+                    const after = stderr_data[end + 4 ..];
+                    if (after.len > 0 and !std.mem.startsWith(u8, after, "HTTP/"))
+                        _ = self.queues.output.push(.error_msg, after);
+                } else if (!std.mem.startsWith(u8, stderr_data, "HTTP/")) {
+                    _ = self.queues.output.push(.error_msg, stderr_data);
+                }
             }
         }
         // Close stdout pipe before wait in case child still has pending output
@@ -2320,6 +2335,41 @@ fn isWordBoundary(text: []const u8, pos: usize) bool {
     const prev = text[pos - 1];
     return prev == ' ' or prev == '\t' or prev == '\n' or prev == '(' or prev == '{' or
         prev == '[' or prev == ',' or prev == ';' or prev == ':' or prev == '!' or prev == '|';
+}
+
+/// Parse rate limit headers from curl's -D /dev/stderr output.
+/// Updates the shared RateLimitState on the Bulletin.
+fn parseRateLimitHeaders(bulletin: *q.Bulletin, data: []const u8) void {
+    var util_5h: ?u8 = null;
+    var util_7d: ?u8 = null;
+    var exceeded = false;
+
+    var pos: usize = 0;
+    while (pos < data.len) {
+        const end = std.mem.indexOfScalarPos(u8, data, pos, '\n') orelse data.len;
+        const line = std.mem.trimRight(u8, data[pos..end], "\r ");
+
+        if (std.mem.startsWith(u8, line, "anthropic-ratelimit-unified-5h-utilization: ")) {
+            util_5h = parseUtilPercent(line[44..]);
+        } else if (std.mem.startsWith(u8, line, "anthropic-ratelimit-unified-7d-utilization: ")) {
+            util_7d = parseUtilPercent(line[44..]);
+        } else if (std.mem.startsWith(u8, line, "anthropic-ratelimit-unified-status: ")) {
+            const status = std.mem.trim(u8, line[36..], " ");
+            if (std.mem.eql(u8, status, "exceeded")) exceeded = true;
+        }
+        pos = end + 1;
+    }
+
+    if (util_5h != null or util_7d != null or exceeded) {
+        bulletin.rate_limit.update(util_5h orelse 0, util_7d orelse 0, exceeded);
+    }
+}
+
+fn parseUtilPercent(s: []const u8) u8 {
+    const trimmed = std.mem.trim(u8, s, " \r\n");
+    // Parse "0.12" -> 12
+    const f = std.fmt.parseFloat(f32, trimmed) catch return 0;
+    return @intFromFloat(@min(100.0, @max(0.0, f * 100.0)));
 }
 
 fn matchKeyword(text: []const u8, pos: usize) ?usize {
