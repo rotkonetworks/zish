@@ -89,14 +89,14 @@ pub const Persona = enum(u8) {
     }
 
     /// Model tier: which model this persona prefers.
-    /// Architect and deep thinking get opus; others get sonnet.
+    /// Deep reasoning roles get opus; execution roles get sonnet.
     pub fn modelTier(self: Persona) ModelTier {
         return switch (self) {
-            .hdevalence => .opus, // architect needs full reasoning
+            .hdevalence => .opus, // architecture requires full reasoning
+            .rphmeier => .opus, // state machines, invariants, protocol proofs
             .micay => .sonnet,
             .redshiftzero => .sonnet,
             .deidrec => .sonnet,
-            .rphmeier => .sonnet,
             .karpathy => .sonnet,
             .ryansolid => .sonnet,
             .isislovecruft => .sonnet,
