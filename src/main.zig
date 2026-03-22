@@ -89,12 +89,16 @@ pub fn main() void {
             std.process.exit(1);
         }
 
-        // Wait for agent to finish and drain output (plain text, no ANSI)
+        // Wait for agent to process and drain output (plain text, no ANSI)
         const agent_queue = @import("agent_queue.zig");
         var exit_code: u8 = 0;
-        while (true) {
+        var got_output = false;
+        var idle_count: u32 = 0;
+        while (idle_count < 500) { // 500 * 20ms = 10s max idle wait
             var msg: agent_queue.Msg = undefined;
             if (shell_instance.agent.queues.output.pop(&msg)) {
+                idle_count = 0;
+                got_output = true;
                 switch (msg.kind) {
                     .text_delta => { _ = std.posix.write(std.posix.STDOUT_FILENO, msg.slice()) catch {}; },
                     .error_msg => {
@@ -108,9 +112,11 @@ pub fn main() void {
                     else => {},
                 }
             } else {
-                // No message — check if agent is still running
-                if (!shell_instance.agent.isBusy()) break;
-                std.Thread.sleep(10 * std.time.ns_per_ms);
+                // No message — wait for agent to produce output
+                // Only exit if we've received output AND agent is idle
+                if (got_output and !shell_instance.agent.isBusy()) break;
+                idle_count += 1;
+                std.Thread.sleep(20 * std.time.ns_per_ms);
             }
         }
 
@@ -189,13 +195,13 @@ pub fn main() void {
 }
 
 const params = clap.parseParamsComptime(
-    \\-h,   --help                  Display this help and exit.
-    \\-v,   --version               print version and exit.
-    \\-l,   --login                 Start as login shell.
-    \\-d,   --debug-log-file <str>  file to write a debug info to.
-    \\       --exec <str>            Execute agent query, output JSON result.
-    \\       --persona <str>         Persona for --exec (default: hdevalence).
-    \\-c    <str>                   command to execute.
+    \\-h, --help                  Display this help and exit.
+    \\-v, --version               print version and exit.
+    \\-l, --login                 Start as login shell.
+    \\-d, --debug-log-file <str>  file to write a debug info to.
+    \\-e, --exec <str>            Execute agent query, output JSON result.
+    \\-p, --persona <str>         Persona for --exec (default: hdevalence).
+    \\-c  <str>                   command to execute.
     \\<str>...
     \\
 );
