@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const keywords = @import("keywords.zig");
+const render_pipeline = @import("render_pipeline.zig");
 
 // ANSI color codes
 pub const Color = struct {
@@ -652,7 +653,11 @@ pub const TermView = struct {
         _ = self.emit("\x1b[2K");
     }
 
-    /// main render - single entry point
+    /// Render the edit buffer to the terminal.
+    ///
+    /// The deferred-wrap cursor correction lives in render_pipeline.positionCursor
+    /// (a standalone function with regression tests) so it cannot be accidentally
+    /// deleted by changes to content emission or syntax highlighting.
     pub fn render(
         self: *Self,
         buf: *const EditBuffer,
@@ -676,9 +681,6 @@ pub const TermView = struct {
         if (!size_changed and hash == self.last_hash and buf.cursor == self.last_cursor) {
             return;
         }
-
-        // Note: cursor hide/show removed — caused flicker in normal shell mode
-        // Agent mode handles cursor visibility separately via \x1b[?25l/h
 
         const w = self.term.width;
         const cont_marker_len: u16 = 2; // "│ "
@@ -707,8 +709,6 @@ pub const TermView = struct {
         _ = self.emit("\r");
 
         // clear from start of our region to end of screen
-        // this is simpler and more reliable than per-line clearing,
-        // and avoids disturbing soft-wrap metadata on individual lines
         _ = self.emit("\x1b[J");
 
         // emit prompt — truncate if wider than terminal
@@ -718,9 +718,13 @@ pub const TermView = struct {
             var byte_pos: usize = 0;
             var in_esc = false;
             while (byte_pos < prompt.len and vis < max_vis) {
-                if (prompt[byte_pos] == 0x1b) { in_esc = true; }
-                else if (in_esc) { if ((prompt[byte_pos] >= 'A' and prompt[byte_pos] <= 'Z') or (prompt[byte_pos] >= 'a' and prompt[byte_pos] <= 'z')) in_esc = false; }
-                else { vis += 1; }
+                if (prompt[byte_pos] == 0x1b) {
+                    in_esc = true;
+                } else if (in_esc) {
+                    if ((prompt[byte_pos] >= 'A' and prompt[byte_pos] <= 'Z') or (prompt[byte_pos] >= 'a' and prompt[byte_pos] <= 'z')) in_esc = false;
+                } else {
+                    vis += 1;
+                }
                 byte_pos += 1;
             }
             while (in_esc and byte_pos < prompt.len) {
@@ -747,7 +751,6 @@ pub const TermView = struct {
             if (c == '\n') {
                 hl.flushWord(self);
                 _ = self.emit(Color.reset);
-                // clear to end of line before newline to avoid trailing artifacts
                 self.clearToEOL();
                 _ = self.emitByte('\n');
                 _ = self.emit(Color.gray);
@@ -755,7 +758,7 @@ pub const TermView = struct {
                 _ = self.emit(Color.reset);
                 _ = self.emitByte(' ');
                 hl.at_line_start = true;
-                hl.first_word = true; // new line = new command context
+                hl.first_word = true;
                 render_row += 1;
                 render_col = cont_marker_len;
             } else {
@@ -789,31 +792,19 @@ pub const TermView = struct {
         // clear any leftover content after our text
         _ = self.emit("\x1b[J");
 
-        // Debug log (append)
-        {
-            const dbg = std.fs.openFileAbsolute("/tmp/zish_render.log", .{ .mode = .write_only }) catch
-                std.fs.createFileAbsolute("/tmp/zish_render.log", .{}) catch null;
-            if (dbg) |f| {
-                defer f.close();
-                f.seekFromEnd(0) catch {};
-                var dbuf: [256]u8 = undefined;
-                const msg = std.fmt.bufPrint(&dbuf, "w={d} pl={d} tl={d} cur={d} rr={d} rc={d} cr={d} cc={d} tr={d} hash={x}\n", .{
-                    w, prompt_visible_len, text.len, buf.cursor,
-                    render_row, render_col, cursor_row, cursor_col,
-                    self.term.row, hash,
-                }) catch "";
-                f.writeAll(msg) catch {};
-            }
-        }
-
-        // Track render end position, then move to cursor
-        self.term.row = render_row;
-        self.term.col = render_col;
-        self.moveTo(cursor_row, cursor_col);
-
-        self.term.rows_owned = render_row + 1;
-        self.last_hash = hash;
-        self.last_cursor = buf.cursor;
+        // Cursor positioning with deferred-wrap correction.
+        // Isolated in render_pipeline.zig with regression tests — do not inline.
+        render_pipeline.positionCursor(
+            self,
+            render_row,
+            render_col,
+            cursor_row,
+            cursor_col,
+            buf.cursor == buf.len,
+            w,
+            hash,
+            buf.cursor,
+        );
 
         try self.flush();
     }
