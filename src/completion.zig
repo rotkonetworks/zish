@@ -8,6 +8,66 @@ const input_mod = @import("input.zig");
 const keywords = @import("keywords.zig");
 const hist = @import("history.zig");
 
+// ============================================================
+// CompletionState: all completion-related fields, grouped.
+// Lives in Shell as `completion: CompletionState`.
+// ============================================================
+
+pub const CompletionState = struct {
+    mode: bool = false,
+    matches: std.ArrayList([]const u8),
+    index: usize = 0,
+    word_start: usize = 0,
+    word_end: usize = 0,
+    original_len: usize = 0,
+    pattern_len: usize = 0,
+    menu_lines: usize = 0,
+    displayed: bool = false,
+    skip_next_slash: bool = false,
+
+    pub fn init() CompletionState {
+        return .{
+            .matches = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 },
+        };
+    }
+
+    pub fn deinit(self: *CompletionState, allocator: std.mem.Allocator) void {
+        for (self.matches.items) |match| {
+            allocator.free(match);
+        }
+        self.matches.deinit(allocator);
+        self.mode = false;
+        self.index = 0;
+        self.displayed = false;
+        self.menu_lines = 0;
+        self.pattern_len = 0;
+        self.skip_next_slash = false;
+    }
+};
+
+pub const CacheState = struct {
+    // flag completion cache (one command at a time, TTL 5 min)
+    flag_cmd: [64]u8 = undefined,
+    flag_cmd_len: usize = 0,
+    flag_buf: [8192]u8 = undefined,
+    flag_offsets: [256]u16 = undefined,
+    flag_lens: [256]u8 = undefined,
+    flag_count: usize = 0,
+    flag_ts: i64 = 0,
+    // flag description cache (parallel to flags)
+    flag_desc_buf: [16384]u8 = undefined,
+    flag_desc_offsets: [256]u16 = undefined,
+    flag_desc_lens: [256]u8 = undefined,
+    // subcommand completion cache (one command at a time, TTL 5 min)
+    subcmd_cmd: [32]u8 = undefined,
+    subcmd_cmd_len: usize = 0,
+    subcmd_buf: [4096]u8 = undefined,
+    subcmd_offsets: [128]u16 = undefined,
+    subcmd_lens: [128]u8 = undefined,
+    subcmd_count: usize = 0,
+    subcmd_ts: i64 = 0,
+};
+
 pub const WordResult = struct {
     word: []const u8,
     start: usize,
@@ -15,6 +75,13 @@ pub const WordResult = struct {
 };
 
 pub const CycleDirection = input_mod.CycleDirection;
+
+/// Alphabetical string comparator for sorting completion matches.
+const StringOrder = struct {
+    fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+        return std.mem.order(u8, a, b) == .lt;
+    }
+};
 
 /// Extract word at cursor position from command string.
 /// Recognizes redirect operators (>, >>, <, 2>, 2>>, &>, &>>) at word boundaries
@@ -242,7 +309,7 @@ pub fn handleTabCompletion(self: *Shell) !void {
         _ = self.edit_buf.insertSlice("/");
         effective_word_end = word_end + 1;
         inserted_slash = true;
-        self.skip_next_slash = true;
+        self.completion.skip_next_slash = true;
 
         if (word.len + 1 < expanded_word_buf.len) {
             @memcpy(expanded_word_buf[0..word.len], word);
@@ -433,15 +500,15 @@ pub fn handleTabCompletion(self: *Shell) !void {
 
         for (matches.items) |match| {
             const owned = try self.allocator.dupe(u8, match);
-            try self.completion_matches.append(self.allocator, owned);
+            try self.completion.matches.append(self.allocator, owned);
         }
 
-        self.completion_mode = true;
-        self.completion_index = self.completion_matches.items.len;
-        self.completion_word_start = word_result.start;
-        self.completion_word_end = effective_word_end;
-        self.completion_original_len = self.edit_buf.len;
-        self.completion_pattern_len = pattern.len;
+        self.completion.mode = true;
+        self.completion.index = self.completion.matches.items.len;
+        self.completion.word_start = word_result.start;
+        self.completion.word_end = effective_word_end;
+        self.completion.original_len = self.edit_buf.len;
+        self.completion.pattern_len = pattern.len;
 
         try self.renderLine();
         try displayCompletions(self);
@@ -500,11 +567,7 @@ fn tryVariableCompletion(self: *Shell, word_result: WordResult) !bool {
 
     if (matches.items.len == 0) return false;
 
-    std.mem.sort([]const u8, matches.items, {}, struct {
-        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.order(u8, a, b) == .lt;
-        }
-    }.lessThan);
+    std.mem.sort([]const u8, matches.items, {}, StringOrder.lessThan);
 
     if (matches.items.len == 1) {
         const match = matches.items[0];
@@ -1142,11 +1205,7 @@ fn tryCommandCompletion(self: *Shell, word_result: WordResult) !bool {
     if (matches.items.len == 0) return false;
 
     // sort matches alphabetically
-    std.mem.sort([]const u8, matches.items, {}, struct {
-        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.order(u8, a, b) == .lt;
-        }
-    }.lessThan);
+    std.mem.sort([]const u8, matches.items, {}, StringOrder.lessThan);
 
     if (matches.items.len == 1) {
         return try applySingleCompletion(self, matches.items[0], word_result);
@@ -1615,16 +1674,16 @@ fn tryHistoryCompletion(self: *Shell, current_input: []const u8) !bool {
     }
 
     // show as completion menu — use full command as match
-    self.completion_matches.deinit(self.allocator);
-    self.completion_matches = .{};
+    self.completion.matches.deinit(self.allocator);
+    self.completion.matches = .{};
     for (matches.items) |m| {
         const owned = try self.allocator.dupe(u8, m);
-        try self.completion_matches.append(self.allocator, owned);
+        try self.completion.matches.append(self.allocator, owned);
     }
-    self.completion_index = 0;
-    self.completion_word_start = 0;
-    self.completion_word_end = @intCast(self.edit_buf.len);
-    self.completion_pattern_len = @intCast(prefix.len);
+    self.completion.index = 0;
+    self.completion.word_start = 0;
+    self.completion.word_end = @intCast(self.edit_buf.len);
+    self.completion.pattern_len = @intCast(prefix.len);
 
     try displayCompletions(self);
     return true;
@@ -1661,20 +1720,20 @@ fn trySubcommandCompletion(self: *Shell, cmd: []const u8, word_result: WordResul
     // check cache (TTL 5 minutes)
     const now = std.time.timestamp();
     const cache_ttl: i64 = 300;
-    const cached = self.subcmd_cache_cmd_len > 0 and
-        self.subcmd_cache_cmd_len == base_cmd.len and
-        base_cmd.len <= self.subcmd_cache_cmd.len and
-        std.mem.eql(u8, self.subcmd_cache_cmd[0..self.subcmd_cache_cmd_len], base_cmd) and
-        (now - self.subcmd_cache_ts) < cache_ttl;
+    const cached = self.cache.subcmd_cmd_len > 0 and
+        self.cache.subcmd_cmd_len == base_cmd.len and
+        base_cmd.len <= self.cache.subcmd_cmd.len and
+        std.mem.eql(u8, self.cache.subcmd_cmd[0..self.cache.subcmd_cmd_len], base_cmd) and
+        (now - self.cache.subcmd_ts) < cache_ttl;
 
     if (!cached) {
         parseSubcmdsFromHelp(self, base_cmd) catch {
-            self.subcmd_cache_count = 0;
+            self.cache.subcmd_count = 0;
         };
-        self.subcmd_cache_ts = now;
+        self.cache.subcmd_ts = now;
     }
 
-    if (self.subcmd_cache_count == 0) return false;
+    if (self.cache.subcmd_count == 0) return false;
 
     var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 32);
     defer {
@@ -1682,10 +1741,10 @@ fn trySubcommandCompletion(self: *Shell, cmd: []const u8, word_result: WordResul
         matches.deinit(self.allocator);
     }
 
-    for (0..self.subcmd_cache_count) |i| {
-        const off = self.subcmd_cache_offsets[i];
-        const len = self.subcmd_cache_lens[i];
-        const subcmd = self.subcmd_cache_buf[off .. off + len];
+    for (0..self.cache.subcmd_count) |i| {
+        const off = self.cache.subcmd_offsets[i];
+        const len = self.cache.subcmd_lens[i];
+        const subcmd = self.cache.subcmd_buf[off .. off + len];
         if (std.mem.startsWith(u8, subcmd, pattern)) {
             const owned = try self.allocator.dupe(u8, subcmd);
             try matches.append(self.allocator, owned);
@@ -1701,10 +1760,10 @@ fn trySubcommandCompletion(self: *Shell, cmd: []const u8, word_result: WordResul
 }
 
 fn parseSubcmdsFromHelp(self: *Shell, base_cmd: []const u8) !void {
-    self.subcmd_cache_count = 0;
-    if (base_cmd.len > self.subcmd_cache_cmd.len) return;
-    @memcpy(self.subcmd_cache_cmd[0..base_cmd.len], base_cmd);
-    self.subcmd_cache_cmd_len = base_cmd.len;
+    self.cache.subcmd_count = 0;
+    if (base_cmd.len > self.cache.subcmd_cmd.len) return;
+    @memcpy(self.cache.subcmd_cmd[0..base_cmd.len], base_cmd);
+    self.cache.subcmd_cmd_len = base_cmd.len;
 
     var argv_buf: [128]u8 = undefined;
     var child = std.process.Child.init(
@@ -1753,7 +1812,7 @@ fn parseSubcmdsFromHelp(self: *Shell, base_cmd: []const u8) !void {
         // deduplicate
         var dup = false;
         for (0..count) |j| {
-            const existing = self.subcmd_cache_buf[self.subcmd_cache_offsets[j] .. self.subcmd_cache_offsets[j] + self.subcmd_cache_lens[j]];
+            const existing = self.cache.subcmd_buf[self.cache.subcmd_offsets[j] .. self.cache.subcmd_offsets[j] + self.cache.subcmd_lens[j]];
             if (std.mem.eql(u8, existing, subcmd)) {
                 dup = true;
                 break;
@@ -1761,15 +1820,15 @@ fn parseSubcmdsFromHelp(self: *Shell, base_cmd: []const u8) !void {
         }
         if (dup) continue;
 
-        if (buf_pos + subcmd.len > self.subcmd_cache_buf.len) break;
-        @memcpy(self.subcmd_cache_buf[buf_pos .. buf_pos + subcmd.len], subcmd);
-        self.subcmd_cache_offsets[count] = @intCast(buf_pos);
-        self.subcmd_cache_lens[count] = @intCast(subcmd.len);
+        if (buf_pos + subcmd.len > self.cache.subcmd_buf.len) break;
+        @memcpy(self.cache.subcmd_buf[buf_pos .. buf_pos + subcmd.len], subcmd);
+        self.cache.subcmd_offsets[count] = @intCast(buf_pos);
+        self.cache.subcmd_lens[count] = @intCast(subcmd.len);
         buf_pos += subcmd.len;
         count += 1;
     }
 
-    self.subcmd_cache_count = count;
+    self.cache.subcmd_count = count;
 }
 
 fn tryFlagCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bool {
@@ -1806,20 +1865,20 @@ fn tryFlagCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bo
     // check cache (TTL 5 minutes)
     const now = std.time.timestamp();
     const cache_ttl: i64 = 300; // 5 minutes
-    const cached = self.flag_cache_cmd_len > 0 and
-        self.flag_cache_cmd_len == command.len and
-        std.mem.eql(u8, self.flag_cache_cmd[0..self.flag_cache_cmd_len], command) and
-        (now - self.flag_cache_ts) < cache_ttl;
+    const cached = self.cache.flag_cmd_len > 0 and
+        self.cache.flag_cmd_len == command.len and
+        std.mem.eql(u8, self.cache.flag_cmd[0..self.cache.flag_cmd_len], command) and
+        (now - self.cache.flag_ts) < cache_ttl;
 
     if (!cached) {
         // run command --help and parse flags
         parseFlagsFromHelp(self, command) catch {
-            self.flag_cache_count = 0;
+            self.cache.flag_count = 0;
         };
-        self.flag_cache_ts = now;
+        self.cache.flag_ts = now;
     }
 
-    if (self.flag_cache_count == 0) return false;
+    if (self.cache.flag_count == 0) return false;
 
     var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 32);
     defer {
@@ -1831,10 +1890,10 @@ fn tryFlagCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bo
     var match_indices: [256]usize = undefined;
     var match_count: usize = 0;
 
-    for (0..self.flag_cache_count) |i| {
-        const off = self.flag_cache_offsets[i];
-        const len = self.flag_cache_lens[i];
-        const flag = self.flag_cache_buf[off .. off + len];
+    for (0..self.cache.flag_count) |i| {
+        const off = self.cache.flag_offsets[i];
+        const len = self.cache.flag_lens[i];
+        const flag = self.cache.flag_buf[off .. off + len];
         if (std.mem.startsWith(u8, flag, pattern)) {
             const owned = try self.allocator.dupe(u8, flag);
             try matches.append(self.allocator, owned);
@@ -1852,7 +1911,7 @@ fn tryFlagCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bo
         // check if any match has a description
         var has_descs = false;
         for (0..match_count) |mi| {
-            if (self.flag_desc_lens[match_indices[mi]] > 0) {
+            if (self.cache.flag_desc_lens[match_indices[mi]] > 0) {
                 has_descs = true;
                 break;
             }
@@ -1865,9 +1924,9 @@ fn tryFlagCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bo
 }
 
 fn parseFlagsFromHelp(self: *Shell, command: []const u8) !void {
-    self.flag_cache_count = 0;
-    @memcpy(self.flag_cache_cmd[0..command.len], command);
-    self.flag_cache_cmd_len = command.len;
+    self.cache.flag_count = 0;
+    @memcpy(self.cache.flag_cmd[0..command.len], command);
+    self.cache.flag_cmd_len = command.len;
 
     var argv_buf: [128]u8 = undefined;
     var child = std.process.Child.init(
@@ -1923,29 +1982,29 @@ fn parseFlagsFromHelp(self: *Shell, command: []const u8) !void {
                 // deduplicate
                 var dup = false;
                 for (0..count) |j| {
-                    const existing = self.flag_cache_buf[self.flag_cache_offsets[j] .. self.flag_cache_offsets[j] + self.flag_cache_lens[j]];
+                    const existing = self.cache.flag_buf[self.cache.flag_offsets[j] .. self.cache.flag_offsets[j] + self.cache.flag_lens[j]];
                     if (std.mem.eql(u8, existing, flag)) {
                         dup = true;
                         break;
                     }
                 }
-                if (!dup and buf_pos + flag.len <= self.flag_cache_buf.len) {
-                    @memcpy(self.flag_cache_buf[buf_pos .. buf_pos + flag.len], flag);
-                    self.flag_cache_offsets[count] = @intCast(buf_pos);
-                    self.flag_cache_lens[count] = @intCast(flag.len);
+                if (!dup and buf_pos + flag.len <= self.cache.flag_buf.len) {
+                    @memcpy(self.cache.flag_buf[buf_pos .. buf_pos + flag.len], flag);
+                    self.cache.flag_offsets[count] = @intCast(buf_pos);
+                    self.cache.flag_lens[count] = @intCast(flag.len);
                     buf_pos += flag.len;
 
                     // extract description: skip to end of flag group, then grab description text
                     const desc = extractFlagDescription(text, i);
                     const desc_len = @min(desc.len, 60); // cap at 60 chars
-                    if (desc_len > 0 and desc_pos + desc_len <= self.flag_desc_buf.len) {
-                        @memcpy(self.flag_desc_buf[desc_pos .. desc_pos + desc_len], desc[0..desc_len]);
-                        self.flag_desc_offsets[count] = @intCast(desc_pos);
-                        self.flag_desc_lens[count] = @intCast(desc_len);
+                    if (desc_len > 0 and desc_pos + desc_len <= self.cache.flag_desc_buf.len) {
+                        @memcpy(self.cache.flag_desc_buf[desc_pos .. desc_pos + desc_len], desc[0..desc_len]);
+                        self.cache.flag_desc_offsets[count] = @intCast(desc_pos);
+                        self.cache.flag_desc_lens[count] = @intCast(desc_len);
                         desc_pos += desc_len;
                     } else {
-                        self.flag_desc_offsets[count] = 0;
-                        self.flag_desc_lens[count] = 0;
+                        self.cache.flag_desc_offsets[count] = 0;
+                        self.cache.flag_desc_lens[count] = 0;
                     }
 
                     count += 1;
@@ -1956,13 +2015,13 @@ fn parseFlagsFromHelp(self: *Shell, command: []const u8) !void {
         }
     }
 
-    self.flag_cache_count = count;
+    self.cache.flag_count = count;
 
     // If most flags lack descriptions, try man page as fallback
     if (count > 0) {
         var desc_count: usize = 0;
         for (0..count) |j| {
-            if (self.flag_desc_lens[j] > 0) desc_count += 1;
+            if (self.cache.flag_desc_lens[j] > 0) desc_count += 1;
         }
         // Only try man page if less than 30% have descriptions
         if (desc_count * 100 / count < 30) {
@@ -2005,8 +2064,8 @@ fn augmentFlagsFromMan(self: *Shell, command: []const u8, count: usize, desc_pos
 
     // For each cached flag without a description, search man page text
     for (0..count) |j| {
-        if (self.flag_desc_lens[j] > 0) continue; // already has description
-        const flag = self.flag_cache_buf[self.flag_cache_offsets[j] .. self.flag_cache_offsets[j] + self.flag_cache_lens[j]];
+        if (self.cache.flag_desc_lens[j] > 0) continue; // already has description
+        const flag = self.cache.flag_buf[self.cache.flag_offsets[j] .. self.cache.flag_offsets[j] + self.cache.flag_lens[j]];
 
         // Search for the flag in man page text
         var pos: usize = 0;
@@ -2028,10 +2087,10 @@ fn augmentFlagsFromMan(self: *Shell, command: []const u8, count: usize, desc_pos
             // Try to extract description from this position
             const desc = extractFlagDescription(text, after);
             const desc_len = @min(desc.len, 60);
-            if (desc_len > 0 and desc_pos.* + desc_len <= self.flag_desc_buf.len) {
-                @memcpy(self.flag_desc_buf[desc_pos.* .. desc_pos.* + desc_len], desc[0..desc_len]);
-                self.flag_desc_offsets[j] = @intCast(desc_pos.*);
-                self.flag_desc_lens[j] = @intCast(desc_len);
+            if (desc_len > 0 and desc_pos.* + desc_len <= self.cache.flag_desc_buf.len) {
+                @memcpy(self.cache.flag_desc_buf[desc_pos.* .. desc_pos.* + desc_len], desc[0..desc_len]);
+                self.cache.flag_desc_offsets[j] = @intCast(desc_pos.*);
+                self.cache.flag_desc_lens[j] = @intCast(desc_len);
                 desc_pos.* += desc_len;
                 break;
             }
@@ -2092,16 +2151,16 @@ fn showFlagCompletionsWithDesc(self: *Shell, matches: *std.ArrayList([]const u8)
     if (matches.items.len == 0) return false;
 
     // store matches for cycling
-    self.completion_matches.deinit(self.allocator);
-    self.completion_matches = .{};
+    self.completion.matches.deinit(self.allocator);
+    self.completion.matches = .{};
     for (matches.items) |m| {
         const owned = try self.allocator.dupe(u8, m);
-        try self.completion_matches.append(self.allocator, owned);
+        try self.completion.matches.append(self.allocator, owned);
     }
-    self.completion_index = 0;
-    self.completion_word_start = word_result.start;
-    self.completion_word_end = word_result.end;
-    self.completion_pattern_len = pattern.len;
+    self.completion.index = 0;
+    self.completion.word_start = word_result.start;
+    self.completion.word_end = word_result.end;
+    self.completion.pattern_len = pattern.len;
 
     // display with descriptions
     const term_width = self.terminal_width;
@@ -2127,20 +2186,20 @@ fn showFlagCompletionsWithDesc(self: *Shell, matches: *std.ArrayList([]const u8)
     const items_to_show = @min(matches.items.len, max_menu_height);
     const start_idx: usize = if (matches.items.len > items_to_show) blk: {
         const half = items_to_show / 2;
-        if (self.completion_index < half) break :blk 0;
-        if (self.completion_index + half >= matches.items.len) break :blk matches.items.len - items_to_show;
-        break :blk self.completion_index - half;
+        if (self.completion.index < half) break :blk 0;
+        if (self.completion.index + half >= matches.items.len) break :blk matches.items.len - items_to_show;
+        break :blk self.completion.index - half;
     } else 0;
     const end_idx = @min(start_idx + items_to_show, matches.items.len);
 
     for (start_idx..end_idx) |idx| {
         const flag = matches.items[idx];
         const cache_idx = if (idx < match_indices.len) match_indices[idx] else 0;
-        const desc_len = self.flag_desc_lens[cache_idx];
-        const desc = if (desc_len > 0) self.flag_desc_buf[self.flag_desc_offsets[cache_idx] .. self.flag_desc_offsets[cache_idx] + desc_len] else "";
+        const desc_len = self.cache.flag_desc_lens[cache_idx];
+        const desc = if (desc_len > 0) self.cache.flag_desc_buf[self.cache.flag_desc_offsets[cache_idx] .. self.cache.flag_desc_offsets[cache_idx] + desc_len] else "";
 
         const display_flag = if (flag.len > 25) flag[0..24] else flag;
-        const is_selected = idx == self.completion_index;
+        const is_selected = idx == self.completion.index;
 
         if (is_selected) {
             try self.stdout().print("{f}", .{tty.Style.reverse});
@@ -2168,17 +2227,17 @@ fn showFlagCompletionsWithDesc(self: *Shell, matches: *std.ArrayList([]const u8)
 
     if (end_idx < matches.items.len) {
         try self.stdout().print("... ({} more)\n", .{matches.items.len - end_idx});
-        self.completion_menu_lines = items_to_show + 1;
+        self.completion.menu_lines = items_to_show + 1;
     } else if (start_idx > 0) {
         try self.stdout().print("... ({} hidden above)\n", .{start_idx});
-        self.completion_menu_lines = items_to_show + 1;
+        self.completion.menu_lines = items_to_show + 1;
     } else {
-        self.completion_menu_lines = items_to_show;
+        self.completion.menu_lines = items_to_show;
     }
 
     try self.stdout().writeAll("\x1b" ++ "8");
     try self.stdout().flush();
-    self.completion_displayed = true;
+    self.completion.displayed = true;
     return true;
 }
 
@@ -2350,6 +2409,11 @@ fn applySingleCompletion(self: *Shell, match: []const u8, word_result: WordResul
 fn showCompletionMatches(self: *Shell, matches: *std.ArrayList([]const u8), word_result: WordResult, pattern: []const u8) !bool {
     if (matches.items.len == 0) return false;
 
+    // sort matches alphabetically for predictable display and cycling order
+    if (matches.items.len > 1) {
+        std.mem.sort([]const u8, matches.items, {}, StringOrder.lessThan);
+    }
+
     var common_prefix_len: usize = matches.items[0].len;
     for (matches.items[1..]) |match| {
         var i: usize = 0;
@@ -2376,15 +2440,15 @@ fn showCompletionMatches(self: *Shell, matches: *std.ArrayList([]const u8), word
 
     for (matches.items) |match| {
         const owned = try self.allocator.dupe(u8, match);
-        try self.completion_matches.append(self.allocator, owned);
+        try self.completion.matches.append(self.allocator, owned);
     }
 
-    self.completion_mode = true;
-    self.completion_index = self.completion_matches.items.len;
-    self.completion_word_start = word_result.start;
-    self.completion_word_end = word_result.end;
-    self.completion_original_len = self.edit_buf.len;
-    self.completion_pattern_len = pattern.len;
+    self.completion.mode = true;
+    self.completion.index = self.completion.matches.items.len;
+    self.completion.word_start = word_result.start;
+    self.completion.word_end = word_result.end;
+    self.completion.original_len = self.edit_buf.len;
+    self.completion.pattern_len = pattern.len;
 
     try self.renderLine();
     try displayCompletions(self);
@@ -2392,10 +2456,10 @@ fn showCompletionMatches(self: *Shell, matches: *std.ArrayList([]const u8), word
 }
 
 pub fn exitCompletionMode(self: *Shell) void {
-    if (!self.completion_mode) return;
+    if (!self.completion.mode) return;
 
     // clear the completion menu if displayed
-    if (self.completion_displayed and self.completion_menu_lines > 0) {
+    if (self.completion.displayed and self.completion.menu_lines > 0) {
         // Save cursor, move past command area, clear everything below, restore
         self.stdout().writeAll("\x1b" ++ "7") catch {}; // DECSC
         const cmd_rows = self.term_view.term.rows_owned;
@@ -2409,23 +2473,23 @@ pub fn exitCompletionMode(self: *Shell) void {
         self.stdout().flush() catch {};
     }
 
-    for (self.completion_matches.items) |match| {
+    for (self.completion.matches.items) |match| {
         self.allocator.free(match);
     }
-    self.completion_matches.clearRetainingCapacity();
+    self.completion.matches.clearRetainingCapacity();
 
-    self.completion_mode = false;
-    self.completion_index = 0;
-    self.completion_pattern_len = 0;
-    self.completion_menu_lines = 0;
-    self.completion_displayed = false;
+    self.completion.mode = false;
+    self.completion.index = 0;
+    self.completion.pattern_len = 0;
+    self.completion.menu_lines = 0;
+    self.completion.displayed = false;
 }
 
 pub fn handleCompletionCycle(self: *Shell, direction: CycleDirection) !void {
-    if (self.completion_matches.items.len == 0) return;
+    if (self.completion.matches.items.len == 0) return;
 
-    const old_index = self.completion_index;
-    const nothing_selected = old_index >= self.completion_matches.items.len;
+    const old_index = self.completion.index;
+    const nothing_selected = old_index >= self.completion.matches.items.len;
 
     // calculate new index first
     var new_index: usize = undefined;
@@ -2434,23 +2498,23 @@ pub fn handleCompletionCycle(self: *Shell, direction: CycleDirection) !void {
             if (nothing_selected) {
                 new_index = 0;
             } else {
-                new_index = (self.completion_index + 1) % self.completion_matches.items.len;
+                new_index = (self.completion.index + 1) % self.completion.matches.items.len;
             }
         },
         .backward => {
             if (nothing_selected) {
-                new_index = self.completion_matches.items.len - 1;
-            } else if (self.completion_index == 0) {
-                new_index = self.completion_matches.items.len - 1;
+                new_index = self.completion.matches.items.len - 1;
+            } else if (self.completion.index == 0) {
+                new_index = self.completion.matches.items.len - 1;
             } else {
-                new_index = self.completion_index - 1;
+                new_index = self.completion.index - 1;
             }
         },
     }
 
     // zsh-style: if cycling back to same directory (wrapped), drill into it
     if (direction == .forward and !nothing_selected and new_index == old_index) {
-        const current_match = self.completion_matches.items[self.completion_index];
+        const current_match = self.completion.matches.items[self.completion.index];
         if (std.mem.endsWith(u8, current_match, "/")) {
             exitCompletionMode(self);
             try self.renderLine();
@@ -2458,9 +2522,9 @@ pub fn handleCompletionCycle(self: *Shell, direction: CycleDirection) !void {
         }
     }
 
-    self.completion_index = new_index;
+    self.completion.index = new_index;
 
-    try applyCompletion(self, self.completion_pattern_len);
+    try applyCompletion(self, self.completion.pattern_len);
 
     // Always clear from command start to end of screen before redrawing
     if (self.term_view.term.row > 0) {
@@ -2476,26 +2540,26 @@ pub fn handleCompletionCycle(self: *Shell, direction: CycleDirection) !void {
 }
 
 fn applyCompletion(self: *Shell, pattern_len: usize) !void {
-    if (self.completion_matches.items.len == 0) return;
+    if (self.completion.matches.items.len == 0) return;
 
-    const match = self.completion_matches.items[self.completion_index];
+    const match = self.completion.matches.items[self.completion.index];
     const comp_str = match[pattern_len..];
 
     // escape special characters for shell
     const escaped = escapeForShell(self.allocator, comp_str) catch return;
     defer self.allocator.free(escaped);
 
-    self.edit_buf.len = @intCast(self.completion_original_len);
-    self.edit_buf.cursor = @intCast(self.completion_word_end);
+    self.edit_buf.len = @intCast(self.completion.original_len);
+    self.edit_buf.cursor = @intCast(self.completion.word_end);
     _ = self.edit_buf.insertSlice(escaped);
 
     // log accepted completion for training data
     const pattern = match[0..pattern_len];
-    logCompletion(self.edit_buf.slice(), self.completion_word_start, pattern, match);
+    logCompletion(self.edit_buf.slice(), self.completion.word_start, pattern, match);
 }
 
 pub fn displayCompletions(self: *Shell) !void {
-    if (self.completion_matches.items.len == 0) return;
+    if (self.completion.matches.items.len == 0) return;
 
     const term_width = self.terminal_width;
     const term_height = self.terminal_height;
@@ -2515,47 +2579,47 @@ pub fn displayCompletions(self: *Shell) !void {
     try self.stdout().writeAll("\r\n\x1b[J"); // CR + LF + clear below
 
     if (term_width < 80) {
-        const items_to_show = @min(self.completion_matches.items.len, max_menu_height);
-        const start_idx = if (self.completion_matches.items.len > items_to_show) blk: {
+        const items_to_show = @min(self.completion.matches.items.len, max_menu_height);
+        const start_idx = if (self.completion.matches.items.len > items_to_show) blk: {
             const half_window = items_to_show / 2;
-            if (self.completion_index < half_window) {
+            if (self.completion.index < half_window) {
                 break :blk 0;
-            } else if (self.completion_index + half_window >= self.completion_matches.items.len) {
-                break :blk self.completion_matches.items.len - items_to_show;
+            } else if (self.completion.index + half_window >= self.completion.matches.items.len) {
+                break :blk self.completion.matches.items.len - items_to_show;
             } else {
-                break :blk self.completion_index - half_window;
+                break :blk self.completion.index - half_window;
             }
         } else 0;
 
-        const end_idx = @min(start_idx + items_to_show, self.completion_matches.items.len);
+        const end_idx = @min(start_idx + items_to_show, self.completion.matches.items.len);
 
-        for (self.completion_matches.items[start_idx..end_idx], start_idx..) |match, mi| {
-            if (mi == self.completion_index and self.completion_index < self.completion_matches.items.len) {
+        for (self.completion.matches.items[start_idx..end_idx], start_idx..) |match, mi| {
+            if (mi == self.completion.index and self.completion.index < self.completion.matches.items.len) {
                 try self.stdout().print("{f}{s}{f}\r\n", .{ tty.Style.reverse, match, tty.Style.reset });
             } else {
                 try self.stdout().print("{s}\r\n", .{match});
             }
         }
 
-        if (end_idx < self.completion_matches.items.len) {
-            try self.stdout().print("... ({} more)\r\n", .{self.completion_matches.items.len - end_idx});
-            self.completion_menu_lines = items_to_show + 1;
+        if (end_idx < self.completion.matches.items.len) {
+            try self.stdout().print("... ({} more)\r\n", .{self.completion.matches.items.len - end_idx});
+            self.completion.menu_lines = items_to_show + 1;
         } else if (start_idx > 0) {
             try self.stdout().print("... ({} hidden above)\r\n", .{start_idx});
-            self.completion_menu_lines = items_to_show + 1;
+            self.completion.menu_lines = items_to_show + 1;
         } else {
-            self.completion_menu_lines = items_to_show;
+            self.completion.menu_lines = items_to_show;
         }
 
         try self.stdout().writeAll("\x1b" ++ "8"); // DECRC
         try self.stdout().flush();
-        self.completion_displayed = true;
+        self.completion.displayed = true;
         return;
     }
 
     const max_item_width: usize = 30;
     var max_len: usize = 0;
-    for (self.completion_matches.items) |match| {
+    for (self.completion.matches.items) |match| {
         const display_len = @min(match.len, max_item_width);
         if (display_len > max_len) max_len = display_len;
     }
@@ -2564,33 +2628,33 @@ pub fn displayCompletions(self: *Shell) !void {
     const effective_width = @min(term_width, max_line_width);
     const cols = @max(1, effective_width / col_width);
 
-    const total_menu_lines = (self.completion_matches.items.len + cols - 1) / cols;
+    const total_menu_lines = (self.completion.matches.items.len + cols - 1) / cols;
     const menu_lines_count = @min(total_menu_lines, max_menu_height);
-    self.completion_menu_lines = menu_lines_count;
+    self.completion.menu_lines = menu_lines_count;
 
     const max_items = menu_lines_count * cols;
-    const items_to_show = @min(self.completion_matches.items.len, max_items);
+    const items_to_show = @min(self.completion.matches.items.len, max_items);
 
-    const start_item = if (self.completion_matches.items.len > items_to_show) blk: {
+    const start_item = if (self.completion.matches.items.len > items_to_show) blk: {
         const half = items_to_show / 2;
-        if (self.completion_index < half) {
+        if (self.completion.index < half) {
             break :blk @as(usize, 0);
-        } else if (self.completion_index + half >= self.completion_matches.items.len) {
-            break :blk self.completion_matches.items.len - items_to_show;
+        } else if (self.completion.index + half >= self.completion.matches.items.len) {
+            break :blk self.completion.matches.items.len - items_to_show;
         } else {
-            break :blk self.completion_index - half;
+            break :blk self.completion.index - half;
         }
     } else 0;
-    const end_item = @min(start_item + items_to_show, self.completion_matches.items.len);
+    const end_item = @min(start_item + items_to_show, self.completion.matches.items.len);
 
     // Draw items in columns, using \r\n for line breaks
     var col_pos: usize = 0;
 
-    for (self.completion_matches.items[start_item..end_item], start_item..) |match, i| {
+    for (self.completion.matches.items[start_item..end_item], start_item..) |match, i| {
         const display_name = if (max_item_width > 1 and match.len > max_item_width) match[0 .. max_item_width - 1] else match;
         const truncated = max_item_width > 0 and match.len > max_item_width;
 
-        if (i == self.completion_index and self.completion_index < self.completion_matches.items.len) {
+        if (i == self.completion.index and self.completion.index < self.completion.matches.items.len) {
             try self.stdout().print("{f}{s}", .{ tty.Style.reverse, display_name });
             if (truncated) try self.stdout().writeByte('~');
             try self.stdout().print("{f}", .{tty.Style.reset});
@@ -2613,16 +2677,16 @@ pub fn displayCompletions(self: *Shell) !void {
     // End last row if not already ended
     if (col_pos > 0) try self.stdout().writeAll("\r\n");
 
-    const hidden = self.completion_matches.items.len - (end_item - start_item);
+    const hidden = self.completion.matches.items.len - (end_item - start_item);
     if (hidden > 0) {
         try self.stdout().print("... ({} more matches)\r\n", .{hidden});
-        self.completion_menu_lines += 1;
+        self.completion.menu_lines += 1;
     }
 
     // Restore cursor to command line
     try self.stdout().writeAll("\x1b" ++ "8");
     try self.stdout().flush();
-    self.completion_displayed = true;
+    self.completion.displayed = true;
 }
 
 // Log accepted/rejected completions to ~/.zish/completion_log.jsonl for training.
@@ -2730,10 +2794,10 @@ pub fn updateCompletionHighlight(self: *Shell, old_index: usize) !void {
     // save cursor position on command line
     try self.stdout().writeAll("\x1b" ++ "7");
 
-    if (old_index >= self.completion_matches.items.len) {
+    if (old_index >= self.completion.matches.items.len) {
         const max_item_width: usize = 30;
         var max_len: usize = 0;
-        for (self.completion_matches.items) |match| {
+        for (self.completion.matches.items) |match| {
             const display_len = @min(match.len, max_item_width);
             if (display_len > max_len) max_len = display_len;
         }
@@ -2742,14 +2806,14 @@ pub fn updateCompletionHighlight(self: *Shell, old_index: usize) !void {
         const effective_width = @min(term_width, max_line_width);
         const cols = @max(1, effective_width / col_width);
 
-        const new_row = self.completion_index / cols;
-        const new_col = self.completion_index % cols;
+        const new_row = self.completion.index / cols;
+        const new_col = self.completion.index % cols;
 
         // move down to menu, then to the item position
         try self.stdout().print("\x1b[{d}B", .{new_row + 1});
         const new_col_pos = new_col * col_width;
         try self.stdout().print("\x1b[{d}G", .{new_col_pos + 1});
-        try self.stdout().print("{f}{s}{f}", .{ tty.Style.reverse, self.completion_matches.items[self.completion_index], tty.Style.reset });
+        try self.stdout().print("{f}{s}{f}", .{ tty.Style.reverse, self.completion.matches.items[self.completion.index], tty.Style.reset });
 
         // restore cursor to command line
         try self.stdout().writeAll("\x1b" ++ "8");
@@ -2769,7 +2833,7 @@ pub fn updateCompletionHighlight(self: *Shell, old_index: usize) !void {
 
     const max_item_width: usize = 30;
     var max_len: usize = 0;
-    for (self.completion_matches.items) |match| {
+    for (self.completion.matches.items) |match| {
         const display_len = @min(match.len, max_item_width);
         if (display_len > max_len) max_len = display_len;
     }
@@ -2780,14 +2844,14 @@ pub fn updateCompletionHighlight(self: *Shell, old_index: usize) !void {
 
     const old_row = old_index / cols;
     const old_col = old_index % cols;
-    const new_row = self.completion_index / cols;
-    const new_col = self.completion_index % cols;
+    const new_row = self.completion.index / cols;
+    const new_col = self.completion.index % cols;
 
     // move down to old item and un-highlight it
     try self.stdout().print("\x1b[{d}B", .{old_row + 1});
     const old_col_pos = old_col * col_width;
     try self.stdout().print("\x1b[{d}G", .{old_col_pos + 1});
-    try self.stdout().print("{s}", .{self.completion_matches.items[old_index]});
+    try self.stdout().print("{s}", .{self.completion.matches.items[old_index]});
 
     // move to new item and highlight it
     if (new_row > old_row) {
@@ -2797,7 +2861,7 @@ pub fn updateCompletionHighlight(self: *Shell, old_index: usize) !void {
     }
     const new_col_pos = new_col * col_width;
     try self.stdout().print("\x1b[{d}G", .{new_col_pos + 1});
-    try self.stdout().print("{f}{s}{f}", .{ tty.Style.reverse, self.completion_matches.items[self.completion_index], tty.Style.reset });
+    try self.stdout().print("{f}{s}{f}", .{ tty.Style.reverse, self.completion.matches.items[self.completion.index], tty.Style.reset });
 
     // restore cursor to command line
     try self.stdout().writeAll("\x1b" ++ "8");
@@ -2851,50 +2915,50 @@ fn ghostFileSuggestion(self: *Shell, partial: []const u8) bool {
     }
 
     if (best_len > 0) {
-        const n = @min(best_len, self.ghost_buf.len);
-        @memcpy(self.ghost_buf[0..n], best[0..n]);
-        self.ghost_len = n;
-        self.ghost_from_ctm = false;
+        const n = @min(best_len, self.ghost.buf.len);
+        @memcpy(self.ghost.buf[0..n], best[0..n]);
+        self.ghost.len = n;
+        self.ghost.from_ctm = false;
         return true;
     }
     return false;
 }
 
 pub fn updateGhostText(self: *Shell) void {
-    self.ghost_len = 0;
+    self.ghost.len = 0;
 
-    if (!self.opt_autosuggestion) return;
+    if (!self.ghost.enabled) return;
 
     // only suggest when cursor is at end and we have content
     const cmd = self.edit_buf.slice();
     if (cmd.len < 2 or self.edit_buf.cursor != self.edit_buf.len) return;
-    if (self.completion_mode) return;
+    if (self.completion.mode) return;
 
     // check for CTM inference result (non-blocking)
     // Accept any result (even from older seq) as long as it was generated for
     // a prefix of the current input. This prevents results being discarded
     // when the user types faster than inference can complete.
-    const res_seq = self.ghost_infer_result_seq.load(.acquire);
-    if (res_seq > 0 and res_seq != self.ghost_last_result_seq) {
-        const rlen = self.ghost_infer_result_len.load(.monotonic);
+    const res_seq = self.ghost.infer_result_seq.load(.acquire);
+    if (res_seq > 0 and res_seq != self.ghost.last_result_seq) {
+        const rlen = self.ghost.infer_result_len.load(.monotonic);
         if (rlen > 0) {
-            const n = @min(rlen, self.ghost_buf.len);
-            @memcpy(self.ghost_buf[0..n], self.ghost_infer_result[0..n]);
-            self.ghost_len = n;
-            self.ghost_from_ctm = true;
-            self.ghost_last_result_seq = res_seq;
+            const n = @min(rlen, self.ghost.buf.len);
+            @memcpy(self.ghost.buf[0..n], self.ghost.infer_result[0..n]);
+            self.ghost.len = n;
+            self.ghost.from_ctm = true;
+            self.ghost.last_result_seq = res_seq;
             // Don't return — still submit new request for updated input
         }
     }
 
     // submit new inference request on every keystroke
-    const cur_seq = self.ghost_infer_seq.load(.monotonic);
-    if (self.ghost_infer_thread != null and cmd.len <= self.ghost_infer_input.len) {
+    const cur_seq = self.ghost.infer_seq.load(.monotonic);
+    if (self.ghost.infer_thread != null and cmd.len <= self.ghost.infer_input.len) {
         const new_seq = cur_seq +% 1;
         const len: u32 = @intCast(cmd.len);
-        @memcpy(self.ghost_infer_input[0..cmd.len], cmd);
-        self.ghost_infer_input_len.store(len, .monotonic);
-        self.ghost_infer_seq.store(new_seq, .release);
+        @memcpy(self.ghost.infer_input[0..cmd.len], cmd);
+        self.ghost.infer_input_len.store(len, .monotonic);
+        self.ghost.infer_seq.store(new_seq, .release);
     }
 
     // Strategy 0: CWD-aware file path completion
@@ -2965,24 +3029,24 @@ pub fn updateGhostText(self: *Shell) void {
     }
 
     // Store all candidates
-    self.ghost_candidate_count = cand_count;
+    self.ghost.candidate_count = cand_count;
     for (0..cand_count) |ci| {
         const command = h.getCommand(items[cand_idxs[ci]]);
         const suffix = command[cmd.len..];
-        const n = @min(suffix.len, self.ghost_candidates[ci].len);
-        @memcpy(self.ghost_candidates[ci][0..n], suffix[0..n]);
-        self.ghost_candidate_lens[ci] = n;
+        const n = @min(suffix.len, self.ghost.candidates[ci].len);
+        @memcpy(self.ghost.candidates[ci][0..n], suffix[0..n]);
+        self.ghost.candidate_lens[ci] = n;
     }
 
     // Show first candidate
     if (cand_count > 0) {
         // Keep current index if still valid, otherwise reset
-        if (self.ghost_candidate_idx >= cand_count) self.ghost_candidate_idx = 0;
-        const ci = self.ghost_candidate_idx;
-        const n = self.ghost_candidate_lens[ci];
-        @memcpy(self.ghost_buf[0..n], self.ghost_candidates[ci][0..n]);
-        self.ghost_len = n;
-        self.ghost_from_ctm = false;
+        if (self.ghost.candidate_idx >= cand_count) self.ghost.candidate_idx = 0;
+        const ci = self.ghost.candidate_idx;
+        const n = self.ghost.candidate_lens[ci];
+        @memcpy(self.ghost.buf[0..n], self.ghost.candidates[ci][0..n]);
+        self.ghost.len = n;
+        self.ghost.from_ctm = false;
         return;
     }
 
@@ -3019,10 +3083,10 @@ pub fn updateGhostText(self: *Shell) void {
         if (seg_best_idx) |idx| {
             const command = h.getCommand(items[idx]);
             const suffix = command[last_seg.len..];
-            const n = @min(suffix.len, self.ghost_buf.len);
-            @memcpy(self.ghost_buf[0..n], suffix[0..n]);
-            self.ghost_len = n;
-            self.ghost_from_ctm = false;
+            const n = @min(suffix.len, self.ghost.buf.len);
+            @memcpy(self.ghost.buf[0..n], suffix[0..n]);
+            self.ghost.len = n;
+            self.ghost.from_ctm = false;
         }
     }
 
@@ -3055,10 +3119,10 @@ pub fn updateGhostText(self: *Shell) void {
         };
         for (&suggestions) |s| {
             if (std.mem.startsWith(u8, cmd, s.prefix) and cmd.len == s.prefix.len) {
-                const n = @min(s.completion.len, self.ghost_buf.len);
-                @memcpy(self.ghost_buf[0..n], s.completion[0..n]);
-                self.ghost_len = n;
-                self.ghost_from_ctm = false;
+                const n = @min(s.completion.len, self.ghost.buf.len);
+                @memcpy(self.ghost.buf[0..n], s.completion[0..n]);
+                self.ghost.len = n;
+                self.ghost.from_ctm = false;
                 return;
             }
         }
@@ -3067,22 +3131,22 @@ pub fn updateGhostText(self: *Shell) void {
 
 /// Cycle ghost text to next/previous candidate (Alt+Down / Alt+Up)
 pub fn cycleGhostCandidate(self: *Shell, direction: i8) bool {
-    if (self.ghost_candidate_count <= 1) return false;
+    if (self.ghost.candidate_count <= 1) return false;
     if (direction > 0) {
-        self.ghost_candidate_idx = (self.ghost_candidate_idx + 1) % self.ghost_candidate_count;
+        self.ghost.candidate_idx = (self.ghost.candidate_idx + 1) % self.ghost.candidate_count;
     } else {
-        self.ghost_candidate_idx = if (self.ghost_candidate_idx == 0) self.ghost_candidate_count - 1 else self.ghost_candidate_idx - 1;
+        self.ghost.candidate_idx = if (self.ghost.candidate_idx == 0) self.ghost.candidate_count - 1 else self.ghost.candidate_idx - 1;
     }
-    const ci = self.ghost_candidate_idx;
-    const n = self.ghost_candidate_lens[ci];
-    @memcpy(self.ghost_buf[0..n], self.ghost_candidates[ci][0..n]);
-    self.ghost_len = n;
+    const ci = self.ghost.candidate_idx;
+    const n = self.ghost.candidate_lens[ci];
+    @memcpy(self.ghost.buf[0..n], self.ghost.candidates[ci][0..n]);
+    self.ghost.len = n;
     return true;
 }
 
 /// Start the ghost inference background thread (called when completion_model is configured).
 pub fn startGhostInference(self: *Shell, model_path: []const u8) void {
-    if (self.ghost_infer_thread != null) return;
+    if (self.ghost.infer_thread != null) return;
     if (model_path.len == 0) return;
 
     // Copy model path to a stable location (self is heap-allocated, fields are stable)
@@ -3100,7 +3164,7 @@ pub fn startGhostInference(self: *Shell, model_path: []const u8) void {
     const ctx = self.allocator.create(GhostInferCtx) catch return;
     ctx.* = .{ .shell = self, .path = path_buf, .path_len = model_path.len };
 
-    self.ghost_infer_thread = std.Thread.spawn(.{}, ghostInferThread, .{ctx}) catch {
+    self.ghost.infer_thread = std.Thread.spawn(.{}, ghostInferThread, .{ctx}) catch {
         self.allocator.destroy(ctx);
         return;
     };
@@ -3124,7 +3188,7 @@ fn ghostInferThread(ctx: anytype) void {
 
     // Initialize pipeline context
     var ghost_ctx = ghost_svc.GhostCtx{
-        .current_seq = &shell.ghost_infer_seq,
+        .current_seq = &shell.ghost.infer_seq,
         .server = &server,
         .model_path = model_path,
         .last_cmd = &.{},
@@ -3136,8 +3200,8 @@ fn ghostInferThread(ctx: anytype) void {
     var last_seq: u32 = 0;
 
     // Poll/debounce loop — scheduling only, pipeline handles transformation
-    while (!shell.ghost_infer_stop.load(.monotonic)) {
-        const seq = shell.ghost_infer_seq.load(.acquire);
+    while (!shell.ghost.infer_stop.load(.monotonic)) {
+        const seq = shell.ghost.infer_seq.load(.acquire);
         if (seq == last_seq) {
             std.Thread.sleep(20 * std.time.ns_per_ms);
             continue;
@@ -3146,13 +3210,13 @@ fn ghostInferThread(ctx: anytype) void {
 
         // Debounce: wait for input to stabilize
         std.Thread.sleep(100 * std.time.ns_per_ms);
-        if (shell.ghost_infer_seq.load(.monotonic) != seq) continue;
+        if (shell.ghost.infer_seq.load(.monotonic) != seq) continue;
 
         // Read input
-        const ilen = shell.ghost_infer_input_len.load(.monotonic);
+        const ilen = shell.ghost.infer_input_len.load(.monotonic);
         if (ilen == 0 or ilen > 512) continue;
         var input_buf: [512]u8 = undefined;
-        @memcpy(input_buf[0..ilen], shell.ghost_infer_input[0..ilen]);
+        @memcpy(input_buf[0..ilen], shell.ghost.infer_input[0..ilen]);
 
         // Update context with latest history command
         if (shell.history) |h| {
@@ -3171,18 +3235,9 @@ fn ghostInferThread(ctx: anytype) void {
         switch (signal) {
             .completion => |c| {
                 const n = c.len;
-                // Debug log
-                const dbg = std.fs.openFileAbsolute("/tmp/zish_inference.log", .{ .mode = .write_only }) catch null;
-                if (dbg) |f| {
-                    f.seekFromEnd(0) catch {};
-                    f.writeAll("ghost: ") catch {};
-                    f.writeAll(c.buf[0..n]) catch {};
-                    f.writeAll("\n") catch {};
-                    f.close();
-                }
-                @memcpy(shell.ghost_infer_result[0..n], c.buf[0..n]);
-                shell.ghost_infer_result_len.store(n, .monotonic);
-                shell.ghost_infer_result_seq.store(c.seq, .release);
+                @memcpy(shell.ghost.infer_result[0..n], c.buf[0..n]);
+                shell.ghost.infer_result_len.store(n, .monotonic);
+                shell.ghost.infer_result_seq.store(c.seq, .release);
             },
             else => {}, // stale, idle — nothing to publish
         }
@@ -3191,25 +3246,25 @@ fn ghostInferThread(ctx: anytype) void {
 
 /// Stop the ghost inference thread.
 pub fn stopGhostInference(self: *Shell) void {
-    self.ghost_infer_stop.store(true, .monotonic);
-    if (self.ghost_infer_thread) |t| {
+    self.ghost.infer_stop.store(true, .monotonic);
+    if (self.ghost.infer_thread) |t| {
         t.join();
-        self.ghost_infer_thread = null;
+        self.ghost.infer_thread = null;
     }
 }
 
 /// Log a ghost text rejection — user typed a character instead of accepting.
 /// This is the counterfactual signal: model predicted X, user did Y.
 pub fn rejectGhostText(self: *Shell) void {
-    if (self.ghost_len == 0) return;
-    if (!self.ghost_from_ctm) return; // only log model predictions, not history matches
+    if (self.ghost.len == 0) return;
+    if (!self.ghost.from_ctm) return; // only log model predictions, not history matches
 
     const cmd = self.edit_buf.slice();
-    const ghost = self.ghost_buf[0..self.ghost_len];
+    const ghost = self.ghost.buf[0..self.ghost.len];
 
     // Log: context = current input, predicted = ghost, actual = what user typed next
     logRejection(cmd, ghost);
-    self.ghost_len = 0;
+    self.ghost.len = 0;
 }
 
 fn writeJsonEscapedToFile(file: std.fs.File, s: []const u8) void {
@@ -3255,16 +3310,16 @@ fn logRejection(cmd: []const u8, predicted: []const u8) void {
 /// Accept ghost text — append it to the edit buffer.
 /// Returns true if ghost text was accepted.
 pub fn acceptGhostText(self: *Shell) bool {
-    if (self.ghost_len == 0) return false;
+    if (self.ghost.len == 0) return false;
     if (self.edit_buf.cursor != self.edit_buf.len) return false;
 
-    const ghost = self.ghost_buf[0..self.ghost_len];
+    const ghost = self.ghost.buf[0..self.ghost.len];
     _ = self.edit_buf.insertSlice(ghost);
-    self.ghost_len = 0;
+    self.ghost.len = 0;
 
     // log accepted ghost suggestion with source tracking
     logCompletionWith(self.edit_buf.slice(), 0, "", self.edit_buf.slice(),
-        if (self.ghost_from_ctm) .ghost_ctm else .ghost_history);
+        if (self.ghost.from_ctm) .ghost_ctm else .ghost_history);
 
     return true;
 }
@@ -3272,10 +3327,10 @@ pub fn acceptGhostText(self: *Shell) bool {
 /// Accept one word from ghost text (Ctrl+Right).
 /// Returns true if a word was accepted.
 pub fn acceptGhostWord(self: *Shell) bool {
-    if (self.ghost_len == 0) return false;
+    if (self.ghost.len == 0) return false;
     if (self.edit_buf.cursor != self.edit_buf.len) return false;
 
-    const ghost = self.ghost_buf[0..self.ghost_len];
+    const ghost = self.ghost.buf[0..self.ghost.len];
 
     // find end of first word: skip leading spaces, then skip non-spaces
     var i: usize = 0;
@@ -3288,11 +3343,11 @@ pub fn acceptGhostWord(self: *Shell) bool {
     _ = self.edit_buf.insertSlice(ghost[0..i]);
 
     // shift remaining ghost text
-    const remaining = self.ghost_len - i;
+    const remaining = self.ghost.len - i;
     if (remaining > 0) {
-        std.mem.copyForwards(u8, &self.ghost_buf, self.ghost_buf[i..self.ghost_len]);
+        std.mem.copyForwards(u8, &self.ghost.buf, self.ghost.buf[i..self.ghost.len]);
     }
-    self.ghost_len = remaining;
+    self.ghost.len = remaining;
 
     return true;
 }

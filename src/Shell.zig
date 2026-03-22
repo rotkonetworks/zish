@@ -155,6 +155,26 @@ const Colors = struct {
     const insert_mode = tty.Color.yellow;
 };
 
+pub const GhostState = struct {
+    enabled: bool = true,
+    buf: [512]u8 = undefined,
+    len: usize = 0,
+    from_ctm: bool = false,
+    candidates: [8][512]u8 = undefined,
+    candidate_lens: [8]usize = [_]usize{0} ** 8,
+    candidate_count: u8 = 0,
+    candidate_idx: u8 = 0,
+    infer_input: [512]u8 = undefined,
+    infer_input_len: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    infer_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    infer_result: [512]u8 = undefined,
+    infer_result_len: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    infer_result_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    last_result_seq: u32 = 0,
+    infer_thread: ?std.Thread = null,
+    infer_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
 allocator: std.mem.Allocator,
 running: bool,
 history: ?*hist.History,
@@ -198,61 +218,15 @@ search_buffer: []u8,
 search_len: usize = 0,
 // paste mode (bracketed paste)
 paste_mode: bool = false,
-// completion state
-completion_mode: bool = false,
-completion_matches: std.ArrayList([]const u8),
-completion_index: usize = 0,
-completion_word_start: usize = 0,
-completion_word_end: usize = 0,
-completion_original_len: usize = 0,
-completion_pattern_len: usize = 0,
-completion_menu_lines: usize = 0,
-completion_displayed: bool = false,
-skip_next_slash: bool = false, // set after completion inserts / for directory
+// completion state (grouped sub-struct — see completion_mod for logic)
+completion: completion_mod.CompletionState,
 ctrl_d_pending: bool = false, // double ctrl+d to exit
 
-// flag completion cache (one command at a time, TTL 5 min)
-flag_cache_cmd: [64]u8 = undefined,
-flag_cache_cmd_len: usize = 0,
-flag_cache_buf: [8192]u8 = undefined,
-flag_cache_offsets: [256]u16 = undefined,
-flag_cache_lens: [256]u8 = undefined,
-flag_cache_count: usize = 0,
-flag_cache_ts: i64 = 0, // timestamp when cache was populated
-// flag description cache (parallel to flag_cache)
-flag_desc_buf: [16384]u8 = undefined,
-flag_desc_offsets: [256]u16 = undefined,
-flag_desc_lens: [256]u8 = undefined,
+// completion caches (grouped sub-struct)
+cache: completion_mod.CacheState = .{},
 
-// subcommand completion cache (one command at a time, TTL 5 min)
-subcmd_cache_cmd: [32]u8 = undefined,
-subcmd_cache_cmd_len: usize = 0,
-subcmd_cache_buf: [4096]u8 = undefined,
-subcmd_cache_offsets: [128]u16 = undefined,
-subcmd_cache_lens: [128]u8 = undefined,
-subcmd_cache_count: usize = 0,
-subcmd_cache_ts: i64 = 0,
-
-// ghost text autosuggestion (fish-style) with multiple candidates
-opt_autosuggestion: bool = true,
-ghost_buf: [512]u8 = undefined,
-ghost_len: usize = 0,
-ghost_from_ctm: bool = false,
-// Multiple ghost candidates (Alt+Up/Down to cycle)
-ghost_candidates: [8][512]u8 = undefined,
-ghost_candidate_lens: [8]usize = [_]usize{0} ** 8,
-ghost_candidate_count: u8 = 0,
-ghost_candidate_idx: u8 = 0, // currently shown candidate
-// CTM inference for ghost text (async — runs on background thread)
-ghost_infer_input: [512]u8 = undefined, // command line sent to inference
-ghost_infer_input_len: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-ghost_infer_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0), // increment on new request
-ghost_infer_result: [512]u8 = undefined, // inference result
-ghost_infer_result_len: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-ghost_infer_result_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0), // seq of completed result
-ghost_last_result_seq: u32 = 0, // last result seq we consumed (non-atomic, main thread only)
-ghost_infer_thread: ?std.Thread = null,
-ghost_infer_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+// ghost text autosuggestion state (grouped sub-struct)
+ghost: GhostState = .{},
 
 // agent continue: loaded conversation context to send as first message
 continue_context: ?[]const u8 = null,
@@ -332,15 +306,7 @@ fn initWithOptions(allocator: std.mem.Allocator, load_config: bool) !*Shell {
         .search_mode = false,
         .search_buffer = search_buffer,
         .search_len = 0,
-        .completion_mode = false,
-        .completion_matches = std.ArrayList([]const u8){ .items = &.{}, .capacity = 0 },
-        .completion_index = 0,
-        .completion_word_start = 0,
-        .completion_word_end = 0,
-        .completion_original_len = 0,
-        .completion_pattern_len = 0,
-        .completion_menu_lines = 0,
-        .completion_displayed = false,
+        .completion = completion_mod.CompletionState.init(),
         .stdout_writer = .init(.stdout(), writer_buffer),
         .path_cache = std.StringHashMap([]const u8).init(allocator),
         .job_table = jobs.JobTable.init(allocator),
@@ -403,11 +369,8 @@ pub fn deinit(self: *Shell) void {
 
     if (self.history) |h| h.deinit();
 
-    // cleanup completion matches
-    for (self.completion_matches.items) |match| {
-        self.allocator.free(match);
-    }
-    self.completion_matches.deinit(self.allocator);
+    // cleanup completion state
+    self.completion.deinit(self.allocator);
 
     // cleanup path cache
     var path_it = self.path_cache.iterator();
@@ -452,7 +415,7 @@ fn clearCommand(self: *Shell) void {
 pub fn renderLine(self: *Shell) !void {
     // update ghost text suggestion before rendering
     completion_mod.updateGhostText(self);
-    self.term_view.ghost_text = self.ghost_buf[0..self.ghost_len];
+    self.term_view.ghost_text = self.ghost.buf[0..self.ghost.len];
     var prompt_buf: [256]u8 = undefined;
     const prompt = self.buildPrompt(&prompt_buf);
     try self.term_view.render(&self.edit_buf, prompt.slice, prompt.visible_len);
@@ -692,23 +655,11 @@ pub fn run(self: *Shell) !void {
     const initial_cursor = if (self.vim_mode == .normal) CursorStyle.block else CursorStyle.bar;
     try self.setCursorStyle(initial_cursor);
 
-    // start agent background thread (optional - silently skip if thread fails)
-    self.agent.start() catch {};
-
-    // start ghost text inference if completion_model is configured
+    // Agent thread starts lazily on first `agent` command or query — no eager startup.
+    // Ghost text inference also lazy — only if completion_model is configured.
     {
         var cfg = agent_log.AgentConfig.load(self.allocator);
         defer cfg.deinit();
-        // Debug: log model loading
-        {
-            const f = std.fs.createFileAbsolute("/tmp/zish_inference.log", .{ .truncate = true }) catch null;
-            if (f) |file| {
-                file.writeAll("completion_model=") catch {};
-                file.writeAll(if (cfg.completion_model.len > 0) cfg.completion_model else "(empty)") catch {};
-                file.writeAll("\n") catch {};
-                file.close();
-            }
-        }
         if (cfg.completion_model.len > 0) {
             // expand ~ to home directory
             var path_buf: [512]u8 = undefined;
@@ -884,7 +835,7 @@ fn handleResize(self: *Shell) !void {
     self.term_view.last_hash = 0;
 
     try self.renderLine();
-    if (self.completion_mode and self.completion_displayed) {
+    if (self.completion.mode and self.completion.displayed) {
         try completion_mod.displayCompletions(self);
     }
 }
@@ -929,7 +880,7 @@ fn handleAction(self: *Shell, action: Action) !void {
 
         .cancel => {
             completion_mod.exitCompletionMode(self);
-            self.ghost_len = 0;
+            self.ghost.len = 0;
             // print ^C like bash does
             try self.stdout().writeAll("^C\n");
             try self.stdout().flush();
@@ -1015,11 +966,11 @@ fn handleAction(self: *Shell, action: Action) !void {
                 }
             } else {
                 // Skip duplicate slash right after completion inserted one
-                if (char == '/' and self.skip_next_slash) {
-                    self.skip_next_slash = false;
+                if (char == '/' and self.completion.skip_next_slash) {
+                    self.completion.skip_next_slash = false;
                     return; // don't insert, don't redraw
                 }
-                self.skip_next_slash = false; // clear for any other char
+                self.completion.skip_next_slash = false; // clear for any other char
 
                 // Use new edit_buf for insertion
                 if (!self.edit_buf.insert(char)) return;
@@ -1225,7 +1176,7 @@ fn handleAction(self: *Shell, action: Action) !void {
                 try self.handleAction(.{ .exit_search_mode = true });
             } else {
                 completion_mod.exitCompletionMode(self);
-                self.ghost_len = 0;
+                self.ghost.len = 0;
 
                 const command = std.mem.trim(u8, self.edit_buf.slice(), " \t\n\r");
 
@@ -1367,7 +1318,7 @@ fn handleAction(self: *Shell, action: Action) !void {
         },
 
         .tap_complete => {
-            if (self.completion_mode) {
+            if (self.completion.mode) {
                 try completion_mod.handleCompletionCycle(self, .forward);
             } else {
                 // Tab always does traditional completion (ls <tab> shows files)
@@ -1385,7 +1336,7 @@ fn handleAction(self: *Shell, action: Action) !void {
         },
 
         .cycle_complete => |direction| {
-            if (self.completion_mode) {
+            if (self.completion.mode) {
                 try completion_mod.handleCompletionCycle(self,direction);
             } else {
                 try completion_mod.handleTabCompletion(self);
@@ -1598,7 +1549,7 @@ fn handleCursorMovement(self: *Shell, move_action: MoveCursorAction) !void {
 
     if (new_pos == old_pos) {
         // At end of line — accept ghost text if available
-        if (old_pos == max_pos and self.ghost_len > 0) {
+        if (old_pos == max_pos and self.ghost.len > 0) {
             switch (move_action) {
                 .relative => |steps| {
                     if (steps > 0) {
@@ -2026,128 +1977,142 @@ fn logEscape(buf: *[4096]u8, start: usize, s: []const u8) usize {
 /// Drain agent output with proper terminal coordination.
 /// Clears the current prompt on first output, then streams directly.
 /// Re-renders prompt only when agent is done.
+/// Handler for agent output in inline shell mode (not interactive TUI).
+/// Used by agent_drain.drain() — each message kind dispatches to an onXxx method.
+const ShellDrainHandler = struct {
+    shell: *Shell,
+    writer: *std.Io.Writer,
+    last_was_text: bool = false,
+    wrote: bool = false,
+
+    fn ensureActive(self: *ShellDrainHandler) !void {
+        if (!self.shell.agent_output_active) {
+            self.shell.term_view.moveTo(self.shell.term_view.term.rows_owned -| 1, 0);
+            self.shell.term_view.clearToEOL();
+            try self.shell.term_view.flush();
+            try self.writer.writeAll("\r\n");
+            self.shell.agent_output_active = true;
+        }
+        self.wrote = true;
+    }
+
+    fn resetText(self: *ShellDrainHandler) !void {
+        if (self.last_was_text) try self.writer.writeAll("\x1b[0m");
+        self.last_was_text = false;
+    }
+
+    pub fn onTextDelta(self: *ShellDrainHandler, data: []const u8) !void {
+        try self.ensureActive();
+        try self.shell.agent_md.render(self.writer, data);
+        self.last_was_text = true;
+    }
+
+    pub fn onToolCall(self: *ShellDrainHandler, data: []const u8) !void {
+        try self.ensureActive();
+        try self.resetText();
+        try self.writer.writeAll("\x1b[90m\xe2\x9a\xa1 "); // ⚡
+        try self.writer.writeAll(data);
+        try self.writer.writeAll("\x1b[0m\n");
+    }
+
+    pub fn onToolDone(self: *ShellDrainHandler, data: []const u8) !void {
+        try self.ensureActive();
+        self.last_was_text = false;
+        if (data.len > 0) {
+            const has_ansi = std.mem.indexOf(u8, data, "\x1b[3") != null;
+            if (has_ansi) {
+                try self.writer.writeAll("  ");
+                try self.writer.writeAll(data);
+            } else {
+                try self.writer.writeAll("  \x1b[90m");
+                try self.writer.writeAll(data);
+            }
+            try self.writer.writeAll("\x1b[0m\n");
+        } else {
+            try self.writer.writeAll("  \x1b[32m\xe2\x9c\x93\x1b[0m\n"); // ✓
+        }
+    }
+
+    pub fn onError(self: *ShellDrainHandler, data: []const u8) !void {
+        try self.ensureActive();
+        if (self.last_was_text) try self.writer.writeAll("\x1b[0m\n");
+        self.last_was_text = false;
+        try self.writer.writeAll("\x1b[31m\xe2\x9c\x97 "); // ✗
+        try self.writer.writeAll(data);
+        try self.writer.writeAll("\x1b[0m\n");
+    }
+
+    pub fn onDone(self: *ShellDrainHandler) !void {
+        try self.ensureActive();
+        try self.resetText();
+        try self.writer.writeByte('\n');
+        self.shell.agent_md.reset();
+        self.shell.agent_output_active = false;
+        try self.writer.flush();
+        self.shell.term_view.finishLine();
+        try self.shell.renderLine();
+    }
+
+    pub fn onConfirmRequest(self: *ShellDrainHandler, data: []const u8) !void {
+        try self.ensureActive();
+        if (self.last_was_text) try self.writer.writeAll("\x1b[0m\n");
+        self.last_was_text = false;
+        self.shell.agent_md.reset();
+        try self.writer.writeAll("\x1b[33m\xe2\x9a\xa0 "); // ⚠
+        try self.writer.writeAll(data);
+        try self.writer.writeAll(" \x1b[90m[\x1b[32my\x1b[90m/\x1b[31mn\x1b[90m/\x1b[33ma\x1b[90mlways]\x1b[0m ");
+        try self.writer.flush();
+        var resp: [1]u8 = undefined;
+        const n = std.posix.read(std.posix.STDIN_FILENO, &resp) catch 0;
+        if (n > 0 and (resp[0] == 'y' or resp[0] == 'Y')) {
+            _ = self.shell.agent.queues.request.push(.confirm_response, "y");
+            try self.writer.writeAll("y\n");
+        } else if (n > 0 and (resp[0] == 'a' or resp[0] == 'A' or resp[0] == '!')) {
+            _ = self.shell.agent.queues.request.push(.confirm_response, "a");
+            try self.writer.writeAll("a (always)\n");
+        } else {
+            _ = self.shell.agent.queues.request.push(.confirm_response, "n");
+            try self.writer.writeAll("n\n");
+        }
+        try self.writer.flush();
+    }
+
+    pub fn onUsage(self: *ShellDrainHandler, data: []const u8) !void {
+        try self.ensureActive();
+        self.last_was_text = false;
+        try self.writer.writeAll("\x1b[90m");
+        try self.writer.writeAll(data);
+        try self.writer.writeAll("\x1b[0m\n");
+    }
+
+    pub fn onAgentStatus(self: *ShellDrainHandler, data: []const u8) !void {
+        try self.ensureActive();
+        self.last_was_text = false;
+        if (data.len > 0) {
+            try self.writer.writeAll(data);
+            try self.writer.writeByte('\n');
+        }
+    }
+
+    pub fn onCancel(self: *ShellDrainHandler) !void {
+        self.last_was_text = false;
+        self.shell.agent_output_active = false;
+    }
+};
+
 fn drainAgentOutput(self: *Shell) !void {
-    const q = @import("agent_queue.zig");
-    var msg: q.Msg = undefined;
-    var wrote = false;
-    var last_was_text = false;
-    const writer = self.stdout();
+    const agent_drain = @import("agent_drain.zig");
+    var handler = ShellDrainHandler{
+        .shell = self,
+        .writer = self.stdout(),
+    };
+    _ = try agent_drain.drain(ShellDrainHandler, &handler, &self.agent.queues);
 
-    while (self.agent.queues.output.pop(&msg)) {
-        if (!self.agent_output_active) {
-            // first message of a new agent response: clear prompt and move below
-            self.term_view.moveTo(self.term_view.term.rows_owned -| 1, 0);
-            self.term_view.clearToEOL();
-            try self.term_view.flush();
-            try writer.writeAll("\r\n");
-            self.agent_output_active = true;
-        }
-        wrote = true;
-
-        switch (msg.kind) {
-            .text_delta => {
-                try self.agent_md.render(writer, msg.slice());
-                last_was_text = true;
-            },
-            .tool_call => {
-                if (last_was_text) try writer.writeAll("\x1b[0m");
-                last_was_text = false;
-                try writer.writeAll("\x1b[90m\xe2\x9a\xa1 "); // ⚡
-                try writer.writeAll(msg.slice());
-                try writer.writeAll("\x1b[0m\n");
-            },
-            .tool_done => {
-                last_was_text = false;
-                const dt = msg.slice();
-                if (dt.len > 0) {
-                    const has_ansi = std.mem.indexOf(u8, dt, "\x1b[3") != null;
-                    if (has_ansi) {
-                        try writer.writeAll("  ");
-                        try writer.writeAll(dt);
-                        try writer.writeAll("\x1b[0m\n");
-                    } else {
-                        try writer.writeAll("  \x1b[90m");
-                        try writer.writeAll(dt);
-                        try writer.writeAll("\x1b[0m\n");
-                    }
-                } else {
-                    try writer.writeAll("  \x1b[32m\xe2\x9c\x93\x1b[0m\n"); // ✓
-                }
-            },
-            .error_msg => {
-                if (last_was_text) try writer.writeAll("\x1b[0m\n");
-                last_was_text = false;
-                try writer.writeAll("\x1b[31m\xe2\x9c\x97 "); // ✗ prefix
-                try writer.writeAll(msg.slice());
-                try writer.writeAll("\x1b[0m\n");
-            },
-            .done => {
-                if (last_was_text) try writer.writeAll("\x1b[0m");
-                last_was_text = false;
-                try writer.writeByte('\n');
-                self.agent_md.reset();
-                self.agent_output_active = false;
-                // re-render prompt now that agent is done
-                try writer.flush();
-                self.term_view.finishLine();
-                try self.renderLine();
-            },
-            .confirm_request => {
-                if (last_was_text) try writer.writeAll("\x1b[0m\n");
-                last_was_text = false;
-                self.agent_md.reset();
-                // Show confirmation prompt
-                try writer.writeAll("\x1b[33m\xe2\x9a\xa0 "); // ⚠ prefix
-                try writer.writeAll(msg.slice());
-                try writer.writeAll(" \x1b[90m[\x1b[32my\x1b[90m/\x1b[31mn\x1b[90m/\x1b[33ma\x1b[90mlways]\x1b[0m ");
-                try writer.flush();
-                // Read single keystroke (terminal is in raw mode)
-                var resp: [1]u8 = undefined;
-                const n = std.posix.read(std.posix.STDIN_FILENO, &resp) catch 0;
-                if (n > 0 and (resp[0] == 'y' or resp[0] == 'Y')) {
-                    _ = self.agent.queues.request.push(.confirm_response, "y");
-                    try writer.writeAll("y\n");
-                } else if (n > 0 and (resp[0] == 'a' or resp[0] == 'A' or resp[0] == '!')) {
-                    _ = self.agent.queues.request.push(.confirm_response, "a");
-                    try writer.writeAll("a (always)\n");
-                } else {
-                    _ = self.agent.queues.request.push(.confirm_response, "n");
-                    try writer.writeAll("n\n");
-                }
-                try writer.flush();
-            },
-            .usage_info => {
-                last_was_text = false;
-                try writer.writeAll("\x1b[90m"); // dim
-                try writer.writeAll(msg.slice());
-                try writer.writeAll("\x1b[0m\n");
-            },
-            .router_info => {
-                // Suppress router info (matches interactive mode)
-            },
-            .confirm_response, .add_task, .spawn_worker, .agent_status_req,
-            .agent_tree_req, .agent_result_req => {}, // handled on agent side
-            .agent_tree_node, .agent_result => {}, // only used in interactive tree view
-            .agent_status => {
-                last_was_text = false;
-                if (msg.len > 0) {
-                    try writer.writeAll(msg.slice());
-                    try writer.writeByte('\n');
-                }
-            },
-            .cancel => {
-                last_was_text = false;
-                self.agent_output_active = false;
-            },
-        }
+    if (handler.wrote) {
+        try handler.writer.flush();
     }
 
-    if (wrote) {
-        try writer.flush();
-    }
-
-    // ── Bulletin: show escalations and discoveries to the user ──
-    self.drainBulletin(writer) catch {};
+    self.drainBulletin(handler.writer) catch {};
 }
 
 fn drainBulletin(self: *Shell, writer: anytype) !void {
