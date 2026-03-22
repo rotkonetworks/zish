@@ -116,13 +116,15 @@ pub fn promptBuilder(ctx: *GhostCtx, signal: GhostSignal) GhostSignal {
             // Add last history command for context
             if (ctx.last_cmd.len > 0 and ctx.last_cmd.len < 60) {
                 const clen = @min(ctx.last_cmd.len, 50);
-                ctx.prompt_buf[ppos] = '$';
-                ctx.prompt_buf[ppos + 1] = ' ';
-                ppos += 2;
-                @memcpy(ctx.prompt_buf[ppos..][0..clen], ctx.last_cmd[0..clen]);
-                ppos += clen;
-                ctx.prompt_buf[ppos] = '\n';
-                ppos += 1;
+                if (ppos + clen + 3 < ctx.prompt_buf.len) {
+                    ctx.prompt_buf[ppos] = '$';
+                    ctx.prompt_buf[ppos + 1] = ' ';
+                    ppos += 2;
+                    @memcpy(ctx.prompt_buf[ppos..][0..clen], ctx.last_cmd[0..clen]);
+                    ppos += clen;
+                    ctx.prompt_buf[ppos] = '\n';
+                    ppos += 1;
+                }
             }
 
             // Add current input

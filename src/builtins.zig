@@ -13,10 +13,10 @@ const linkify = @import("linkify.zig");
 var dir_stack: std.ArrayList([]const u8) = undefined;
 var dir_stack_initialized: bool = false;
 
-fn ensureDirStack(allocator: std.mem.Allocator) void {
+fn ensureDirStack(allocator: std.mem.Allocator) !void {
     if (!dir_stack_initialized) {
         dir_stack = std.ArrayList([]const u8){};
-        dir_stack.ensureTotalCapacity(allocator, 8) catch {};
+        try dir_stack.ensureTotalCapacity(allocator, 8);
         dir_stack_initialized = true;
     }
 }
@@ -224,7 +224,7 @@ fn dash(shell: *Shell) !u8 {
 }
 
 pub fn pushd(shell: *Shell, args: []const []const u8) !u8 {
-    ensureDirStack(shell.allocator);
+    ensureDirStack(shell.allocator) catch return 1;
 
     var cwd_buf: [4096]u8 = undefined;
     const cwd = std.posix.getcwd(&cwd_buf) catch {
@@ -265,7 +265,7 @@ pub fn pushd(shell: *Shell, args: []const []const u8) !u8 {
 
 pub fn popd(shell: *Shell, args: []const []const u8) !u8 {
     _ = args;
-    ensureDirStack(shell.allocator);
+    ensureDirStack(shell.allocator) catch return 1;
 
     if (dir_stack.items.len == 0) {
         try shell.stdout().writeAll("popd: directory stack empty\n");
@@ -289,7 +289,7 @@ pub fn popd(shell: *Shell, args: []const []const u8) !u8 {
 
 pub fn dirs(shell: *Shell, args: []const []const u8) !u8 {
     _ = args;
-    ensureDirStack(shell.allocator);
+    ensureDirStack(shell.allocator) catch return 1;
     try printDirStack(shell);
     return 0;
 }
@@ -962,7 +962,7 @@ fn set(shell: *Shell, args: []const []const u8) !u8 {
             shell.opt_pipefail = enabled;
             if (i + 1 < args.len) i += 1;
         } else if (std.mem.eql(u8, arg, "autosuggestion") or std.mem.eql(u8, arg, "ghost")) {
-            shell.opt_autosuggestion = enabled;
+            shell.ghost.enabled = enabled;
             if (i + 1 < args.len) i += 1;
         } else {
             try shell.stdout().print("set: unknown option: {s}\n", .{arg});
@@ -2595,6 +2595,32 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
             try out.print("  small:    {s}\n", .{cfg.haiku_model});
             try out.print("  medium:   {s}\n", .{cfg.sonnet_model});
             try out.print("  large:    {s}\n", .{cfg.opus_model});
+        }
+        // Resource status
+        try out.print("\n\x1b[1mResources:\x1b[0m\n", .{});
+        try out.print("  agent thread:  {s}\n", .{if (shell.agent.thread != null) "\x1b[32mrunning\x1b[0m" else "\x1b[90midle (starts on first use)\x1b[0m"});
+        try out.print("  ghost text:    {s}\n", .{if (shell.ghost.infer_thread != null) "\x1b[32mrunning\x1b[0m" else "\x1b[90moff\x1b[0m"});
+        if (cfg.completion_model.len > 0) {
+            try out.print("  ghost model:   {s}\n", .{cfg.completion_model});
+        }
+        if (cfg.router_local_model.len > 0) {
+            try out.print("  router model:  {s}\n", .{cfg.router_local_model});
+        }
+        // Process memory from /proc/self/statm
+        {
+            var statm_buf: [128]u8 = undefined;
+            if (std.fs.openFileAbsolute("/proc/self/statm", .{})) |f| {
+                defer f.close();
+                const n = f.read(&statm_buf) catch 0;
+                if (n > 0) {
+                    var it = std.mem.splitScalar(u8, statm_buf[0..n], ' ');
+                    const vsize_pages = std.fmt.parseInt(u64, it.first(), 10) catch 0;
+                    const rss_pages = if (it.next()) |s| std.fmt.parseInt(u64, s, 10) catch 0 else 0;
+                    const page_size: u64 = 4096;
+                    try out.print("  memory (RSS):  {d} MB\n", .{(rss_pages * page_size) / (1024 * 1024)});
+                    try out.print("  memory (virt): {d} MB\n", .{(vsize_pages * page_size) / (1024 * 1024)});
+                }
+            } else |_| {}
         }
         try out.flush();
         return 0;
