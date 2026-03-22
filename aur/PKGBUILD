@@ -1,6 +1,6 @@
 # Maintainer: Rotko Networks <hq@rotko.net>
 pkgname=zish
-pkgver=0.11.0
+pkgver=0.13.0
 pkgrel=1
 pkgdesc="fast shell interpreter written in zig with built-in AI agent and GGUF inference"
 arch=('x86_64')
@@ -9,7 +9,7 @@ license=('MIT')
 depends=('glibc')
 makedepends=('zig>=0.15.1')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/rotkonetworks/$pkgname/archive/v$pkgver.tar.gz")
-sha256sums=('6c420776ee759ff0b344a077fa634ecc3eb00ecef23fee46be0ea7be9fc7576b')
+sha256sums=('a41e9a650f1ec01602d8757a99589ca48175a2778d0f1430e379e6b0c048c199')
 
 build() {
     cd "$pkgname-$pkgver"
