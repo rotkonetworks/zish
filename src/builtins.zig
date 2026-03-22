@@ -2421,6 +2421,97 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
         return agentInteractive(shell);
     }
 
+    // agent exec / agent -e — headless one-shot with persona, JSON output
+    if (std.mem.eql(u8, subcmd, "exec") or std.mem.eql(u8, subcmd, "-e")) {
+        const personas = @import("personas.zig");
+        const agent_queue = @import("agent_queue.zig");
+
+        // Parse: agent exec [-p persona] <query>
+        var persona: personas.Persona = .hdevalence;
+        var query_start: usize = arg_start + 1;
+
+        if (query_start < args.len) {
+            if (std.mem.eql(u8, args[query_start], "-p") and query_start + 1 < args.len) {
+                persona = personas.Persona.fromName(args[query_start + 1]) orelse .hdevalence;
+                query_start += 2;
+            }
+        }
+
+        if (query_start >= args.len) {
+            try out.writeAll("Usage: agent exec [-p persona] <query>\n");
+            try out.flush();
+            return 1;
+        }
+
+        // Join remaining args as query
+        var qbuf: [4096]u8 = undefined;
+        var qlen: usize = 0;
+        for (args[query_start..]) |arg| {
+            if (qlen > 0) { qbuf[qlen] = ' '; qlen += 1; }
+            const n = @min(arg.len, qbuf.len - qlen);
+            @memcpy(qbuf[qlen..][0..n], arg[0..n]);
+            qlen += n;
+        }
+
+        // Build query with persona context
+        var full_buf: [8192]u8 = undefined;
+        const full_query = std.fmt.bufPrint(&full_buf, "{s}\n\n{s}", .{
+            persona.systemPrompt()[0..@min(persona.systemPrompt().len, 500)],
+            qbuf[0..qlen],
+        }) catch qbuf[0..qlen];
+
+        // Start agent and send query
+        shell.agent.start() catch {
+            try out.writeAll("{\"error\":\"agent failed to start\"}\n");
+            try out.flush();
+            return 1;
+        };
+        if (!shell.agent.query(full_query)) {
+            try out.writeAll("{\"error\":\"queue full\"}\n");
+            try out.flush();
+            return 1;
+        }
+
+        // Drain output as plain text
+        var exit_code: u8 = 0;
+        var got_output = false;
+        var idle_count: u32 = 0;
+        while (idle_count < 500) : (idle_count += 1) {
+            var msg: agent_queue.Msg = undefined;
+            if (shell.agent.queues.output.pop(&msg)) {
+                idle_count = 0;
+                got_output = true;
+                switch (msg.kind) {
+                    .text_delta => try out.writeAll(msg.slice()),
+                    .error_msg => {
+                        try out.writeAll(msg.slice());
+                        try out.writeByte('\n');
+                        exit_code = 1;
+                    },
+                    .done => break,
+                    else => {},
+                }
+            } else {
+                if (got_output and !shell.agent.isBusy()) break;
+                std.Thread.sleep(20 * std.time.ns_per_ms);
+            }
+        }
+
+        // JSON footer
+        const rl = &shell.agent.bulletin.rate_limit;
+        try out.print("\n{{\"persona\":\"{s}\",\"model\":\"{s}\",\"rate_limit\":{d}}}\n", .{
+            persona.name(),
+            switch (persona.modelTier()) {
+                .opus => "opus",
+                .sonnet => "sonnet",
+                .haiku => "haiku",
+            },
+            rl.maxUtil(),
+        });
+        try out.flush();
+        return exit_code;
+    }
+
     // agent stop
     if (std.mem.eql(u8, subcmd, "stop")) {
         shell.agent.cancel();

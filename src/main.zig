@@ -57,87 +57,6 @@ pub fn main() void {
             };
     }
 
-    // --exec mode: run agent query, output JSON result on stdout.
-    // Designed for use as a tool by Claude Code or other agents.
-    // Example: zish --exec "audit this code" --persona micay
-    if (res.args.exec) |query| {
-        const personas = @import("personas.zig");
-        const agent_log = @import("agent_log.zig");
-
-        // Parse persona (default: hdevalence)
-        const persona = if (res.args.persona) |p|
-            personas.Persona.fromName(p) orelse .hdevalence
-        else
-            .hdevalence;
-
-        // Start agent
-        shell_instance.agent.start() catch {
-            std.debug.print("{{\"error\":\"agent failed to start\"}}\n", .{});
-            std.process.exit(1);
-        };
-
-        // Build query with persona context
-        var qbuf: [8192]u8 = undefined;
-        const full_query = std.fmt.bufPrint(&qbuf, "{s}\n\n{s}", .{
-            persona.systemPrompt()[0..@min(persona.systemPrompt().len, 500)],
-            query,
-        }) catch query;
-
-        // Send query
-        if (!shell_instance.agent.query(full_query)) {
-            std.debug.print("{{\"error\":\"queue full\"}}\n", .{});
-            std.process.exit(1);
-        }
-
-        // Wait for agent to process and drain output (plain text, no ANSI)
-        const agent_queue = @import("agent_queue.zig");
-        var exit_code: u8 = 0;
-        var got_output = false;
-        var idle_count: u32 = 0;
-        while (idle_count < 500) { // 500 * 20ms = 10s max idle wait
-            var msg: agent_queue.Msg = undefined;
-            if (shell_instance.agent.queues.output.pop(&msg)) {
-                idle_count = 0;
-                got_output = true;
-                switch (msg.kind) {
-                    .text_delta => { _ = std.posix.write(std.posix.STDOUT_FILENO, msg.slice()) catch {}; },
-                    .error_msg => {
-                        _ = std.posix.write(std.posix.STDOUT_FILENO, msg.slice()) catch {};
-                        _ = std.posix.write(std.posix.STDOUT_FILENO, "\n") catch {};
-                        exit_code = 1;
-                    },
-                    .tool_call => {}, // skip tool display in exec mode
-                    .tool_done => {},
-                    .done => break,
-                    else => {},
-                }
-            } else {
-                // No message — wait for agent to produce output
-                // Only exit if we've received output AND agent is idle
-                if (got_output and !shell_instance.agent.isBusy()) break;
-                idle_count += 1;
-                std.Thread.sleep(20 * std.time.ns_per_ms);
-            }
-        }
-
-        // Print structured result footer
-        const rl = &shell_instance.agent.bulletin.rate_limit;
-        var footer_buf: [256]u8 = undefined;
-        const footer = std.fmt.bufPrint(&footer_buf, "\n{{\"persona\":\"{s}\",\"model\":\"{s}\",\"rate_limit\":{d}}}\n", .{
-            persona.name(),
-            switch (persona.modelTier()) {
-                .opus => "opus",
-                .sonnet => "sonnet",
-                .haiku => "haiku",
-            },
-            rl.maxUtil(),
-        }) catch "";
-        _ = std.posix.write(std.posix.STDOUT_FILENO, footer) catch {};
-
-        _ = agent_log;
-        std.posix.exit(exit_code);
-    }
-
     if (res.args.c) |command| {
         // set positional parameters if provided
         inline for (res.positionals, 0..) |positional_slice, idx| {
@@ -199,8 +118,6 @@ const params = clap.parseParamsComptime(
     \\-v, --version               print version and exit.
     \\-l, --login                 Start as login shell.
     \\-d, --debug-log-file <str>  file to write a debug info to.
-    \\-e, --exec <str>            Execute agent query, output JSON result.
-    \\-p, --persona <str>         Persona for --exec (default: hdevalence).
     \\-c  <str>                   command to execute.
     \\<str>...
     \\
