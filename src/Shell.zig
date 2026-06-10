@@ -448,6 +448,7 @@ fn showSearchMatch(self: *Shell) !void {
             self.edit_buf.set(cmd);
         }
     }
+    try writer.flush(); // flush erase before any stderr redraw
 }
 
 const PromptInfo = struct {
@@ -830,6 +831,7 @@ fn handleResize(self: *Shell) !void {
         try self.stdout().print("\x1b[{d}A", .{self.term_view.term.row});
     }
     try self.stdout().writeAll("\r\x1b[J");
+    try self.stdout().flush(); // flush erase before redraw (stderr) to prevent stale buffer blanking screen
     self.term_view.term.row = 0;
     self.term_view.term.col = 0;
     self.term_view.last_hash = 0;
@@ -1364,6 +1366,7 @@ fn handleAction(self: *Shell, action: Action) !void {
             } else {
                 try self.stdout().writeAll("(forward-i-search): ");
             }
+            try self.stdout().flush(); // flush erase before any stderr redraw
         },
 
         .exit_search_mode => |execute| {
@@ -2586,6 +2589,7 @@ fn loadHistoryEntry(self: *Shell, h: *hist.History) !void {
             writer.print("\x1b[{d}A", .{self.term_view.term.row}) catch {};
         }
         writer.writeAll("\r\x1b[J") catch {}; // clear from here to end of screen
+        writer.flush() catch {}; // flush erase before stderr redraw
         self.term_view.term.row = 0;
         self.term_view.term.col = 0;
         self.term_view.last_hash = 0; // force full redraw

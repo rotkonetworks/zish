@@ -5082,6 +5082,9 @@ fn agentInteractive(shell: *Shell) !u8 {
             }
         }
     }
+    // Fell out of main loop (e.g., stdin EOF/error) — clean up terminal
+    Layout.doExit(out, term_rows, input_height);
+    out.flush() catch {};
     return 0;
 }
 

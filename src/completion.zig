@@ -455,7 +455,7 @@ pub fn handleTabCompletion(self: *Shell) !void {
         }
         // empty line hint if directory is empty
         if (pattern.len == 0 and std.mem.endsWith(u8, effective_word, "/")) {
-            try self.stdout().writeAll("\x1b" ++ "7\n\n\x1b" ++ "8");
+            try self.stdout().writeAll("\n\n\x1b[2A");
             try self.stdout().flush();
         }
         return;
@@ -2167,9 +2167,9 @@ fn showFlagCompletionsWithDesc(self: *Shell, matches: *std.ArrayList([]const u8)
     const term_height = self.terminal_height;
     const max_menu_height = if (term_height > 3) term_height - 3 else 1;
 
-    try self.stdout().writeAll("\x1b" ++ "7");
     const cmd_rows = self.term_view.term.rows_owned;
     const cursor_row = self.term_view.term.row;
+    const cursor_col = self.term_view.term.col;
     const rows_below_cursor = if (cmd_rows > cursor_row + 1) cmd_rows - cursor_row - 1 else 0;
     if (rows_below_cursor > 0) {
         try self.stdout().print("\x1b[{d}B", .{rows_below_cursor});
@@ -2192,6 +2192,7 @@ fn showFlagCompletionsWithDesc(self: *Shell, matches: *std.ArrayList([]const u8)
     } else 0;
     const end_idx = @min(start_idx + items_to_show, matches.items.len);
 
+    var lines_emitted: usize = 0;
     for (start_idx..end_idx) |idx| {
         const flag = matches.items[idx];
         const cache_idx = if (idx < match_indices.len) match_indices[idx] else 0;
@@ -2223,19 +2224,29 @@ fn showFlagCompletionsWithDesc(self: *Shell, matches: *std.ArrayList([]const u8)
             try self.stdout().print("\x1b[2m{s}\x1b[22m", .{show_desc});
         }
         try self.stdout().writeByte('\n');
+        lines_emitted += 1;
     }
 
     if (end_idx < matches.items.len) {
         try self.stdout().print("... ({} more)\n", .{matches.items.len - end_idx});
         self.completion.menu_lines = items_to_show + 1;
+        lines_emitted += 1;
     } else if (start_idx > 0) {
         try self.stdout().print("... ({} hidden above)\n", .{start_idx});
         self.completion.menu_lines = items_to_show + 1;
+        lines_emitted += 1;
     } else {
         self.completion.menu_lines = items_to_show;
     }
 
-    try self.stdout().writeAll("\x1b" ++ "8");
+    // Move cursor back: menu lines + 1 (the \n into menu area) + rows_below
+    const total_up = lines_emitted + 1 + rows_below_cursor;
+    try self.stdout().print("\x1b[{d}A", .{total_up});
+    if (cursor_col > 0) {
+        try self.stdout().print("\x1b[{d}G", .{cursor_col + 1});
+    } else {
+        try self.stdout().writeAll("\r");
+    }
     try self.stdout().flush();
     self.completion.displayed = true;
     return true;
@@ -2460,16 +2471,23 @@ pub fn exitCompletionMode(self: *Shell) void {
 
     // clear the completion menu if displayed
     if (self.completion.displayed and self.completion.menu_lines > 0) {
-        // Save cursor, move past command area, clear everything below, restore
-        self.stdout().writeAll("\x1b" ++ "7") catch {}; // DECSC
+        // Move past command area, clear menu, move back
         const cmd_rows = self.term_view.term.rows_owned;
         const cursor_row = self.term_view.term.row;
+        const cursor_col = self.term_view.term.col;
         const rows_below = if (cmd_rows > cursor_row + 1) cmd_rows - cursor_row - 1 else 0;
         if (rows_below > 0) {
             self.stdout().print("\x1b[{d}B", .{rows_below}) catch {};
         }
         self.stdout().writeAll("\r\n\x1b[J") catch {}; // move to menu area + clear
-        self.stdout().writeAll("\x1b" ++ "8") catch {}; // DECRC
+        // Move back up: 1 (the \n) + rows_below
+        const total_up = 1 + rows_below;
+        self.stdout().print("\x1b[{d}A", .{total_up}) catch {};
+        if (cursor_col > 0) {
+            self.stdout().print("\x1b[{d}G", .{cursor_col + 1}) catch {};
+        } else {
+            self.stdout().writeAll("\r") catch {};
+        }
         self.stdout().flush() catch {};
     }
 
@@ -2565,18 +2583,19 @@ pub fn displayCompletions(self: *Shell) !void {
     const term_height = self.terminal_height;
     const max_menu_height = if (term_height > 3) term_height - 3 else 1;
 
-    // Save cursor, move to end of command area, clear below, write menu
-    try self.stdout().writeAll("\x1b" ++ "7"); // DECSC
-
     // Move cursor to the end of the command area (past all owned rows)
     const cmd_rows = self.term_view.term.rows_owned;
     const cursor_row = self.term_view.term.row;
+    const cursor_col = self.term_view.term.col;
     const rows_below = if (cmd_rows > cursor_row + 1) cmd_rows - cursor_row - 1 else 0;
     if (rows_below > 0) {
         try self.stdout().print("\x1b[{d}B", .{rows_below});
     }
     // Move to column 1, then one line down into the menu area
     try self.stdout().writeAll("\r\n\x1b[J"); // CR + LF + clear below
+
+    // Track total lines emitted so we can move cursor back up
+    var lines_emitted: usize = 0;
 
     if (term_width < 80) {
         const items_to_show = @min(self.completion.matches.items.len, max_menu_height);
@@ -2599,19 +2618,30 @@ pub fn displayCompletions(self: *Shell) !void {
             } else {
                 try self.stdout().print("{s}\r\n", .{match});
             }
+            lines_emitted += 1;
         }
 
         if (end_idx < self.completion.matches.items.len) {
             try self.stdout().print("... ({} more)\r\n", .{self.completion.matches.items.len - end_idx});
             self.completion.menu_lines = items_to_show + 1;
+            lines_emitted += 1;
         } else if (start_idx > 0) {
             try self.stdout().print("... ({} hidden above)\r\n", .{start_idx});
             self.completion.menu_lines = items_to_show + 1;
+            lines_emitted += 1;
         } else {
             self.completion.menu_lines = items_to_show;
         }
 
-        try self.stdout().writeAll("\x1b" ++ "8"); // DECRC
+        // Move cursor back: menu lines + 1 (the \n into menu area) + rows_below
+        const total_up = lines_emitted + 1 + rows_below;
+        try self.stdout().print("\x1b[{d}A", .{total_up});
+        // Restore column position
+        if (cursor_col > 0) {
+            try self.stdout().print("\x1b[{d}G", .{cursor_col + 1}); // 1-based
+        } else {
+            try self.stdout().writeAll("\r");
+        }
         try self.stdout().flush();
         self.completion.displayed = true;
         return;
@@ -2672,19 +2702,31 @@ pub fn displayCompletions(self: *Shell) !void {
         if (col_pos >= cols) {
             try self.stdout().writeAll("\r\n");
             col_pos = 0;
+            lines_emitted += 1;
         }
     }
     // End last row if not already ended
-    if (col_pos > 0) try self.stdout().writeAll("\r\n");
+    if (col_pos > 0) {
+        try self.stdout().writeAll("\r\n");
+        lines_emitted += 1;
+    }
 
     const hidden = self.completion.matches.items.len - (end_item - start_item);
     if (hidden > 0) {
         try self.stdout().print("... ({} more matches)\r\n", .{hidden});
         self.completion.menu_lines += 1;
+        lines_emitted += 1;
     }
 
-    // Restore cursor to command line
-    try self.stdout().writeAll("\x1b" ++ "8");
+    // Move cursor back: menu lines + 1 (the \n into menu area) + rows_below
+    const total_up = lines_emitted + 1 + rows_below;
+    try self.stdout().print("\x1b[{d}A", .{total_up});
+    // Restore column position
+    if (cursor_col > 0) {
+        try self.stdout().print("\x1b[{d}G", .{cursor_col + 1}); // 1-based
+    } else {
+        try self.stdout().writeAll("\r");
+    }
     try self.stdout().flush();
     self.completion.displayed = true;
 }
@@ -2786,86 +2828,6 @@ fn writeJsonEscaped(buf: *[4096]u8, start: usize, s: []const u8) usize {
         }
     }
     return pos;
-}
-
-pub fn updateCompletionHighlight(self: *Shell, old_index: usize) !void {
-    const term_width = self.terminal_width;
-
-    // save cursor position on command line
-    try self.stdout().writeAll("\x1b" ++ "7");
-
-    if (old_index >= self.completion.matches.items.len) {
-        const max_item_width: usize = 30;
-        var max_len: usize = 0;
-        for (self.completion.matches.items) |match| {
-            const display_len = @min(match.len, max_item_width);
-            if (display_len > max_len) max_len = display_len;
-        }
-        const col_width = max_len + 2;
-        const max_line_width: usize = 120;
-        const effective_width = @min(term_width, max_line_width);
-        const cols = @max(1, effective_width / col_width);
-
-        const new_row = self.completion.index / cols;
-        const new_col = self.completion.index % cols;
-
-        // move down to menu, then to the item position
-        try self.stdout().print("\x1b[{d}B", .{new_row + 1});
-        const new_col_pos = new_col * col_width;
-        try self.stdout().print("\x1b[{d}G", .{new_col_pos + 1});
-        try self.stdout().print("{f}{s}{f}", .{ tty.Style.reverse, self.completion.matches.items[self.completion.index], tty.Style.reset });
-
-        // restore cursor to command line
-        try self.stdout().writeAll("\x1b" ++ "8");
-        try self.stdout().flush();
-        return;
-    }
-
-    if (term_width < 80) {
-        // narrow terminal - redraw entire menu
-        try self.stdout().writeByte('\n');
-        try self.stdout().writeAll("\x1b[J");
-        // don't use save/restore here since displayCompletions does its own
-        try self.stdout().writeAll("\x1b" ++ "8"); // restore first
-        try displayCompletions(self);
-        return;
-    }
-
-    const max_item_width: usize = 30;
-    var max_len: usize = 0;
-    for (self.completion.matches.items) |match| {
-        const display_len = @min(match.len, max_item_width);
-        if (display_len > max_len) max_len = display_len;
-    }
-    const col_width = max_len + 2;
-    const max_line_width: usize = 120;
-    const effective_width = @min(term_width, max_line_width);
-    const cols = @max(1, effective_width / col_width);
-
-    const old_row = old_index / cols;
-    const old_col = old_index % cols;
-    const new_row = self.completion.index / cols;
-    const new_col = self.completion.index % cols;
-
-    // move down to old item and un-highlight it
-    try self.stdout().print("\x1b[{d}B", .{old_row + 1});
-    const old_col_pos = old_col * col_width;
-    try self.stdout().print("\x1b[{d}G", .{old_col_pos + 1});
-    try self.stdout().print("{s}", .{self.completion.matches.items[old_index]});
-
-    // move to new item and highlight it
-    if (new_row > old_row) {
-        try self.stdout().print("\x1b[{d}B", .{new_row - old_row});
-    } else if (old_row > new_row) {
-        try self.stdout().print("\x1b[{d}A", .{old_row - new_row});
-    }
-    const new_col_pos = new_col * col_width;
-    try self.stdout().print("\x1b[{d}G", .{new_col_pos + 1});
-    try self.stdout().print("{f}{s}{f}", .{ tty.Style.reverse, self.completion.matches.items[self.completion.index], tty.Style.reset });
-
-    // restore cursor to command line
-    try self.stdout().writeAll("\x1b" ++ "8");
-    try self.stdout().flush();
 }
 
 // ============================================================
