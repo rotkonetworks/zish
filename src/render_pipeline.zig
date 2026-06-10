@@ -6,6 +6,7 @@
 // to content emission, syntax highlighting, or ghost text rendering.
 
 const std = @import("std");
+const compat = @import("compat.zig");
 const editor = @import("editor.zig");
 
 const TermView = editor.TermView;
@@ -52,7 +53,7 @@ pub fn positionCursor(
 // ============================================================
 
 test "deferred-wrap: render_col==0 corrects terminal row" {
-    var view = TermView.init(std.posix.STDERR_FILENO);
+    var view = TermView.init(compat.posix.STDERR_FILENO);
     view.term.width = 80;
     view.term.row = 0;
     view.term.col = 0;
@@ -68,7 +69,7 @@ test "deferred-wrap: render_col==0 corrects terminal row" {
 }
 
 test "deferred-wrap: no adjustment when render_col != 0" {
-    var view = TermView.init(std.posix.STDERR_FILENO);
+    var view = TermView.init(compat.posix.STDERR_FILENO);
     view.term.width = 80;
 
     positionCursor(&view, 1, 50, 1, 30, false, 80, 0xABCD, 90);
@@ -78,7 +79,7 @@ test "deferred-wrap: no adjustment when render_col != 0" {
 }
 
 test "deferred-wrap: cursor at exact fill corrects cursor target" {
-    var view = TermView.init(std.posix.STDERR_FILENO);
+    var view = TermView.init(compat.posix.STDERR_FILENO);
     view.term.width = 80;
 
     // cursor_col=0, cursor_row=1, cursor_at_end=true → deferred wrap for cursor too

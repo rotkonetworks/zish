@@ -4,6 +4,7 @@
 // Optional CTM (Continuous Thought Machine) blocks replace MLP in selected layers.
 
 const std = @import("std");
+const compat = @import("../compat.zig");
 const gguf = @import("gguf.zig");
 const gpu = @import("gpu.zig");
 const math = @import("math.zig");
@@ -638,7 +639,7 @@ pub const Transformer = struct {
                 }
 
                 // Run CTM on the same pre-norm input (state.work still holds it)
-                var ctm_timer = std.time.Timer.start() catch null;
+                var ctm_timer = compat.Timer.start() catch null;
                 ctm_block.forward(
                     state.work,
                     state.work2,

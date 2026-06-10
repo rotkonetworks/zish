@@ -8,6 +8,7 @@ const BindableAction = input_mod.BindableAction;
 const editor = @import("editor.zig");
 const audio_mod = @import("audio.zig");
 const linkify = @import("linkify.zig");
+const compat = @import("compat.zig");
 
 // directory stack for pushd/popd
 var dir_stack: std.ArrayList([]const u8) = undefined;
@@ -15,7 +16,7 @@ var dir_stack_initialized: bool = false;
 
 fn ensureDirStack(allocator: std.mem.Allocator) !void {
     if (!dir_stack_initialized) {
-        dir_stack = std.ArrayList([]const u8){};
+        dir_stack = .empty;
         try dir_stack.ensureTotalCapacity(allocator, 8);
         dir_stack_initialized = true;
     }
@@ -142,14 +143,14 @@ pub fn dispatch(shell: *Shell, cmd_name: []const u8, args: []const []const u8) !
 fn cd(shell: *Shell, args: []const []const u8) !u8 {
     // save current directory to OLDPWD
     var cwd_buf: [4096]u8 = undefined;
-    const cwd = std.posix.getcwd(&cwd_buf) catch "";
+    const cwd = compat.posix.getcwd(&cwd_buf) catch "";
 
     const path = if (args.len > 1) blk: {
         const arg = args[1];
         // handle cd -
         if (std.mem.eql(u8, arg, "-")) {
             const oldpwd = shell.variables.get("OLDPWD") orelse
-                std.posix.getenv("OLDPWD") orelse {
+                compat.posix.getenv("OLDPWD") orelse {
                 try shell.stdout().writeAll("cd: OLDPWD not set\n");
                 return 1;
             };
@@ -158,13 +159,13 @@ fn cd(shell: *Shell, args: []const []const u8) !u8 {
         }
         break :blk arg;
     } else blk: {
-        break :blk std.posix.getenv("HOME") orelse {
+        break :blk compat.posix.getenv("HOME") orelse {
             try shell.stdout().writeAll("cd: HOME not set\n");
             return 1;
         };
     };
 
-    std.posix.chdir(path) catch {
+    compat.posix.chdir(path) catch {
         try shell.stdout().print("cd: {s}: no such file or directory\n", .{path});
         return 1;
     };
@@ -179,7 +180,7 @@ fn cd(shell: *Shell, args: []const []const u8) !u8 {
 fn pwd(shell: *Shell, args: []const []const u8) !u8 {
     _ = args;
     var cwd_buf: [4096]u8 = undefined;
-    const cwd = std.posix.getcwd(&cwd_buf) catch {
+    const cwd = compat.posix.getcwd(&cwd_buf) catch {
         try shell.stdout().writeAll("pwd: cannot get current directory\n");
         return 1;
     };
@@ -188,7 +189,7 @@ fn pwd(shell: *Shell, args: []const []const u8) !u8 {
 }
 
 fn dotdot(shell: *Shell) !u8 {
-    std.posix.chdir("..") catch {
+    compat.posix.chdir("..") catch {
         try shell.stdout().writeAll("..: cannot go up\n");
         return 1;
     };
@@ -196,7 +197,7 @@ fn dotdot(shell: *Shell) !u8 {
 }
 
 fn dotdotdot(shell: *Shell) !u8 {
-    std.posix.chdir("../..") catch {
+    compat.posix.chdir("../..") catch {
         try shell.stdout().writeAll("...: cannot go up\n");
         return 1;
     };
@@ -205,15 +206,15 @@ fn dotdotdot(shell: *Shell) !u8 {
 
 fn dash(shell: *Shell) !u8 {
     const oldpwd = shell.variables.get("OLDPWD") orelse
-        std.posix.getenv("OLDPWD") orelse {
+        compat.posix.getenv("OLDPWD") orelse {
         try shell.stdout().writeAll("-: OLDPWD not set\n");
         return 1;
     };
 
     var cwd_buf: [4096]u8 = undefined;
-    const cwd = std.posix.getcwd(&cwd_buf) catch "";
+    const cwd = compat.posix.getcwd(&cwd_buf) catch "";
 
-    std.posix.chdir(oldpwd) catch {
+    compat.posix.chdir(oldpwd) catch {
         try shell.stdout().print("-: {s}: no such directory\n", .{oldpwd});
         return 1;
     };
@@ -227,7 +228,7 @@ pub fn pushd(shell: *Shell, args: []const []const u8) !u8 {
     ensureDirStack(shell.allocator) catch return 1;
 
     var cwd_buf: [4096]u8 = undefined;
-    const cwd = std.posix.getcwd(&cwd_buf) catch {
+    const cwd = compat.posix.getcwd(&cwd_buf) catch {
         try shell.stdout().writeAll("pushd: cannot get current directory\n");
         return 1;
     };
@@ -241,7 +242,7 @@ pub fn pushd(shell: *Shell, args: []const []const u8) !u8 {
             try shell.stdout().writeAll("pushd: no other directory\n");
             return 1;
         };
-        std.posix.chdir(top) catch {
+        compat.posix.chdir(top) catch {
             try shell.stdout().print("pushd: {s}: no such directory\n", .{top});
             dir_stack.append(shell.allocator, top) catch {};
             return 1;
@@ -253,7 +254,7 @@ pub fn pushd(shell: *Shell, args: []const []const u8) !u8 {
     }
 
     const path = args[1];
-    std.posix.chdir(path) catch {
+    compat.posix.chdir(path) catch {
         try shell.stdout().print("pushd: {s}: no such directory\n", .{path});
         return 1;
     };
@@ -278,7 +279,7 @@ pub fn popd(shell: *Shell, args: []const []const u8) !u8 {
     };
     defer shell.allocator.free(path);
 
-    std.posix.chdir(path) catch {
+    compat.posix.chdir(path) catch {
         try shell.stdout().print("popd: {s}: no such directory\n", .{path});
         return 1;
     };
@@ -296,7 +297,7 @@ pub fn dirs(shell: *Shell, args: []const []const u8) !u8 {
 
 fn printDirStack(shell: *Shell) !void {
     var cwd_buf: [4096]u8 = undefined;
-    const cwd = std.posix.getcwd(&cwd_buf) catch "";
+    const cwd = compat.posix.getcwd(&cwd_buf) catch "";
     try shell.stdout().print("{s}", .{cwd});
     var i: usize = dir_stack.items.len;
     while (i > 0) {
@@ -644,23 +645,23 @@ fn read(shell: *Shell, args: []const []const u8) !u8 {
         shell.stdout().flush() catch {};
     }
 
-    const stdin_fd = std.posix.STDIN_FILENO;
+    const stdin_fd = compat.posix.STDIN_FILENO;
 
     // save terminal state for silent mode
-    var orig_termios: ?std.posix.termios = null;
-    if (silent and std.posix.isatty(stdin_fd)) {
-        orig_termios = std.posix.tcgetattr(stdin_fd) catch null;
+    var orig_termios: ?compat.posix.termios = null;
+    if (silent and compat.posix.isatty(stdin_fd)) {
+        orig_termios = compat.posix.tcgetattr(stdin_fd) catch null;
         if (orig_termios) |ot| {
             var new_termios = ot;
             new_termios.lflag.ECHO = false;
-            std.posix.tcsetattr(stdin_fd, .NOW, new_termios) catch {};
+            compat.posix.tcsetattr(stdin_fd, .NOW, new_termios) catch {};
         }
     }
     defer {
         if (orig_termios) |ot| {
-            std.posix.tcsetattr(stdin_fd, .NOW, ot) catch {};
+            compat.posix.tcsetattr(stdin_fd, .NOW, ot) catch {};
             // print newline since echo was off
-            _ = std.posix.write(std.posix.STDOUT_FILENO, "\n") catch {};
+            _ = compat.posix.write(compat.posix.STDOUT_FILENO, "\n") catch {};
         }
     }
 
@@ -673,20 +674,20 @@ fn read(shell: *Shell, args: []const []const u8) !u8 {
 
     while (pos < max_chars) {
         // use poll for timeout support
-        var fds = [_]std.posix.pollfd{.{
+        var fds = [_]compat.posix.pollfd{.{
             .fd = stdin_fd,
-            .events = std.posix.POLL.IN,
+            .events = compat.posix.POLL.IN,
             .revents = 0,
         }};
 
-        const poll_result = std.posix.poll(&fds, timeout_ms) catch return 1;
+        const poll_result = compat.posix.poll(&fds, timeout_ms) catch return 1;
         if (poll_result == 0) {
             // timeout
             return 1;
         }
 
         var c: [1]u8 = undefined;
-        const n = std.posix.read(stdin_fd, &c) catch return 1;
+        const n = compat.posix.read(stdin_fd, &c) catch return 1;
         if (n == 0) break; // EOF
 
         // handle newline (end of input unless -n specified)
@@ -700,7 +701,7 @@ fn read(shell: *Shell, args: []const []const u8) !u8 {
         // handle backslash escapes (unless -r)
         if (!raw and c[0] == '\\' and pos < max_chars) {
             // read next char
-            const n2 = std.posix.read(stdin_fd, &c) catch break;
+            const n2 = compat.posix.read(stdin_fd, &c) catch break;
             if (n2 == 0) break;
             // in non-raw mode, backslash-newline continues line
             if (c[0] == '\n') continue;
@@ -754,28 +755,28 @@ fn testCmd(shell: *Shell, args: []const []const u8) !u8 {
         if (std.mem.eql(u8, op, "-n")) return if (arg.len > 0) 0 else 1;
         if (std.mem.eql(u8, op, "-z")) return if (arg.len == 0) 0 else 1;
         if (std.mem.eql(u8, op, "-d")) {
-            var dir = std.fs.cwd().openDir(arg, .{}) catch return 1;
-            dir.close();
+            var dir = std.Io.Dir.cwd().openDir(compat.io(), arg, .{}) catch return 1;
+            dir.close(compat.io());
             return 0;
         }
         if (std.mem.eql(u8, op, "-f")) {
-            const stat = std.fs.cwd().statFile(arg) catch return 1;
+            const stat = std.Io.Dir.cwd().statFile(compat.io(), arg, .{}) catch return 1;
             return if (stat.kind == .file) 0 else 1;
         }
         if (std.mem.eql(u8, op, "-e")) {
-            std.fs.cwd().access(arg, .{}) catch return 1;
+            std.Io.Dir.cwd().access(compat.io(), arg, .{}) catch return 1;
             return 0;
         }
         if (std.mem.eql(u8, op, "-r") or std.mem.eql(u8, op, "-w") or std.mem.eql(u8, op, "-x")) {
-            std.fs.cwd().access(arg, .{}) catch return 1;
+            std.Io.Dir.cwd().access(compat.io(), arg, .{}) catch return 1;
             return 0;
         }
         if (std.mem.eql(u8, op, "-s")) {
-            const stat = std.fs.cwd().statFile(arg) catch return 1;
+            const stat = std.Io.Dir.cwd().statFile(compat.io(), arg, .{}) catch return 1;
             return if (stat.size > 0) 0 else 1;
         }
         if (std.mem.eql(u8, op, "-L") or std.mem.eql(u8, op, "-h")) {
-            const stat = std.fs.cwd().statFile(arg) catch return 1;
+            const stat = std.Io.Dir.cwd().statFile(compat.io(), arg, .{}) catch return 1;
             return if (stat.kind == .sym_link) 0 else 1;
         }
     }
@@ -1151,13 +1152,13 @@ fn source(shell: *Shell, args: []const []const u8) !u8 {
     }
     const filename = args[1];
 
-    const file = std.fs.cwd().openFile(filename, .{}) catch {
+    const file = std.Io.Dir.cwd().openFile(compat.io(), filename, .{}) catch {
         try shell.stdout().print("{s}: {s}: No such file or directory\n", .{ args[0], filename });
         return 1;
     };
-    defer file.close();
+    defer file.close(compat.io());
 
-    const content = file.readToEndAlloc(shell.allocator, 1024 * 1024) catch {
+    const content = std.Io.Dir.cwd().readFileAlloc(compat.io(), filename, shell.allocator, .limited(1024 * 1024)) catch {
         try shell.stdout().print("{s}: {s}: Error reading file\n", .{ args[0], filename });
         return 1;
     };
@@ -1239,12 +1240,12 @@ fn exec(shell: *Shell, args: []const []const u8) !u8 {
     argv_buf[arg_count] = null;
 
     const argv = argv_buf[0..arg_count :null];
-    const envp = @as([*:null]const ?[*:0]const u8, @ptrCast(std.os.environ.ptr));
+    const envp = @as([*:null]const ?[*:0]const u8, @ptrCast(std.c.environ));
 
     const path_z = try shell.allocator.dupeZ(u8, full_path);
-    std.posix.execvpeZ(path_z.ptr, argv, envp) catch {
+    compat.posix.execvpeZ(path_z.ptr, argv, envp) catch {
         shell.stdout().print("exec: {s}: command not found\n", .{cmd_name}) catch {};
-        std.posix.exit(126);
+        compat.posix.exit(126);
     };
     unreachable;
 }
@@ -1491,7 +1492,7 @@ fn wait(shell: *Shell, args: []const []const u8) !u8 {
     if (args.len > 1) {
         // Wait for specific job/pid
         const spec = args[1];
-        var pid: std.posix.pid_t = 0;
+        var pid: compat.posix.pid_t = 0;
 
         if (spec[0] == '%') {
             // Job spec
@@ -1506,22 +1507,22 @@ fn wait(shell: *Shell, args: []const []const u8) !u8 {
                 return 127;
             }
         } else {
-            pid = std.fmt.parseInt(std.posix.pid_t, spec, 10) catch {
+            pid = std.fmt.parseInt(compat.posix.pid_t, spec, 10) catch {
                 try shell.stdout().print("wait: {s}: invalid pid\n", .{spec});
                 return 1;
             };
         }
 
         // Wait for specific process/group
-        const result = std.posix.waitpid(pid, 0);
+        const result = compat.posix.waitpid(pid, 0);
         if (result.pid > 0) {
             shell.job_table.markProcessStatus(result.pid, result.status);
-            return @truncate(std.posix.W.EXITSTATUS(result.status));
+            return @truncate(compat.posix.W.EXITSTATUS(result.status));
         }
     } else {
         // Wait for all background jobs
         while (true) {
-            const result = std.posix.waitpid(-1, 0);
+            const result = compat.posix.waitpid(-1, 0);
             if (result.pid <= 0) break;
             shell.job_table.markProcessStatus(result.pid, result.status);
         }
@@ -1566,11 +1567,11 @@ fn kill(shell: *Shell, args: []const []const u8) !u8 {
     }
 
     for (args[pid_start..]) |pid_str| {
-        const pid = std.fmt.parseInt(std.posix.pid_t, pid_str, 10) catch {
+        const pid = std.fmt.parseInt(compat.posix.pid_t, pid_str, 10) catch {
             try shell.stdout().print("kill: invalid pid: {s}\n", .{pid_str});
             return 1;
         };
-        const result = std.os.linux.kill(pid, sig);
+        const result = std.os.linux.kill(pid, @enumFromInt(sig));
         if (result != 0) {
             try shell.stdout().print("kill: {d}: operation not permitted\n", .{pid});
             return 1;
@@ -1799,8 +1800,8 @@ fn commandCmd(shell: *Shell, args: []const []const u8) !u8 {
 
 // rusage struct for Linux (matches kernel definition)
 const Rusage = extern struct {
-    ru_utime: std.posix.timeval, // user time
-    ru_stime: std.posix.timeval, // system time
+    ru_utime: compat.posix.timeval, // user time
+    ru_stime: compat.posix.timeval, // system time
     ru_maxrss: isize, // max resident set size (KB on Linux)
     ru_ixrss: isize,
     ru_idrss: isize,
@@ -1818,7 +1819,7 @@ const Rusage = extern struct {
 };
 
 // wait4 syscall - like waitpid but returns rusage
-fn wait4(pid: std.posix.pid_t, status: *u32, options: u32, rusage: ?*Rusage) std.posix.pid_t {
+fn wait4(pid: compat.posix.pid_t, status: *u32, options: u32, rusage: ?*Rusage) compat.posix.pid_t {
     const ret = std.os.linux.syscall4(
         .wait4,
         @bitCast(@as(isize, pid)),
@@ -1948,10 +1949,10 @@ fn timeCmd(shell: *Shell, args: []const []const u8) !u8 {
 }
 
 fn runTimedCommand(shell: *Shell, cmd_args: []const []const u8) !BenchSample {
-    const start = std.time.nanoTimestamp();
+    const start = compat.nanoTimestamp();
 
     // fork and run command
-    const pid = std.posix.fork() catch return BenchSample{
+    const pid = compat.posix.fork() catch return BenchSample{
         .wall_ns = 0,
         .user_ns = 0,
         .sys_ns = 0,
@@ -1963,30 +1964,30 @@ fn runTimedCommand(shell: *Shell, cmd_args: []const []const u8) !BenchSample {
         // child - exec the command
         var argv_buf: [256]?[*:0]const u8 = undefined;
         for (cmd_args, 0..) |arg, i| {
-            const arg_z = shell.allocator.dupeZ(u8, arg) catch std.posix.exit(127);
+            const arg_z = shell.allocator.dupeZ(u8, arg) catch compat.posix.exit(127);
             argv_buf[i] = arg_z.ptr;
         }
         argv_buf[cmd_args.len] = null;
 
         const argv = argv_buf[0..cmd_args.len :null];
-        std.posix.execvpeZ(argv[0].?, argv, @ptrCast(std.os.environ.ptr)) catch {};
-        std.posix.exit(127);
+        compat.posix.execvpeZ(argv[0].?, argv, @ptrCast(std.c.environ)) catch {};
+        compat.posix.exit(127);
     }
 
     // parent - wait for child with rusage via wait4
     var status: u32 = 0;
     var rusage: Rusage = std.mem.zeroes(Rusage);
     _ = wait4(pid, &status, 0, &rusage);
-    const end = std.time.nanoTimestamp();
+    const end = compat.nanoTimestamp();
 
     const wall_ns = end - start;
     const user_ns = timevalToNs(rusage.ru_utime);
     const sys_ns = timevalToNs(rusage.ru_stime);
 
-    const exit_code: u8 = if (std.posix.W.IFEXITED(status))
-        std.posix.W.EXITSTATUS(status)
-    else if (std.posix.W.IFSIGNALED(status))
-        128 + @as(u8, @truncate(@as(u32, @intCast(std.posix.W.TERMSIG(status)))))
+    const exit_code: u8 = if (compat.posix.W.IFEXITED(status))
+        compat.posix.W.EXITSTATUS(status)
+    else if (compat.posix.W.IFSIGNALED(status))
+        128 + @as(u8, @truncate(@as(u32, @intCast(@intFromEnum(compat.posix.W.TERMSIG(status))))))
     else
         1;
 
@@ -1999,7 +2000,7 @@ fn runTimedCommand(shell: *Shell, cmd_args: []const []const u8) !BenchSample {
     };
 }
 
-fn timevalToNs(tv: std.posix.timeval) i128 {
+fn timevalToNs(tv: compat.posix.timeval) i128 {
     return @as(i128, tv.sec) * 1_000_000_000 + @as(i128, tv.usec) * 1000;
 }
 
@@ -2351,9 +2352,9 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
     if (std.mem.eql(u8, subcmd, "c") or std.mem.eql(u8, subcmd, "continue")) {
         // Find most recent session for current cwd
         var cwd_buf: [256]u8 = undefined;
-        const cwd = std.posix.getcwd(&cwd_buf) catch "";
+        const cwd = compat.posix.getcwd(&cwd_buf) catch "";
 
-        var sessions: std.ArrayList(agent_log.SessionInfo) = .{};
+        var sessions: std.ArrayList(agent_log.SessionInfo) = .empty;
         defer sessions.deinit(shell.allocator);
         agent_log.listSessions(shell.allocator, &sessions) catch {};
 
@@ -2375,12 +2376,12 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
             const conv_path = std.fmt.bufPrint(&conv_path_buf, "{s}/sessions/{s}/conversation.jsonl", .{ base, session.id }) catch "";
 
             if (conv_path.len > 0) {
-                const content = std.fs.cwd().readFileAlloc(shell.allocator, conv_path, 4 * 1024 * 1024) catch null;
+                const content = std.Io.Dir.cwd().readFileAlloc(compat.io(), conv_path, shell.allocator, .limited(4 * 1024 * 1024)) catch null;
                 if (content) |data| {
                     defer shell.allocator.free(data);
 
                     // Build a summary of the previous conversation
-                    var summary: std.ArrayList(u8) = .{};
+                    var summary: std.ArrayList(u8) = .empty;
                     defer summary.deinit(shell.allocator);
                     summary.appendSlice(shell.allocator, "Continue from our previous session. Here's what we discussed:\n\n") catch {};
 
@@ -2493,7 +2494,7 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
                 }
             } else {
                 if (got_output and !shell.agent.isBusy()) break;
-                std.Thread.sleep(20 * std.time.ns_per_ms);
+                compat.sleep(20 * std.time.ns_per_ms);
             }
         }
 
@@ -2538,7 +2539,7 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
 
     // agent sessions
     if (std.mem.eql(u8, subcmd, "sessions")) {
-        var sessions: std.ArrayList(agent_log.SessionInfo) = .{};
+        var sessions: std.ArrayList(agent_log.SessionInfo) = .empty;
         defer sessions.deinit(shell.allocator);
         agent_log.listSessions(shell.allocator, &sessions) catch {};
 
@@ -2609,9 +2610,9 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
         // Process memory from /proc/self/statm
         {
             var statm_buf: [128]u8 = undefined;
-            if (std.fs.openFileAbsolute("/proc/self/statm", .{})) |f| {
-                defer f.close();
-                const n = f.read(&statm_buf) catch 0;
+            if (std.Io.Dir.openFileAbsolute(compat.io(), "/proc/self/statm", .{})) |f| {
+                defer f.close(compat.io());
+                const n = compat.readAll(f, &statm_buf) catch 0;
                 if (n > 0) {
                     var it = std.mem.splitScalar(u8, statm_buf[0..n], ' ');
                     const vsize_pages = std.fmt.parseInt(u64, it.first(), 10) catch 0;
@@ -2695,7 +2696,7 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
             if (agent_log.getBaseDir(&base_buf2)) |base| {
                 var p_buf: [512]u8 = undefined;
                 if (std.fmt.bufPrint(&p_buf, "{s}/sessions/{s}/conversation.jsonl", .{ base, sid })) |conv_path| {
-                    if (std.fs.cwd().readFileAlloc(shell.allocator, conv_path, 512 * 1024)) |content| {
+                    if (std.Io.Dir.cwd().readFileAlloc(compat.io(), conv_path, shell.allocator, .limited(512 * 1024))) |content| {
                         defer shell.allocator.free(content);
                         var iter = std.mem.splitScalar(u8, content, '\n');
                         var found_any = false;
@@ -2787,13 +2788,13 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
         const agent_drain = @import("agent_drain.zig");
         var handler = agent_drain.SimpleHandler.init(out, &shell.agent.queues.request);
         // Disable markdown rendering when piped (not a TTY)
-        if (!std.posix.isatty(std.posix.STDOUT_FILENO)) handler.plain_mode = true;
+        if (!compat.posix.isatty(compat.posix.STDOUT_FILENO)) handler.plain_mode = true;
         // wait up to 120 seconds
         var ticks: usize = 0;
         while (!handler.isDone() and ticks < 2400) : (ticks += 1) {
             _ = try agent_drain.drain(agent_drain.SimpleHandler, &handler, &shell.agent.queues);
             try handler.flush();
-            if (!handler.isDone()) std.Thread.sleep(50 * std.time.ns_per_ms);
+            if (!handler.isDone()) compat.sleep(50 * std.time.ns_per_ms);
         }
     }
     return 0;
@@ -2803,7 +2804,7 @@ fn getTermRows() u16 {
     const TIOCGWINSZ = 0x5413;
     const Winsize = extern struct { ws_row: u16, ws_col: u16, ws_xpixel: u16, ws_ypixel: u16 };
     var ws: Winsize = undefined;
-    if (std.posix.system.ioctl(std.posix.STDOUT_FILENO, TIOCGWINSZ, @intFromPtr(&ws)) == 0 and ws.ws_row > 0)
+    if (std.posix.system.ioctl(compat.posix.STDOUT_FILENO, TIOCGWINSZ, @intFromPtr(&ws)) == 0 and ws.ws_row > 0)
         return ws.ws_row;
     return 24;
 }
@@ -2812,7 +2813,7 @@ fn getTermCols() u16 {
     const TIOCGWINSZ = 0x5413;
     const Winsize = extern struct { ws_row: u16, ws_col: u16, ws_xpixel: u16, ws_ypixel: u16 };
     var ws: Winsize = undefined;
-    if (std.posix.system.ioctl(std.posix.STDOUT_FILENO, TIOCGWINSZ, @intFromPtr(&ws)) == 0 and ws.ws_col > 0)
+    if (std.posix.system.ioctl(compat.posix.STDOUT_FILENO, TIOCGWINSZ, @intFromPtr(&ws)) == 0 and ws.ws_col > 0)
         return ws.ws_col;
     return 80;
 }
@@ -3012,16 +3013,16 @@ const EscAction = union(enum) {
 };
 
 fn parseEscSequence() EscAction {
-    const stdin = std.fs.File.stdin();
-    var esc_poll = [_]std.posix.pollfd{.{
-        .fd = std.posix.STDIN_FILENO,
-        .events = std.posix.POLL.IN,
+    const stdin = std.Io.File.stdin();
+    var esc_poll = [_]compat.posix.pollfd{.{
+        .fd = compat.posix.STDIN_FILENO,
+        .events = compat.posix.POLL.IN,
         .revents = 0,
     }};
-    if ((std.posix.poll(&esc_poll, 10) catch 0) == 0) return .none;
+    if ((compat.posix.poll(&esc_poll, 10) catch 0) == 0) return .none;
 
     var b: [1]u8 = undefined;
-    const n = stdin.read(&b) catch return .none;
+    const n = compat.readAll(stdin, &b) catch return .none;
     if (n == 0) return .none;
 
     // ESC followed by \r or \n — treat as plain enter (ignore the ESC).
@@ -3035,8 +3036,8 @@ fn parseEscSequence() EscAction {
     }
 
     // Read CSI parameter
-    if ((std.posix.poll(&esc_poll, 10) catch 0) == 0) return .none;
-    const n2 = stdin.read(&b) catch return .none;
+    if ((compat.posix.poll(&esc_poll, 10) catch 0) == 0) return .none;
+    const n2 = compat.readAll(stdin, &b) catch return .none;
     if (n2 == 0) return .none;
 
     return switch (b[0]) {
@@ -3052,8 +3053,8 @@ fn parseEscSequence() EscAction {
             var mod_buf: [3]u8 = undefined;
             var mi: usize = 0;
             while (mi < 3) : (mi += 1) {
-                if ((std.posix.poll(&esc_poll, 10) catch 0) == 0) break;
-                const mn = stdin.read(mod_buf[mi..][0..1]) catch break;
+                if ((compat.posix.poll(&esc_poll, 10) catch 0) == 0) break;
+                const mn = compat.readAll(stdin, mod_buf[mi..][0..1]) catch break;
                 if (mn == 0) break;
                 // Direction letter terminates the sequence
                 if (mod_buf[mi] >= 'A' and mod_buf[mi] <= 'H') { mi += 1; break; }
@@ -3085,8 +3086,8 @@ fn parseEscSequence() EscAction {
                 };
             }
             // Consume remaining
-            while ((std.posix.poll(&esc_poll, 5) catch 0) > 0) {
-                _ = stdin.read(&b) catch break;
+            while ((compat.posix.poll(&esc_poll, 5) catch 0) > 0) {
+                _ = compat.readAll(stdin, &b) catch break;
             }
             break :blk .none;
         },
@@ -3096,8 +3097,8 @@ fn parseEscSequence() EscAction {
             var seq: [4]u8 = undefined;
             var si: usize = 0;
             while (si < 4) : (si += 1) {
-                if ((std.posix.poll(&esc_poll, 10) catch 0) == 0) break;
-                const sn = stdin.read(seq[si..][0..1]) catch break;
+                if ((compat.posix.poll(&esc_poll, 10) catch 0) == 0) break;
+                const sn = compat.readAll(stdin, seq[si..][0..1]) catch break;
                 if (sn == 0) break;
                 if (seq[si] == '~') { si += 1; break; }
             }
@@ -3105,8 +3106,8 @@ fn parseEscSequence() EscAction {
                 break :blk .paste;
             }
             // Not paste — consume rest
-            while ((std.posix.poll(&esc_poll, 5) catch 0) > 0) {
-                _ = stdin.read(&b) catch break;
+            while ((compat.posix.poll(&esc_poll, 5) catch 0) > 0) {
+                _ = compat.readAll(stdin, &b) catch break;
             }
             break :blk .none;
         },
@@ -3114,7 +3115,7 @@ fn parseEscSequence() EscAction {
             // PageUp: ESC [ 5 ~ (or ESC [ 5 ; N ~)
             var discard: [1]u8 = undefined;
             while (true) {
-                const dn = stdin.read(&discard) catch break;
+                const dn = compat.readAll(stdin, &discard) catch break;
                 if (dn == 0 or (discard[0] >= 0x40 and discard[0] <= 0x7E)) break;
             }
             break :blk .page_up;
@@ -3123,7 +3124,7 @@ fn parseEscSequence() EscAction {
             // PageDown: ESC [ 6 ~ (or ESC [ 6 ; N ~)
             var discard: [1]u8 = undefined;
             while (true) {
-                const dn = stdin.read(&discard) catch break;
+                const dn = compat.readAll(stdin, &discard) catch break;
                 if (dn == 0 or (discard[0] >= 0x40 and discard[0] <= 0x7E)) break;
             }
             break :blk .page_down;
@@ -3132,15 +3133,15 @@ fn parseEscSequence() EscAction {
             // Delete: ESC [ 3 ~ (or ESC [ 3 ; N ~)
             var discard: [1]u8 = undefined;
             while (true) {
-                const dn = stdin.read(&discard) catch break;
+                const dn = compat.readAll(stdin, &discard) catch break;
                 if (dn == 0 or (discard[0] >= 0x40 and discard[0] <= 0x7E)) break;
             }
             break :blk .delete;
         },
         else => blk: {
             // Consume remaining bytes of unknown sequence
-            while ((std.posix.poll(&esc_poll, 5) catch 0) > 0) {
-                _ = stdin.read(&b) catch break;
+            while ((compat.posix.poll(&esc_poll, 5) catch 0) > 0) {
+                _ = compat.readAll(stdin, &b) catch break;
             }
             break :blk .none;
         },
@@ -3309,8 +3310,8 @@ fn agentInteractive(shell: *Shell) !u8 {
     Layout.goOutput(out, out_last);
     {
         var cwd_buf: [256]u8 = undefined;
-        const cwd_full = std.posix.getcwd(&cwd_buf) catch "?";
-        const home = std.posix.getenv("HOME") orelse "";
+        const cwd_full = compat.posix.getcwd(&cwd_buf) catch "?";
+        const home = compat.posix.getenv("HOME") orelse "";
         var cwd_short_buf: [256]u8 = undefined;
         const cwd = if (home.len > 0 and std.mem.startsWith(u8, cwd_full, home))
             std.fmt.bufPrint(&cwd_short_buf, "~{s}", .{cwd_full[home.len..]}) catch cwd_full
@@ -3319,9 +3320,9 @@ fn agentInteractive(shell: *Shell) !u8 {
         // Detect git branch for context
         var branch: []const u8 = "";
         var branch_read_buf: [256]u8 = undefined;
-        if (std.fs.cwd().openFile(".git/HEAD", .{})) |head| {
-            defer head.close();
-            const n = head.read(&branch_read_buf) catch 0;
+        if (std.Io.Dir.cwd().openFile(compat.io(), ".git/HEAD", .{})) |head| {
+            defer head.close(compat.io());
+            const n = compat.readAll(head, &branch_read_buf) catch 0;
             const content = std.mem.trim(u8, branch_read_buf[0..n], " \t\r\n");
             if (std.mem.startsWith(u8, content, "ref: refs/heads/"))
                 branch = content[16..];
@@ -3330,10 +3331,10 @@ fn agentInteractive(shell: *Shell) !u8 {
         // Count dirty files for context
         var dirty_count: u16 = 0;
         {
-            const git_result = std.process.Child.run(.{
-                .allocator = shell.allocator,
+            const git_result = std.process.run(shell.allocator, compat.io(), .{
                 .argv = &[_][]const u8{ "git", "status", "--porcelain" },
-                .max_output_bytes = 8192,
+                .stdout_limit = .limited(8192),
+                .stderr_limit = .limited(8192),
             }) catch null;
             if (git_result) |gr| {
                 defer shell.allocator.free(gr.stdout);
@@ -3423,23 +3424,23 @@ fn agentInteractive(shell: *Shell) !u8 {
         }
 
         // Poll stdin (and mic if voice active) with timeout
-        var poll_fds: [2]std.posix.pollfd = .{
+        var poll_fds: [2]compat.posix.pollfd = .{
             .{
-                .fd = std.posix.STDIN_FILENO,
-                .events = std.posix.POLL.IN,
+                .fd = compat.posix.STDIN_FILENO,
+                .events = compat.posix.POLL.IN,
                 .revents = 0,
             },
             .{
                 .fd = if (shell.voice_capture) |cap| cap.stdout_fd else -1,
-                .events = std.posix.POLL.IN,
+                .events = compat.posix.POLL.IN,
                 .revents = 0,
             },
         };
         const n_poll_fds: u32 = if (shell.voice_active and shell.voice_capture != null) 2 else 1;
-        const poll_n = std.posix.poll(poll_fds[0..n_poll_fds], if (agent_active) @as(i32, 20) else @as(i32, 100)) catch 0;
+        const poll_n = compat.posix.poll(poll_fds[0..n_poll_fds], if (agent_active) @as(i32, 20) else @as(i32, 100)) catch 0;
 
         // ── Read mic audio if available ──
-        if (n_poll_fds > 1 and (poll_fds[1].revents & std.posix.POLL.IN) != 0) {
+        if (n_poll_fds > 1 and (poll_fds[1].revents & compat.posix.POLL.IN) != 0) {
             if (shell.voice_capture) |*cap| {
             var mic_buf: [1600]i16 = undefined; // 100ms @ 16kHz
             const n_samples = cap.read(&mic_buf);
@@ -3464,7 +3465,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                 } else if (voice_was_speaking and voice_audio_len > 0) {
                     // Speech just stopped — start silence timer
                     if (voice_silence_start == 0) {
-                        voice_silence_start = std.time.milliTimestamp();
+                        voice_silence_start = compat.milliTimestamp();
                         // Also buffer the trailing silence (some ASR models need it)
                         const avail = voice_audio_buf.len - voice_audio_len;
                         const copy_n = @min(n_samples, avail);
@@ -3481,7 +3482,7 @@ fn agentInteractive(shell: *Shell) !u8 {
 
         // ── Voice silence timeout → submit to ASR ──
         if (voice_silence_start > 0 and voice_audio_len > 1600) { // at least 100ms of audio
-            const elapsed = std.time.milliTimestamp() - voice_silence_start;
+            const elapsed = compat.milliTimestamp() - voice_silence_start;
             if (elapsed >= voice_silence_timeout) {
                 // Transcribe accumulated audio
                 const s = "transcribing...";
@@ -3510,7 +3511,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                         // Send to agent
                         if (shell.agent.query(transcribed)) {
                             agent_active = true;
-                            query_start_ms = std.time.milliTimestamp();
+                            query_start_ms = compat.milliTimestamp();
                             const thinking = "thinking...";
                             @memcpy(status_text[0..thinking.len], thinking);
                             status_len = thinking.len;
@@ -3521,7 +3522,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                     @memcpy(status_text[0..vs.len], vs);
                     status_len = vs.len;
                 }
-                Layout.drawStatusBarSafeCtx(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0, ctx_tokens, ctx_max);
+                Layout.drawStatusBarSafeCtx(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) compat.milliTimestamp() - query_start_ms else 0, ctx_tokens, ctx_max);
                 try out.flush();
             }
         }
@@ -3600,7 +3601,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                         const slen = @min(name_end, status_text.len);
                         @memcpy(status_text[0..slen], tool_text[0..slen]);
                         status_len = slen;
-                        Layout.drawStatusBarSafeCtx(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0, ctx_tokens, ctx_max);
+                        Layout.drawStatusBarSafeCtx(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) compat.milliTimestamp() - query_start_ms else 0, ctx_tokens, ctx_max);
                     }
                     // ⚡ ToolName args — compact indicator
                     try tee.writeAll("\n\x1b[90m\xe2\x9a\xa1 ");
@@ -3616,13 +3617,13 @@ fn agentInteractive(shell: *Shell) !u8 {
                             const path_end = std.mem.indexOfScalar(u8, tool_args, ' ') orelse tool_args.len;
                             const path = tool_args[0..path_end];
                             // Shorten: /home/user/... → ~/... or /cwd/... → ./...
-                            const home = std.posix.getenv("HOME") orelse "";
+                            const home = compat.posix.getenv("HOME") orelse "";
                             var short_buf: [256]u8 = undefined;
                             const display_path = if (home.len > 0 and std.mem.startsWith(u8, path, home))
                                 std.fmt.bufPrint(&short_buf, "~{s}", .{path[home.len..]}) catch path
                             else blk: {
                                 var cwd_b: [256]u8 = undefined;
-                                const cwd_s = std.posix.getcwd(&cwd_b) catch break :blk path;
+                                const cwd_s = compat.posix.getcwd(&cwd_b) catch break :blk path;
                                 if (std.mem.startsWith(u8, path, cwd_s) and path.len > cwd_s.len and path[cwd_s.len] == '/')
                                     break :blk path[cwd_s.len + 1 ..]
                                 else
@@ -3736,7 +3737,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                     const thinking = "thinking...";
                     @memcpy(status_text[0..thinking.len], thinking);
                     status_len = thinking.len;
-                    Layout.drawStatusBarSafeCtx(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0, ctx_tokens, ctx_max);
+                    Layout.drawStatusBarSafeCtx(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) compat.milliTimestamp() - query_start_ms else 0, ctx_tokens, ctx_max);
                 },
                 .error_msg => {
                     if (last_was_text) {
@@ -3793,7 +3794,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                             }
                         }
                     }
-                    Layout.drawStatusBarSafeCtx(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0, ctx_tokens, ctx_max);
+                    Layout.drawStatusBarSafeCtx(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) compat.milliTimestamp() - query_start_ms else 0, ctx_tokens, ctx_max);
                     if (last_was_text) {
                         try md.flush(tee);
                         md.reset();
@@ -3826,7 +3827,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                     agent_active = false;
                     // Show elapsed time + cost summary after response
                     if (query_start_ms > 0) {
-                        const resp_elapsed = std.time.milliTimestamp() - query_start_ms;
+                        const resp_elapsed = compat.milliTimestamp() - query_start_ms;
                         const resp_secs = @divTrunc(resp_elapsed, 1000);
                         var time_buf: [64]u8 = undefined;
                         const time_str = if (resp_secs >= 60)
@@ -3894,7 +3895,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                     const confirm_s = "awaiting";
                     @memcpy(status_text[0..confirm_s.len], confirm_s);
                     status_len = confirm_s.len;
-                    Layout.drawStatusBarSafeCtx(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0, ctx_tokens, ctx_max);
+                    Layout.drawStatusBarSafeCtx(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) compat.milliTimestamp() - query_start_ms else 0, ctx_tokens, ctx_max);
                     // Render confirm prompt in input area (outside scroll region)
                     out.print("\x1b[1;{d}r", .{term_rows}) catch {};
                     try out.print("\x1b[{d};1H\x1b[2K\x1b[33m\xe2\x9a\xa0 \x1b[0m{s} \x1b[90m[\x1b[32my\x1b[90m/\x1b[31mn\x1b[90m/\x1b[33ma\x1b[90mlways]\x1b[0m ", .{ input_first_row, msg.slice() }); // ⚠ prefix
@@ -3937,7 +3938,7 @@ fn agentInteractive(shell: *Shell) !u8 {
             }
             try out.flush();
         } else if (agent_active and query_start_ms > 0) {
-            const elapsed = std.time.milliTimestamp() - query_start_ms;
+            const elapsed = compat.milliTimestamp() - query_start_ms;
 
             // Live token counter from agent thread
             const live_tokens = shell.agent.getTotalInputTokens();
@@ -3949,9 +3950,9 @@ fn agentInteractive(shell: *Shell) !u8 {
         }
 
         // ── Handle stdin ──
-        if (poll_n > 0 and (poll_fds[0].revents & std.posix.POLL.IN) != 0) {
+        if (poll_n > 0 and (poll_fds[0].revents & compat.posix.POLL.IN) != 0) {
             var byte: [1]u8 = undefined;
-            const n = std.fs.File.stdin().read(&byte) catch break;
+            const n = compat.readAll(std.Io.File.stdin(), &byte) catch break;
             if (n == 0) {
                 Layout.doExit(out, term_rows, input_height);
                 if (cost_len > 0 or files_changed > 0) {
@@ -4000,7 +4001,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                     }
                     msg_history.commitLine(); // commit partial streamed line
                     // Show what was happening when cancelled
-                    const cancel_elapsed = if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0;
+                    const cancel_elapsed = if (query_start_ms > 0) compat.milliTimestamp() - query_start_ms else 0;
                     const cancel_secs = @divTrunc(cancel_elapsed, 1000);
                     if (status_len > 0 and cancel_secs > 0) {
                         var cancel_buf: [96]u8 = undefined;
@@ -4457,12 +4458,12 @@ fn agentInteractive(shell: *Shell) !u8 {
                     },
                     .paste => {
                         // Bracketed paste: read until ESC[201~
-                        const stdin_f = std.fs.File.stdin();
+                        const stdin_f = std.Io.File.stdin();
                         var paste_byte: [1]u8 = undefined;
                         var esc_state: u8 = 0; // 0=normal, 1=ESC, 2=[, 3=2, 4=0, 5=1
                         var pasted = false;
                         while (true) {
-                            const pn = stdin_f.read(&paste_byte) catch break;
+                            const pn = compat.readAll(stdin_f, &paste_byte) catch break;
                             if (pn == 0) break;
                             const pc = paste_byte[0];
                             // Detect ESC[201~ end sequence
@@ -4558,14 +4559,14 @@ fn agentInteractive(shell: *Shell) !u8 {
                     // Two-key commands: read next key
                     'd', 'c' => {
                         // Read next key for motion
-                        var esc_poll2 = [_]std.posix.pollfd{.{
-                            .fd = std.posix.STDIN_FILENO,
-                            .events = std.posix.POLL.IN,
+                        var esc_poll2 = [_]compat.posix.pollfd{.{
+                            .fd = compat.posix.STDIN_FILENO,
+                            .events = compat.posix.POLL.IN,
                             .revents = 0,
                         }};
-                        if ((std.posix.poll(&esc_poll2, 500) catch 0) > 0) {
+                        if ((compat.posix.poll(&esc_poll2, 500) catch 0) > 0) {
                             var b2: [1]u8 = undefined;
-                            const n2 = std.fs.File.stdin().read(&b2) catch 0;
+                            const n2 = compat.readAll(std.Io.File.stdin(), &b2) catch 0;
                             if (n2 > 0) {
                                 if (b2[0] == vi_c) {
                                     // dd or cc — delete/change entire line
@@ -4606,21 +4607,21 @@ fn agentInteractive(shell: *Shell) !u8 {
                     },
                     'r' => {
                         // Replace char: read next key (UTF-8 aware)
-                        var esc_poll2 = [_]std.posix.pollfd{.{
-                            .fd = std.posix.STDIN_FILENO,
-                            .events = std.posix.POLL.IN,
+                        var esc_poll2 = [_]compat.posix.pollfd{.{
+                            .fd = compat.posix.STDIN_FILENO,
+                            .events = compat.posix.POLL.IN,
                             .revents = 0,
                         }};
-                        if ((std.posix.poll(&esc_poll2, 500) catch 0) > 0) {
+                        if ((compat.posix.poll(&esc_poll2, 500) catch 0) > 0) {
                             var b2: [4]u8 = undefined;
-                            const n2 = std.fs.File.stdin().read(b2[0..1]) catch 0;
+                            const n2 = compat.readAll(std.Io.File.stdin(), b2[0..1]) catch 0;
                             if (n2 > 0 and b2[0] >= 0x20) {
                                 // Determine UTF-8 sequence length from lead byte
                                 const seq_len: usize = if (b2[0] < 0x80) 1 else if ((b2[0] & 0xE0) == 0xC0) 2 else if ((b2[0] & 0xF0) == 0xE0) 3 else if ((b2[0] & 0xF8) == 0xF0) 4 else 1;
                                 // Read remaining continuation bytes
                                 var got: usize = 1;
                                 while (got < seq_len) {
-                                    const nr = std.fs.File.stdin().read(b2[got .. got + 1]) catch break;
+                                    const nr = compat.readAll(std.Io.File.stdin(), b2[got .. got + 1]) catch break;
                                     if (nr == 0) break;
                                     got += 1;
                                 }
@@ -4753,17 +4754,17 @@ fn agentInteractive(shell: *Shell) !u8 {
                         const file_prefix = if (last_slash) |s| prefix[s + 1 ..] else prefix;
 
                         const dir_to_open = if (dir_path.len > 0) dir_path else ".";
-                        var dir = std.fs.cwd().openDir(dir_to_open, .{ .iterate = true }) catch {
+                        var dir = std.Io.Dir.cwd().openDir(compat.io(), dir_to_open, .{ .iterate = true }) catch {
                             continue;
                         };
-                        defer dir.close();
+                        defer dir.close(compat.io());
 
                         // Collect up to 32 matches
                         var name_storage: [32][256]u8 = undefined;
                         var name_lens: [32]u16 = undefined;
                         var match_count: u16 = 0;
                         var iter = dir.iterate();
-                        while (iter.next() catch null) |entry| {
+                        while (iter.next(compat.io()) catch null) |entry| {
                             if (std.mem.startsWith(u8, entry.name, file_prefix)) {
                                 if (match_count < 32) {
                                     const elen: u16 = @intCast(@min(entry.name.len, 256));
@@ -4990,12 +4991,12 @@ fn agentInteractive(shell: *Shell) !u8 {
                             } else {
                                 agent_active = true;
                                 cursor_at = .output;
-                                query_start_ms = std.time.milliTimestamp();
+                                query_start_ms = compat.milliTimestamp();
                                 const tb = shell.agent.queues.shared_thinking_budget.load(.monotonic);
                                 const thinking_s = if (tb >= 32000) "ultrathinking..." else if (tb >= 10000) "megathinking..." else if (tb > 0) "thinking deeply..." else "thinking...";
                                 @memcpy(status_text[0..thinking_s.len], thinking_s);
                                 status_len = thinking_s.len;
-                                Layout.drawStatusBarSafeCtx(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) std.time.milliTimestamp() - query_start_ms else 0, ctx_tokens, ctx_max);
+                                Layout.drawStatusBarSafeCtx(out, status_row, term_rows, out_last, term_cols, model_name, cost_buf[0..cost_len], status_text[0..status_len], if (query_start_ms > 0) compat.milliTimestamp() - query_start_ms else 0, ctx_tokens, ctx_max);
                             }
                             try out.flush();
                             continue;
@@ -5065,7 +5066,7 @@ fn agentInteractive(shell: *Shell) !u8 {
                     var ci: u8 = 0;
                     while (ci < expect) : (ci += 1) {
                         var cb: [1]u8 = undefined;
-                        const cn = std.fs.File.stdin().read(&cb) catch break;
+                        const cn = compat.readAll(std.Io.File.stdin(), &cb) catch break;
                         if (cn == 0 or (cb[0] & 0xC0) != 0x80) break;
                         _ = edit_buf.insert(cb[0]);
                     }
@@ -5097,7 +5098,7 @@ fn agentLog(shell: *Shell, args: []const []const u8) !u8 {
         session_id = args[2];
     } else {
         // Find most recent session
-        var sessions: std.ArrayList(agent_log.SessionInfo) = .{};
+        var sessions: std.ArrayList(agent_log.SessionInfo) = .empty;
         defer sessions.deinit(shell.allocator);
         agent_log.listSessions(shell.allocator, &sessions) catch {};
         if (sessions.items.len == 0) {
@@ -5124,7 +5125,7 @@ fn agentLog(shell: *Shell, args: []const []const u8) !u8 {
         return 1;
     };
 
-    const content = std.fs.cwd().readFileAlloc(shell.allocator, conv_path, 512 * 1024) catch {
+    const content = std.Io.Dir.cwd().readFileAlloc(compat.io(), conv_path, shell.allocator, .limited(512 * 1024)) catch {
         try out.print("Session not found: {s}\n", .{session_id});
         try out.flush();
         return 1;
@@ -5134,14 +5135,14 @@ fn agentLog(shell: *Shell, args: []const []const u8) !u8 {
     // Also read meta.json for context
     var meta_path_buf: [512]u8 = undefined;
     const meta_path = std.fmt.bufPrint(&meta_path_buf, "{s}/sessions/{s}/meta.json", .{ base, session_id }) catch "";
-    if (std.fs.cwd().readFileAlloc(shell.allocator, meta_path, 4096)) |meta| {
+    if (std.Io.Dir.cwd().readFileAlloc(compat.io(), meta_path, shell.allocator, .limited(4096))) |meta| {
         defer shell.allocator.free(meta);
         try out.print("\x1b[90m{s}", .{session_id});
         if (agent_log.jsonExtractStr(meta, "model")) |model| {
             try out.print(" \xc2\xb7 {s}", .{model});
         }
         if (agent_log.jsonExtractStr(meta, "cwd")) |cwd| {
-            const home = std.posix.getenv("HOME") orelse "";
+            const home = compat.posix.getenv("HOME") orelse "";
             if (home.len > 0 and std.mem.startsWith(u8, cwd, home)) {
                 try out.print(" \xc2\xb7 ~{s}", .{cwd[home.len..]});
             } else {
@@ -5164,7 +5165,7 @@ fn agentLog(shell: *Shell, args: []const []const u8) !u8 {
 }
 
 fn agentLatestSession(shell: *Shell) ?[]const u8 {
-    var sessions: std.ArrayList(agent_log.SessionInfo) = .{};
+    var sessions: std.ArrayList(agent_log.SessionInfo) = .empty;
     defer sessions.deinit(shell.allocator);
     agent_log.listSessions(shell.allocator, &sessions) catch return null;
     if (sessions.items.len == 0) return null;
@@ -5182,7 +5183,7 @@ fn agentAttach(shell: *Shell, args: []const []const u8) !u8 {
         session_id = args[2];
     } else {
         // Find latest active session (has ctl FIFO)
-        var sessions: std.ArrayList(agent_log.SessionInfo) = .{};
+        var sessions: std.ArrayList(agent_log.SessionInfo) = .empty;
         defer sessions.deinit(shell.allocator);
         agent_log.listSessions(shell.allocator, &sessions) catch {};
         // Search from newest to oldest for an active session
@@ -5196,7 +5197,7 @@ fn agentAttach(shell: *Shell, args: []const []const u8) !u8 {
             const base = agent_log.getBaseDir(&base_buf) orelse break;
             var ctl_check: [512]u8 = undefined;
             const ctl_p = std.fmt.bufPrint(&ctl_check, "{s}/sessions/{s}/ctl", .{ base, @as([]const u8, &info.id) }) catch continue;
-            std.fs.cwd().access(ctl_p, .{}) catch continue;
+            std.Io.Dir.cwd().access(compat.io(), ctl_p, .{}) catch continue;
             session_id = &info.id;
             found = true;
             break;
@@ -5232,22 +5233,22 @@ fn agentAttach(shell: *Shell, args: []const []const u8) !u8 {
 
     // Check if ctl FIFO exists (session is alive)
     const has_ctl = blk: {
-        std.fs.cwd().access(ctl_path, .{}) catch break :blk false;
+        std.Io.Dir.cwd().access(compat.io(), ctl_path, .{}) catch break :blk false;
         break :blk true;
     };
 
     // Open conversation.jsonl for reading
-    const conv_file = std.fs.cwd().openFile(conv_path, .{}) catch {
+    const conv_file = std.Io.Dir.cwd().openFile(compat.io(), conv_path, .{}) catch {
         try out.print("Session not found: {s}\n", .{session_id});
         try out.flush();
         return 1;
     };
-    defer conv_file.close();
+    defer conv_file.close(compat.io());
 
     // Read meta.json for header
     var meta_path_buf: [512]u8 = undefined;
     const meta_path = std.fmt.bufPrint(&meta_path_buf, "{s}/sessions/{s}/meta.json", .{ base, session_id }) catch "";
-    const meta_model = if (std.fs.cwd().readFileAlloc(shell.allocator, meta_path, 4096)) |meta| blk: {
+    const meta_model = if (std.Io.Dir.cwd().readFileAlloc(compat.io(), meta_path, shell.allocator, .limited(4096))) |meta| blk: {
         defer shell.allocator.free(meta);
         break :blk agent_log.jsonExtractStr(meta, "model");
     } else |_| null;
@@ -5283,7 +5284,7 @@ fn agentAttach(shell: *Shell, args: []const []const u8) !u8 {
     try out.flush();
 
     // Replay existing content
-    const initial = std.fs.cwd().readFileAlloc(shell.allocator, conv_path, 1024 * 1024) catch "";
+    const initial = std.Io.Dir.cwd().readFileAlloc(compat.io(), conv_path, shell.allocator, .limited(1024 * 1024)) catch "";
     defer if (initial.len > 0) shell.allocator.free(initial);
 
     var md: agent_mod.MarkdownRenderer = .{};
@@ -5297,10 +5298,10 @@ fn agentAttach(shell: *Shell, args: []const []const u8) !u8 {
     var file_pos: u64 = if (initial.len > 0) @intCast(initial.len) else 0;
 
     // Open ctl FIFO for writing (if alive)
-    const ctl_fd: ?std.posix.fd_t = if (has_ctl) blk: {
-        break :blk std.posix.open(ctl_path, .{ .ACCMODE = .WRONLY, .NONBLOCK = true }, 0) catch null;
+    const ctl_fd: ?compat.posix.fd_t = if (has_ctl) blk: {
+        break :blk compat.posix.open(ctl_path, .{ .ACCMODE = .WRONLY, .NONBLOCK = true }, 0) catch null;
     } else null;
-    defer if (ctl_fd) |fd| std.posix.close(fd);
+    defer if (ctl_fd) |fd| compat.posix.close(fd);
 
     // State
     var line_buf: [4096]u8 = undefined;
@@ -5325,28 +5326,27 @@ fn agentAttach(shell: *Shell, args: []const []const u8) !u8 {
     // Follow mode event loop
     while (true) {
         // Poll stdin
-        var poll_fds = [_]std.posix.pollfd{.{
-            .fd = std.posix.STDIN_FILENO,
-            .events = std.posix.POLL.IN,
+        var poll_fds = [_]compat.posix.pollfd{.{
+            .fd = compat.posix.STDIN_FILENO,
+            .events = compat.posix.POLL.IN,
             .revents = 0,
         }};
         const poll_timeout: i32 = 200; // check file every 200ms
-        const poll_n = std.posix.poll(&poll_fds, poll_timeout) catch 0;
+        const poll_n = compat.posix.poll(&poll_fds, poll_timeout) catch 0;
 
         // Check for new data in conversation.jsonl
         const file_size = blk: {
-            const stat = conv_file.stat() catch break :blk file_pos;
+            const stat = conv_file.stat(compat.io()) catch break :blk file_pos;
             break :blk stat.size;
         };
 
         if (file_size > file_pos) {
             // Read new data
-            conv_file.seekTo(file_pos) catch {};
             const new_len = file_size - file_pos;
             const max_read: usize = @min(@as(usize, @intCast(new_len)), 65536);
             var read_buf = shell.allocator.alloc(u8, max_read) catch continue;
             defer shell.allocator.free(read_buf);
-            const n = conv_file.read(read_buf) catch 0;
+            const n = conv_file.readPositionalAll(compat.io(), read_buf, file_pos) catch 0;
             if (n > 0) {
                 file_pos += n;
                 // Position cursor in output area
@@ -5363,9 +5363,9 @@ fn agentAttach(shell: *Shell, args: []const []const u8) !u8 {
         }
 
         // Handle stdin
-        if (poll_n > 0 and (poll_fds[0].revents & std.posix.POLL.IN) != 0) {
+        if (poll_n > 0 and (poll_fds[0].revents & compat.posix.POLL.IN) != 0) {
             var byte: [1]u8 = undefined;
-            const n = std.fs.File.stdin().read(&byte) catch break;
+            const n = compat.readAll(std.Io.File.stdin(), &byte) catch break;
             if (n == 0) {
                 exitRestore.f(out, term_rows);
                 return 0;
@@ -5386,13 +5386,13 @@ fn agentAttach(shell: *Shell, args: []const []const u8) !u8 {
             // Escape sequences — discard
             if (byte[0] == 27) {
                 var esc_buf: [8]u8 = undefined;
-                var esc_poll = [_]std.posix.pollfd{.{
-                    .fd = std.posix.STDIN_FILENO,
-                    .events = std.posix.POLL.IN,
+                var esc_poll = [_]compat.posix.pollfd{.{
+                    .fd = compat.posix.STDIN_FILENO,
+                    .events = compat.posix.POLL.IN,
                     .revents = 0,
                 }};
-                if ((std.posix.poll(&esc_poll, 10) catch 0) > 0) {
-                    _ = std.fs.File.stdin().read(&esc_buf) catch {};
+                if ((compat.posix.poll(&esc_poll, 10) catch 0) > 0) {
+                    _ = std.Io.File.stdin().readStreaming(compat.io(), &.{&esc_buf}) catch {};
                 }
                 continue;
             }
@@ -5412,8 +5412,8 @@ fn agentAttach(shell: *Shell, args: []const []const u8) !u8 {
 
                 if (ctl_fd) |fd| {
                     // Write to FIFO with newline
-                    _ = std.posix.write(fd, input) catch {};
-                    _ = std.posix.write(fd, "\n") catch {};
+                    _ = compat.posix.write(fd, input) catch {};
+                    _ = compat.posix.write(fd, "\n") catch {};
                     // Echo in output area
                     try out.print("\x1b[{d};1H", .{output_bottom});
                     try out.writeAll("\n\x1b[1;35m> \x1b[0m");
@@ -5502,7 +5502,7 @@ fn renderLogLine(out: anytype, md: *agent_mod.MarkdownRenderer, line: []const u8
 /// its contents to the query. Returns null if no expansion needed or on error.
 /// Pattern: "@path/to/file" at word boundary (preceded by space or start of string).
 fn expandAtMentions(query: []const u8, buf: *[4096]u8, alloc: std.mem.Allocator) ?[]const u8 {
-    var result: std.ArrayList(u8) = .{};
+    var result: std.ArrayList(u8) = .empty;
     defer result.deinit(alloc);
     result.appendSlice(alloc, query) catch return null;
 
@@ -5520,10 +5520,10 @@ fn expandAtMentions(query: []const u8, buf: *[4096]u8, alloc: std.mem.Allocator)
         const path = query[path_start..path_end];
         if (path.len == 0) continue;
         // Try to read the file
-        const file = std.fs.cwd().openFile(path, .{}) catch continue;
-        defer file.close();
+        const file = std.Io.Dir.cwd().openFile(compat.io(), path, .{}) catch continue;
+        defer file.close(compat.io());
         var read_buf: [3072]u8 = undefined;
-        const n = file.readAll(&read_buf) catch continue;
+        const n = compat.readAll(file, &read_buf) catch continue;
         if (n == 0) continue;
         // Append file contents to query
         files_found = true;
@@ -5546,6 +5546,7 @@ fn expandAtMentions(query: []const u8, buf: *[4096]u8, alloc: std.mem.Allocator)
 /// Send text to TTS endpoint, pipe audio to paplay.
 /// Blocks until playback complete (or errors out).
 fn voiceSpeak(alloc: std.mem.Allocator, text: []const u8) void {
+    _ = alloc;
     // Strip markdown/ANSI from text for cleaner TTS
     var clean_buf: [8192]u8 = undefined;
     var clean_len: usize = 0;
@@ -5592,26 +5593,23 @@ fn voiceSpeak(alloc: std.mem.Allocator, text: []const u8) void {
 
     // curl to TTS endpoint → raw WAV → pipe to paplay
     // Two-step: curl gets WAV, then paplay plays it
-    var child = std.process.Child.init(
-        &.{
+    var child = std.process.spawn(compat.io(), .{
+        .argv = &.{
             "sh", "-c",
             "curl -sS --max-time 60 -X POST -H 'Content-Type: application/json' " ++
                 "-d @- http://localhost:8888/synthesize -o /tmp/zish_tts.wav < /dev/stdin && " ++
                 "paplay --format=s16le --rate=24000 --channels=1 --raw /tmp/zish_tts.wav",
         },
-        alloc,
-    );
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-
-    child.spawn() catch return;
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return;
     if (child.stdin) |stdin| {
-        stdin.writeAll(json) catch {};
-        stdin.close();
+        compat.writeAll(stdin, json) catch {};
+        stdin.close(compat.io());
         child.stdin = null;
     }
-    _ = child.wait() catch {};
+    _ = child.wait(compat.io()) catch {};
 }
 
 // ── Voice transcription via ASR endpoint ──

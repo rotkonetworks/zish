@@ -9,6 +9,7 @@
 //   - Cross-attention: sync-driven query re-observes input at each tick
 
 const std = @import("std");
+const compat = @import("../compat.zig");
 const math = @import("math.zig");
 const gpu_mod = @import("gpu.zig");
 
@@ -473,8 +474,8 @@ pub const CTMState = struct {
 
     /// Save sync state to file. Preserves sync accumulators + dopamine EMA.
     pub fn save(self: *const CTMState, path: []const u8) !void {
-        const file = try std.fs.cwd().createFile(path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(compat.io(), path, .{});
+        defer file.close(compat.io());
 
         // Header: magic(4) + version(4) + n_layers(4) + n_synch(4) + initialized(1) + ema(4) = 21 bytes
         var hdr: [21]u8 = undefined;
@@ -485,24 +486,24 @@ pub const CTMState = struct {
         hdr[16] = if (self.initialized) 1 else 0;
         const ema_val: f32 = self.surprise_ema orelse std.math.nan(f32);
         @memcpy(hdr[17..21], std.mem.asBytes(&ema_val));
-        try file.writeAll(&hdr);
+        try compat.writeAll(file, &hdr);
 
         // Sync arrays
         const total = self.n_layers * self.n_synch;
-        try file.writeAll(std.mem.sliceAsBytes(self.alpha_out[0..total]));
-        try file.writeAll(std.mem.sliceAsBytes(self.beta_out[0..total]));
-        try file.writeAll(std.mem.sliceAsBytes(self.alpha_act[0..total]));
-        try file.writeAll(std.mem.sliceAsBytes(self.beta_act[0..total]));
+        try compat.writeAll(file, std.mem.sliceAsBytes(self.alpha_out[0..total]));
+        try compat.writeAll(file, std.mem.sliceAsBytes(self.beta_out[0..total]));
+        try compat.writeAll(file, std.mem.sliceAsBytes(self.alpha_act[0..total]));
+        try compat.writeAll(file, std.mem.sliceAsBytes(self.beta_act[0..total]));
     }
 
     /// Load sync state from file. Returns false if file doesn't exist or is incompatible.
     pub fn load(self: *CTMState, path: []const u8) bool {
-        const file = std.fs.cwd().openFile(path, .{}) catch return false;
-        defer file.close();
+        const file = std.Io.Dir.cwd().openFile(compat.io(), path, .{}) catch return false;
+        defer file.close(compat.io());
 
         // Read header
         var hdr: [21]u8 = undefined;
-        _ = file.readAll(&hdr) catch return false;
+        _ = compat.readAll(file, &hdr) catch return false;
 
         const magic = std.mem.readInt(u32, hdr[0..4], .little);
         const version = std.mem.readInt(u32, hdr[4..8], .little);
@@ -521,10 +522,10 @@ pub const CTMState = struct {
 
         // Sync arrays
         const total = self.n_layers * self.n_synch;
-        _ = file.readAll(std.mem.sliceAsBytes(self.alpha_out[0..total])) catch return false;
-        _ = file.readAll(std.mem.sliceAsBytes(self.beta_out[0..total])) catch return false;
-        _ = file.readAll(std.mem.sliceAsBytes(self.alpha_act[0..total])) catch return false;
-        _ = file.readAll(std.mem.sliceAsBytes(self.beta_act[0..total])) catch return false;
+        _ = compat.readAll(file, std.mem.sliceAsBytes(self.alpha_out[0..total])) catch return false;
+        _ = compat.readAll(file, std.mem.sliceAsBytes(self.beta_out[0..total])) catch return false;
+        _ = compat.readAll(file, std.mem.sliceAsBytes(self.alpha_act[0..total])) catch return false;
+        _ = compat.readAll(file, std.mem.sliceAsBytes(self.beta_act[0..total])) catch return false;
 
         return true;
     }
@@ -719,7 +720,7 @@ pub const CTMBlock = struct {
             }
 
             // 2. Cross-attention: query from sync, key/value from input
-            var tick_timer = std.time.Timer.start() catch null;
+            var tick_timer = compat.Timer.start() catch null;
             linearForward(attn_q, synch_readout, self.attn_q_proj_w, D, n_synch);
             qkNorm(attn_q_norm, attn_q, D);
 
@@ -1243,8 +1244,8 @@ pub const CTMBlock = struct {
     /// Save all plastic weights to an overlay file.
     /// Format: [magic(4)][version(4)][c_proj_size(4)][c_proj_data][up_size(4)][up_data]
     pub fn savePlasticWeights(self: *const CTMBlock, path: []const u8) !void {
-        const file = try std.fs.cwd().createFile(path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(compat.io(), path, .{});
+        defer file.close(compat.io());
 
         var hdr: [12]u8 = undefined;
         const PLASTIC_MAGIC: u32 = 0x50435457; // "PCTW"
@@ -1257,11 +1258,11 @@ pub const CTMBlock = struct {
             const n_synch = self.config.n_synch;
             const size = D * n_synch;
             std.mem.writeInt(u32, hdr[8..12], @intCast(size), .little);
-            try file.writeAll(&hdr);
-            try file.writeAll(std.mem.sliceAsBytes(cp[0..size]));
+            try compat.writeAll(file, &hdr);
+            try compat.writeAll(file, std.mem.sliceAsBytes(cp[0..size]));
         } else {
             std.mem.writeInt(u32, hdr[8..12], 0, .little);
-            try file.writeAll(&hdr);
+            try compat.writeAll(file, &hdr);
         }
 
         // last synapse up
@@ -1270,21 +1271,21 @@ pub const CTMBlock = struct {
             const last = self.synapses.half_k - 1;
             const size = self.synapses.up_in_dims[last] * self.synapses.up_out_dims[last];
             std.mem.writeInt(u32, &sz_buf, @intCast(size), .little);
-            try file.writeAll(&sz_buf);
-            try file.writeAll(std.mem.sliceAsBytes(uw[0..size]));
+            try compat.writeAll(file, &sz_buf);
+            try compat.writeAll(file, std.mem.sliceAsBytes(uw[0..size]));
         } else {
             std.mem.writeInt(u32, &sz_buf, 0, .little);
-            try file.writeAll(&sz_buf);
+            try compat.writeAll(file, &sz_buf);
         }
     }
 
     /// Load plastic weight overlay from file. Returns true if loaded successfully.
     pub fn loadPlasticWeights(self: *CTMBlock, path: []const u8) bool {
-        const file = std.fs.cwd().openFile(path, .{}) catch return false;
-        defer file.close();
+        const file = std.Io.Dir.cwd().openFile(compat.io(), path, .{}) catch return false;
+        defer file.close(compat.io());
 
         var hdr: [12]u8 = undefined;
-        _ = file.readAll(&hdr) catch return false;
+        _ = compat.readAll(file, &hdr) catch return false;
 
         const magic = std.mem.readInt(u32, hdr[0..4], .little);
         const version = std.mem.readInt(u32, hdr[4..8], .little);
@@ -1295,7 +1296,7 @@ pub const CTMBlock = struct {
         if (c_size > 0) {
             if (self.mutable_c_proj_w) |cp| {
                 if (cp.len == c_size) {
-                    _ = file.readAll(std.mem.sliceAsBytes(cp)) catch return false;
+                    _ = compat.readAll(file, std.mem.sliceAsBytes(cp)) catch return false;
                     self.c_proj_w = cp;
                     self.c_proj_base_norm = vecNorm(cp);
                 } else return false;
@@ -1304,12 +1305,12 @@ pub const CTMBlock = struct {
 
         // last synapse up
         var sz_buf: [4]u8 = undefined;
-        _ = file.readAll(&sz_buf) catch return false;
+        _ = compat.readAll(file, &sz_buf) catch return false;
         const up_size = std.mem.readInt(u32, &sz_buf, .little);
         if (up_size > 0) {
             if (self.mutable_last_up_w) |uw| {
                 if (uw.len == up_size) {
-                    _ = file.readAll(std.mem.sliceAsBytes(uw)) catch return false;
+                    _ = compat.readAll(file, std.mem.sliceAsBytes(uw)) catch return false;
                     const last = self.synapses.half_k - 1;
                     @constCast(self.synapses.up_weights)[last] = uw;
                     self.up_base_norm = vecNorm(uw);
@@ -1364,7 +1365,7 @@ pub const ReplayBuffer = struct {
         @memcpy(entry.tokens[0..copy_len], tokens[0..copy_len]);
         entry.len = copy_len;
         entry.surprise = mean_surprise;
-        entry.timestamp = std.time.timestamp();
+        entry.timestamp = compat.timestamp();
 
         self.write_pos += 1;
         if (self.count < MAX_ENTRIES) self.count += 1;
@@ -1385,7 +1386,7 @@ pub const ReplayBuffer = struct {
     /// Prune entries with low surprise (decay over time).
     /// Entries older than max_age_seconds with surprise below decay_threshold are cleared.
     pub fn prune(self: *ReplayBuffer, max_age_seconds: i64, decay_threshold: f32) void {
-        const now = std.time.timestamp();
+        const now = compat.timestamp();
         // Clear expired entries (old + low surprise) by zeroing their length.
         // The ring buffer naturally overwrites, but this frees them for inspection.
         for (0..MAX_ENTRIES) |i| {
@@ -1402,14 +1403,14 @@ pub const ReplayBuffer = struct {
     const REPLAY_MAGIC: u32 = 0x52504C42; // "RPLB"
 
     pub fn save(self: *const ReplayBuffer, path: []const u8) !void {
-        const file = try std.fs.cwd().createFile(path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(compat.io(), path, .{});
+        defer file.close(compat.io());
 
         var hdr: [12]u8 = undefined;
         std.mem.writeInt(u32, hdr[0..4], REPLAY_MAGIC, .little);
         std.mem.writeInt(u32, hdr[4..8], @intCast(self.count), .little);
         std.mem.writeInt(u32, hdr[8..12], @intCast(self.write_pos), .little);
-        try file.writeAll(&hdr);
+        try compat.writeAll(file, &hdr);
 
         for (0..MAX_ENTRIES) |i| {
             const entry = &self.entries[i];
@@ -1417,17 +1418,17 @@ pub const ReplayBuffer = struct {
             std.mem.writeInt(u32, entry_hdr[0..4], @intCast(entry.len), .little);
             @memcpy(entry_hdr[4..8], std.mem.asBytes(&entry.surprise));
             @memcpy(entry_hdr[8..16], std.mem.asBytes(&entry.timestamp));
-            try file.writeAll(&entry_hdr);
-            try file.writeAll(std.mem.sliceAsBytes(entry.tokens[0..MAX_SEQ_LEN]));
+            try compat.writeAll(file, &entry_hdr);
+            try compat.writeAll(file, std.mem.sliceAsBytes(entry.tokens[0..MAX_SEQ_LEN]));
         }
     }
 
     pub fn load(self: *ReplayBuffer, path: []const u8) bool {
-        const file = std.fs.cwd().openFile(path, .{}) catch return false;
-        defer file.close();
+        const file = std.Io.Dir.cwd().openFile(compat.io(), path, .{}) catch return false;
+        defer file.close(compat.io());
 
         var hdr: [12]u8 = undefined;
-        _ = file.readAll(&hdr) catch return false;
+        _ = compat.readAll(file, &hdr) catch return false;
 
         const magic = std.mem.readInt(u32, hdr[0..4], .little);
         if (magic != REPLAY_MAGIC) return false;
@@ -1437,11 +1438,11 @@ pub const ReplayBuffer = struct {
         for (0..MAX_ENTRIES) |i| {
             const entry = &self.entries[i];
             var entry_hdr: [16]u8 = undefined;
-            _ = file.readAll(&entry_hdr) catch return false;
+            _ = compat.readAll(file, &entry_hdr) catch return false;
             entry.len = @intCast(std.mem.readInt(u32, entry_hdr[0..4], .little));
             @memcpy(std.mem.asBytes(&entry.surprise), entry_hdr[4..8]);
             @memcpy(std.mem.asBytes(&entry.timestamp), entry_hdr[8..16]);
-            _ = file.readAll(std.mem.sliceAsBytes(entry.tokens[0..MAX_SEQ_LEN])) catch return false;
+            _ = compat.readAll(file, std.mem.sliceAsBytes(entry.tokens[0..MAX_SEQ_LEN])) catch return false;
         }
         return true;
     }

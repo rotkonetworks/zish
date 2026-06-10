@@ -1,6 +1,7 @@
 // glob.zig - wildcard pattern matching and expansion
 
 const std = @import("std");
+const compat = @import("compat.zig");
 
 pub fn expandGlob(allocator: std.mem.Allocator, pattern: []const u8) ![][]const u8 {
     // check if pattern contains glob characters
@@ -48,15 +49,15 @@ fn expandSimpleGlob(allocator: std.mem.Allocator, pattern: []const u8) ![][]cons
     const file_pattern = if (last_slash) |idx| pattern[idx + 1 ..] else pattern;
 
     // open directory
-    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch {
+    var dir = std.Io.Dir.cwd().openDir(compat.io(), dir_path, .{ .iterate = true }) catch {
         // if directory doesn't exist, return empty
         return try results.toOwnedSlice(allocator);
     };
-    defer dir.close();
+    defer dir.close(compat.io());
 
     // iterate and match
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(compat.io())) |entry| {
         if (matchGlob(file_pattern, entry.name)) {
             const full_path = if (std.mem.eql(u8, dir_path, "."))
                 try allocator.dupe(u8, entry.name)
@@ -113,11 +114,11 @@ fn walkRecursive(
     // depth limit to prevent stack overflow on deep/cyclic trees
     if (depth >= MAX_GLOB_DEPTH) return;
 
-    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
-    defer dir.close();
+    var dir = std.Io.Dir.cwd().openDir(compat.io(), dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(compat.io());
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(compat.io())) |entry| {
         const full_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
         defer allocator.free(full_path);
 

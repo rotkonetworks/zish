@@ -3,6 +3,7 @@
 // Filters are composed via agent_service.Stack() at comptime.
 
 const std = @import("std");
+const compat = @import("compat.zig");
 const svc = @import("agent_service.zig");
 const router_mod = @import("agent_router.zig");
 const log_mod = @import("agent_log.zig");
@@ -49,7 +50,7 @@ pub fn RetryFilter(comptime Inner: type) type {
 
                 // Exponential backoff: 2s, 4s
                 const delay_ms: u64 = @as(u64, 2000) * (@as(u64, 1) << @intCast(attempt - 1));
-                std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+                compat.sleep(delay_ms * std.time.ns_per_ms);
             }
         }
     };
@@ -233,16 +234,16 @@ pub fn RouterFilter(comptime Inner: type) type {
 
             const alloc = std.heap.page_allocator;
             var path_buf: [512]u8 = undefined;
-            const home = std.process.getEnvVarOwned(alloc, "HOME") catch return;
+            const home = compat.getEnvVarOwned(alloc, "HOME") catch return;
             defer alloc.free(home);
 
             const path = std.fmt.bufPrint(&path_buf, "{s}/.zish/router_log.jsonl", .{home}) catch return;
-            const file = std.fs.cwd().openFile(path, .{ .mode = .write_only }) catch |e| switch (e) {
-                error.FileNotFound => std.fs.cwd().createFile(path, .{}) catch return,
+            const file = std.Io.Dir.cwd().openFile(compat.io(), path, .{ .mode = .write_only }) catch |e| switch (e) {
+                error.FileNotFound => std.Io.Dir.cwd().createFile(compat.io(), path, .{}) catch return,
                 else => return,
             };
-            defer file.close();
-            file.seekFromEnd(0) catch return;
+            defer file.close(compat.io());
+            const file_end = file.length(compat.io()) catch return;
 
             const action_str: []const u8 = switch (rd.action) {
                 .agent => "agent",
@@ -254,7 +255,7 @@ pub fn RouterFilter(comptime Inner: type) type {
                 .large => "large",
             };
 
-            const ts: u64 = @bitCast(std.time.timestamp());
+            const ts: u64 = @bitCast(compat.timestamp());
             var buf: [4096]u8 = undefined;
             var pos: usize = 0;
             const prefix = "{\"q\":\"";
@@ -275,7 +276,7 @@ pub fn RouterFilter(comptime Inner: type) type {
                 action_str, tier_str, rd.reason(), ts,
             }) catch return;
             pos += mid.len;
-            file.writeAll(buf[0..pos]) catch {};
+            file.writePositionalAll(compat.io(), buf[0..pos], file_end) catch {};
         }
     };
 }

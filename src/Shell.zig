@@ -1,6 +1,8 @@
 const Shell = @This();
 
 const std = @import("std");
+const compat = @import("compat.zig");
+const posix = compat.posix;
 const types = @import("types.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
@@ -181,7 +183,7 @@ history: ?*hist.History,
 vim_mode: VimMode,
 history_index: i32,
 history_search_prefix_len: usize,
-original_termios: ?std.posix.termios = null,
+original_termios: ?posix.termios = null,
 aliases: std.StringHashMap([]const u8),
 variables: std.StringHashMap([]const u8),
 arrays: std.StringHashMap(std.ArrayListUnmanaged([]const u8)), // array variables
@@ -197,8 +199,8 @@ opt_pipefail: bool = false, // pipefail: pipeline fails if any command fails
 // when true, external commands exec directly instead of fork+exec (for pipeline children)
 in_pipeline: bool = false,
 // process substitution tracking
-proc_subst_pids: [16]std.posix.pid_t = [_]std.posix.pid_t{0} ** 16,
-proc_subst_fds: [16]std.posix.fd_t = [_]std.posix.fd_t{-1} ** 16,
+proc_subst_pids: [16]posix.pid_t = [_]posix.pid_t{0} ** 16,
+proc_subst_fds: [16]posix.fd_t = [_]posix.fd_t{-1} ** 16,
 proc_subst_count: usize = 0,
 // job control
 job_table: jobs.JobTable,
@@ -246,8 +248,8 @@ terminal_width: usize = 80,
 terminal_height: usize = 24,
 last_resize_time: i64 = 0,
 
-stdout_writer: std.fs.File.Writer,
-log_file: ?std.fs.File = null,
+stdout_writer: std.Io.File.Writer,
+log_file: ?std.Io.File = null,
 
 // PATH lookup cache - maps command name -> full path
 path_cache: std.StringHashMap([]const u8),
@@ -299,7 +301,7 @@ fn initWithOptions(allocator: std.mem.Allocator, load_config: bool) !*Shell {
         .functions = std.StringHashMap(*const ast.AstNode).init(allocator),
         // new modular editor
         .edit_buf = .{},
-        .term_view = editor.TermView.init(std.posix.STDERR_FILENO),
+        .term_view = editor.TermView.init(posix.STDERR_FILENO),
         .vi = .{},
         .clipboard = clipboard_buffer,
         .clipboard_len = 0,
@@ -307,7 +309,7 @@ fn initWithOptions(allocator: std.mem.Allocator, load_config: bool) !*Shell {
         .search_buffer = search_buffer,
         .search_len = 0,
         .completion = completion_mod.CompletionState.init(),
-        .stdout_writer = .init(.stdout(), writer_buffer),
+        .stdout_writer = std.Io.File.stdout().writer(compat.io(), writer_buffer),
         .path_cache = std.StringHashMap([]const u8).init(allocator),
         .job_table = jobs.JobTable.init(allocator),
         .agent = agent_mod.AgentContext.init(allocator),
@@ -461,19 +463,19 @@ fn buildPrompt(self: *Shell, buf: *[256]u8) PromptInfo {
     const mode_str = self.vi.modeIndicatorColored();
 
     // get user
-    const user = std.process.getEnvVarOwned(self.allocator, "USER") catch "?";
+    const user = compat.getEnvVarOwned(self.allocator, "USER") catch "?";
     defer if (!std.mem.eql(u8, user, "?")) self.allocator.free(user);
 
     // get hostname
-    var hostname_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
-    const hostname = std.posix.gethostname(&hostname_buf) catch "localhost";
+    var hostname_buf: [posix.HOST_NAME_MAX]u8 = undefined;
+    const hostname = posix.gethostname(&hostname_buf) catch "localhost";
 
     // get cwd
     var cwd_buf: [256]u8 = undefined;
-    const cwd = std.posix.getcwd(&cwd_buf) catch "?";
+    const cwd = posix.getcwd(&cwd_buf) catch "?";
 
     // simplify home path
-    const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch null;
+    const home = compat.getEnvVarOwned(self.allocator, "HOME") catch null;
     defer if (home) |h| self.allocator.free(h);
 
     var path_buf: [256]u8 = undefined;
@@ -499,10 +501,10 @@ fn buildPrompt(self: *Shell, buf: *[256]u8) PromptInfo {
     var branch_buf: [64]u8 = undefined;
     var branch_visible: u16 = 0;
     const branch_str = blk: {
-        const head = std.fs.cwd().openFile(".git/HEAD", .{}) catch break :blk "";
-        defer head.close();
+        const head = std.Io.Dir.cwd().openFile(compat.io(), ".git/HEAD", .{}) catch break :blk "";
+        defer head.close(compat.io());
         var hbuf: [256]u8 = undefined;
-        const n = head.read(&hbuf) catch break :blk "";
+        const n = compat.readAll(head, &hbuf) catch break :blk "";
         const content = std.mem.trim(u8, hbuf[0..n], " \t\r\n");
         if (std.mem.startsWith(u8, content, "ref: refs/heads/")) {
             const name = content[16..];
@@ -567,11 +569,11 @@ pub fn lookupCommand(self: *Shell, cmd_name: []const u8) ?[]const u8 {
     if (self.path_cache.get(cmd_name)) |cached_path| {
         // verify file still exists and is executable
         const file = if (std.fs.path.isAbsolute(cached_path))
-            std.fs.openFileAbsolute(cached_path, .{})
+            std.Io.Dir.openFileAbsolute(compat.io(), cached_path, .{})
         else
-            std.fs.cwd().openFile(cached_path, .{});
+            std.Io.Dir.cwd().openFile(compat.io(), cached_path, .{});
         if (file) |f| {
-            f.close();
+            f.close(compat.io());
             return cached_path;
         } else |_| {
             // file no longer exists, remove from cache
@@ -588,7 +590,7 @@ pub fn lookupCommand(self: *Shell, cmd_name: []const u8) ?[]const u8 {
 
 fn searchPath(self: *Shell, cmd_name: []const u8) ?[]const u8 {
     // Check shell variables first (for exported PATH), then fall back to system env
-    const path_env = self.variables.get("PATH") orelse (std.posix.getenv("PATH") orelse return null);
+    const path_env = self.variables.get("PATH") orelse (posix.getenv("PATH") orelse return null);
 
     var path_iter = std.mem.splitScalar(u8, path_env, ':');
     while (path_iter.next()) |dir| {
@@ -599,20 +601,20 @@ fn searchPath(self: *Shell, cmd_name: []const u8) ?[]const u8 {
 
         // check if file exists and is executable
         const file = (if (std.fs.path.isAbsolute(full_path))
-            std.fs.openFileAbsolute(full_path, .{})
+            std.Io.Dir.openFileAbsolute(compat.io(), full_path, .{})
         else
-            std.fs.cwd().openFile(full_path, .{})) catch {
+            std.Io.Dir.cwd().openFile(compat.io(), full_path, .{})) catch {
             self.allocator.free(full_path);
             continue;
         };
-        const stat = file.stat() catch {
-            file.close();
+        const stat = file.stat(compat.io()) catch {
+            file.close(compat.io());
             self.allocator.free(full_path);
             continue;
         };
-        file.close();
+        file.close(compat.io());
         // check execute bit
-        if ((stat.mode & 0o111) == 0) {
+        if ((stat.permissions.toMode() & 0o111) == 0) {
             self.allocator.free(full_path);
             continue;
         }
@@ -665,7 +667,7 @@ pub fn run(self: *Shell) !void {
             // expand ~ to home directory
             var path_buf: [512]u8 = undefined;
             const model_path = if (std.mem.startsWith(u8, cfg.completion_model, "~/")) blk: {
-                const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch break :blk cfg.completion_model;
+                const home = compat.getEnvVarOwned(self.allocator, "HOME") catch break :blk cfg.completion_model;
                 defer self.allocator.free(home);
                 break :blk std.fmt.bufPrint(&path_buf, "{s}{s}", .{ home, cfg.completion_model[1..] }) catch cfg.completion_model;
             } else cfg.completion_model;
@@ -729,7 +731,7 @@ const CursorStyle = enum {
 
 fn setCursorStyle(_: *Shell, style: CursorStyle) !void {
     // Write to stderr so it doesn't interfere with pipelines
-    _ = std.posix.write(std.posix.STDERR_FILENO, style.escapeCode()) catch {};
+    _ = posix.write(posix.STDERR_FILENO, style.escapeCode()) catch {};
 }
 
 const TerminalSize = struct {
@@ -748,7 +750,7 @@ fn getTerminalSize(_: *Shell) TerminalSize {
     };
 
     var ws: winsize = undefined;
-    const result = std.posix.system.ioctl(std.posix.STDOUT_FILENO, TIOCGWINSZ, @intFromPtr(&ws));
+    const result = std.posix.system.ioctl(posix.STDOUT_FILENO, TIOCGWINSZ, @intFromPtr(&ws));
 
     if (result == 0 and ws.ws_col > 0 and ws.ws_row > 0) {
         return .{ .width = ws.ws_col, .height = ws.ws_row };
@@ -757,7 +759,7 @@ fn getTerminalSize(_: *Shell) TerminalSize {
     return .{ .width = 80, .height = 24 }; // fallback if ioctl fails
 }
 
-fn handleSigwinch(_: c_int) callconv(.c) void {
+fn handleSigwinch(_: posix.SIG) callconv(.c) void {
     // atomic load to safely access from signal handler context
     const shell = @atomicLoad(?*Shell, &global_shell, .acquire);
     if (shell) |s| {
@@ -769,34 +771,34 @@ fn setupResizeHandler(self: *Shell) void {
     // atomic store to safely publish to signal handler
     @atomicStore(?*Shell, &global_shell, self, .release);
 
-    const SIGWINCH = if (@hasDecl(std.posix.SIG, "WINCH")) std.posix.SIG.WINCH else 28;
+    const SIGWINCH: posix.SIG = if (@hasField(posix.SIG, "WINCH")) .WINCH else @enumFromInt(28);
 
-    const empty_mask: std.posix.sigset_t = std.mem.zeroes(std.posix.sigset_t);
+    const empty_mask: posix.sigset_t = std.mem.zeroes(posix.sigset_t);
 
-    var act = std.posix.Sigaction{
+    var act = posix.Sigaction{
         .handler = .{ .handler = handleSigwinch },
         .mask = empty_mask,
         .flags = 0,
     };
 
-    std.posix.sigaction(SIGWINCH, &act, null);
+    posix.sigaction(SIGWINCH, &act, null);
 }
 
 /// Set up signal handlers for job control
 /// Interactive shells must ignore SIGTTIN/SIGTTOU to avoid being stopped
 /// when terminal control is temporarily given to a child process group
 fn setupJobControlSignals() void {
-    const ignore_action = std.posix.Sigaction{
-        .handler = .{ .handler = std.posix.SIG.IGN },
-        .mask = std.mem.zeroes(std.posix.sigset_t),
+    const ignore_action = posix.Sigaction{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .mask = std.mem.zeroes(posix.sigset_t),
         .flags = 0,
     };
 
     // Ignore SIGTTIN - sent when bg process reads from terminal
-    std.posix.sigaction(std.posix.SIG.TTIN, &ignore_action, null);
+    posix.sigaction(posix.SIG.TTIN, &ignore_action, null);
 
     // Ignore SIGTTOU - sent when bg process writes to terminal
-    std.posix.sigaction(std.posix.SIG.TTOU, &ignore_action, null);
+    posix.sigaction(posix.SIG.TTOU, &ignore_action, null);
 }
 
 fn handleResize(self: *Shell) !void {
@@ -809,7 +811,7 @@ fn handleResize(self: *Shell) !void {
     }
 
     // debounce rapid resizes
-    const now = std.time.milliTimestamp();
+    const now = compat.milliTimestamp();
     const debounce_ms = 50; // wait 50ms between redraws
     if (now - self.last_resize_time < debounce_ms) {
         // schedule another check by keeping the flag set
@@ -867,7 +869,7 @@ fn log(self: *Shell, last_action: Action) !void {
                 last_action,
             },
         );
-        try file.writeAll(slice);
+        try compat.writeAll(file, slice);
     }
 }
 
@@ -938,7 +940,7 @@ fn handleAction(self: *Shell, action: Action) !void {
 
             // send SIGTSTP to ourselves - we'll be stopped here
             const pid = std.os.linux.getpid();
-            _ = std.posix.kill(pid, std.posix.SIG.TSTP) catch {};
+            _ = posix.kill(pid, posix.SIG.TSTP) catch {};
 
             // === EXECUTION RESUMES HERE AFTER SIGCONT ===
             // the parent shell may have changed terminal settings while we
@@ -948,7 +950,7 @@ fn handleAction(self: *Shell, action: Action) !void {
             self.enableRawMode() catch {};
 
             // also update our cached shell terminal modes for job control
-            self.job_table.shell_tmodes = std.posix.tcgetattr(std.posix.STDIN_FILENO) catch self.job_table.shell_tmodes;
+            self.job_table.shell_tmodes = posix.tcgetattr(posix.STDIN_FILENO) catch self.job_table.shell_tmodes;
 
             // redraw the prompt
             try self.stdout().writeAll("\n");
@@ -1210,7 +1212,7 @@ fn handleAction(self: *Shell, action: Action) !void {
                 if (command.len > 0) {
                     // ? translate mode: natural language -> shell command
                     if (command[0] == '?' and command.len > 1) {
-                        const nl_query = std.mem.trimLeft(u8, command[1..], " \t");
+                        const nl_query = std.mem.trimStart(u8, command[1..], " \t");
                         if (nl_query.len > 0) {
                             try self.handleTranslateQuery(nl_query);
                             self.clearCommand();
@@ -1232,9 +1234,9 @@ fn handleAction(self: *Shell, action: Action) !void {
                         command;
                     defer if (processed_cmd.ptr != command.ptr) self.allocator.free(processed_cmd);
 
-                    const start_ts = std.time.timestamp();
+                    const start_ts = compat.timestamp();
                     self.last_exit_code = try self.executeCommand(processed_cmd);
-                    const elapsed = std.time.timestamp() - start_ts;
+                    const elapsed = compat.timestamp() - start_ts;
 
                     // Show elapsed time for long-running commands (>1s)
                     if (elapsed > 0) {
@@ -1824,7 +1826,7 @@ fn handleTranslateQuery(self: *Shell, nl_query: []const u8) !void {
                 else => {},
             }
         }
-        if (!done) std.Thread.sleep(20 * std.time.ns_per_ms);
+        if (!done) compat.sleep(20 * std.time.ns_per_ms);
     }
 
     // Clear thinking indicator
@@ -1876,18 +1878,18 @@ fn handleTranslateQuery(self: *Shell, nl_query: []const u8) !void {
 /// Log a ? translate query and result for training data.
 fn logTranslation(query: []const u8, result: []const u8) void {
     var path_buf: [512]u8 = undefined;
-    const home = std.process.getEnvVarOwned(std.heap.page_allocator, "HOME") catch return;
+    const home = compat.getEnvVarOwned(std.heap.page_allocator, "HOME") catch return;
     defer std.heap.page_allocator.free(home);
     const path = std.fmt.bufPrint(&path_buf, "{s}/.zish/translate_log.jsonl", .{home}) catch return;
 
-    const file = std.fs.cwd().openFile(path, .{ .mode = .write_only }) catch |e| switch (e) {
-        error.FileNotFound => std.fs.cwd().createFile(path, .{}) catch return,
+    const file = std.Io.Dir.cwd().openFile(compat.io(), path, .{ .mode = .write_only }) catch |e| switch (e) {
+        error.FileNotFound => std.Io.Dir.cwd().createFile(compat.io(), path, .{}) catch return,
         else => return,
     };
-    defer file.close();
-    file.seekFromEnd(0) catch return;
+    defer file.close(compat.io());
+    const end_pos = file.length(compat.io()) catch return;
 
-    const ts: u64 = @bitCast(std.time.timestamp());
+    const ts: u64 = @bitCast(compat.timestamp());
     var buf: [4096]u8 = undefined;
     var pos: usize = 0;
     pos += logCopy(&buf, pos, "{\"query\":\"");
@@ -1897,7 +1899,7 @@ fn logTranslation(query: []const u8, result: []const u8) void {
     pos += logCopy(&buf, pos, "\",\"ts\":");
     pos += (std.fmt.bufPrint(buf[pos..], "{d}", .{ts}) catch return).len;
     pos += logCopy(&buf, pos, "}\n");
-    _ = file.write(buf[0..pos]) catch {};
+    file.writePositionalAll(compat.io(), buf[0..pos], end_pos) catch {};
 }
 
 /// Log every executed command with exit code and duration for training data.
@@ -1905,21 +1907,21 @@ fn logCommandExecution(command: []const u8, exit_code: u8, elapsed: i64) void {
     if (command.len == 0 or command.len > 2048) return;
 
     var path_buf: [512]u8 = undefined;
-    const home = std.process.getEnvVarOwned(std.heap.page_allocator, "HOME") catch return;
+    const home = compat.getEnvVarOwned(std.heap.page_allocator, "HOME") catch return;
     defer std.heap.page_allocator.free(home);
     const path = std.fmt.bufPrint(&path_buf, "{s}/.zish/command_log.jsonl", .{home}) catch return;
 
-    const file = std.fs.cwd().openFile(path, .{ .mode = .write_only }) catch |e| switch (e) {
-        error.FileNotFound => std.fs.cwd().createFile(path, .{}) catch return,
+    const file = std.Io.Dir.cwd().openFile(compat.io(), path, .{ .mode = .write_only }) catch |e| switch (e) {
+        error.FileNotFound => std.Io.Dir.cwd().createFile(compat.io(), path, .{}) catch return,
         else => return,
     };
-    defer file.close();
-    file.seekFromEnd(0) catch return;
+    defer file.close(compat.io());
+    const end_pos = file.length(compat.io()) catch return;
 
     var cwd_buf: [256]u8 = undefined;
-    const cwd = std.posix.getcwd(&cwd_buf) catch "?";
+    const cwd = posix.getcwd(&cwd_buf) catch "?";
 
-    const ts: u64 = @bitCast(std.time.timestamp());
+    const ts: u64 = @bitCast(compat.timestamp());
     var buf: [4096]u8 = undefined;
     var pos: usize = 0;
     pos += logCopy(&buf, pos, "{\"cmd\":\"");
@@ -1933,7 +1935,7 @@ fn logCommandExecution(command: []const u8, exit_code: u8, elapsed: i64) void {
     pos += logCopy(&buf, pos, ",\"ts\":");
     pos += (std.fmt.bufPrint(buf[pos..], "{d}", .{ts}) catch return).len;
     pos += logCopy(&buf, pos, "}\n");
-    _ = file.write(buf[0..pos]) catch {};
+    file.writePositionalAll(compat.io(), buf[0..pos], end_pos) catch {};
 }
 
 /// Shared helpers for JSON log writing.
@@ -2066,7 +2068,7 @@ const ShellDrainHandler = struct {
         try self.writer.writeAll(" \x1b[90m[\x1b[32my\x1b[90m/\x1b[31mn\x1b[90m/\x1b[33ma\x1b[90mlways]\x1b[0m ");
         try self.writer.flush();
         var resp: [1]u8 = undefined;
-        const n = std.posix.read(std.posix.STDIN_FILENO, &resp) catch 0;
+        const n = posix.read(posix.STDIN_FILENO, &resp) catch 0;
         if (n > 0 and (resp[0] == 'y' or resp[0] == 'Y')) {
             _ = self.shell.agent.queues.request.push(.confirm_response, "y");
             try self.writer.writeAll("y\n");
@@ -2151,15 +2153,15 @@ fn drainBulletin(self: *Shell, writer: anytype) !void {
 /// Non-blocking input read using poll. Returns .none if no input available within timeout.
 /// Used when agent is busy so we can interleave output draining with input reading.
 fn pollNextAction(self: *Shell) !Action {
-    const stdin_fd = std.posix.STDIN_FILENO;
-    var fds = [_]std.posix.pollfd{.{
+    const stdin_fd = posix.STDIN_FILENO;
+    var fds = [_]posix.pollfd{.{
         .fd = stdin_fd,
-        .events = std.posix.POLL.IN,
+        .events = posix.POLL.IN,
         .revents = 0,
     }};
 
     // 50ms timeout — responsive enough for streaming, not too CPU-hot
-    const poll_result = std.posix.poll(&fds, 50) catch return .none;
+    const poll_result = posix.poll(&fds, 50) catch return .none;
     if (poll_result == 0) return .none; // timeout, no input
 
     // input available, read normally
@@ -2168,7 +2170,7 @@ fn pollNextAction(self: *Shell) !Action {
 
 fn readNextAction(self: *Shell) !Action {
     var temp_buf: [1]u8 = undefined;
-    const count = try std.fs.File.stdin().read(temp_buf[0..]);
+    const count = try compat.readAll(std.Io.File.stdin(), temp_buf[0..]);
     const char = temp_buf[0];
 
     if (count == 0) return .none;
@@ -2272,7 +2274,7 @@ fn normalModeAction(char: u8) Action {
 }
 
 fn escapeSequenceAction(self: *Shell) !Action {
-    const stdin_fd = std.posix.STDIN_FILENO;
+    const stdin_fd = posix.STDIN_FILENO;
     var temp_buf: [2]u8 = undefined;
 
     // Set non-blocking temporarily via system call
@@ -2324,7 +2326,7 @@ fn escapeSequenceAction(self: *Shell) !Action {
 }
 
 /// consume remaining bytes of an escape sequence until terminator (letter or ~)
-fn consumeEscapeSequence(stdin_fd: std.posix.fd_t) void {
+fn consumeEscapeSequence(stdin_fd: posix.fd_t) void {
     var buf: [1]u8 = undefined;
     var iterations: u8 = 0;
     while (iterations < 32) : (iterations += 1) {
@@ -2336,7 +2338,7 @@ fn consumeEscapeSequence(stdin_fd: std.posix.fd_t) void {
     }
 }
 
-fn readTildeSequence(stdin_fd: std.posix.fd_t, flags: usize, action: Action) !Action {
+fn readTildeSequence(stdin_fd: posix.fd_t, flags: usize, action: Action) !Action {
     var buf: [1]u8 = undefined;
     const result = std.posix.system.read(stdin_fd, &buf, 1);
     if (result <= 0) return .none;
@@ -2345,7 +2347,7 @@ fn readTildeSequence(stdin_fd: std.posix.fd_t, flags: usize, action: Action) !Ac
     return .none;
 }
 
-fn handleExtendedEscapeSequence(stdin_fd: std.posix.fd_t, flags: usize) !Action {
+fn handleExtendedEscapeSequence(stdin_fd: posix.fd_t, flags: usize) !Action {
     var temp_buf: [1]u8 = undefined;
     _ = flags;
 
@@ -2417,7 +2419,7 @@ fn handleExtendedEscapeSequence(stdin_fd: std.posix.fd_t, flags: usize) !Action 
     }
 }
 
-fn handleBracketedPaste(stdin_fd: std.posix.fd_t, flags: usize) !Action {
+fn handleBracketedPaste(stdin_fd: posix.fd_t, flags: usize) !Action {
     _ = flags;
 
     // Sequence is ESC[200~ or ESC[201~
@@ -2456,14 +2458,14 @@ fn getSearchModeAction(self: *Shell, char: u8) Action {
 }
 
 pub fn enableRawMode(self: *Shell) !void {
-    const stdin_fd = std.posix.STDIN_FILENO;
+    const stdin_fd = posix.STDIN_FILENO;
 
     // use saved original if available (prevents child processes from
     // corrupting our terminal state), otherwise read current state
     var termios = if (self.original_termios) |orig|
         orig
     else blk: {
-        const current = std.posix.tcgetattr(stdin_fd) catch return;
+        const current = posix.tcgetattr(stdin_fd) catch return;
         self.original_termios = current;
         break :blk current;
     };
@@ -2479,23 +2481,23 @@ pub fn enableRawMode(self: *Shell) !void {
     termios.iflag.IXON = false; // disable Ctrl+S/Ctrl+Q flow control
 
     // set minimum characters to read and timeout
-    termios.cc[@intFromEnum(std.posix.V.MIN)] = 1; // read 1 char at a time
-    termios.cc[@intFromEnum(std.posix.V.TIME)] = 0; // no timeout
+    termios.cc[@intFromEnum(posix.V.MIN)] = 1; // read 1 char at a time
+    termios.cc[@intFromEnum(posix.V.TIME)] = 0; // no timeout
 
     // apply the changes
-    std.posix.tcsetattr(stdin_fd, .NOW, termios) catch return;
+    posix.tcsetattr(stdin_fd, .NOW, termios) catch return;
 
     // enable bracketed paste mode (write to stderr to avoid capture by redirects)
-    _ = std.posix.write(std.posix.STDERR_FILENO, "\x1b[?2004h") catch {};
+    _ = posix.write(posix.STDERR_FILENO, "\x1b[?2004h") catch {};
 }
 
 pub fn disableRawMode(self: *Shell) void {
     // disable bracketed paste mode (write to stderr to avoid capture by redirects)
-    _ = std.posix.write(std.posix.STDERR_FILENO, "\x1b[?2004l") catch {};
+    _ = posix.write(posix.STDERR_FILENO, "\x1b[?2004l") catch {};
 
     if (self.original_termios) |original| {
-        const stdin_fd = std.posix.STDIN_FILENO;
-        std.posix.tcsetattr(stdin_fd, .NOW, original) catch {};
+        const stdin_fd = posix.STDIN_FILENO;
+        posix.tcsetattr(stdin_fd, .NOW, original) catch {};
     }
 }
 
@@ -2600,7 +2602,7 @@ fn loadHistoryEntry(self: *Shell, h: *hist.History) !void {
 
 fn loadKeybindings(self: *Shell) void {
     var path_buf: [512]u8 = undefined;
-    const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch return;
+    const home = compat.getEnvVarOwned(self.allocator, "HOME") catch return;
     defer self.allocator.free(home);
     const path = std.fmt.bufPrint(&path_buf, "{s}/.zish/keybindings.json", .{home}) catch return;
     self.keybindings = input_mod.KeyBindings.loadFromFile(path);
@@ -2608,7 +2610,7 @@ fn loadKeybindings(self: *Shell) void {
 
 fn loadConfig(self: *Shell) !void {
     // get home directory
-    const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch return;
+    const home = compat.getEnvVarOwned(self.allocator, "HOME") catch return;
     defer self.allocator.free(home);
 
     // construct ~/.zishrc path
@@ -2616,7 +2618,7 @@ fn loadConfig(self: *Shell) !void {
     defer self.allocator.free(config_path);
 
     // check if file exists
-    std.fs.cwd().access(config_path, .{}) catch return;
+    std.Io.Dir.cwd().access(compat.io(), config_path, .{}) catch return;
 
     // source the config file using the source builtin
     const source_cmd = try std.fmt.allocPrint(self.allocator, "source {s}", .{config_path});
@@ -2681,7 +2683,7 @@ pub fn setArray(self: *Shell, name: []const u8, values: []const []const u8) !voi
     const name_copy = try self.allocator.dupe(u8, name);
     errdefer self.allocator.free(name_copy);
 
-    var arr = std.ArrayListUnmanaged([]const u8){};
+    var arr: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer {
         for (arr.items) |elem| self.allocator.free(elem);
         arr.deinit(self.allocator);
@@ -2724,7 +2726,7 @@ pub fn getArrayLen(self: *Shell, name: []const u8) ?usize {
 pub fn setArrayElement(self: *Shell, name: []const u8, index: usize, value: []const u8) !void {
     const arr_ptr = self.arrays.getPtr(name) orelse {
         // create new array with this element
-        var arr = std.ArrayListUnmanaged([]const u8){};
+        var arr: std.ArrayListUnmanaged([]const u8) = .empty;
         errdefer {
             for (arr.items) |elem| self.allocator.free(elem);
             arr.deinit(self.allocator);
@@ -2840,7 +2842,7 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
     // Tilde expansion at start of input
     if (input.len > 0 and input[0] == '~') {
         if (input.len == 1 or input[1] == '/') {
-            const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch "";
+            const home = compat.getEnvVarOwned(self.allocator, "HOME") catch "";
             defer if (home.len > 0) self.allocator.free(home);
             try result.appendSlice(self.allocator, home);
             i = 1; // skip the ~
@@ -2913,7 +2915,7 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
 
                     // Execute command and capture output
                     const cmd_output = self.executeCommandAndCapture(command) catch "";
-                    try result.appendSlice(self.allocator, std.mem.trimRight(u8, cmd_output, "\n\r"));
+                    try result.appendSlice(self.allocator, std.mem.trimEnd(u8, cmd_output, "\n\r"));
                     continue;
                 } else {
                     // Unmatched parens, treat as regular text
@@ -2960,7 +2962,7 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
                         // regular variable length
                         if (self.variables.get(var_name)) |value| {
                             var_len = value.len;
-                        } else if (std.process.getEnvVarOwned(self.allocator, var_name)) |val| {
+                        } else if (compat.getEnvVarOwned(self.allocator, var_name)) |val| {
                             var_len = val.len;
                             self.allocator.free(val);
                         } else |_| {}
@@ -3021,7 +3023,7 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
                     if (self.variables.get(var_name)) |value| {
                         var_value = value;
                     } else {
-                        const env_value = std.process.getEnvVarOwned(self.allocator, var_name) catch null;
+                        const env_value = compat.getEnvVarOwned(self.allocator, var_name) catch null;
                         if (env_value) |val| {
                             owned_value = val;
                             var_value = val;
@@ -3213,7 +3215,7 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
                         try result.appendSlice(self.allocator, value);
                     } else {
                         // Try environment variable
-                        const env_value = std.process.getEnvVarOwned(self.allocator, var_name) catch null;
+                        const env_value = compat.getEnvVarOwned(self.allocator, var_name) catch null;
                         if (env_value) |val| {
                             defer self.allocator.free(val);
                             try result.appendSlice(self.allocator, val);
@@ -3245,7 +3247,7 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
 
                 // Execute command and capture output
                 const cmd_output = self.executeCommandAndCapture(command) catch "";
-                try result.appendSlice(self.allocator, std.mem.trimRight(u8, cmd_output, "\n\r"));
+                try result.appendSlice(self.allocator, std.mem.trimEnd(u8, cmd_output, "\n\r"));
             } else {
                 // Unmatched backtick, treat as regular text
                 try result.append(self.allocator, '`');
@@ -3357,7 +3359,7 @@ fn executeCommandAndCapture(self: *Shell, command: []const u8) ![]const u8 {
         // pwd builtin
         if (std.mem.eql(u8, trimmed_cmd, "pwd")) {
             var buf: [4096]u8 = undefined;
-            const cwd = std.posix.getcwd(&buf) catch return self.allocator.dupe(u8, "");
+            const cwd = posix.getcwd(&buf) catch return self.allocator.dupe(u8, "");
             return self.allocator.dupe(u8, cwd);
         }
 
@@ -3398,10 +3400,9 @@ fn executeCommandAndCapture(self: *Shell, command: []const u8) ![]const u8 {
 
 fn executeExternalAndCapture(self: *Shell, command: []const u8) ![]const u8 {
     // Execute external command and capture output
-    const result = try std.process.Child.run(.{
-        .allocator = self.allocator,
+    const result = try std.process.run(self.allocator, compat.io(), .{
         .argv = &[_][]const u8{ "/bin/sh", "-c", command },
-        .max_output_bytes = 4096,
+        .stdout_limit = .limited(4096),
     });
     defer self.allocator.free(result.stderr);
 
@@ -3495,7 +3496,7 @@ fn executeExternal(self: *Shell, command: []const u8) !u8 {
 
     // execute with PATH resolution
     // restore terminal to normal mode so child can handle signals properly
-    const is_tty = std.posix.isatty(std.posix.STDIN_FILENO);
+    const is_tty = posix.isatty(posix.STDIN_FILENO);
     if (is_tty) {
         self.disableRawMode();
     }
@@ -3503,17 +3504,15 @@ fn executeExternal(self: *Shell, command: []const u8) !u8 {
         self.enableRawMode() catch {};
     };
 
-    var child = std.process.Child.init(args.items, self.allocator);
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
-    child.stdin_behavior = .Inherit;
-
-    // inherit full environment from parent
-    child.env_map = null; // null means inherit all from parent
-
     // spawn child first, THEN ignore SIGINT in parent
     // (child must not inherit SIG_IGN or it can't be interrupted)
-    child.spawn() catch |err| switch (err) {
+    // environment is inherited from parent by default
+    var child = std.process.spawn(compat.io(), .{
+        .argv = args.items,
+        .stdout = .inherit,
+        .stderr = .inherit,
+        .stdin = .inherit,
+    }) catch |err| switch (err) {
         error.FileNotFound => {
             try self.stdout().print("zish: {s}: command not found\n", .{args.items[0]});
             return 127;
@@ -3522,21 +3521,21 @@ fn executeExternal(self: *Shell, command: []const u8) !u8 {
     };
 
     // now ignore SIGINT in shell while child runs
-    var old_sigint: std.posix.Sigaction = undefined;
-    const ignore_action = std.posix.Sigaction{
-        .handler = .{ .handler = std.posix.SIG.IGN },
-        .mask = std.mem.zeroes(std.posix.sigset_t),
+    var old_sigint: posix.Sigaction = undefined;
+    const ignore_action = posix.Sigaction{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .mask = std.mem.zeroes(posix.sigset_t),
         .flags = 0,
     };
-    std.posix.sigaction(std.posix.SIG.INT, &ignore_action, &old_sigint);
-    defer std.posix.sigaction(std.posix.SIG.INT, &old_sigint, null);
+    posix.sigaction(posix.SIG.INT, &ignore_action, &old_sigint);
+    defer posix.sigaction(posix.SIG.INT, &old_sigint, null);
 
-    const term = child.wait();
+    const term = try child.wait(compat.io());
     return switch (term) {
-        .Exited => |code| code,
-        .Signal => |sig| @as(u8, @intCast(sig + 128)),
-        .Stopped => |sig| @as(u8, @intCast(sig + 128)),
-        .Unknown => |code| @as(u8, @intCast(code)),
+        .exited => |code| code,
+        .signal => |sig| @as(u8, @intCast(@intFromEnum(sig) + 128)),
+        .stopped => |sig| @as(u8, @intCast(@intFromEnum(sig) + 128)),
+        .unknown => |code| @as(u8, @intCast(code)),
     };
 }
 
@@ -3643,14 +3642,14 @@ fn preprocessHeredoc(allocator: std.mem.Allocator, command: []const u8, delimite
     const suffix = std.mem.trim(u8, command[suffix_start..], " \t\r\n");
 
     // Write content to a temp file (use timestamp for uniqueness)
-    const ts = std.time.milliTimestamp();
+    const ts = compat.milliTimestamp();
     var path_buf: [64]u8 = undefined;
     const tmp_path = std.fmt.bufPrint(&path_buf, "/tmp/zish_heredoc_{d}", .{ts}) catch return error.OutOfMemory;
 
-    const file = std.fs.createFileAbsolute(tmp_path, .{ .truncate = true }) catch return error.FileError;
-    defer file.close();
-    file.writeAll(content) catch return error.WriteError;
-    file.writeAll("\n") catch return error.WriteError;
+    const file = std.Io.Dir.createFileAbsolute(compat.io(), tmp_path, .{ .truncate = true }) catch return error.FileError;
+    defer file.close(compat.io());
+    compat.writeAll(file, content) catch return error.WriteError;
+    compat.writeAll(file, "\n") catch return error.WriteError;
 
     // Build new command: prefix < /tmp/zish_heredoc_TS; suffix
     const need_suffix = suffix.len > 0;
@@ -3737,7 +3736,7 @@ fn expandBracesWithDepth(allocator: std.mem.Allocator, input: []const u8, depth:
     const brace_content = input[start + 1 .. end];
 
     // parse brace content
-    var expansions = std.ArrayListUnmanaged([]const u8){};
+    var expansions: std.ArrayListUnmanaged([]const u8) = .empty;
     defer {
         for (expansions.items) |exp| allocator.free(exp);
         expansions.deinit(allocator);
@@ -3807,7 +3806,7 @@ fn expandBracesWithDepth(allocator: std.mem.Allocator, input: []const u8, depth:
     }
 
     // build results with prefix and suffix, then recursively expand
-    var results = std.ArrayListUnmanaged([]const u8){};
+    var results: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer {
         for (results.items) |r| allocator.free(r);
         results.deinit(allocator);
@@ -3900,7 +3899,7 @@ fn stripSuffix(str: []const u8, pattern: []const u8, greedy: bool) []const u8 {
 fn patternReplace(allocator: std.mem.Allocator, str: []const u8, pattern: []const u8, replacement: []const u8, replace_all: bool) ![]const u8 {
     if (str.len == 0 or pattern.len == 0) return try allocator.dupe(u8, str);
 
-    var result = std.ArrayListUnmanaged(u8){};
+    var result: std.ArrayListUnmanaged(u8) = .empty;
     defer result.deinit(allocator);
 
     var i: usize = 0;

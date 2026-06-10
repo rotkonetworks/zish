@@ -1,8 +1,9 @@
 // history_log.zig - append-only encrypted log for history persistence
 const std = @import("std");
+const compat = @import("compat.zig");
 const crypto_mod = @import("crypto.zig");
-const fs = std.fs;
-const posix = std.posix;
+const fs = std.Io.Dir;
+const posix = compat.posix;
 
 const CryptoContext = crypto_mod.CryptoContext;
 
@@ -124,7 +125,7 @@ pub const LogWriter = struct {
         errdefer allocator.free(log_dir);
 
         // ensure directory exists
-        fs.makeDirAbsolute(log_dir) catch |err| {
+        fs.createDirAbsolute(compat.io(), log_dir, .default_dir) catch |err| {
             if (err != error.PathAlreadyExists) return err;
         };
 
@@ -158,7 +159,7 @@ pub const LogWriter = struct {
             .entry_len = 0, // placeholder
             .instance = self.instance_id,
             .sequence = self.sequence,
-            .timestamp = if (entry.timestamp > 0) entry.timestamp else @intCast(std.time.timestamp()),
+            .timestamp = if (entry.timestamp > 0) entry.timestamp else @intCast(compat.timestamp()),
             .padding = [_]u8{0} ** 6,
         };
 
@@ -189,29 +190,29 @@ pub const LogWriter = struct {
         defer self.allocator.free(log_path);
 
         // open or create file in append mode (atomic)
-        const file = fs.openFileAbsolute(log_path, .{
+        const file = fs.openFileAbsolute(compat.io(), log_path, .{
             .mode = .write_only,
         }) catch |err| blk: {
             if (err == error.FileNotFound) {
                 // create the file
-                break :blk try fs.createFileAbsolute(log_path, .{
-                    .mode = 0o600,
+                break :blk try fs.createFileAbsolute(compat.io(), log_path, .{
+                    .permissions = .fromMode(0o600),
                 });
             }
             return err;
         };
-        defer file.close();
+        defer file.close(compat.io());
 
         // seek to end
-        try file.seekFromEnd(0);
+        const end_pos = try file.length(compat.io());
 
         // write header + encrypted data atomically
         const header_bytes = std.mem.asBytes(&header);
-        try file.writeAll(header_bytes);
-        try file.writeAll(encrypted);
+        try file.writePositionalAll(compat.io(), header_bytes, end_pos);
+        try file.writePositionalAll(compat.io(), encrypted, end_pos + header_bytes.len);
 
         // fsync for durability
-        try file.sync();
+        try file.sync(compat.io());
 
         // increment sequence
         self.sequence += 1;
@@ -297,21 +298,20 @@ pub const LogReader = struct {
     }
 
     fn readFileFrom(self: *LogReader, path: []const u8, entries: *std.ArrayList(EntryData), start_offset: u64, end_offset: *u64) !void {
-        const file = try fs.openFileAbsolute(path, .{});
-        defer file.close();
+        const file = try fs.openFileAbsolute(compat.io(), path, .{});
+        defer file.close(compat.io());
 
-        if (start_offset > 0) {
-            try file.seekTo(start_offset);
-        }
+        var pos: u64 = start_offset;
 
         while (true) {
             // read header
             var header: EntryHeader = undefined;
             const header_bytes = std.mem.asBytes(&header);
-            const n = file.readAll(header_bytes) catch |err| {
+            const n = file.readPositionalAll(compat.io(), header_bytes, pos) catch |err| {
                 if (err == error.EndOfStream) break;
                 return err;
             };
+            pos += n;
 
             if (n == 0) break; // eof
             if (n < @sizeOf(EntryHeader)) break; // truncated file
@@ -323,7 +323,8 @@ pub const LogReader = struct {
             const encrypted = try self.allocator.alloc(u8, header.entry_len);
             defer self.allocator.free(encrypted);
 
-            const data_read = try file.readAll(encrypted);
+            const data_read = try file.readPositionalAll(compat.io(), encrypted, pos);
+            pos += data_read;
             if (data_read < header.entry_len) break; // truncated entry
 
             // create AAD same as during encryption (manual serialization)
@@ -352,7 +353,7 @@ pub const LogReader = struct {
             try entries.append(self.allocator, entry);
         }
 
-        end_offset.* = file.getPos() catch start_offset;
+        end_offset.* = pos;
     }
 };
 

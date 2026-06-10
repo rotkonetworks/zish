@@ -16,7 +16,8 @@
 //   - GPU resources (future) isolated in child address space
 
 const std = @import("std");
-const posix = std.posix;
+const compat = @import("../compat.zig");
+const posix = compat.posix;
 
 pub const gguf = @import("gguf.zig");
 pub const gpu_mod = @import("gpu.zig");
@@ -71,7 +72,7 @@ pub const ForkServer = struct {
 
             // Auto-terminate when parent dies (prevents zombie/orphan VRAM leaks)
             const PR_SET_PDEATHSIG = 1;
-            _ = std.os.linux.prctl(@intCast(PR_SET_PDEATHSIG), @as(usize, std.os.linux.SIG.TERM), 0, 0, 0);
+            _ = std.os.linux.prctl(@intCast(PR_SET_PDEATHSIG), @intFromEnum(std.os.linux.SIG.TERM), 0, 0, 0);
 
             // Redirect stdout/stderr to /dev/null so inference noise
             // doesn't corrupt the terminal
@@ -214,12 +215,12 @@ fn childMain(req_fd: posix.fd_t, resp_fd: posix.fd_t, model_path: []const u8) vo
     const alloc = std.heap.page_allocator;
 
     // Debug log for diagnosing model load failures
-    const dbg = std.fs.createFileAbsolute("/tmp/zish_inference.log", .{ .truncate = true }) catch null;
-    defer if (dbg) |f| f.close();
+    const dbg = std.Io.Dir.createFileAbsolute(compat.io(), "/tmp/zish_inference.log", .{ .truncate = true }) catch null;
+    defer if (dbg) |f| f.close(compat.io());
 
     const logMsg = struct {
-        fn write(f: ?std.fs.File, msg: []const u8) void {
-            if (f) |file| file.writeAll(msg) catch {};
+        fn write(f: ?std.Io.File, msg: []const u8) void {
+            if (f) |file| compat.writeAll(file, msg) catch {};
         }
     }.write;
 
@@ -433,7 +434,7 @@ fn handleRequestWithDopamine(
     defer alloc.free(tokens);
 
     // Batch prefill — process all prompt tokens in one pass (no per-token GPU dispatch)
-    var prefill_timer = std.time.Timer.start() catch null;
+    var prefill_timer = compat.Timer.start() catch null;
     var total_surprise: f32 = 0;
 
     // Reset position for fresh context
@@ -498,7 +499,7 @@ fn handleRequestWithDopamine(
     const all_temps = [4]f32{ 0.0, 0.3, 0.5, 0.8 };
     const temps = all_temps[0..N_CAND];
 
-    var best_tokens: std.ArrayList(tokenizer.Token) = .{};
+    var best_tokens: std.ArrayList(tokenizer.Token) = .empty;
     defer best_tokens.deinit(alloc);
     var best_score: f32 = -std.math.inf(f32);
 
@@ -548,7 +549,7 @@ fn handleRequestWithDopamine(
 
         var next_tok: tokenizer.Token = sampleToken(state.output, params, recent_ring[0..@min(recent_count.*, 64)]);
 
-        var cand: std.ArrayList(tokenizer.Token) = .{};
+        var cand: std.ArrayList(tokenizer.Token) = .empty;
         var total_logprob: f32 = 0;
 
         for (0..max_tokens) |_| {
@@ -606,10 +607,10 @@ fn handleRequestWithDopamine(
 
     // Log timing
     {
-        const dbg = std.fs.openFileAbsolute("/tmp/zish_inference.log", .{ .mode = .write_only }) catch null;
+        const dbg = std.Io.Dir.openFileAbsolute(compat.io(), "/tmp/zish_inference.log", .{ .mode = .write_only }) catch null;
         if (dbg) |f| {
-            defer f.close();
-            f.seekFromEnd(0) catch {};
+            defer f.close(compat.io());
+            const end_pos = f.length(compat.io()) catch 0;
             var buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "timing: prefill={d}ms/{d}tok gen={d}ms/{d}tok x{d}\n", .{
                 prefill_ns / std.time.ns_per_ms,
@@ -618,7 +619,7 @@ fn handleRequestWithDopamine(
                 best_tokens.items.len,
                 N_CAND,
             }) catch "?";
-            f.writeAll(msg) catch {};
+            f.writePositionalAll(compat.io(), msg, end_pos) catch {};
         }
     }
 
@@ -726,7 +727,7 @@ fn handleRequest(
     pos.* = 0;
     recent_count.* = 0;
 
-    var timer = std.time.Timer.start() catch null;
+    var timer = compat.Timer.start() catch null;
 
     // Prefill prompt tokens
     for (tokens) |t| {
@@ -749,7 +750,7 @@ fn handleRequest(
     var next_tok: tokenizer.Token = sampleToken(state.output, params, recent_ring[0..lookback]);
 
     // Generate response tokens
-    var output_tokens: std.ArrayList(tokenizer.Token) = .{};
+    var output_tokens: std.ArrayList(tokenizer.Token) = .empty;
     defer output_tokens.deinit(alloc);
 
     for (0..max_tokens) |_| {
@@ -770,10 +771,10 @@ fn handleRequest(
 
     // Log timing
     {
-        const dbg = std.fs.openFileAbsolute("/tmp/zish_inference.log", .{ .mode = .write_only }) catch null;
+        const dbg = std.Io.Dir.openFileAbsolute(compat.io(), "/tmp/zish_inference.log", .{ .mode = .write_only }) catch null;
         if (dbg) |f| {
-            defer f.close();
-            f.seekFromEnd(0) catch {};
+            defer f.close(compat.io());
+            const end_pos = f.length(compat.io()) catch 0;
             var buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "timing: prefill={d}ms ({d} toks) gen={d}ms ({d} toks)\n", .{
                 prefill_ns / std.time.ns_per_ms,
@@ -781,7 +782,7 @@ fn handleRequest(
                 (total_ns - prefill_ns) / std.time.ns_per_ms,
                 output_tokens.items.len,
             }) catch "?";
-            f.writeAll(msg) catch {};
+            f.writePositionalAll(compat.io(), msg, end_pos) catch {};
         }
     }
 
@@ -825,7 +826,7 @@ fn generateTokens(
     var next_tok: Token = sampleToken(state.output, params, &.{});
 
     // Generate with repetition penalty lookback
-    var output_tokens: std.ArrayList(Token) = .{};
+    var output_tokens: std.ArrayList(Token) = .empty;
     defer output_tokens.deinit(alloc);
 
     // Ring buffer for recent tokens (lookback 64, adapted from nanochat)
@@ -1041,7 +1042,7 @@ pub const InferenceContext = struct {
         self.reset();
 
         // Prefill benchmark
-        var timer = std.time.Timer.start() catch return .{ .prefill_tps = 0, .generate_tps = 0, .gpu = self.gpu_ctx != null };
+        var timer = compat.Timer.start() catch return .{ .prefill_tps = 0, .generate_tps = 0, .gpu = self.gpu_ctx != null };
         for (tokens, 0..) |t, i| {
             _ = self.transformer.forward(&self.state, t, i);
             if (i == 0) {
@@ -1157,7 +1158,7 @@ fn sampleToken(logits: []f32, params: SampleParams, recent_tokens: []const Token
         return @intCast(best_idx);
     }
 
-    var rng = std.Random.DefaultPrng.init(@intCast(std.time.nanoTimestamp()));
+    var rng = std.Random.DefaultPrng.init(@intCast(compat.nanoTimestamp()));
 
     if (params.top_k > 0 and params.top_k < logits.len) {
         // Top-k sampling: find k largest logits, sample from those only

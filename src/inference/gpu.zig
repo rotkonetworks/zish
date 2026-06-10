@@ -23,6 +23,7 @@
 //   RMSNorm, LayerNorm, SiLU/GLU, sync accumulators, trace shifts, RoPE, softmax
 
 const std = @import("std");
+const compat = @import("../compat.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -356,7 +357,7 @@ pub const GpuContext = struct {
     /// prefer_igpu: select integrated GPU (shared memory, lower latency for small ops)
     pub fn init(alloc: Allocator, prefer_igpu: bool) ?GpuContext {
         // Allow disabling GPU for benchmarking/debugging
-        if (std.posix.getenv("ZISH_NO_GPU")) |_| return null;
+        if (compat.posix.getenv("ZISH_NO_GPU")) |_| return null;
 
         var self = GpuContext{ .allocator = alloc };
 
@@ -1373,17 +1374,17 @@ pub const GpuContext = struct {
 /// Load pre-compiled SPIR-V from ~/.zish/shaders/<name>.spv
 pub fn loadShaderFile(alloc: Allocator, name: []const u8) ?[]align(4) const u8 {
     var path_buf: [256]u8 = undefined;
-    const home = std.posix.getenv("HOME") orelse return null;
+    const home = compat.posix.getenv("HOME") orelse return null;
     const path = std.fmt.bufPrint(&path_buf, "{s}/.zish/shaders/{s}.spv", .{ home, name }) catch return null;
 
-    const file = std.fs.cwd().openFile(path, .{}) catch return null;
-    defer file.close();
+    const file = std.Io.Dir.cwd().openFile(compat.io(), path, .{}) catch return null;
+    defer file.close(compat.io());
 
-    const stat = file.stat() catch return null;
+    const stat = file.stat(compat.io()) catch return null;
     if (stat.size == 0 or stat.size > 1024 * 1024) return null;
 
     const buf = alloc.alignedAlloc(u8, .@"4", stat.size) catch return null;
-    const n = file.readAll(buf) catch {
+    const n = compat.readAll(file, buf) catch {
         alloc.free(buf);
         return null;
     };

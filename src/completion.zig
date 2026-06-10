@@ -1,5 +1,6 @@
 // completion.zig - Tab completion logic for zish
 const std = @import("std");
+const compat = @import("compat.zig");
 const Shell = @import("Shell.zig");
 const tty = @import("tty.zig");
 const git = @import("git.zig");
@@ -259,7 +260,7 @@ pub fn handleTabCompletion(self: *Shell) !void {
 
         // expand ~ for directory check
         const check_path: []const u8 = if (std.mem.startsWith(u8, word, "~")) inner: {
-            const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch break :blk word;
+            const home = compat.getEnvVarOwned(self.allocator, "HOME") catch break :blk word;
             defer self.allocator.free(home);
             const rest = word[1..];
             if (home.len + rest.len < expanded_word_buf.len) {
@@ -271,8 +272,8 @@ pub fn handleTabCompletion(self: *Shell) !void {
         } else word;
 
         // check if it's a directory by trying to open it (more reliable than stat)
-        var d = std.fs.cwd().openDir(check_path, .{}) catch break :blk word;
-        d.close();
+        var d = std.Io.Dir.cwd().openDir(compat.io(), check_path, .{}) catch break :blk word;
+        d.close(compat.io());
 
         // Before auto-inserting /, check if sibling entries also match this prefix.
         // e.g. typing "papi" with both "papi/" and "papi-console/" should show menu,
@@ -286,11 +287,11 @@ pub fn handleTabCompletion(self: *Shell) !void {
                 word[slash + 1 ..]
             else
                 word;
-            var pd = std.fs.cwd().openDir(parent_dir, .{ .iterate = true }) catch break :blk2 false;
-            defer pd.close();
+            var pd = std.Io.Dir.cwd().openDir(compat.io(), parent_dir, .{ .iterate = true }) catch break :blk2 false;
+            defer pd.close(compat.io());
             var it = pd.iterate();
             var sibling_count: u8 = 0;
-            while (it.next() catch null) |entry| {
+            while (it.next(compat.io()) catch null) |entry| {
                 if (entry.name.len > basename.len and std.mem.startsWith(u8, entry.name, basename)) {
                     sibling_count += 1;
                     if (sibling_count > 0) break :blk2 true;
@@ -325,7 +326,7 @@ pub fn handleTabCompletion(self: *Shell) !void {
         } else {
             const dir_part = effective_word[0..last_slash];
             if (std.mem.startsWith(u8, dir_part, "~")) {
-                const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch break :blk dir_part;
+                const home = compat.getEnvVarOwned(self.allocator, "HOME") catch break :blk dir_part;
                 defer self.allocator.free(home);
                 const rest = dir_part[1..];
                 const expanded_len = home.len + rest.len;
@@ -338,7 +339,7 @@ pub fn handleTabCompletion(self: *Shell) !void {
             break :blk dir_part;
         }
     } else if (std.mem.eql(u8, effective_word, "~")) blk: {
-        const home = std.process.getEnvVarOwned(self.allocator, "HOME") catch break :blk ".";
+        const home = compat.getEnvVarOwned(self.allocator, "HOME") catch break :blk ".";
         defer self.allocator.free(home);
         if (home.len < expanded_dir_buf.len) {
             @memcpy(expanded_dir_buf[0..home.len], home);
@@ -388,17 +389,17 @@ pub fn handleTabCompletion(self: *Shell) !void {
 
     // detect if we're completing for cd/pushd (dirs only)
     const dirs_only = blk: {
-        const t = std.mem.trimLeft(u8, cmd, " \t");
+        const t = std.mem.trimStart(u8, cmd, " \t");
         if (std.mem.startsWith(u8, t, "cd ") or std.mem.startsWith(u8, t, "pushd ") or
             std.mem.startsWith(u8, t, "mkdir ") or std.mem.startsWith(u8, t, "rmdir "))
             break :blk true;
         break :blk false;
     };
 
-    const dir = std.fs.cwd().openDir(search_dir, .{ .iterate = true }) catch return;
+    const dir = std.Io.Dir.cwd().openDir(compat.io(), search_dir, .{ .iterate = true }) catch return;
     var iter = dir.iterate();
     const show_hidden = pattern.len > 0 and pattern[0] == '.';
-    while (try iter.next()) |entry| {
+    while (try iter.next(compat.io())) |entry| {
         // skip dotfiles unless pattern starts with .
         if (!show_hidden and entry.name.len > 0 and entry.name[0] == '.') continue;
         if (std.mem.startsWith(u8, entry.name, pattern)) {
@@ -431,8 +432,8 @@ pub fn handleTabCompletion(self: *Shell) !void {
                     // stat the entry to check if target is a directory
                     const full_path = std.fs.path.join(self.allocator, &.{ search_dir, entry.name }) catch break :blk false;
                     defer self.allocator.free(full_path);
-                    var d = std.fs.cwd().openDir(full_path, .{}) catch break :blk false;
-                    d.close();
+                    var d = std.Io.Dir.cwd().openDir(compat.io(), full_path, .{}) catch break :blk false;
+                    d.close(compat.io());
                     break :blk true;
                 } else false;
 
@@ -545,8 +546,8 @@ fn tryVariableCompletion(self: *Shell, word_result: WordResult) !bool {
     }
 
     // get environment variables
-    const environ = std.os.environ;
-    for (environ) |env_ptr| {
+    var environ = std.c.environ;
+    while (environ[0]) |env_ptr| : (environ += 1) {
         const env: [*:0]const u8 = env_ptr;
         var len: usize = 0;
         while (env[len] != 0) : (len += 1) {}
@@ -583,7 +584,7 @@ fn tryVariableCompletion(self: *Shell, word_result: WordResult) !bool {
 
 fn tryHostCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bool {
     // only complete hosts for ssh/scp/rsync/sftp commands
-    const trimmed = std.mem.trimLeft(u8, cmd, " \t");
+    const trimmed = std.mem.trimStart(u8, cmd, " \t");
     const cmd_end = std.mem.indexOfAny(u8, trimmed, " \t") orelse return false;
     const base_cmd = trimmed[0..cmd_end];
     const is_ssh_cmd = for ([_][]const u8{ "ssh", "scp", "rsync", "sftp", "sshfs", "mosh" }) |tool| {
@@ -603,33 +604,33 @@ fn tryHostCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bo
     defer seen.deinit();
 
     // Parse ~/.ssh/config for Host entries
-    if (std.process.getEnvVarOwned(self.allocator, "HOME")) |home| {
+    if (compat.getEnvVarOwned(self.allocator, "HOME")) |home| {
         defer self.allocator.free(home);
         var path_buf: [512]u8 = undefined;
 
         // SSH config: Host lines
         const config_path = std.fmt.bufPrint(&path_buf, "{s}/.ssh/config", .{home}) catch "";
         if (config_path.len > 0) {
-            if (std.fs.cwd().openFile(config_path, .{})) |file| {
-                defer file.close();
+            if (std.Io.Dir.cwd().openFile(compat.io(), config_path, .{})) |file| {
+                defer file.close(compat.io());
                 var read_buf: [8192]u8 = undefined;
-                const n = file.read(&read_buf) catch 0;
+                const n = compat.posix.read(file.handle, &read_buf) catch 0;
                 const text = read_buf[0..n];
                 var line_start: usize = 0;
                 while (line_start < text.len) {
                     const line_end = std.mem.indexOfScalarPos(u8, text, line_start, '\n') orelse text.len;
-                    const line = std.mem.trimLeft(u8, text[line_start..line_end], " \t");
+                    const line = std.mem.trimStart(u8, text[line_start..line_end], " \t");
                     line_start = line_end + 1;
                     // Match "Host " (case-insensitive)
                     if (line.len > 5 and (line[0] == 'H' or line[0] == 'h') and
                         (std.mem.startsWith(u8, line, "Host ") or std.mem.startsWith(u8, line, "host ")))
                     {
                         // Can have multiple hosts on one line
-                        var rest = std.mem.trimLeft(u8, line[5..], " \t");
+                        var rest = std.mem.trimStart(u8, line[5..], " \t");
                         while (rest.len > 0) {
                             const host_end = std.mem.indexOfAny(u8, rest, " \t") orelse rest.len;
                             const host = rest[0..host_end];
-                            rest = if (host_end < rest.len) std.mem.trimLeft(u8, rest[host_end..], " \t") else "";
+                            rest = if (host_end < rest.len) std.mem.trimStart(u8, rest[host_end..], " \t") else "";
                             // Skip wildcard patterns
                             if (std.mem.indexOf(u8, host, "*") != null) continue;
                             if (std.mem.indexOf(u8, host, "?") != null) continue;
@@ -651,10 +652,10 @@ fn tryHostCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bo
         // SSH known_hosts: hostname entries
         const known_path = std.fmt.bufPrint(&path_buf, "{s}/.ssh/known_hosts", .{home}) catch "";
         if (known_path.len > 0) {
-            if (std.fs.cwd().openFile(known_path, .{})) |file| {
-                defer file.close();
+            if (std.Io.Dir.cwd().openFile(compat.io(), known_path, .{})) |file| {
+                defer file.close(compat.io());
                 var read_buf: [32768]u8 = undefined;
-                const n = file.read(&read_buf) catch 0;
+                const n = compat.posix.read(file.handle, &read_buf) catch 0;
                 const text = read_buf[0..n];
                 var line_start: usize = 0;
                 while (line_start < text.len) {
@@ -700,7 +701,7 @@ fn tryHostCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bo
 }
 
 fn tryKillCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bool {
-    const trimmed = std.mem.trimLeft(u8, cmd, " \t");
+    const trimmed = std.mem.trimStart(u8, cmd, " \t");
     const cmd_end = std.mem.indexOfAny(u8, trimmed, " \t") orelse return false;
     const base_cmd = trimmed[0..cmd_end];
     if (!std.mem.eql(u8, base_cmd, "kill") and !std.mem.eql(u8, base_cmd, "killall")) return false;
@@ -739,25 +740,23 @@ fn tryKillCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bo
     // Process name completion for killall
     if (std.mem.eql(u8, base_cmd, "killall") and word.len > 0) {
         // Use ps to get running process names
-        var child = std.process.Child.init(
-            &.{ "/bin/sh", "-c", "ps -eo comm= 2>/dev/null | sort -u" },
-            self.allocator,
-        );
-        child.stdin_behavior = .Ignore;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
-        child.spawn() catch return false;
+        var child = std.process.spawn(compat.io(), .{
+            .argv = &.{ "/bin/sh", "-c", "ps -eo comm= 2>/dev/null | sort -u" },
+            .stdin = .ignore,
+            .stdout = .pipe,
+            .stderr = .ignore,
+        }) catch return false;
 
         const stdout = child.stdout.?;
         var read_buf: [8192]u8 = undefined;
         var total: usize = 0;
         while (total < read_buf.len) {
-            const n = stdout.read(read_buf[total..]) catch break;
+            const n = compat.posix.read(stdout.handle, read_buf[total..]) catch break;
             if (n == 0) break;
             total += n;
         }
-        if (child.stdout) |*s| { s.close(); child.stdout = null; }
-        _ = child.wait() catch {};
+        if (child.stdout) |*s| { s.close(compat.io()); child.stdout = null; }
+        _ = child.wait(compat.io()) catch {};
 
         var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 32);
         defer {
@@ -793,7 +792,7 @@ fn tryKillCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bo
 
 fn tryMakeCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bool {
     // only complete targets for make/gmake
-    const trimmed = std.mem.trimLeft(u8, cmd, " \t");
+    const trimmed = std.mem.trimStart(u8, cmd, " \t");
     const cmd_end = std.mem.indexOfAny(u8, trimmed, " \t") orelse return false;
     const base_cmd = trimmed[0..cmd_end];
     if (!std.mem.eql(u8, base_cmd, "make") and !std.mem.eql(u8, base_cmd, "gmake")) return false;
@@ -819,16 +818,16 @@ fn tryMakeCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bo
     }
 
     // Try Makefile, then makefile
-    const file = std.fs.cwd().openFile(makefile_name, .{}) catch blk: {
+    const file = std.Io.Dir.cwd().openFile(compat.io(), makefile_name, .{}) catch blk: {
         if (std.mem.eql(u8, makefile_name, "Makefile")) {
-            break :blk std.fs.cwd().openFile("makefile", .{}) catch return false;
+            break :blk std.Io.Dir.cwd().openFile(compat.io(), "makefile", .{}) catch return false;
         }
         return false;
     };
-    defer file.close();
+    defer file.close(compat.io());
 
     var read_buf: [32768]u8 = undefined;
-    const n = file.read(&read_buf) catch return false;
+    const n = compat.posix.read(file.handle, &read_buf) catch return false;
     const text = read_buf[0..n];
 
     var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 32);
@@ -891,17 +890,17 @@ fn tryMakeCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bo
 
 /// Complete `just` recipes from justfile
 fn tryJustCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bool {
-    const trimmed = std.mem.trimLeft(u8, cmd, " \t");
+    const trimmed = std.mem.trimStart(u8, cmd, " \t");
     if (!std.mem.startsWith(u8, trimmed, "just ") and !std.mem.eql(u8, trimmed, "just")) return false;
     const pattern = word_result.word;
 
     // Try justfile, then Justfile
-    const file = std.fs.cwd().openFile("justfile", .{}) catch
-        std.fs.cwd().openFile("Justfile", .{}) catch return false;
-    defer file.close();
+    const file = std.Io.Dir.cwd().openFile(compat.io(), "justfile", .{}) catch
+        std.Io.Dir.cwd().openFile(compat.io(), "Justfile", .{}) catch return false;
+    defer file.close(compat.io());
 
     var read_buf: [16384]u8 = undefined;
-    const n = file.read(&read_buf) catch return false;
+    const n = compat.posix.read(file.handle, &read_buf) catch return false;
     const text = read_buf[0..n];
 
     var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 16);
@@ -954,7 +953,7 @@ fn tryJustCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bo
 
 fn trySystemctlCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bool {
     // only for systemctl (+ journalctl -u) commands
-    const trimmed = std.mem.trimLeft(u8, cmd, " \t");
+    const trimmed = std.mem.trimStart(u8, cmd, " \t");
     const cmd_end = std.mem.indexOfAny(u8, trimmed, " \t") orelse return false;
     const base_cmd = trimmed[0..cmd_end];
 
@@ -964,7 +963,7 @@ fn trySystemctlCompletion(self: *Shell, cmd: []const u8, word_result: WordResult
 
     // For journalctl, only complete after -u flag
     if (is_journalctl) {
-        const rest = std.mem.trimLeft(u8, trimmed[cmd_end..], " \t");
+        const rest = std.mem.trimStart(u8, trimmed[cmd_end..], " \t");
         // Check if the previous arg is -u
         var prev_is_u = false;
         var i: usize = 0;
@@ -997,10 +996,10 @@ fn trySystemctlCompletion(self: *Shell, cmd: []const u8, word_result: WordResult
         "/run/systemd/system",
     };
     for (&dirs) |dir_path| {
-        var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch continue;
-        defer dir.close();
+        var dir = std.Io.Dir.cwd().openDir(compat.io(), dir_path, .{ .iterate = true }) catch continue;
+        defer dir.close(compat.io());
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(compat.io())) |entry| {
             const name = entry.name;
             // Only .service, .timer, .socket, .mount, .target, .path, .slice, .scope
             const is_unit = std.mem.endsWith(u8, name, ".service") or
@@ -1031,13 +1030,13 @@ fn trySystemctlCompletion(self: *Shell, cmd: []const u8, word_result: WordResult
 }
 
 fn tryDockerCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bool {
-    const trimmed = std.mem.trimLeft(u8, cmd, " \t");
+    const trimmed = std.mem.trimStart(u8, cmd, " \t");
     const cmd_end = std.mem.indexOfAny(u8, trimmed, " \t") orelse return false;
     const base_cmd = trimmed[0..cmd_end];
     if (!std.mem.eql(u8, base_cmd, "docker") and !std.mem.eql(u8, base_cmd, "podman")) return false;
 
     // Find subcommand
-    const rest = std.mem.trimLeft(u8, trimmed[cmd_end..], " \t");
+    const rest = std.mem.trimStart(u8, trimmed[cmd_end..], " \t");
     const sub_end = std.mem.indexOfAny(u8, rest, " \t") orelse return false;
     const subcmd = rest[0..sub_end];
 
@@ -1064,22 +1063,23 @@ fn tryDockerCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !
     else
         &[_][]const u8{ "/bin/sh", "-c", "docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null" };
 
-    var child = std.process.Child.init(list_cmd, self.allocator);
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch return false;
+    var child = std.process.spawn(compat.io(), .{
+        .argv = list_cmd,
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    }) catch return false;
 
     const stdout = child.stdout.?;
     var read_buf: [8192]u8 = undefined;
     var total: usize = 0;
     while (total < read_buf.len) {
-        const n = stdout.read(read_buf[total..]) catch break;
+        const n = compat.posix.read(stdout.handle, read_buf[total..]) catch break;
         if (n == 0) break;
         total += n;
     }
-    if (child.stdout) |*s| { s.close(); child.stdout = null; }
-    _ = child.wait() catch {};
+    if (child.stdout) |*s| { s.close(compat.io()); child.stdout = null; }
+    _ = child.wait(compat.io()) catch {};
 
     var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 32);
     defer {
@@ -1161,7 +1161,7 @@ fn tryCommandCompletion(self: *Shell, word_result: WordResult) !bool {
     }
 
     // search PATH directories for matching executables
-    const path_env = std.process.getEnvVarOwned(self.allocator, "PATH") catch {
+    const path_env = compat.getEnvVarOwned(self.allocator, "PATH") catch {
         if (matches.items.len > 0) {
             return if (matches.items.len == 1)
                 try applySingleCompletion(self, matches.items[0], word_result)
@@ -1176,9 +1176,9 @@ fn tryCommandCompletion(self: *Shell, word_result: WordResult) !bool {
     while (path_iter.next()) |path_dir| {
         if (path_dir.len == 0) continue;
 
-        const dir = std.fs.cwd().openDir(path_dir, .{ .iterate = true }) catch continue;
+        const dir = std.Io.Dir.cwd().openDir(compat.io(), path_dir, .{ .iterate = true }) catch continue;
         var iter = dir.iterate();
-        while (iter.next() catch null) |entry| {
+        while (iter.next(compat.io()) catch null) |entry| {
             if (entry.kind != .file and entry.kind != .sym_link) continue;
             if (!std.mem.startsWith(u8, entry.name, pattern)) continue;
             if (seen.contains(entry.name)) continue;
@@ -1187,8 +1187,8 @@ fn tryCommandCompletion(self: *Shell, word_result: WordResult) !bool {
             const full_path = std.fs.path.join(self.allocator, &.{ path_dir, entry.name }) catch continue;
             defer self.allocator.free(full_path);
 
-            const stat = std.fs.cwd().statFile(full_path) catch continue;
-            if (stat.mode & 0o111 == 0) continue;
+            const stat = std.Io.Dir.cwd().statFile(compat.io(), full_path, .{}) catch continue;
+            if (stat.permissions.toMode() & 0o111 == 0) continue;
 
             const name = self.allocator.dupe(u8, entry.name) catch continue;
             seen.put(name, {}) catch {
@@ -1216,7 +1216,7 @@ fn tryCommandCompletion(self: *Shell, word_result: WordResult) !bool {
 
 /// Project-aware completions: zig build targets, cargo bins/examples, npm scripts
 fn tryProjectCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bool {
-    const trimmed = std.mem.trimLeft(u8, cmd, " \t");
+    const trimmed = std.mem.trimStart(u8, cmd, " \t");
     const pattern = word_result.word;
 
     // zig build <target> — parse build.zig for addExecutable/addTest/step names
@@ -1251,11 +1251,11 @@ fn tryProjectCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) 
 
 /// Complete zig build targets by parsing build.zig for step/exe names
 fn tryZigBuildTargetCompletion(self: *Shell, pattern: []const u8, word_result: WordResult) !bool {
-    const file = std.fs.cwd().openFile("build.zig", .{}) catch return false;
-    defer file.close();
+    const file = std.Io.Dir.cwd().openFile(compat.io(), "build.zig", .{}) catch return false;
+    defer file.close(compat.io());
 
     var read_buf: [32768]u8 = undefined;
-    const n = file.read(&read_buf) catch return false;
+    const n = compat.posix.read(file.handle, &read_buf) catch return false;
     const text = read_buf[0..n];
 
     var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 16);
@@ -1330,11 +1330,11 @@ fn tryCargoBinCompletion(self: *Shell, cmd: []const u8, pattern: []const u8, wor
     }
 
     // Scan src/bin/ for binary names
-    if (std.fs.cwd().openDir("src/bin", .{ .iterate = true })) |dir_handle| {
+    if (std.Io.Dir.cwd().openDir(compat.io(), "src/bin", .{ .iterate = true })) |dir_handle| {
         var dir = dir_handle;
-        defer dir.close();
+        defer dir.close(compat.io());
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(compat.io())) |entry| {
             if (entry.kind != .file) continue;
             // strip .rs extension
             const name = if (std.mem.endsWith(u8, entry.name, ".rs"))
@@ -1349,11 +1349,11 @@ fn tryCargoBinCompletion(self: *Shell, cmd: []const u8, pattern: []const u8, wor
     } else |_| {}
 
     // Scan examples/ for example names
-    if (std.fs.cwd().openDir("examples", .{ .iterate = true })) |dir_handle| {
+    if (std.Io.Dir.cwd().openDir(compat.io(), "examples", .{ .iterate = true })) |dir_handle| {
         var dir = dir_handle;
-        defer dir.close();
+        defer dir.close(compat.io());
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(compat.io())) |entry| {
             if (entry.kind != .file) continue;
             const name = if (std.mem.endsWith(u8, entry.name, ".rs"))
                 entry.name[0 .. entry.name.len - 3]
@@ -1367,10 +1367,10 @@ fn tryCargoBinCompletion(self: *Shell, cmd: []const u8, pattern: []const u8, wor
     } else |_| {}
 
     // Also parse Cargo.toml for [[bin]] names
-    if (std.fs.cwd().openFile("Cargo.toml", .{})) |file| {
-        defer file.close();
+    if (std.Io.Dir.cwd().openFile(compat.io(), "Cargo.toml", .{})) |file| {
+        defer file.close(compat.io());
         var read_buf: [8192]u8 = undefined;
-        const n = file.read(&read_buf) catch 0;
+        const n = compat.posix.read(file.handle, &read_buf) catch 0;
         const text = read_buf[0..n];
         // Simple parse: look for name = "xxx" after [[bin]] or [[example]]
         var pos: usize = 0;
@@ -1400,11 +1400,11 @@ fn tryCargoBinCompletion(self: *Shell, cmd: []const u8, pattern: []const u8, wor
 
 /// Complete npm/yarn/pnpm script names from package.json
 fn tryNpmScriptCompletion(self: *Shell, pattern: []const u8, word_result: WordResult) !bool {
-    const file = std.fs.cwd().openFile("package.json", .{}) catch return false;
-    defer file.close();
+    const file = std.Io.Dir.cwd().openFile(compat.io(), "package.json", .{}) catch return false;
+    defer file.close(compat.io());
 
     var read_buf: [16384]u8 = undefined;
-    const n = file.read(&read_buf) catch return false;
+    const n = compat.posix.read(file.handle, &read_buf) catch return false;
     const text = read_buf[0..n];
 
     // Find "scripts": { ... } section and extract keys
@@ -1586,7 +1586,7 @@ fn tryPipeCompletion(self: *Shell, word_result: WordResult) !bool {
     };
 
     const pattern = word_result.word;
-    var matches = std.ArrayList([]const u8){};
+    var matches: std.ArrayList([]const u8) = .empty;
     defer matches.deinit(self.allocator);
 
     for (&pipe_targets) |target| {
@@ -1609,7 +1609,7 @@ fn tryPipeCompletion(self: *Shell, word_result: WordResult) !bool {
 
 fn tryHistoryCompletion(self: *Shell, current_input: []const u8) !bool {
     const h = self.history orelse return false;
-    const prefix = std.mem.trimLeft(u8, current_input, " \t");
+    const prefix = std.mem.trimStart(u8, current_input, " \t");
     if (prefix.len < 2) return false;
 
     var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 32);
@@ -1675,7 +1675,7 @@ fn tryHistoryCompletion(self: *Shell, current_input: []const u8) !bool {
 
     // show as completion menu — use full command as match
     self.completion.matches.deinit(self.allocator);
-    self.completion.matches = .{};
+    self.completion.matches = .empty;
     for (matches.items) |m| {
         const owned = try self.allocator.dupe(u8, m);
         try self.completion.matches.append(self.allocator, owned);
@@ -1691,7 +1691,7 @@ fn tryHistoryCompletion(self: *Shell, current_input: []const u8) !bool {
 
 fn trySubcommandCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bool {
     // only complete subcommands when cursor is on the second word
-    const trimmed = std.mem.trimLeft(u8, cmd, " \t");
+    const trimmed = std.mem.trimStart(u8, cmd, " \t");
     const cmd_end = std.mem.indexOfAny(u8, trimmed, " \t") orelse return false;
     const base_cmd = trimmed[0..cmd_end];
 
@@ -1707,18 +1707,18 @@ fn trySubcommandCompletion(self: *Shell, cmd: []const u8, word_result: WordResul
     if (!is_subcmd_tool) return false;
 
     // check we're on the subcommand position (second word, cursor at/within it)
-    const rest = std.mem.trimLeft(u8, trimmed[cmd_end..], " \t");
+    const rest = std.mem.trimStart(u8, trimmed[cmd_end..], " \t");
     const sub_end = std.mem.indexOfAny(u8, rest, " \t") orelse rest.len;
     // if there's more text after the subcommand word, we're past subcommand position
     if (sub_end < rest.len) {
-        const after_sub = std.mem.trimLeft(u8, rest[sub_end..], " \t");
+        const after_sub = std.mem.trimStart(u8, rest[sub_end..], " \t");
         if (after_sub.len > 0) return false;
     }
 
     const pattern = word_result.word;
 
     // check cache (TTL 5 minutes)
-    const now = std.time.timestamp();
+    const now = compat.timestamp();
     const cache_ttl: i64 = 300;
     const cached = self.cache.subcmd_cmd_len > 0 and
         self.cache.subcmd_cmd_len == base_cmd.len and
@@ -1766,25 +1766,23 @@ fn parseSubcmdsFromHelp(self: *Shell, base_cmd: []const u8) !void {
     self.cache.subcmd_cmd_len = base_cmd.len;
 
     var argv_buf: [128]u8 = undefined;
-    var child = std.process.Child.init(
-        &.{ "/bin/sh", "-c", std.fmt.bufPrint(&argv_buf, "{s} --help 2>&1", .{base_cmd}) catch return },
-        self.allocator,
-    );
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
+    var child = try std.process.spawn(compat.io(), .{
+        .argv = &.{ "/bin/sh", "-c", std.fmt.bufPrint(&argv_buf, "{s} --help 2>&1", .{base_cmd}) catch return },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
 
     const stdout = child.stdout.?;
     var read_buf: [16384]u8 = undefined;
     var total_read: usize = 0;
     while (total_read < read_buf.len) {
-        const n = stdout.read(read_buf[total_read..]) catch break;
+        const n = compat.posix.read(stdout.handle, read_buf[total_read..]) catch break;
         if (n == 0) break;
         total_read += n;
     }
-    if (child.stdout) |*s| { s.close(); child.stdout = null; }
-    _ = child.wait() catch {};
+    if (child.stdout) |*s| { s.close(compat.io()); child.stdout = null; }
+    _ = child.wait(compat.io()) catch {};
 
     // parse subcommands: lines starting with 2+ spaces followed by a word (no dash prefix)
     const text = read_buf[0..total_read];
@@ -1833,7 +1831,7 @@ fn parseSubcmdsFromHelp(self: *Shell, base_cmd: []const u8) !void {
 
 fn tryFlagCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bool {
     // extract command + subcommand for tools that use subcommands
-    const trimmed = std.mem.trimLeft(u8, cmd, " \t");
+    const trimmed = std.mem.trimStart(u8, cmd, " \t");
     const cmd_end = std.mem.indexOfAny(u8, trimmed, " \t") orelse return false;
     const base_cmd = trimmed[0..cmd_end];
     if (base_cmd.len == 0 or base_cmd.len > 32) return false;
@@ -1846,7 +1844,7 @@ fn tryFlagCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bo
     var full_cmd_buf: [64]u8 = undefined;
     const command = blk: {
         if (has_subcmds) {
-            const rest = std.mem.trimLeft(u8, trimmed[cmd_end..], " \t");
+            const rest = std.mem.trimStart(u8, trimmed[cmd_end..], " \t");
             if (rest.len > 0) {
                 const sub_end = std.mem.indexOfAny(u8, rest, " \t") orelse rest.len;
                 const sub = rest[0..sub_end];
@@ -1863,7 +1861,7 @@ fn tryFlagCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bo
     const pattern = word_result.word;
 
     // check cache (TTL 5 minutes)
-    const now = std.time.timestamp();
+    const now = compat.timestamp();
     const cache_ttl: i64 = 300; // 5 minutes
     const cached = self.cache.flag_cmd_len > 0 and
         self.cache.flag_cmd_len == command.len and
@@ -1929,14 +1927,12 @@ fn parseFlagsFromHelp(self: *Shell, command: []const u8) !void {
     self.cache.flag_cmd_len = command.len;
 
     var argv_buf: [128]u8 = undefined;
-    var child = std.process.Child.init(
-        &.{ "/bin/sh", "-c", std.fmt.bufPrint(&argv_buf, "{s} --help 2>&1", .{command}) catch return },
-        self.allocator,
-    );
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    try child.spawn();
+    var child = try std.process.spawn(compat.io(), .{
+        .argv = &.{ "/bin/sh", "-c", std.fmt.bufPrint(&argv_buf, "{s} --help 2>&1", .{command}) catch return },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
 
     const stdout = child.stdout.?;
     var buf_pos: usize = 0;
@@ -1947,7 +1943,7 @@ fn parseFlagsFromHelp(self: *Shell, command: []const u8) !void {
     var read_buf: [16384]u8 = undefined;
     var total_read: usize = 0;
     while (total_read < read_buf.len) {
-        const n = stdout.read(read_buf[total_read..]) catch break;
+        const n = compat.posix.read(stdout.handle, read_buf[total_read..]) catch break;
         if (n == 0) break;
         total_read += n;
     }
@@ -1955,11 +1951,11 @@ fn parseFlagsFromHelp(self: *Shell, command: []const u8) !void {
     // Close stdout pipe before wait — prevents deadlock if child produced
     // more output than our buffer (child blocks on write, wait blocks on child).
     if (child.stdout) |*s| {
-        s.close();
+        s.close(compat.io());
         child.stdout = null;
     }
-    if (child.stdout) |*s| { s.close(); child.stdout = null; }
-    _ = child.wait() catch {};
+    if (child.stdout) |*s| { s.close(compat.io()); child.stdout = null; }
+    _ = child.wait(compat.io()) catch {};
 
     // parse flags from help text — extract flag + description
     const text = read_buf[0..total_read];
@@ -2039,25 +2035,23 @@ fn augmentFlagsFromMan(self: *Shell, command: []const u8, count: usize, desc_pos
     var argv_buf: [128]u8 = undefined;
     const man_cmd = std.fmt.bufPrint(&argv_buf, "COLUMNS=200 man {s} 2>/dev/null | col -bx", .{base_cmd}) catch return;
 
-    var child = std.process.Child.init(
-        &.{ "/bin/sh", "-c", man_cmd },
-        self.allocator,
-    );
-    child.stdin_behavior = .Ignore;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch return;
+    var child = std.process.spawn(compat.io(), .{
+        .argv = &.{ "/bin/sh", "-c", man_cmd },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    }) catch return;
 
     const stdout = child.stdout.?;
     var read_buf: [32768]u8 = undefined;
     var total_read: usize = 0;
     while (total_read < read_buf.len) {
-        const n = stdout.read(read_buf[total_read..]) catch break;
+        const n = compat.posix.read(stdout.handle, read_buf[total_read..]) catch break;
         if (n == 0) break;
         total_read += n;
     }
-    if (child.stdout) |*s| { s.close(); child.stdout = null; }
-    _ = child.wait() catch {};
+    if (child.stdout) |*s| { s.close(compat.io()); child.stdout = null; }
+    _ = child.wait(compat.io()) catch {};
 
     if (total_read == 0) return;
     const text = read_buf[0..total_read];
@@ -2152,7 +2146,7 @@ fn showFlagCompletionsWithDesc(self: *Shell, matches: *std.ArrayList([]const u8)
 
     // store matches for cycling
     self.completion.matches.deinit(self.allocator);
-    self.completion.matches = .{};
+    self.completion.matches = .empty;
     for (matches.items) |m| {
         const owned = try self.allocator.dupe(u8, m);
         try self.completion.matches.append(self.allocator, owned);
@@ -2254,16 +2248,16 @@ fn showFlagCompletionsWithDesc(self: *Shell, matches: *std.ArrayList([]const u8)
 
 fn getGitBranches(self: *Shell, matches: *std.ArrayList([]const u8), pattern: []const u8) !void {
     // local branches from .git/refs/heads/
-    const refs_dir = std.fs.cwd().openDir(".git/refs/heads", .{ .iterate = true }) catch return;
+    const refs_dir = std.Io.Dir.cwd().openDir(compat.io(), ".git/refs/heads", .{ .iterate = true }) catch return;
     var dir = refs_dir;
-    defer dir.close();
+    defer dir.close(compat.io());
 
     var local_set: [64][64]u8 = undefined;
     var local_lens: [64]usize = undefined;
     var local_count: usize = 0;
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(compat.io())) |entry| {
         if (entry.kind == .file and std.mem.startsWith(u8, entry.name, pattern)) {
             const branch = try self.allocator.dupe(u8, entry.name);
             try matches.append(self.allocator, branch);
@@ -2277,20 +2271,20 @@ fn getGitBranches(self: *Shell, matches: *std.ArrayList([]const u8), pattern: []
     }
 
     // remote branches from .git/refs/remotes/*/
-    const remotes_dir = std.fs.cwd().openDir(".git/refs/remotes", .{ .iterate = true }) catch return;
+    const remotes_dir = std.Io.Dir.cwd().openDir(compat.io(), ".git/refs/remotes", .{ .iterate = true }) catch return;
     var rdir = remotes_dir;
-    defer rdir.close();
+    defer rdir.close(compat.io());
 
     var remote_iter = rdir.iterate();
-    while (try remote_iter.next()) |remote_entry| {
+    while (try remote_iter.next(compat.io())) |remote_entry| {
         if (remote_entry.kind != .directory) continue;
         const remote_name = remote_entry.name;
 
-        var remote_branch_dir = rdir.openDir(remote_name, .{ .iterate = true }) catch continue;
-        defer remote_branch_dir.close();
+        var remote_branch_dir = rdir.openDir(compat.io(), remote_name, .{ .iterate = true }) catch continue;
+        defer remote_branch_dir.close(compat.io());
 
         var branch_iter = remote_branch_dir.iterate();
-        while (try branch_iter.next()) |branch_entry| {
+        while (try branch_iter.next(compat.io())) |branch_entry| {
             if (branch_entry.kind != .file) continue;
             if (std.mem.eql(u8, branch_entry.name, "HEAD")) continue;
             if (!std.mem.startsWith(u8, branch_entry.name, pattern)) continue;
@@ -2318,11 +2312,11 @@ fn getGitBranches(self: *Shell, matches: *std.ArrayList([]const u8), pattern: []
 
 /// Parse .git/packed-refs for refs matching a prefix (e.g. "refs/heads/", "refs/tags/")
 fn readPackedRefs(self: *Shell, matches: *std.ArrayList([]const u8), ref_prefix: []const u8, pattern: []const u8, existing: [][64]u8, existing_lens: []usize) !void {
-    const file = std.fs.cwd().openFile(".git/packed-refs", .{}) catch return;
-    defer file.close();
+    const file = std.Io.Dir.cwd().openFile(compat.io(), ".git/packed-refs", .{}) catch return;
+    defer file.close(compat.io());
 
     var buf: [8192]u8 = undefined;
-    const n = file.read(&buf) catch return;
+    const n = compat.posix.read(file.handle, &buf) catch return;
     const text = buf[0..n];
 
     var line_start: usize = 0;
@@ -2373,16 +2367,16 @@ fn getGitTags(self: *Shell, matches: *std.ArrayList([]const u8), pattern: []cons
     var existing_lens: [64]usize = undefined;
     var existing_count: usize = 0;
 
-    const tags_dir = std.fs.cwd().openDir(".git/refs/tags", .{ .iterate = true }) catch {
+    const tags_dir = std.Io.Dir.cwd().openDir(compat.io(), ".git/refs/tags", .{ .iterate = true }) catch {
         // no refs/tags dir — try packed-refs only
         readPackedRefs(self, matches, "refs/tags/", pattern, &.{}, &.{}) catch {};
         return;
     };
     var dir = tags_dir;
-    defer dir.close();
+    defer dir.close(compat.io());
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(compat.io())) |entry| {
         if (entry.kind == .file and std.mem.startsWith(u8, entry.name, pattern)) {
             const tag = try self.allocator.dupe(u8, entry.name);
             try matches.append(self.allocator, tag);
@@ -2749,19 +2743,19 @@ fn logCompletion(cmd: []const u8, word_start: usize, prefix: []const u8, complet
 
 fn logCompletionImpl(cmd: []const u8, word_start: usize, prefix: []const u8, completion: []const u8, source: CompletionSource) void {
     var path_buf: [512]u8 = undefined;
-    const home = std.process.getEnvVarOwned(std.heap.page_allocator, "HOME") catch return;
+    const home = compat.getEnvVarOwned(std.heap.page_allocator, "HOME") catch return;
     defer std.heap.page_allocator.free(home);
     const path = std.fmt.bufPrint(&path_buf, "{s}/.zish/completion_log.jsonl", .{home}) catch return;
 
-    const file = std.fs.cwd().openFile(path, .{ .mode = .write_only }) catch |e| switch (e) {
-        error.FileNotFound => std.fs.cwd().createFile(path, .{}) catch return,
+    const file = std.Io.Dir.cwd().openFile(compat.io(), path, .{ .mode = .write_only }) catch |e| switch (e) {
+        error.FileNotFound => std.Io.Dir.cwd().createFile(compat.io(), path, .{}) catch return,
         else => return,
     };
-    defer file.close();
-    file.seekFromEnd(0) catch return;
+    defer file.close(compat.io());
+    if (std.posix.errno(std.os.linux.lseek(file.handle, 0, std.os.linux.SEEK.END)) != .SUCCESS) return;
 
     const ctx = cmd[0..@min(word_start, cmd.len)];
-    const ts: u64 = @bitCast(std.time.timestamp());
+    const ts: u64 = @bitCast(compat.timestamp());
 
     // write JSON with manual escaping
     var buf: [4096]u8 = undefined;
@@ -2783,7 +2777,7 @@ fn logCompletionImpl(cmd: []const u8, word_start: usize, prefix: []const u8, com
     pos += (std.fmt.bufPrint(buf[pos..], "{d}", .{ts}) catch return).len;
     pos += copySlice(&buf, pos, "}\n");
 
-    _ = file.write(buf[0..pos]) catch {};
+    _ = compat.posix.write(file.handle, buf[0..pos]) catch {};
 }
 
 fn copySlice(buf: *[4096]u8, pos: usize, s: []const u8) usize {
@@ -2848,17 +2842,17 @@ fn ghostFileSuggestion(self: *Shell, partial: []const u8) bool {
 
     // Open directory
     var dir = if (dir_path[0] == '/')
-        std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return false
+        std.Io.Dir.openDirAbsolute(compat.io(), dir_path, .{ .iterate = true }) catch return false
     else
-        std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return false;
-    defer dir.close();
+        std.Io.Dir.cwd().openDir(compat.io(), dir_path, .{ .iterate = true }) catch return false;
+    defer dir.close(compat.io());
 
     // Find first match
     var iter = dir.iterate();
     var best: [256]u8 = undefined;
     var best_len: usize = 0;
 
-    while (iter.next() catch null) |entry| {
+    while (iter.next(compat.io()) catch null) |entry| {
         if (entry.name.len > file_prefix.len and
             std.mem.startsWith(u8, entry.name, file_prefix))
         {
@@ -2938,7 +2932,7 @@ pub fn updateGhostText(self: *Shell) void {
     // Strategy 1: frecency-ranked history prefix match (collect top N candidates)
     const h = self.history orelse return;
     const items = h.entries.items;
-    const now_ts: u32 = @intCast(@min(@as(u64, @intCast(std.time.timestamp())), std.math.maxInt(u32)));
+    const now_ts: u32 = @intCast(@min(@as(u64, @intCast(compat.timestamp())), std.math.maxInt(u32)));
 
     const MAX_CANDIDATES = 8;
     var cand_scores: [MAX_CANDIDATES]f32 = [_]f32{0} ** MAX_CANDIDATES;
@@ -3018,7 +3012,7 @@ pub fn updateGhostText(self: *Shell) void {
         var pos = cmd.len;
         while (pos > 0) : (pos -= 1) {
             if (cmd[pos - 1] == '|' or cmd[pos - 1] == ';') {
-                break :blk std.mem.trimLeft(u8, cmd[pos..], " \t");
+                break :blk std.mem.trimStart(u8, cmd[pos..], " \t");
             }
         }
         break :blk @as([]const u8, "");
@@ -3165,13 +3159,13 @@ fn ghostInferThread(ctx: anytype) void {
     while (!shell.ghost.infer_stop.load(.monotonic)) {
         const seq = shell.ghost.infer_seq.load(.acquire);
         if (seq == last_seq) {
-            std.Thread.sleep(20 * std.time.ns_per_ms);
+            compat.sleep(20 * std.time.ns_per_ms);
             continue;
         }
         last_seq = seq;
 
         // Debounce: wait for input to stabilize
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        compat.sleep(100 * std.time.ns_per_ms);
         if (shell.ghost.infer_seq.load(.monotonic) != seq) continue;
 
         // Read input
@@ -3229,16 +3223,16 @@ pub fn rejectGhostText(self: *Shell) void {
     self.ghost.len = 0;
 }
 
-fn writeJsonEscapedToFile(file: std.fs.File, s: []const u8) void {
+fn writeJsonEscapedToFile(file: std.Io.File, s: []const u8) void {
     for (s) |c| {
         switch (c) {
-            '"' => file.writeAll("\\\"") catch return,
-            '\\' => file.writeAll("\\\\") catch return,
-            '\n' => file.writeAll("\\n") catch return,
-            '\r' => file.writeAll("\\r") catch return,
-            '\t' => file.writeAll("\\t") catch return,
+            '"' => compat.writeAll(file, "\\\"") catch return,
+            '\\' => compat.writeAll(file, "\\\\") catch return,
+            '\n' => compat.writeAll(file, "\\n") catch return,
+            '\r' => compat.writeAll(file, "\\r") catch return,
+            '\t' => compat.writeAll(file, "\\t") catch return,
             else => if (c < 0x20) {} else {
-                file.writeAll(&.{c}) catch return;
+                compat.writeAll(file, &.{c}) catch return;
             },
         }
     }
@@ -3246,27 +3240,27 @@ fn writeJsonEscapedToFile(file: std.fs.File, s: []const u8) void {
 
 fn logRejection(cmd: []const u8, predicted: []const u8) void {
     var path_buf: [512]u8 = undefined;
-    const home = std.process.getEnvVarOwned(std.heap.page_allocator, "HOME") catch return;
+    const home = compat.getEnvVarOwned(std.heap.page_allocator, "HOME") catch return;
     defer std.heap.page_allocator.free(home);
     const path = std.fmt.bufPrint(&path_buf, "{s}/.zish/ghost_rejections.jsonl", .{home}) catch return;
 
-    const file = std.fs.cwd().openFile(path, .{ .mode = .write_only }) catch |e| switch (e) {
-        error.FileNotFound => std.fs.cwd().createFile(path, .{}) catch return,
+    const file = std.Io.Dir.cwd().openFile(compat.io(), path, .{ .mode = .write_only }) catch |e| switch (e) {
+        error.FileNotFound => std.Io.Dir.cwd().createFile(compat.io(), path, .{}) catch return,
         else => return,
     };
-    defer file.close();
-    file.seekFromEnd(0) catch return;
+    defer file.close(compat.io());
+    if (std.posix.errno(std.os.linux.lseek(file.handle, 0, std.os.linux.SEEK.END)) != .SUCCESS) return;
 
-    const ts: u64 = @bitCast(std.time.timestamp());
+    const ts: u64 = @bitCast(compat.timestamp());
 
     // Write JSON manually with proper string escaping
-    file.writeAll("{\"ctx\":\"") catch return;
+    compat.writeAll(file, "{\"ctx\":\"") catch return;
     writeJsonEscapedToFile(file, cmd[0..@min(cmd.len, 200)]);
-    file.writeAll("\",\"predicted\":\"") catch return;
+    compat.writeAll(file, "\",\"predicted\":\"") catch return;
     writeJsonEscapedToFile(file, predicted[0..@min(predicted.len, 100)]);
     var ts_buf: [32]u8 = undefined;
     const ts_str = std.fmt.bufPrint(&ts_buf, "\",\"ts\":{d}}}\n", .{ts}) catch return;
-    file.writeAll(ts_str) catch {};
+    compat.writeAll(file, ts_str) catch {};
 }
 
 /// Accept ghost text — append it to the edit buffer.

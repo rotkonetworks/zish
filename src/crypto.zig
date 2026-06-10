@@ -1,8 +1,9 @@
 // crypto.zig - encryption for history at rest
 const std = @import("std");
+const compat = @import("compat.zig");
 const crypto = std.crypto;
-const fs = std.fs;
-const posix = std.posix;
+const fs = std.Io.Dir;
+const posix = compat.posix;
 const history_log = @import("history_log.zig");
 
 const AEAD = crypto.aead.chacha_poly.XChaCha20Poly1305;
@@ -22,7 +23,7 @@ pub const CryptoContext = struct {
 
         // check if password mode is enabled (and not bypassed)
         const bypass_password = posix.getenv("ZISH_BYPASS_PASSWORD") != null;
-        const stdin_is_tty = std.posix.isatty(std.posix.STDIN_FILENO);
+        const stdin_is_tty = compat.posix.isatty(compat.posix.STDIN_FILENO);
 
         // skip password prompt if stdin is not a tty (eg. in tests or pipes)
         if (isPasswordModeEnabled(allocator) and !bypass_password and stdin_is_tty) {
@@ -46,37 +47,37 @@ pub const CryptoContext = struct {
                 } else {
                     const remaining = 2 - attempts;
                     if (remaining > 0) {
-                        const stdout_fd = std.posix.STDOUT_FILENO;
+                        const stdout_fd = compat.posix.STDOUT_FILENO;
                         const msg = try std.fmt.allocPrint(allocator, "Wrong password. {d} attempt(s) remaining.\n", .{remaining});
                         defer allocator.free(msg);
-                        _ = std.posix.write(stdout_fd, msg) catch {};
+                        _ = compat.posix.write(stdout_fd, msg) catch {};
                     } else {
                         // 3 failed attempts - offer to reset
-                        const stdout_fd = std.posix.STDOUT_FILENO;
-                        _ = std.posix.write(stdout_fd, "\nToo many failed attempts.\n") catch {};
-                        _ = std.posix.write(stdout_fd, "Reset history and start fresh? (yes/no): ") catch {};
+                        const stdout_fd = compat.posix.STDOUT_FILENO;
+                        _ = compat.posix.write(stdout_fd, "\nToo many failed attempts.\n") catch {};
+                        _ = compat.posix.write(stdout_fd, "Reset history and start fresh? (yes/no): ") catch {};
 
                         // enable canonical mode to read full line
-                        const stdin_fd = std.posix.STDIN_FILENO;
-                        const orig_termios = std.posix.tcgetattr(stdin_fd) catch {
+                        const stdin_fd = compat.posix.STDIN_FILENO;
+                        const orig_termios = compat.posix.tcgetattr(stdin_fd) catch {
                             return error.TooManyFailedAttempts;
                         };
                         var line_termios = orig_termios;
                         line_termios.lflag.ICANON = true;
                         line_termios.lflag.ECHO = true;
-                        std.posix.tcsetattr(stdin_fd, .NOW, line_termios) catch {};
-                        defer std.posix.tcsetattr(stdin_fd, .NOW, orig_termios) catch {};
+                        compat.posix.tcsetattr(stdin_fd, .NOW, line_termios) catch {};
+                        defer compat.posix.tcsetattr(stdin_fd, .NOW, orig_termios) catch {};
 
                         var response_buf: [256]u8 = undefined;
-                        const bytes_read = std.posix.read(stdin_fd, &response_buf) catch 0;
+                        const bytes_read = compat.posix.read(stdin_fd, &response_buf) catch 0;
                         const response = std.mem.trim(u8, response_buf[0..bytes_read], " \t\r\n");
 
                         if (std.mem.eql(u8, response, "yes") or std.mem.eql(u8, response, "y")) {
                             try resetHistory(allocator);
-                            _ = std.posix.write(stdout_fd, "History reset. Starting fresh.\n") catch {};
+                            _ = compat.posix.write(stdout_fd, "History reset. Starting fresh.\n") catch {};
 
                             // generate new random key
-                            crypto.random.bytes(&key);
+                            compat.io().random(&key);
                             try saveKey(key);
                             break;
                         } else {
@@ -91,7 +92,7 @@ pub const CryptoContext = struct {
                 // existing key loaded
             } else |_| {
                 // generate new random key
-                crypto.random.bytes(&key);
+                compat.io().random(&key);
                 try saveKey(key);
             }
         }
@@ -129,7 +130,7 @@ pub const CryptoContext = struct {
 
         // generate random nonce
         var nonce: [NONCE_LEN]u8 = undefined;
-        crypto.random.bytes(&nonce);
+        compat.io().random(&nonce);
 
         // copy nonce to output
         @memcpy(result[0..NONCE_LEN], &nonce);
@@ -188,10 +189,10 @@ fn loadKey(key: *[KEY_LEN]u8) !void {
 
     const key_path = try getKeyPath(allocator);
 
-    const file = try fs.openFileAbsolute(key_path, .{});
-    defer file.close();
+    const file = try fs.openFileAbsolute(compat.io(), key_path, .{});
+    defer file.close(compat.io());
 
-    const bytes_read = try file.readAll(key);
+    const bytes_read = try compat.readAll(file, key);
     if (bytes_read != KEY_LEN) {
         return error.InvalidKeyFile;
     }
@@ -212,48 +213,48 @@ fn saveKey(key: [KEY_LEN]u8) !void {
 
     // ensure directory exists
     if (std.fs.path.dirname(key_path)) |dir| {
-        fs.makeDirAbsolute(dir) catch |err| {
+        fs.createDirAbsolute(compat.io(), dir, .default_dir) catch |err| {
             if (err != error.PathAlreadyExists) return err;
         };
     }
 
     // create file with secure permissions
-    const file = try fs.createFileAbsolute(key_path, .{
-        .mode = 0o600, // user read/write only
+    const file = try fs.createFileAbsolute(compat.io(), key_path, .{
+        .permissions = .fromMode(0o600), // user read/write only
     });
-    defer file.close();
+    defer file.close(compat.io());
 
-    try file.writeAll(&key);
-    try file.sync(); // ensure it hits disk
+    try compat.writeAll(file, &key);
+    try file.sync(compat.io()); // ensure it hits disk
 }
 
 /// prompt for password with echo disabled
 pub fn promptPassword(allocator: std.mem.Allocator, prompt_text: []const u8) ![]u8 {
-    const stdin_fd = std.posix.STDIN_FILENO;
-    const stdout_fd = std.posix.STDOUT_FILENO;
+    const stdin_fd = compat.posix.STDIN_FILENO;
+    const stdout_fd = compat.posix.STDOUT_FILENO;
 
     // save original termios
-    const original_termios = try std.posix.tcgetattr(stdin_fd);
+    const original_termios = try compat.posix.tcgetattr(stdin_fd);
 
     // disable echo but enable canonical mode for line input
     var termios = original_termios;
     termios.lflag.ECHO = false;
     termios.lflag.ICANON = true; // enable line-buffered input
-    try std.posix.tcsetattr(stdin_fd, .NOW, termios);
+    try compat.posix.tcsetattr(stdin_fd, .NOW, termios);
 
     // restore on exit
-    defer std.posix.tcsetattr(stdin_fd, .NOW, original_termios) catch {};
+    defer compat.posix.tcsetattr(stdin_fd, .NOW, original_termios) catch {};
 
     // show prompt
-    _ = std.posix.write(stdout_fd, prompt_text) catch return error.WriteFailed;
+    _ = compat.posix.write(stdout_fd, prompt_text) catch return error.WriteFailed;
 
     // read password
     var password_buf: [256]u8 = undefined;
-    const bytes_read = std.posix.read(stdin_fd, &password_buf) catch return error.ReadFailed;
+    const bytes_read = compat.posix.read(stdin_fd, &password_buf) catch return error.ReadFailed;
     const password_line = password_buf[0..bytes_read];
 
     // print newline since echo was disabled
-    _ = std.posix.write(stdout_fd, "\n") catch {};
+    _ = compat.posix.write(stdout_fd, "\n") catch {};
 
     // trim whitespace (including newline)
     const password = std.mem.trim(u8, password_line, " \t\r\n");
@@ -277,6 +278,7 @@ pub fn deriveKeyFromPassword(password: []const u8, allocator: std.mem.Allocator)
         &salt,
         .{ .t = 3, .m = 65536, .p = 4 }, // moderate security params
         .argon2id,
+        compat.io(),
     );
 
     return key;
@@ -301,13 +303,13 @@ fn validateKey(key: [KEY_LEN]u8, allocator: std.mem.Allocator) bool {
     defer allocator.free(log_path);
 
     // if file doesn't exist, key is "valid" (nothing to validate)
-    const file = fs.openFileAbsolute(log_path, .{}) catch return true;
-    defer file.close();
+    const file = fs.openFileAbsolute(compat.io(), log_path, .{}) catch return true;
+    defer file.close(compat.io());
 
     // read header using proper struct to handle alignment
     var header: history_log.EntryHeader = undefined;
     const header_bytes = std.mem.asBytes(&header);
-    const bytes_read = file.readAll(header_bytes) catch return false;
+    const bytes_read = compat.readAll(file, header_bytes) catch return false;
     if (bytes_read < @sizeOf(history_log.EntryHeader)) return true; // empty/incomplete file is valid
 
     // validate header magic
@@ -319,7 +321,7 @@ fn validateKey(key: [KEY_LEN]u8, allocator: std.mem.Allocator) bool {
     const encrypted = allocator.alloc(u8, header.entry_len) catch return false;
     defer allocator.free(encrypted);
 
-    const data_read = file.readAll(encrypted) catch return false;
+    const data_read = compat.readAll(file, encrypted) catch return false;
     if (data_read < header.entry_len) return false;
 
     // create crypto context with the key
@@ -351,11 +353,11 @@ fn resetHistory(allocator: std.mem.Allocator) !void {
     defer allocator.free(log_path);
 
     // rename old history file with timestamp
-    const timestamp = std.time.timestamp();
+    const timestamp = compat.timestamp();
     const backup_path = try std.fmt.allocPrint(allocator, "{s}/corrupted_{d}.log.enc", .{ history_dir, timestamp });
     defer allocator.free(backup_path);
 
-    fs.renameAbsolute(log_path, backup_path) catch |err| {
+    fs.renameAbsolute(log_path, backup_path, compat.io()) catch |err| {
         if (err != error.FileNotFound) return err;
     };
 
@@ -367,8 +369,8 @@ pub fn isPasswordModeEnabled(allocator: std.mem.Allocator) bool {
     const path = getPasswordModePath(allocator) catch return false;
     defer allocator.free(path);
 
-    const file = fs.openFileAbsolute(path, .{}) catch return false;
-    file.close();
+    const file = fs.openFileAbsolute(compat.io(), path, .{}) catch return false;
+    file.close(compat.io());
     return true;
 }
 
@@ -377,21 +379,21 @@ pub fn enablePasswordMode(allocator: std.mem.Allocator) !void {
     defer allocator.free(path);
 
     if (std.fs.path.dirname(path)) |dir| {
-        fs.makeDirAbsolute(dir) catch |err| {
+        fs.createDirAbsolute(compat.io(), dir, .default_dir) catch |err| {
             if (err != error.PathAlreadyExists) return err;
         };
     }
 
-    const file = try fs.createFileAbsolute(path, .{ .mode = 0o600 });
-    defer file.close();
-    try file.writeAll("1");
+    const file = try fs.createFileAbsolute(compat.io(), path, .{ .permissions = .fromMode(0o600) });
+    defer file.close(compat.io());
+    try compat.writeAll(file, "1");
 }
 
 pub fn disablePasswordMode(allocator: std.mem.Allocator) !void {
     const path = try getPasswordModePath(allocator);
     defer allocator.free(path);
 
-    fs.deleteFileAbsolute(path) catch |err| {
+    fs.deleteFileAbsolute(compat.io(), path) catch |err| {
         if (err != error.FileNotFound) return err;
     };
 }
@@ -406,10 +408,10 @@ fn loadOrGenerateSalt(allocator: std.mem.Allocator) ![16]u8 {
     defer allocator.free(salt_path);
 
     // try to load existing salt
-    if (fs.openFileAbsolute(salt_path, .{})) |file| {
-        defer file.close();
+    if (fs.openFileAbsolute(compat.io(), salt_path, .{})) |file| {
+        defer file.close(compat.io());
         var salt: [16]u8 = undefined;
-        const bytes_read = try file.readAll(&salt);
+        const bytes_read = try compat.readAll(file, &salt);
         if (bytes_read == 16) {
             return salt;
         }
@@ -417,22 +419,22 @@ fn loadOrGenerateSalt(allocator: std.mem.Allocator) ![16]u8 {
 
     // generate new salt
     var salt: [16]u8 = undefined;
-    crypto.random.bytes(&salt);
+    compat.io().random(&salt);
 
     // save to disk
     if (std.fs.path.dirname(salt_path)) |dir| {
-        fs.makeDirAbsolute(dir) catch |err| {
+        fs.createDirAbsolute(compat.io(), dir, .default_dir) catch |err| {
             if (err != error.PathAlreadyExists) return err;
         };
     }
 
-    const file = try fs.createFileAbsolute(salt_path, .{
-        .mode = 0o600,
+    const file = try fs.createFileAbsolute(compat.io(), salt_path, .{
+        .permissions = .fromMode(0o600),
     });
-    defer file.close();
+    defer file.close(compat.io());
 
-    try file.writeAll(&salt);
-    try file.sync();
+    try compat.writeAll(file, &salt);
+    try file.sync(compat.io());
 
     return salt;
 }

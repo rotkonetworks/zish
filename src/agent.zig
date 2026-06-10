@@ -3,6 +3,7 @@
 // Supports Anthropic API, Ollama, and any OpenAI-compatible endpoint.
 
 const std = @import("std");
+const compat = @import("compat.zig");
 const q = @import("agent_queue.zig");
 const log_mod = @import("agent_log.zig");
 const router_mod = @import("agent_router.zig");
@@ -289,14 +290,14 @@ const TOOLS_JSON =
 // ============================================================
 
 fn getGitBranch(buf: []u8) ![]const u8 {
-    const result = std.process.Child.run(.{
-        .allocator = std.heap.page_allocator,
+    const result = std.process.run(std.heap.page_allocator, compat.io(), .{
         .argv = &[_][]const u8{ "git", "rev-parse", "--abbrev-ref", "HEAD" },
-        .max_output_bytes = 256,
+        .stdout_limit = .limited(256),
+        .stderr_limit = .limited(256),
     }) catch return error.GitFailed;
     defer std.heap.page_allocator.free(result.stdout);
     defer std.heap.page_allocator.free(result.stderr);
-    const trimmed = std.mem.trimRight(u8, result.stdout, "\n\r ");
+    const trimmed = std.mem.trimEnd(u8, result.stdout, "\n\r ");
     if (trimmed.len == 0) return error.GitFailed;
     const n = @min(trimmed.len, buf.len);
     @memcpy(buf[0..n], trimmed[0..n]);
@@ -473,8 +474,8 @@ const AgentThread = struct {
         if (rel_count == 0) return buf[0..0];
 
         // Build context note for the model — LLM decides what to vote/comment on via Post tool
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var fbs: std.Io.Writer = .fixed(buf);
+        const w = &fbs;
         w.writeAll("\n\n[bulletin — peer activity]\n") catch {};
         for (relevant[0..rel_count]) |idx| {
             const p = &posts[idx];
@@ -491,7 +492,7 @@ const AgentThread = struct {
         if (!self.allow_edit) {
             w.writeAll("[you are read-only — respond with discoveries or escalate if urgent]\n") catch {};
         }
-        return buf[0..fbs.pos];
+        return buf[0..fbs.end];
     }
 
     /// Scan bulletin for unclaimed request_peer posts and spawn workers.
@@ -557,7 +558,7 @@ const AgentThread = struct {
         self.peer_scan_cursor = self.bulletin_cursor;
 
         // get cwd
-        const cwd = std.process.getCwd(&self.cwd) catch "/";
+        const cwd = compat.posix.getcwd(&self.cwd) catch "/";
         self.cwd_len = @intCast(cwd.len);
 
         // get git branch
@@ -594,20 +595,20 @@ const AgentThread = struct {
     }
 
     fn buildSystemPrompt(self: *AgentThread) void {
-        var fbs = std.io.fixedBufferStream(&self.system_prompt_buf);
-        const w = fbs.writer();
+        var fbs: std.Io.Writer = .fixed(&self.system_prompt_buf);
+        const w = &fbs;
         w.writeAll(SYSTEM_PROMPT_PREFIX) catch return;
         w.print("\nWorking directory: {s}\n", .{self.cwdSlice()}) catch return;
         w.print("Git branch: {s}\n", .{self.branchSlice()}) catch return;
 
         // try to list top-level files for project context
-        if (std.fs.cwd().openDir(self.cwdSlice(), .{ .iterate = true })) |dir_handle| {
+        if (std.Io.Dir.cwd().openDir(compat.io(), self.cwdSlice(), .{ .iterate = true })) |dir_handle| {
             var dir = dir_handle;
-            defer dir.close();
+            defer dir.close(compat.io());
             w.writeAll("\nProject files: ") catch return;
             var count: usize = 0;
             var iter = dir.iterate();
-            while (iter.next() catch null) |entry| {
+            while (iter.next(compat.io()) catch null) |entry| {
                 if (count > 0) w.writeAll(", ") catch return;
                 w.writeAll(entry.name) catch return;
                 count += 1;
@@ -622,7 +623,7 @@ const AgentThread = struct {
         // Load CLAUDE.md project instructions (check cwd, then parent dirs)
         self.loadClaudeMd(w);
 
-        self.system_prompt_len = @intCast(fbs.pos);
+        self.system_prompt_len = @intCast(fbs.end);
     }
 
     fn loadClaudeMd(self: *AgentThread, w: anytype) void {
@@ -653,7 +654,7 @@ const AgentThread = struct {
                 var file_path: [512]u8 = undefined;
                 const fp = std.fmt.bufPrint(&file_path, "{s}/{s}{s}", .{ dir_path[0..path_len], f.subdir, f.name }) catch continue;
 
-                if (std.fs.cwd().readFileAlloc(std.heap.page_allocator, fp, 4096)) |content| {
+                if (std.Io.Dir.cwd().readFileAlloc(compat.io(), fp, std.heap.page_allocator, .limited(4096))) |content| {
                     defer std.heap.page_allocator.free(content);
                     w.print("\n# Project Instructions ({s})\n", .{f.name}) catch return;
                     const max = @min(content.len, 3072);
@@ -772,11 +773,11 @@ const AgentThread = struct {
             const wt_cmd = std.fmt.bufPrint(&wt_cmd_buf, "git worktree add -b {s} {s} HEAD 2>&1", .{
                 branch, wt_path,
             }) catch "";
-            const wt_result = std.process.Child.run(.{
-                .allocator = self.allocator,
+            const wt_result = std.process.run(self.allocator, compat.io(), .{
                 .argv = &[_][]const u8{ "/bin/sh", "-c", wt_cmd },
-                .max_output_bytes = 4096,
-                .cwd = if (self.cwd_len > 0) self.cwd[0..self.cwd_len] else null,
+                .stdout_limit = .limited(4096),
+                .stderr_limit = .limited(4096),
+                .cwd = if (self.cwd_len > 0) .{ .path = self.cwd[0..self.cwd_len] } else .inherit,
             }) catch {
                 sa.setResult("Failed to create git worktree", .failed);
                 return error.SpawnFailed;
@@ -784,7 +785,7 @@ const AgentThread = struct {
             self.allocator.free(wt_result.stdout);
             self.allocator.free(wt_result.stderr);
 
-            if (wt_result.term != .Exited or wt_result.term.Exited != 0) {
+            if (wt_result.term != .exited or wt_result.term.exited != 0) {
                 sa.setResult("git worktree add failed", .failed);
                 return error.SpawnFailed;
             }
@@ -838,9 +839,9 @@ const AgentThread = struct {
             if (i >= self.subagent_count) break;
             if (std.mem.eql(u8, sa.id(), agent_id)) {
                 // Wait for completion with timeout
-                const deadline = @as(u64, @intCast(std.time.milliTimestamp())) + timeout_ms;
+                const deadline = @as(u64, @intCast(compat.milliTimestamp())) + timeout_ms;
                 while (!sa.isDone()) {
-                    if (@as(u64, @intCast(std.time.milliTimestamp())) >= deadline) {
+                    if (@as(u64, @intCast(compat.milliTimestamp())) >= deadline) {
                         sa.requestCancel();
                         return "Subagent timed out";
                     }
@@ -848,7 +849,7 @@ const AgentThread = struct {
                         sa.requestCancel();
                         return "Cancelled";
                     }
-                    std.Thread.sleep(50 * std.time.ns_per_ms);
+                    compat.sleep(50 * std.time.ns_per_ms);
                 }
                 // Join thread
                 if (sa.thread) |t| {
@@ -870,7 +871,7 @@ const AgentThread = struct {
     /// Merge a worker's worktree branch, then clean up.
     /// Auto-commits any uncommitted changes in the worktree first.
     fn mergeWorktree(self: *AgentThread, sa: *SubAgent) void {
-        const cwd = if (self.cwd_len > 0) self.cwd[0..self.cwd_len] else null;
+        const cwd: std.process.Child.Cwd = if (self.cwd_len > 0) .{ .path = self.cwd[0..self.cwd_len] } else .inherit;
         const wt = sa.worktreePath();
         const branch = sa.branchName();
 
@@ -882,10 +883,10 @@ const AgentThread = struct {
             .{ wt, sa.id(), desc_trunc },
         ) catch "";
         if (commit_cmd.len > 0) {
-            const cr = std.process.Child.run(.{
-                .allocator = self.allocator,
+            const cr = std.process.run(self.allocator, compat.io(), .{
                 .argv = &[_][]const u8{ "/bin/sh", "-c", commit_cmd },
-                .max_output_bytes = 4096,
+                .stdout_limit = .limited(4096),
+                .stderr_limit = .limited(4096),
             }) catch null;
             if (cr) |r| {
                 self.allocator.free(r.stdout);
@@ -901,21 +902,21 @@ const AgentThread = struct {
                 "git merge --no-edit {s} 2>&1", .{branch},
             ) catch "";
             if (merge_cmd.len > 0) {
-                const mr = std.process.Child.run(.{
-                    .allocator = self.allocator,
+                const mr = std.process.run(self.allocator, compat.io(), .{
                     .argv = &[_][]const u8{ "/bin/sh", "-c", merge_cmd },
-                    .max_output_bytes = 4096,
+                    .stdout_limit = .limited(4096),
+                    .stderr_limit = .limited(4096),
                     .cwd = cwd,
                 }) catch null;
                 if (mr) |r| {
                     defer self.allocator.free(r.stdout);
                     defer self.allocator.free(r.stderr);
-                    if (r.term != .Exited or r.term.Exited != 0) {
+                    if (r.term != .exited or r.term.exited != 0) {
                         // Merge conflict — abort, keep branch for manual resolution
-                        const abort = std.process.Child.run(.{
-                            .allocator = self.allocator,
+                        const abort = std.process.run(self.allocator, compat.io(), .{
                             .argv = &[_][]const u8{ "/bin/sh", "-c", "git merge --abort 2>/dev/null" },
-                            .max_output_bytes = 256,
+                            .stdout_limit = .limited(256),
+                            .stderr_limit = .limited(256),
                             .cwd = cwd,
                         }) catch null;
                         if (abort) |ar| {
@@ -930,10 +931,10 @@ const AgentThread = struct {
                             "git worktree remove --force {s} 2>/dev/null", .{wt},
                         ) catch "";
                         if (rm_cmd.len > 0) {
-                            const rr = std.process.Child.run(.{
-                                .allocator = self.allocator,
+                            const rr = std.process.run(self.allocator, compat.io(), .{
                                 .argv = &[_][]const u8{ "/bin/sh", "-c", rm_cmd },
-                                .max_output_bytes = 256,
+                                .stdout_limit = .limited(256),
+                                .stderr_limit = .limited(256),
                                 .cwd = cwd,
                             }) catch null;
                             if (rr) |r2| {
@@ -955,17 +956,17 @@ const AgentThread = struct {
     /// Remove worktree directory and delete the branch.
     fn cleanupWorktree(self: *AgentThread, sa: *SubAgent) void {
         if (!sa.has_worktree) return;
-        const cwd = if (self.cwd_len > 0) self.cwd[0..self.cwd_len] else null;
+        const cwd: std.process.Child.Cwd = if (self.cwd_len > 0) .{ .path = self.cwd[0..self.cwd_len] } else .inherit;
         var cleanup_buf: [512]u8 = undefined;
         const cleanup_cmd = std.fmt.bufPrint(&cleanup_buf,
             "git worktree remove --force {s} 2>/dev/null; git branch -D {s} 2>/dev/null",
             .{ sa.worktreePath(), sa.branchName() },
         ) catch "";
         if (cleanup_cmd.len > 0) {
-            const cr = std.process.Child.run(.{
-                .allocator = self.allocator,
+            const cr = std.process.run(self.allocator, compat.io(), .{
                 .argv = &[_][]const u8{ "/bin/sh", "-c", cleanup_cmd },
-                .max_output_bytes = 256,
+                .stdout_limit = .limited(256),
+                .stderr_limit = .limited(256),
                 .cwd = cwd,
             }) catch null;
             if (cr) |r| {
@@ -977,11 +978,11 @@ const AgentThread = struct {
     }
 
     fn listSubAgents(self: *AgentThread, buf: []u8) []const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var fbs: std.Io.Writer = .fixed(buf);
+        const w = &fbs;
         if (self.subagent_count == 0) {
             w.writeAll("No subagents.\n") catch {};
-            return buf[0..fbs.pos];
+            return buf[0..fbs.end];
         }
         for (&self.subagents, 0..) |*sa, i| {
             if (i >= self.subagent_count) break;
@@ -992,14 +993,14 @@ const AgentThread = struct {
             };
             w.print("{s} [{s}] {s}\n", .{ sa.id(), status_str, sa.desc() }) catch {};
         }
-        return buf[0..fbs.pos];
+        return buf[0..fbs.end];
     }
 
     /// Main agent loop: process requests from main thread and remote attach (FIFO)
     fn run(self: *AgentThread) void {
         // Create ctl FIFO for remote attach
-        const ctl_fd: ?std.posix.fd_t = if (self.session_log) |*sl| sl.createCtlFifo() else null;
-        defer if (ctl_fd) |fd| std.posix.close(fd);
+        const ctl_fd: ?compat.posix.fd_t = if (self.session_log) |*sl| sl.createCtlFifo() else null;
+        defer if (ctl_fd) |fd| compat.posix.close(fd);
 
         var req_msg: q.Msg = undefined;
         var fifo_buf: [4096]u8 = undefined;
@@ -1085,7 +1086,7 @@ const AgentThread = struct {
 
             // Check FIFO for remote input (non-blocking)
             if (ctl_fd) |fd| {
-                const n = std.posix.read(fd, &fifo_buf) catch 0;
+                const n = compat.posix.read(fd, &fifo_buf) catch 0;
                 if (n > 0) {
                     // Accumulate into fifo_line, process complete lines
                     for (fifo_buf[0..n]) |byte| {
@@ -1147,14 +1148,14 @@ const AgentThread = struct {
                 self.pickUpPeerRequests();
             }
 
-            std.Thread.sleep(10 * std.time.ns_per_ms);
+            compat.sleep(10 * std.time.ns_per_ms);
         }
     }
 
     fn buildContextSummary(self: *AgentThread, buf: *[256]u8) []const u8 {
         if (self.history.count == 0) return "";
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var fbs: std.Io.Writer = .fixed(buf);
+        const w = &fbs;
         w.print("{d} messages", .{self.history.count}) catch {};
         // Include first user message as topic hint
         if (self.history.count > 0 and self.history.messages[0].role == .user) {
@@ -1162,7 +1163,7 @@ const AgentThread = struct {
             const preview_len = @min(first.len, 80);
             w.print(", topic: {s}", .{first[0..preview_len]}) catch {};
         }
-        return buf[0..fbs.pos];
+        return buf[0..fbs.end];
     }
 
     fn processQuery(self: *AgentThread, query: []const u8) !void {
@@ -1248,8 +1249,8 @@ const AgentThread = struct {
 
             // Build assistant message with content blocks: [text (if any), tool_use]
             var assist_buf: [MAX_CONTENT_LEN]u8 = undefined;
-            var assist_fbs = std.io.fixedBufferStream(&assist_buf);
-            const aw = assist_fbs.writer();
+            var assist_fbs: std.Io.Writer = .fixed(&assist_buf);
+            const aw = &assist_fbs;
             aw.writeByte('[') catch {};
             if (response.text.len > 0) {
                 aw.writeAll("{\"type\":\"text\",\"text\":") catch {};
@@ -1262,7 +1263,7 @@ const AgentThread = struct {
                 tool_id, tool_name, effective_input,
             }) catch {};
             aw.writeByte(']') catch {};
-            try self.history.addKind(.assistant, .tool_use_response, assist_buf[0..assist_fbs.pos]);
+            try self.history.addKind(.assistant, .tool_use_response, assist_buf[0..assist_fbs.end]);
 
             if (self.session_log) |*sl| sl.logToolCall(tool_name, tool_input) catch {};
 
@@ -1286,8 +1287,8 @@ const AgentThread = struct {
             const extra: usize = if (truncated) 100 else 0; // for truncation notice
             var result_json_buf = try self.allocator.alloc(u8, effective_output.len * 2 + 256 + extra);
             defer self.allocator.free(result_json_buf);
-            var result_fbs = std.io.fixedBufferStream(result_json_buf);
-            const rw = result_fbs.writer();
+            var result_fbs: std.Io.Writer = .fixed(result_json_buf);
+            const rw = &result_fbs;
             rw.print("[{{\"type\":\"tool_result\",\"tool_use_id\":\"{s}\",\"content\":", .{tool_id}) catch {};
             if (truncated) {
                 // Write truncated output with notice
@@ -1324,7 +1325,7 @@ const AgentThread = struct {
             } else {
                 rw.writeAll("}]") catch {};
             }
-            try self.history.addKind(.user, .tool_result, result_json_buf[0..result_fbs.pos]);
+            try self.history.addKind(.user, .tool_result, result_json_buf[0..result_fbs.end]);
         }
 
         return .{
@@ -1634,14 +1635,14 @@ const AgentThread = struct {
                 _ = self.queues.output.push(.tool_call, retry_msg);
                 // Exponential backoff: 2s, 4s
                 const delay_ms: u64 = @as(u64, 2000) * (@as(u64, 1) << @intCast(attempt - 1));
-                std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+                compat.sleep(delay_ms * std.time.ns_per_ms);
             }
         }
     }
 
     fn buildMessagesJSON(self: *AgentThread, buf: []u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var fbs: std.Io.Writer = .fixed(buf);
+        const w = &fbs;
         try w.writeByte('[');
         for (0..self.history.count) |i| {
             if (i > 0) try w.writeByte(',');
@@ -1661,7 +1662,7 @@ const AgentThread = struct {
             }
         }
         try w.writeByte(']');
-        return buf[0..fbs.pos];
+        return buf[0..fbs.end];
     }
 
     fn callAnthropic(self: *AgentThread) !APIResponse {
@@ -1674,8 +1675,8 @@ const AgentThread = struct {
         var msg_buf: [MAX_CONTENT_LEN * 3]u8 = undefined;
         const messages_json = try self.buildMessagesJSON(&msg_buf);
 
-        var fbs = std.io.fixedBufferStream(&body_buf);
-        const w = fbs.writer();
+        var fbs: std.Io.Writer = .fixed(&body_buf);
+        const w = &fbs;
         // Check for effort override from /effort command
         const effective_max_tokens = blk: {
             const override = self.queues.shared_max_tokens.load(.monotonic);
@@ -1716,7 +1717,7 @@ const AgentThread = struct {
             self.toolsJson(),
         }) catch return error.BodyTooLarge;
 
-        const body = body_buf[0..fbs.pos];
+        const body = body_buf[0..fbs.end];
 
         // Build URL (OAuth requires ?beta=true query parameter)
         var url_buf: [256]u8 = undefined;
@@ -1765,8 +1766,8 @@ const AgentThread = struct {
         // Build a chat-style text prompt from conversation history
         var prompt_buf = try self.allocator.alloc(u8, MAX_CONTENT_LEN * 2);
         defer self.allocator.free(prompt_buf);
-        var fbs = std.io.fixedBufferStream(prompt_buf);
-        const w = fbs.writer();
+        var fbs: std.Io.Writer = .fixed(prompt_buf);
+        const w = &fbs;
 
         // System prompt
         w.writeAll("System: ") catch {};
@@ -1782,7 +1783,7 @@ const AgentThread = struct {
             w.print("{s}: {s}\n", .{ role_str, content }) catch {};
         }
         w.writeAll("Assistant:") catch {};
-        const prompt = prompt_buf[0..fbs.pos];
+        const prompt = prompt_buf[0..fbs.end];
 
         // Call ForkServer
         const max_tokens: u16 = @intCast(@min(self.config.max_tokens, 4096));
@@ -1826,7 +1827,7 @@ const AgentThread = struct {
 
                 // Generate a tool_use id
                 const id = std.fmt.bufPrint(&resp.tool_id_buf, "local_{d}", .{
-                    @as(u64, @bitCast(std.time.milliTimestamp())),
+                    @as(u64, @bitCast(compat.milliTimestamp())),
                 }) catch "local_0";
                 resp.tool_id_len = @intCast(id.len);
 
@@ -2000,17 +2001,18 @@ const AgentThread = struct {
         argc += 1;
 
         // Spawn curl process
-        var child = std.process.Child.init(argv_buf[0..argc], self.allocator);
-        child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Pipe;
-        child.spawn() catch return error.CurlFailed;
-        errdefer _ = child.wait() catch {};
+        var child = std.process.spawn(compat.io(), .{
+            .argv = argv_buf[0..argc],
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .pipe,
+        }) catch return error.CurlFailed;
+        errdefer child.kill(compat.io()); // no-op if already waited/killed
 
         // Write body to curl stdin
         if (child.stdin) |*stdin_pipe| {
-            stdin_pipe.writeAll(body) catch {};
-            stdin_pipe.close();
+            compat.writeAll(stdin_pipe.*, body) catch {};
+            stdin_pipe.close(compat.io());
             child.stdin = null;
         }
 
@@ -2021,13 +2023,12 @@ const AgentThread = struct {
 
         outer: while (true) {
             if (self.queues.checkCancel()) {
-                _ = child.kill() catch {};
-                _ = child.wait() catch {};
+                child.kill(compat.io()); // kills, waits, and cleans up all resources
                 self.allocator.free(text_buf);
                 return error.Cancelled;
             }
 
-            const n = stdout_file.read(sse_buf[sse_pos..]) catch break;
+            const n = stdout_file.readStreaming(compat.io(), &.{sse_buf[sse_pos..]}) catch break;
             if (n == 0) break;
             sse_pos += n;
 
@@ -2035,7 +2036,7 @@ const AgentThread = struct {
             var scan: usize = 0;
             while (scan < sse_pos) {
                 const line_end = std.mem.indexOfScalarPos(u8, sse_buf[0..sse_pos], scan, '\n') orelse break;
-                const line = std.mem.trimRight(u8, sse_buf[scan..line_end], "\r");
+                const line = std.mem.trimEnd(u8, sse_buf[scan..line_end], "\r");
                 scan = line_end + 1;
 
                 if (!std.mem.startsWith(u8, line, "data: ")) continue;
@@ -2072,8 +2073,8 @@ const AgentThread = struct {
         // Parse rate limit headers, then report remaining content as errors.
         if (child.stderr) |*stderr_pipe| {
             var err_out: [4096]u8 = undefined;
-            const err_n = stderr_pipe.read(&err_out) catch 0;
-            stderr_pipe.close();
+            const err_n = stderr_pipe.readStreaming(compat.io(), &.{&err_out}) catch 0;
+            stderr_pipe.close(compat.io());
             child.stderr = null;
             if (err_n > 0) {
                 const stderr_data = err_out[0..err_n];
@@ -2090,9 +2091,9 @@ const AgentThread = struct {
             }
         }
         // Close stdout pipe before wait in case child still has pending output
-        if (child.stdout) |*s| { s.close(); child.stdout = null; }
+        if (child.stdout) |*s| { s.close(compat.io()); child.stdout = null; }
 
-        _ = child.wait() catch {};
+        _ = child.wait(compat.io()) catch {};
 
         // If no text was received but no tool call, check if response was an error
         if (text_len == 0 and !has_tool_call) {
@@ -2249,7 +2250,7 @@ fn jsonGetStr(json: []const u8, key: []const u8) ?[]const u8 {
     const quoted_key = std.fmt.bufPrint(&key_buf, "\"{s}\":", .{key}) catch return null;
     const idx = std.mem.indexOf(u8, json, quoted_key) orelse return null;
     const after = json[idx + quoted_key.len..];
-    const trimmed = std.mem.trimLeft(u8, after, " \t");
+    const trimmed = std.mem.trimStart(u8, after, " \t");
     if (trimmed.len == 0 or trimmed[0] != '"') return null;
     // find closing quote (handle \")
     var i: usize = 1;
@@ -2266,7 +2267,7 @@ fn jsonGetInt(json: []const u8, key: []const u8) ?u64 {
     const quoted_key = std.fmt.bufPrint(&key_buf, "\"{s}\":", .{key}) catch return null;
     const idx = std.mem.indexOf(u8, json, quoted_key) orelse return null;
     const after = json[idx + quoted_key.len..];
-    const trimmed = std.mem.trimLeft(u8, after, " \t");
+    const trimmed = std.mem.trimStart(u8, after, " \t");
     // Find the end of the number
     var end: usize = 0;
     while (end < trimmed.len and (trimmed[end] >= '0' and trimmed[end] <= '9')) : (end += 1) {}
@@ -2381,7 +2382,7 @@ fn parseRateLimitHeaders(bulletin: *q.Bulletin, data: []const u8) void {
     var pos: usize = 0;
     while (pos < data.len) {
         const end = std.mem.indexOfScalarPos(u8, data, pos, '\n') orelse data.len;
-        const line = std.mem.trimRight(u8, data[pos..end], "\r ");
+        const line = std.mem.trimEnd(u8, data[pos..end], "\r ");
 
         if (std.mem.startsWith(u8, line, "anthropic-ratelimit-unified-5h-utilization: ")) {
             util_5h = parseUtilPercent(line[44..]);
@@ -3246,7 +3247,7 @@ fn subAgentThreadFn(
         @memcpy(agent.cwd[0..wt.len], wt);
         agent.cwd_len = @intCast(wt.len);
     } else {
-        const cwd = std.process.getCwd(&agent.cwd) catch "/";
+        const cwd = compat.posix.getcwd(&agent.cwd) catch "/";
         agent.cwd_len = @intCast(cwd.len);
     }
     agent.peer_scan_cursor = agent.bulletin_cursor;
@@ -3320,8 +3321,8 @@ fn subAgentThreadFn(
 
         // Build assistant history entry
         var assist_buf: [MAX_CONTENT_LEN]u8 = undefined;
-        var assist_fbs = std.io.fixedBufferStream(&assist_buf);
-        const aw = assist_fbs.writer();
+        var assist_fbs: std.Io.Writer = .fixed(&assist_buf);
+        const aw = &assist_fbs;
         aw.writeByte('[') catch {};
         if (response.text.len > 0) {
             aw.writeAll("{\"type\":\"text\",\"text\":") catch {};
@@ -3333,7 +3334,7 @@ fn subAgentThreadFn(
             tool_id, tool_name, effective_input,
         }) catch {};
         aw.writeByte(']') catch {};
-        agent.history.addKind(.assistant, .tool_use_response, assist_buf[0..assist_fbs.pos]) catch {};
+        agent.history.addKind(.assistant, .tool_use_response, assist_buf[0..assist_fbs.end]) catch {};
         allocator.free(response.text_alloc);
 
         // Dispatch tool (full_tools: all tools including Agent for recursive spawning)
@@ -3357,8 +3358,8 @@ fn subAgentThreadFn(
             return;
         };
         defer allocator.free(result_json_buf);
-        var result_fbs = std.io.fixedBufferStream(result_json_buf);
-        const rw = result_fbs.writer();
+        var result_fbs: std.Io.Writer = .fixed(result_json_buf);
+        const rw = &result_fbs;
         rw.print("[{{\"type\":\"tool_result\",\"tool_use_id\":\"{s}\",\"content\":", .{tool_id}) catch {};
         if (truncated) {
             // Manually write JSON string with truncation notice inside
@@ -3385,7 +3386,7 @@ fn subAgentThreadFn(
             writeJSONString(rw, effective_output) catch {};
         }
         rw.writeAll("}]") catch {};
-        agent.history.addKind(.user, .tool_result, result_json_buf[0..result_fbs.pos]) catch {};
+        agent.history.addKind(.user, .tool_result, result_json_buf[0..result_fbs.end]) catch {};
     }
 
     // Join any sub-agents this worker spawned (recursive cleanup)

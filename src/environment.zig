@@ -1,36 +1,37 @@
 // environment.zig - environment variable management with memory safety
 
 const std = @import("std");
+const compat = @import("compat.zig");
 const types = @import("types.zig");
 
 // environment variable management system
 pub const Environment = struct {
-    arena: std.heap.arenaallocator,
-    capabilities: std.enumset(types.EnvironmentCapability),
-    variables: std.hashmap(types.InternedString, []const u8, stringcontext, 80),
+    arena: std.heap.ArenaAllocator,
+    capabilities: std.EnumSet(types.EnvironmentCapability),
+    variables: std.HashMap(types.InternedString, []const u8, stringcontext, 80),
     current_dir: []const u8,
     exit_status: i32,
 
     const Self = @This();
     const stringcontext = struct {
         pub fn hash(_: @This(), s: types.InternedString) u64 {
-            return std.hash_map.hashstring(s.data);
+            return std.hash_map.hashString(s.data);
         }
         pub fn eql(_: @This(), a: types.InternedString, b: types.InternedString) bool {
             return a.eql(b);
         }
     };
 
-    pub fn init(parent_allocator: std.mem.allocator, caps: std.enumset(types.EnvironmentCapability)) !*Self {
-        var arena = std.heap.arenaallocator.init(parent_allocator);
+    pub fn init(parent_allocator: std.mem.Allocator, caps: std.EnumSet(types.EnvironmentCapability)) !*Self {
+        var arena = std.heap.ArenaAllocator.init(parent_allocator);
         const allocator = arena.allocator();
 
         const env = try allocator.create(Self);
         env.* = .{
             .arena = arena,
             .capabilities = caps,
-            .variables = std.hashmap(types.InternedString, []const u8, stringcontext, 80).init(allocator),
-            .current_dir = try std.fs.cwd().realpathallocarena(allocator, "."),
+            .variables = std.HashMap(types.InternedString, []const u8, stringcontext, 80).init(allocator),
+            .current_dir = try std.Io.Dir.cwd().realPathFileAlloc(compat.io(), ".", allocator),
             .exit_status = 0,
         };
 
@@ -54,7 +55,7 @@ pub const Environment = struct {
         try types.validateShellSafe(value);
 
         if (value.len > types.MAX_ENV_VALUE_LENGTH) {
-            return error.environmentvaluetoolong;
+            return error.EnvironmentValueTooLong;
         }
 
         const allocator = self.arena.allocator();
@@ -80,7 +81,7 @@ pub const Environment = struct {
         try types.validateShellSafe(path);
 
         const allocator = self.arena.allocator();
-        const new_path = std.fs.cwd().realpathallocarena(allocator, path) catch |err| {
+        const new_path = std.Io.Dir.cwd().realPathFileAlloc(compat.io(), path, allocator) catch |err| {
             return err;
         };
 
@@ -93,7 +94,7 @@ pub const Environment = struct {
         const allocator = self.arena.allocator();
 
         if (std.mem.eql(u8, name, "?")) {
-            return std.fmt.allocprint(allocator, "{}", .{self.exit_status});
+            return std.fmt.allocPrint(allocator, "{}", .{self.exit_status});
         }
         if (std.mem.eql(u8, name, "pwd")) {
             return self.current_dir;
@@ -104,21 +105,21 @@ pub const Environment = struct {
 
     // capability-restricted environment import
     fn importsystemenv(self: *Self) !void {
-        if (self.capabilities.contains(.readuserinfo)) {
+        if (self.capabilities.contains(.ReadUserInfo)) {
             try self.importsafeenvvars(&[_][]const u8{ "home", "user" });
         }
 
-        if (self.capabilities.contains(.readlocale)) {
+        if (self.capabilities.contains(.ReadLocale)) {
             try self.importsafeenvvars(&[_][]const u8{ "lang", "lc_all" });
         }
 
-        if (self.capabilities.contains(.readterminal)) {
+        if (self.capabilities.contains(.ReadTerminal)) {
             try self.importsafeenvvars(&[_][]const u8{ "term" });
         }
 
-        if (self.capabilities.contains(.readpath)) {
+        if (self.capabilities.contains(.ReadPath)) {
             // restricted path import - validate each component
-            if (std.posix.getenv("path")) |path_value| {
+            if (compat.posix.getenv("path")) |path_value| {
                 const clean_path = try self.sanitizepath(path_value);
                 try self.set("path", clean_path);
             }
@@ -131,7 +132,7 @@ pub const Environment = struct {
 
     fn importsafeenvvars(self: *Self, var_names: []const []const u8) !void {
         for (var_names) |var_name| {
-            if (std.posix.getenv(var_name)) |value| {
+            if (compat.posix.getenv(var_name)) |value| {
                 const clean_value = try self.sanitizeenvvalue(value);
                 try self.set(var_name, clean_value);
             }
@@ -141,16 +142,16 @@ pub const Environment = struct {
     fn sanitizeenvvalue(self: *Self, value: []const u8) ![]const u8 {
         // length limit
         if (value.len > types.MAX_ENV_VALUE_LENGTH) {
-            return error.environmentvaluetoolong;
+            return error.EnvironmentValueTooLong;
         }
 
         // reject dangerous characters
         for (value) |c| {
             switch (c) {
                 // allow safe characters
-                'a'...'z', 'a'...'z', '0'...'9', '/', '-', '_', '.', ':' => {},
+                'a'...'z', 'A'...'Z', '0'...'9', '/', '-', '_', '.', ':' => {},
                 // reject everything else including shell metacharacters
-                else => return error.unsafeenvironmentvalue,
+                else => return error.UnsafeEnvironmentValue,
             }
         }
 
@@ -159,13 +160,13 @@ pub const Environment = struct {
 
     fn sanitizepath(self: *Self, path_value: []const u8) ![]const u8 {
         const allocator = self.arena.allocator();
-        var safe_paths = std.arraylist([]const u8).init(allocator);
+        var safe_paths: std.ArrayList([]const u8) = .empty;
 
-        var path_iter = std.mem.split(u8, path_value, ":");
+        var path_iter = std.mem.splitScalar(u8, path_value, ':');
         while (path_iter.next()) |path_component| {
             // only allow safe path components
             if (self.ispathsafe(path_component)) {
-                try safe_paths.append(try allocator.dupe(u8, path_component));
+                try safe_paths.append(allocator, try allocator.dupe(u8, path_component));
             }
         }
 
@@ -177,8 +178,8 @@ pub const Environment = struct {
 
         // reject dangerous paths
         if (path.len == 0) return false;
-        if (std.mem.startswith(u8, path, "/tmp")) return false;  // temp dirs unsafe
-        if (std.mem.indexofscalar(u8, path, ' ')) |_| return false;  // spaces unsafe
+        if (std.mem.startsWith(u8, path, "/tmp")) return false;  // temp dirs unsafe
+        if (std.mem.indexOfScalar(u8, path, ' ')) |_| return false;  // spaces unsafe
         if (path[0] == '.') return false;  // relative paths unsafe
         if (path[0] != '/') return false;  // must be absolute
 
@@ -188,7 +189,7 @@ pub const Environment = struct {
         };
 
         for (safe_prefixes) |prefix| {
-            if (std.mem.startswith(u8, path, prefix)) return true;
+            if (std.mem.startsWith(u8, path, prefix)) return true;
         }
 
         return false;
@@ -205,19 +206,19 @@ pub const Environment = struct {
     // secure environment export for external commands
     pub fn getenvp(self: *Self) ![][*:0]const u8 {
         const allocator = self.arena.allocator();
-        var env_array = std.arraylist([*:0]const u8).init(allocator);
+        var env_array: std.ArrayList([*:0]const u8) = .empty;
 
         var iterator = self.variables.iterator();
         while (iterator.next()) |entry| {
             // create null-terminated environment string
-            const env_str = try std.fmt.allocprintz(allocator, "{s}={s}", .{
+            const env_str = try std.fmt.allocPrintSentinel(allocator, "{s}={s}", .{
                 entry.key_ptr.data,
                 entry.value_ptr.*,
-            });
-            try env_array.append(env_str.ptr);
+            }, 0);
+            try env_array.append(allocator, env_str.ptr);
         }
 
-        return env_array.toownedslice();
+        return env_array.toOwnedSlice(allocator);
     }
 };
 

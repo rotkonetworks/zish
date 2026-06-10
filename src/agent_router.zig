@@ -3,6 +3,7 @@
 // The router never speaks to the user — it only emits structured routing decisions.
 
 const std = @import("std");
+const compat = @import("compat.zig");
 const agent_mod = @import("agent.zig");
 const inference = @import("inference/root.zig");
 
@@ -175,16 +176,16 @@ pub const RouterConfig = struct {
     ///   word2
     fn loadUserPatterns(self: *RouterConfig) void {
         const alloc = std.heap.page_allocator;
-        const home = std.process.getEnvVarOwned(alloc, "HOME") catch return;
+        const home = compat.getEnvVarOwned(alloc, "HOME") catch return;
         defer alloc.free(home);
         var dir_buf: [512]u8 = undefined;
         const dir_path = std.fmt.bufPrint(&dir_buf, "{s}/.zish/patterns", .{home}) catch return;
-        var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
-        defer dir.close();
+        var dir = std.Io.Dir.cwd().openDir(compat.io(), dir_path, .{ .iterate = true }) catch return;
+        defer dir.close(compat.io());
         var iter = dir.iterate();
-        while (iter.next() catch null) |entry| {
+        while (iter.next(compat.io()) catch null) |entry| {
             if (entry.kind != .file) continue;
-            const content = dir.readFileAlloc(alloc, entry.name, 8192) catch continue;
+            const content = dir.readFileAlloc(compat.io(), entry.name, alloc, .limited(8192)) catch continue;
             defer alloc.free(content);
             self.parsePatternFile(content);
         }
@@ -426,8 +427,7 @@ pub fn classifyWithModel(
 
     // Build request body — use Ollama native API for think:false support
     var body_buf: [8192]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&body_buf);
-    const w = fbs.writer();
+    var w = std.Io.Writer.fixed(&body_buf);
 
     const is_ollama = (config.provider == .ollama);
 
@@ -449,7 +449,7 @@ pub fn classifyWithModel(
 
         // Actual query
         w.writeAll("{\"role\":\"user\",\"content\":\"") catch return null;
-        writeEscaped(w, query[0..@min(query.len, 500)]);
+        writeEscaped(&w, query[0..@min(query.len, 500)]);
         w.writeAll("\"}]}") catch return null;
     } else if (config.provider == .anthropic) {
         // Anthropic Messages API
@@ -462,7 +462,7 @@ pub fn classifyWithModel(
             w.print("{{\"role\":\"user\",\"content\":\"{s}\"}},{{\"role\":\"assistant\",\"content\":\"{s}\"}},", .{ ex.user, ex.response }) catch return null;
         }
         w.writeAll("{\"role\":\"user\",\"content\":\"") catch return null;
-        writeEscaped(w, query[0..@min(query.len, 500)]);
+        writeEscaped(&w, query[0..@min(query.len, 500)]);
         w.writeAll("\"}]}") catch return null;
     } else {
         // OpenAI-compat
@@ -476,11 +476,11 @@ pub fn classifyWithModel(
             w.print("{{\"role\":\"user\",\"content\":\"{s}\"}},{{\"role\":\"assistant\",\"content\":\"{s}\"}},", .{ ex.user, ex.response }) catch return null;
         }
         w.writeAll("{\"role\":\"user\",\"content\":\"") catch return null;
-        writeEscaped(w, query[0..@min(query.len, 500)]);
+        writeEscaped(&w, query[0..@min(query.len, 500)]);
         w.writeAll("\"}]}") catch return null;
     }
 
-    const body = body_buf[0..fbs.pos];
+    const body = body_buf[0..w.end];
 
     // Build URL
     var url_buf: [256]u8 = undefined;
@@ -557,16 +557,18 @@ pub fn classifyWithModel(
     argc += 1;
 
     // Spawn curl
-    var child = std.process.Child.init(argv[0..argc], allocator);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    child.spawn() catch return null;
+    _ = allocator;
+    var child = std.process.spawn(compat.io(), .{
+        .argv = argv[0..argc],
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    }) catch return null;
 
     // Write body
-    if (child.stdin) |*stdin_pipe| {
-        stdin_pipe.writeAll(body) catch {};
-        stdin_pipe.close();
+    if (child.stdin) |stdin_pipe| {
+        compat.writeAll(stdin_pipe, body) catch {};
+        stdin_pipe.close(compat.io());
         child.stdin = null;
     }
 
@@ -575,13 +577,13 @@ pub fn classifyWithModel(
     var resp_len: usize = 0;
     if (child.stdout) |stdout| {
         while (resp_len < resp_buf.len) {
-            const n = stdout.read(resp_buf[resp_len..]) catch break;
+            const n = stdout.readStreaming(compat.io(), &.{resp_buf[resp_len..]}) catch break;
             if (n == 0) break;
             resp_len += n;
         }
     }
-    if (child.stdout) |*s| { s.close(); child.stdout = null; }
-    _ = child.wait() catch {};
+    if (child.stdout) |s| { s.close(compat.io()); child.stdout = null; }
+    _ = child.wait(compat.io()) catch {};
 
     if (resp_len == 0) return null;
     const response = resp_buf[0..resp_len];
@@ -725,7 +727,7 @@ fn jsonGetStr(json: []const u8, key: []const u8) ?[]const u8 {
     const quoted_key = std.fmt.bufPrint(&key_buf, "\"{s}\":", .{key}) catch return null;
     const idx = std.mem.indexOf(u8, json, quoted_key) orelse return null;
     const after = json[idx + quoted_key.len..];
-    const trimmed = std.mem.trimLeft(u8, after, " \t");
+    const trimmed = std.mem.trimStart(u8, after, " \t");
     if (trimmed.len == 0 or trimmed[0] != '"') return null;
     var i: usize = 1;
     while (i < trimmed.len) : (i += 1) {
@@ -828,20 +830,20 @@ pub fn logCorrection(query: []const u8, routed_tier: []const u8, corrected_tier:
     if (query.len == 0 or query.len > 2048) return;
 
     const alloc = std.heap.page_allocator;
-    const home = std.process.getEnvVarOwned(alloc, "HOME") catch return;
+    const home = compat.getEnvVarOwned(alloc, "HOME") catch return;
     defer alloc.free(home);
 
     var path_buf: [512]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/.zish/router_log.jsonl", .{home}) catch return;
 
-    const file = std.fs.cwd().openFile(path, .{ .mode = .write_only }) catch |e| switch (e) {
-        error.FileNotFound => std.fs.cwd().createFile(path, .{}) catch return,
+    const file = std.Io.Dir.cwd().openFile(compat.io(), path, .{ .mode = .write_only }) catch |e| switch (e) {
+        error.FileNotFound => std.Io.Dir.cwd().createFile(compat.io(), path, .{}) catch return,
         else => return,
     };
-    defer file.close();
-    file.seekFromEnd(0) catch return;
+    defer file.close(compat.io());
+    const file_end = file.length(compat.io()) catch return;
 
-    const ts: u64 = @bitCast(std.time.timestamp());
+    const ts: u64 = @bitCast(compat.timestamp());
     var buf: [4096]u8 = undefined;
     var pos: usize = 0;
 
@@ -863,7 +865,7 @@ pub fn logCorrection(query: []const u8, routed_tier: []const u8, corrected_tier:
         routed_tier, corrected_tier, ts,
     }) catch return;
     pos += mid.len;
-    file.writeAll(buf[0..pos]) catch {};
+    file.writePositionalAll(compat.io(), buf[0..pos], file_end) catch {};
 }
 
 // ============================================================
@@ -874,13 +876,13 @@ pub fn logCorrection(query: []const u8, routed_tier: []const u8, corrected_tier:
 /// write ~/.zish/patterns/learned.txt. Called on agent startup.
 pub fn learnPatterns() void {
     const alloc = std.heap.page_allocator;
-    const home = std.process.getEnvVarOwned(alloc, "HOME") catch return;
+    const home = compat.getEnvVarOwned(alloc, "HOME") catch return;
     defer alloc.free(home);
 
     // Read the log file
     var log_path_buf: [512]u8 = undefined;
     const log_path = std.fmt.bufPrint(&log_path_buf, "{s}/.zish/router_log.jsonl", .{home}) catch return;
-    const log_content = std.fs.cwd().readFileAlloc(alloc, log_path, 1 << 20) catch return; // 1MB max
+    const log_content = std.Io.Dir.cwd().readFileAlloc(compat.io(), log_path, alloc, .limited(1 << 20)) catch return; // 1MB max
     defer alloc.free(log_content);
 
     // Count word → tier corrections
@@ -989,13 +991,13 @@ pub fn learnPatterns() void {
     // Write to ~/.zish/patterns/learned.txt
     var pat_path_buf: [512]u8 = undefined;
     const pat_dir = std.fmt.bufPrint(&pat_path_buf, "{s}/.zish/patterns", .{home}) catch return;
-    std.fs.cwd().makePath(pat_dir) catch {};
+    std.Io.Dir.cwd().createDirPath(compat.io(), pat_dir) catch {};
 
     var file_path_buf: [512]u8 = undefined;
     const file_path = std.fmt.bufPrint(&file_path_buf, "{s}/.zish/patterns/learned.txt", .{home}) catch return;
-    const file = std.fs.cwd().createFile(file_path, .{}) catch return;
-    defer file.close();
-    file.writeAll(out_buf[0..out_pos]) catch {};
+    const file = std.Io.Dir.cwd().createFile(compat.io(), file_path, .{}) catch return;
+    defer file.close(compat.io());
+    compat.writeAll(file, out_buf[0..out_pos]) catch {};
 }
 
 fn isStopword(w: []const u8) bool {

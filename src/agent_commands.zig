@@ -1,5 +1,6 @@
 // agent_commands.zig — table-driven slash command dispatcher for agent interactive mode
 const std = @import("std");
+const compat = @import("compat.zig");
 const Shell = @import("Shell.zig");
 const editor = @import("editor.zig");
 const agent_log = @import("agent_log.zig");
@@ -766,7 +767,7 @@ pub const CommandCtx = struct {
     }
 
     fn drawStatusElapsed(self: *CommandCtx) void {
-        const elapsed = if (self.query_start_ms.* > 0) std.time.milliTimestamp() - self.query_start_ms.* else 0;
+        const elapsed = if (self.query_start_ms.* > 0) compat.milliTimestamp() - self.query_start_ms.* else 0;
         Layout.drawStatusBarSafeElapsed(self.out, self.status_row.*, self.term_rows.*, self.out_last.*, self.term_cols.*, self.model_name, self.cost_buf[0..self.cost_len.*], self.status_text[0..self.status_len.*], elapsed);
     }
 
@@ -885,7 +886,7 @@ fn cmdConsult(ctx: *CommandCtx, arg: []const u8) DispatchResult {
     };
 
     const persona_name = arg[0..space];
-    const question = std.mem.trimLeft(u8, arg[space + 1 ..], " ");
+    const question = std.mem.trimStart(u8, arg[space + 1 ..], " ");
 
     const persona = personas.Persona.fromName(persona_name) orelse {
         Layout.goOutput(ctx.out, ctx.out_last.*);
@@ -937,7 +938,7 @@ fn cmdMeeting(ctx: *CommandCtx, arg: []const u8) DispatchResult {
 
     const space = std.mem.indexOfScalar(u8, trimmed, ' ');
     const type_name = if (space) |s| trimmed[0..s] else trimmed;
-    const topic = if (space) |s| std.mem.trimLeft(u8, trimmed[s + 1 ..], " ") else "Review current work";
+    const topic = if (space) |s| std.mem.trimStart(u8, trimmed[s + 1 ..], " ") else "Review current work";
 
     const meeting = personas.MeetingType.fromName(type_name) orelse {
         Layout.goOutput(ctx.out, ctx.out_last.*);
@@ -970,8 +971,7 @@ fn cmdMeeting(ctx: *CommandCtx, arg: []const u8) DispatchResult {
 
     // Build a combined prompt that asks for each persona's perspective
     var prompt_buf: [4096]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&prompt_buf);
-    const w = fbs.writer();
+    var w = std.Io.Writer.fixed(&prompt_buf);
     w.print("TEAM MEETING: {s}\nTopic: {s}\n\n", .{ meeting.name(), topic }) catch {};
     w.writeAll("Please provide feedback from EACH of these team perspectives:\n\n") catch {};
     for (attendees) |p| {
@@ -984,7 +984,7 @@ fn cmdMeeting(ctx: *CommandCtx, arg: []const u8) DispatchResult {
     }
     w.writeAll("For each persona, give their specific feedback on the topic. Be concise — 2-3 sentences per persona.\n") catch {};
 
-    const prompt = prompt_buf[0..fbs.pos];
+    const prompt = w.buffered();
 
     if (!ctx.shell.agent.query(prompt)) {
         ctx.out.writeAll("\x1b[31mQueue full\x1b[0m\n") catch {};
@@ -1036,12 +1036,11 @@ fn cmdPaste(ctx: *CommandCtx, _: []const u8) DispatchResult {
     // Grab clipboard image via xclip and save to /tmp
     const alloc = ctx.shell.allocator;
     var ts_buf: [32]u8 = undefined;
-    const ts: u64 = @bitCast(std.time.timestamp());
+    const ts: u64 = @bitCast(compat.timestamp());
     const filename = std.fmt.bufPrint(&ts_buf, "/tmp/zish_paste_{d}.png", .{ts}) catch "/tmp/zish_paste.png";
 
     // Run xclip to extract image from clipboard
-    const result = std.process.Child.run(.{
-        .allocator = alloc,
+    const result = std.process.run(alloc, compat.io(), .{
         .argv = &.{ "xclip", "-selection", "clipboard", "-t", "image/png", "-o" },
     }) catch {
         Layout.goOutput(ctx.out, ctx.out_last.*);
@@ -1058,13 +1057,13 @@ fn cmdPaste(ctx: *CommandCtx, _: []const u8) DispatchResult {
     }
 
     // Write to file
-    const file = std.fs.cwd().createFile(filename, .{}) catch {
+    const file = std.Io.Dir.cwd().createFile(compat.io(), filename, .{}) catch {
         Layout.goOutput(ctx.out, ctx.out_last.*);
         ctx.out.writeAll("\x1b[31mFailed to write file\x1b[0m\n") catch {};
         return .handled;
     };
-    file.writeAll(result.stdout) catch {};
-    file.close();
+    compat.writeAll(file, result.stdout) catch {};
+    file.close(compat.io());
 
     // Insert @file mention into the edit buffer so next query includes the image
     var mention_buf: [64]u8 = undefined;
@@ -1141,10 +1140,11 @@ fn cmdRedo(ctx: *CommandCtx, _: []const u8) DispatchResult {
     Layout.goOutput(ctx.out, ctx.out_last.*);
     // Redo = checkout from stash or re-apply last change
     // Check if there's a stash to pop
-    const stash_result = std.process.Child.run(.{
-        .allocator = ctx.shell.allocator,
+    const stash_result = std.process.run(ctx.shell.allocator, compat.io(), .{
         .argv = &[_][]const u8{ "git", "stash", "list" },
-        .max_output_bytes = 1024,
+        .stdout_limit = .limited(1024),
+
+        .stderr_limit = .limited(1024),
     }) catch {
         ctx.out.writeAll("\x1b[90mnot a git repository\x1b[0m\n") catch {};
         ctx.out.flush() catch {};
@@ -1154,10 +1154,11 @@ fn cmdRedo(ctx: *CommandCtx, _: []const u8) DispatchResult {
     defer ctx.shell.allocator.free(stash_result.stderr);
     if (stash_result.stdout.len > 0) {
         // Pop last stash
-        const pop_result = std.process.Child.run(.{
-            .allocator = ctx.shell.allocator,
+        const pop_result = std.process.run(ctx.shell.allocator, compat.io(), .{
             .argv = &[_][]const u8{ "git", "stash", "pop" },
-            .max_output_bytes = 4096,
+            .stdout_limit = .limited(4096),
+
+            .stderr_limit = .limited(4096),
         }) catch {
             ctx.out.writeAll("\x1b[31mredo failed\x1b[0m\n") catch {};
             ctx.out.flush() catch {};
@@ -1194,27 +1195,28 @@ fn cmdTest(ctx: *CommandCtx, arg: []const u8) DispatchResult {
     // Auto-detect test command from project files
     const test_cmd: []const u8 = if (arg.len > 0)
         arg
-    else if (std.fs.cwd().access("build.zig", .{}) catch null != null)
+    else if (std.Io.Dir.cwd().access(compat.io(), "build.zig", .{}) catch null != null)
         "zig build test"
-    else if (std.fs.cwd().access("Cargo.toml", .{}) catch null != null)
+    else if (std.Io.Dir.cwd().access(compat.io(), "Cargo.toml", .{}) catch null != null)
         "cargo test"
-    else if (std.fs.cwd().access("package.json", .{}) catch null != null)
+    else if (std.Io.Dir.cwd().access(compat.io(), "package.json", .{}) catch null != null)
         "npm test"
-    else if (std.fs.cwd().access("Makefile", .{}) catch null != null)
+    else if (std.Io.Dir.cwd().access(compat.io(), "Makefile", .{}) catch null != null)
         "make test"
-    else if (std.fs.cwd().access("go.mod", .{}) catch null != null)
+    else if (std.Io.Dir.cwd().access(compat.io(), "go.mod", .{}) catch null != null)
         "go test ./..."
-    else if (std.fs.cwd().access("pytest.ini", .{}) catch null != null or
-        std.fs.cwd().access("setup.py", .{}) catch null != null)
+    else if (std.Io.Dir.cwd().access(compat.io(), "pytest.ini", .{}) catch null != null or
+        std.Io.Dir.cwd().access(compat.io(), "setup.py", .{}) catch null != null)
         "python3 -m pytest"
     else
         "echo 'No test runner detected'";
 
     ctx.out.print("\x1b[90m\xe2\x96\xb6 {s}\x1b[0m\n", .{test_cmd}) catch {};
-    const result = std.process.Child.run(.{
-        .allocator = ctx.shell.allocator,
+    const result = std.process.run(ctx.shell.allocator, compat.io(), .{
         .argv = &[_][]const u8{ "/bin/sh", "-c", test_cmd },
-        .max_output_bytes = 64 * 1024,
+        .stdout_limit = .limited(64 * 1024),
+
+        .stderr_limit = .limited(64 * 1024),
     }) catch {
         ctx.out.writeAll("\x1b[31mexec failed\x1b[0m\n") catch {};
         ctx.out.flush() catch {};
@@ -1228,7 +1230,7 @@ fn cmdTest(ctx: *CommandCtx, arg: []const u8) DispatchResult {
         ctx.out.writeAll(result.stderr) catch {};
         ctx.out.writeAll("\x1b[0m") catch {};
     }
-    const exited = result.term.Exited;
+    const exited = result.term.exited;
     if (exited == 0) {
         ctx.out.writeAll("\x1b[32m\xe2\x9c\x93 tests passed\x1b[0m\n") catch {};
     } else {
@@ -1241,26 +1243,27 @@ fn cmdTest(ctx: *CommandCtx, arg: []const u8) DispatchResult {
 fn cmdBuild(ctx: *CommandCtx, _: []const u8) DispatchResult {
     Layout.goOutput(ctx.out, ctx.out_last.*);
     // Auto-detect build command
-    const build_cmd: []const u8 = if (std.fs.cwd().access("build.zig", .{}) catch null != null)
+    const build_cmd: []const u8 = if (std.Io.Dir.cwd().access(compat.io(), "build.zig", .{}) catch null != null)
         "zig build"
-    else if (std.fs.cwd().access("Cargo.toml", .{}) catch null != null)
+    else if (std.Io.Dir.cwd().access(compat.io(), "Cargo.toml", .{}) catch null != null)
         "cargo build"
-    else if (std.fs.cwd().access("package.json", .{}) catch null != null)
+    else if (std.Io.Dir.cwd().access(compat.io(), "package.json", .{}) catch null != null)
         "npm run build"
-    else if (std.fs.cwd().access("Makefile", .{}) catch null != null)
+    else if (std.Io.Dir.cwd().access(compat.io(), "Makefile", .{}) catch null != null)
         "make"
-    else if (std.fs.cwd().access("CMakeLists.txt", .{}) catch null != null)
+    else if (std.Io.Dir.cwd().access(compat.io(), "CMakeLists.txt", .{}) catch null != null)
         "cmake --build build"
-    else if (std.fs.cwd().access("go.mod", .{}) catch null != null)
+    else if (std.Io.Dir.cwd().access(compat.io(), "go.mod", .{}) catch null != null)
         "go build ./..."
     else
         "echo 'No build system detected'";
 
     ctx.out.print("\x1b[90m\xe2\x96\xb6 {s}\x1b[0m\n", .{build_cmd}) catch {};
-    const result = std.process.Child.run(.{
-        .allocator = ctx.shell.allocator,
+    const result = std.process.run(ctx.shell.allocator, compat.io(), .{
         .argv = &[_][]const u8{ "/bin/sh", "-c", build_cmd },
-        .max_output_bytes = 64 * 1024,
+        .stdout_limit = .limited(64 * 1024),
+
+        .stderr_limit = .limited(64 * 1024),
     }) catch {
         ctx.out.writeAll("\x1b[31mexec failed\x1b[0m\n") catch {};
         ctx.out.flush() catch {};
@@ -1274,7 +1277,7 @@ fn cmdBuild(ctx: *CommandCtx, _: []const u8) DispatchResult {
         ctx.out.writeAll(result.stderr) catch {};
         ctx.out.writeAll("\x1b[0m") catch {};
     }
-    const exited = result.term.Exited;
+    const exited = result.term.exited;
     if (exited == 0) {
         ctx.out.writeAll("\x1b[32m\xe2\x9c\x93 build succeeded\x1b[0m\n") catch {};
     } else {
@@ -1317,21 +1320,21 @@ fn cmdWeb(ctx: *CommandCtx, arg: []const u8) DispatchResult {
 
 fn cmdCd(ctx: *CommandCtx, arg: []const u8) DispatchResult {
     Layout.goOutput(ctx.out, ctx.out_last.*);
-    const path = if (arg.len > 0) arg else std.posix.getenv("HOME") orelse "/";
+    const path = if (arg.len > 0) arg else compat.posix.getenv("HOME") orelse "/";
     // Expand ~ to home
     var path_buf: [512]u8 = undefined;
     const real_path = if (std.mem.startsWith(u8, path, "~/")) blk: {
-        const home = std.posix.getenv("HOME") orelse "/";
+        const home = compat.posix.getenv("HOME") orelse "/";
         break :blk std.fmt.bufPrint(&path_buf, "{s}{s}", .{ home, path[1..] }) catch path;
     } else path;
-    std.posix.chdir(real_path) catch {
+    compat.posix.chdir(real_path) catch {
         ctx.out.print("\x1b[31mcd: {s}: not found\x1b[0m\n", .{real_path}) catch {};
         ctx.out.flush() catch {};
         return .handled;
     };
     // Show new cwd
     var cwd_buf: [256]u8 = undefined;
-    const cwd = std.posix.getcwd(&cwd_buf) catch "?";
+    const cwd = compat.posix.getcwd(&cwd_buf) catch "?";
     ctx.out.print("\x1b[90m{s}\x1b[0m\n", .{cwd}) catch {};
     ctx.out.flush() catch {};
     return .handled;
@@ -1345,10 +1348,11 @@ fn cmdRun(ctx: *CommandCtx, arg: []const u8) DispatchResult {
         return .handled;
     }
     Layout.goOutput(ctx.out, ctx.out_last.*);
-    const result = std.process.Child.run(.{
-        .allocator = ctx.shell.allocator,
+    const result = std.process.run(ctx.shell.allocator, compat.io(), .{
         .argv = &[_][]const u8{ "/bin/sh", "-c", arg },
-        .max_output_bytes = 64 * 1024,
+        .stdout_limit = .limited(64 * 1024),
+
+        .stderr_limit = .limited(64 * 1024),
     }) catch {
         ctx.out.writeAll("\x1b[31mexec failed\x1b[0m\n") catch {};
         ctx.out.flush() catch {};
@@ -1373,7 +1377,7 @@ fn cmdCat(ctx: *CommandCtx, arg: []const u8) DispatchResult {
         ctx.out.flush() catch {};
         return .handled;
     }
-    const content = std.fs.cwd().readFileAlloc(ctx.shell.allocator, arg, 64 * 1024) catch {
+    const content = std.Io.Dir.cwd().readFileAlloc(compat.io(), arg, ctx.shell.allocator, .limited(64 * 1024)) catch {
         ctx.out.print("\x1b[31mcan't read: {s}\x1b[0m\n", .{arg}) catch {};
         ctx.out.flush() catch {};
         return .handled;
@@ -1412,10 +1416,11 @@ fn cmdCat(ctx: *CommandCtx, arg: []const u8) DispatchResult {
 fn cmdLs(ctx: *CommandCtx, arg: []const u8) DispatchResult {
     Layout.goOutput(ctx.out, ctx.out_last.*);
     const path = if (arg.len > 0) arg else ".";
-    const result = std.process.Child.run(.{
-        .allocator = ctx.shell.allocator,
+    const result = std.process.run(ctx.shell.allocator, compat.io(), .{
         .argv = &[_][]const u8{ "ls", "-la", "--color=always", path },
-        .max_output_bytes = 16 * 1024,
+        .stdout_limit = .limited(16 * 1024),
+
+        .stderr_limit = .limited(16 * 1024),
     }) catch {
         ctx.out.writeAll("\x1b[31mls failed\x1b[0m\n") catch {};
         ctx.out.flush() catch {};
@@ -1472,13 +1477,13 @@ fn cmdStatus(ctx: *CommandCtx, _: []const u8) DispatchResult {
     }
     // CWD
     var cwd_buf: [256]u8 = undefined;
-    const cwd = std.posix.getcwd(&cwd_buf) catch "?";
+    const cwd = compat.posix.getcwd(&cwd_buf) catch "?";
     ctx.out.print("  \x1b[90mcwd\x1b[0m       {s}\n", .{cwd}) catch {};
     // Git branch
-    if (std.fs.cwd().openFile(".git/HEAD", .{})) |head| {
-        defer head.close();
+    if (std.Io.Dir.cwd().openFile(compat.io(), ".git/HEAD", .{})) |head| {
+        defer head.close(compat.io());
         var branch_buf: [128]u8 = undefined;
-        const n = head.read(&branch_buf) catch 0;
+        const n = compat.readAll(head, &branch_buf) catch 0;
         const content = std.mem.trim(u8, branch_buf[0..n], " \t\r\n");
         if (std.mem.startsWith(u8, content, "ref: refs/heads/")) {
             ctx.out.print("  \x1b[90mbranch\x1b[0m    \x1b[33m{s}\x1b[0m\n", .{content[16..]}) catch {};
@@ -1553,10 +1558,11 @@ fn cmdModel(ctx: *CommandCtx, arg: []const u8) DispatchResult {
 fn cmdDiff(ctx: *CommandCtx, _: []const u8) DispatchResult {
     Layout.goOutput(ctx.out, ctx.out_last.*);
     // Show staged changes
-    const staged = std.process.Child.run(.{
-        .allocator = ctx.shell.allocator,
+    const staged = std.process.run(ctx.shell.allocator, compat.io(), .{
         .argv = &[_][]const u8{ "git", "diff", "--cached", "--stat", "--color=always" },
-        .max_output_bytes = 64 * 1024,
+        .stdout_limit = .limited(64 * 1024),
+
+        .stderr_limit = .limited(64 * 1024),
     }) catch {
         ctx.out.writeAll("\x1b[90mnot a git repository\x1b[0m\n") catch {};
         ctx.out.flush() catch {};
@@ -1569,10 +1575,11 @@ fn cmdDiff(ctx: *CommandCtx, _: []const u8) DispatchResult {
         ctx.out.writeAll(staged.stdout) catch {};
     }
     // Show unstaged changes
-    const unstaged = std.process.Child.run(.{
-        .allocator = ctx.shell.allocator,
+    const unstaged = std.process.run(ctx.shell.allocator, compat.io(), .{
         .argv = &[_][]const u8{ "git", "diff", "--stat", "--color=always" },
-        .max_output_bytes = 64 * 1024,
+        .stdout_limit = .limited(64 * 1024),
+
+        .stderr_limit = .limited(64 * 1024),
     }) catch {
         ctx.out.flush() catch {};
         return .handled;
@@ -1584,10 +1591,11 @@ fn cmdDiff(ctx: *CommandCtx, _: []const u8) DispatchResult {
         ctx.out.writeAll(unstaged.stdout) catch {};
     }
     // Show untracked files
-    const untracked = std.process.Child.run(.{
-        .allocator = ctx.shell.allocator,
+    const untracked = std.process.run(ctx.shell.allocator, compat.io(), .{
         .argv = &[_][]const u8{ "git", "ls-files", "--others", "--exclude-standard" },
-        .max_output_bytes = 16 * 1024,
+        .stdout_limit = .limited(16 * 1024),
+
+        .stderr_limit = .limited(16 * 1024),
     }) catch {
         ctx.out.flush() catch {};
         return .handled;
@@ -1668,10 +1676,11 @@ fn cmdReview(ctx: *CommandCtx, _: []const u8) DispatchResult {
 fn cmdUndo(ctx: *CommandCtx, _: []const u8) DispatchResult {
     Layout.goOutput(ctx.out, ctx.out_last.*);
     // Direct git undo: checkout the most recently modified file
-    const diff_result = std.process.Child.run(.{
-        .allocator = ctx.shell.allocator,
+    const diff_result = std.process.run(ctx.shell.allocator, compat.io(), .{
         .argv = &[_][]const u8{ "git", "diff", "--name-only" },
-        .max_output_bytes = 4096,
+        .stdout_limit = .limited(4096),
+
+        .stderr_limit = .limited(4096),
     }) catch {
         ctx.out.writeAll("\x1b[90mnot a git repository\x1b[0m\n") catch {};
         ctx.out.flush() catch {};
@@ -1685,7 +1694,7 @@ fn cmdUndo(ctx: *CommandCtx, _: []const u8) DispatchResult {
         return .handled;
     }
     // Get last file from the list (most recently modified is typically last)
-    const trimmed_out = std.mem.trimRight(u8, diff_result.stdout, "\n\r ");
+    const trimmed_out = std.mem.trimEnd(u8, diff_result.stdout, "\n\r ");
     const last_nl = std.mem.lastIndexOfScalar(u8, trimmed_out, '\n');
     const last_file = if (last_nl) |nl| trimmed_out[nl + 1 ..] else trimmed_out;
     if (last_file.len == 0) {
@@ -1694,10 +1703,11 @@ fn cmdUndo(ctx: *CommandCtx, _: []const u8) DispatchResult {
         return .handled;
     }
     // Checkout the file
-    const checkout_result = std.process.Child.run(.{
-        .allocator = ctx.shell.allocator,
+    const checkout_result = std.process.run(ctx.shell.allocator, compat.io(), .{
         .argv = &[_][]const u8{ "git", "checkout", "--", last_file },
-        .max_output_bytes = 1024,
+        .stdout_limit = .limited(1024),
+
+        .stderr_limit = .limited(1024),
     }) catch {
         ctx.out.writeAll("\x1b[31mundo failed\x1b[0m\n") catch {};
         ctx.out.flush() catch {};
@@ -1853,10 +1863,10 @@ pub fn runTreeView(
     // Collect nodes (poll for up to 500ms)
     var nodes: [64]TreeNode = undefined;
     var node_count: u8 = 0;
-    var deadline: i64 = std.time.milliTimestamp() + 500;
+    var deadline: i64 = compat.milliTimestamp() + 500;
     var got_end = false;
 
-    while (std.time.milliTimestamp() < deadline and !got_end) {
+    while (compat.milliTimestamp() < deadline and !got_end) {
         var msg: q.Msg = undefined;
         while (shell.agent.queues.output.pop(&msg)) {
             if (msg.kind == .agent_tree_node) {
@@ -1873,7 +1883,7 @@ pub fn runTreeView(
             }
             // Discard other messages during tree collection
         }
-        if (!got_end) std.Thread.sleep(10 * std.time.ns_per_ms);
+        if (!got_end) compat.sleep(10 * std.time.ns_per_ms);
     }
 
     if (node_count == 0) {
@@ -1951,7 +1961,7 @@ pub fn runTreeView(
 
         // Read input
         var byte: [1]u8 = undefined;
-        const nr = std.fs.File.stdin().read(&byte) catch break;
+        const nr = compat.readAll(std.Io.File.stdin(), &byte) catch break;
         if (nr == 0) break;
 
         if (viewing_result) {
@@ -2002,9 +2012,9 @@ pub fn runTreeView(
                         result_len = 0;
                         _ = shell.agent.queues.request.push(.agent_result_req, nodes[cursor].idSlice());
                         // Collect result chunks
-                        const rdl: i64 = std.time.milliTimestamp() + 1000;
+                        const rdl: i64 = compat.milliTimestamp() + 1000;
                         var got_res_end = false;
-                        while (std.time.milliTimestamp() < rdl and !got_res_end) {
+                        while (compat.milliTimestamp() < rdl and !got_res_end) {
                             var rmsg: q.Msg = undefined;
                             while (shell.agent.queues.output.pop(&rmsg)) {
                                 if (rmsg.kind == .agent_result) {
@@ -2019,7 +2029,7 @@ pub fn runTreeView(
                                     result_len += cn;
                                 }
                             }
-                            if (!got_res_end) std.Thread.sleep(10 * std.time.ns_per_ms);
+                            if (!got_res_end) compat.sleep(10 * std.time.ns_per_ms);
                         }
                         viewing_result = true;
                         result_scroll = 0;
@@ -2036,9 +2046,9 @@ pub fn runTreeView(
                 'r' => { // Refresh tree
                     _ = shell.agent.queues.request.push(.agent_tree_req, "");
                     node_count = 0;
-                    deadline = std.time.milliTimestamp() + 500;
+                    deadline = compat.milliTimestamp() + 500;
                     got_end = false;
-                    while (std.time.milliTimestamp() < deadline and !got_end) {
+                    while (compat.milliTimestamp() < deadline and !got_end) {
                         var rmsg: q.Msg = undefined;
                         while (shell.agent.queues.output.pop(&rmsg)) {
                             if (rmsg.kind == .agent_tree_node) {
@@ -2054,7 +2064,7 @@ pub fn runTreeView(
                                 }
                             }
                         }
-                        if (!got_end) std.Thread.sleep(10 * std.time.ns_per_ms);
+                        if (!got_end) compat.sleep(10 * std.time.ns_per_ms);
                     }
                     if (cursor >= node_count and node_count > 0) cursor = node_count - 1;
                 },
@@ -2265,14 +2275,14 @@ fn drawBulletin(
 
 fn cmdSessions(ctx: *CommandCtx, _: []const u8) DispatchResult {
     Layout.goOutput(ctx.out, ctx.out_last.*);
-    var sessions_list: std.ArrayList(agent_log.SessionInfo) = .{};
+    var sessions_list: std.ArrayList(agent_log.SessionInfo) = .empty;
     defer sessions_list.deinit(ctx.shell.allocator);
     agent_log.listSessions(ctx.shell.allocator, &sessions_list) catch {};
     if (sessions_list.items.len == 0) {
         ctx.out.writeAll("\x1b[90mNo saved sessions.\x1b[0m\n") catch {};
     } else {
         const start = if (sessions_list.items.len > 10) sessions_list.items.len - 10 else 0;
-        const now_secs: u64 = @intCast(std.time.timestamp());
+        const now_secs: u64 = @intCast(compat.timestamp());
         for (sessions_list.items[start..]) |*info| {
             const epoch_secs: u64 = if (info.created > 0) @intCast(info.created) else 0;
             // Relative time
@@ -2288,7 +2298,7 @@ fn cmdSessions(ctx: *CommandCtx, _: []const u8) DispatchResult {
                 std.fmt.bufPrint(&time_buf, "{d}d ago", .{age / 86400}) catch "old";
             // Shorten CWD: replace home with ~
             const cwd = info.cwd();
-            const home = std.posix.getenv("HOME") orelse "";
+            const home = compat.posix.getenv("HOME") orelse "";
             var cwd_buf: [128]u8 = undefined;
             const display_cwd = if (home.len > 0 and std.mem.startsWith(u8, cwd, home)) blk: {
                 const rest = cwd[home.len..];
@@ -2422,12 +2432,12 @@ fn cmdExport(ctx: *CommandCtx, arg: []const u8) DispatchResult {
     const filename = if (arg.len > 0) std.mem.trim(u8, arg, " ") else "conversation.md";
 
     // Export visible history as markdown
-    const file = std.fs.cwd().createFile(filename, .{}) catch {
+    const file = std.Io.Dir.cwd().createFile(compat.io(), filename, .{}) catch {
         ctx.out.print("\x1b[31mcannot create {s}\x1b[0m\n", .{filename}) catch {};
         ctx.out.flush() catch {};
         return .handled;
     };
-    defer file.close();
+    defer file.close(compat.io());
 
     const hist = ctx.msg_history;
     var i: u32 = 0;
@@ -2449,11 +2459,11 @@ fn cmdExport(ctx: *CommandCtx, arg: []const u8) DispatchResult {
                         if (j < line.len and line[j] == '\\') j += 1;
                     }
                 } else {
-                    file.writeAll(&[1]u8{line[j]}) catch break;
+                    compat.writeAll(file, &[1]u8{line[j]}) catch break;
                     j += 1;
                 }
             }
-            file.writeAll("\n") catch break;
+            compat.writeAll(file, "\n") catch break;
         }
     }
 
@@ -2496,10 +2506,11 @@ fn cmdGit(ctx: *CommandCtx, arg: []const u8) DispatchResult {
         return .handled;
     };
 
-    const result = std.process.Child.run(.{
-        .allocator = ctx.shell.allocator,
+    const result = std.process.run(ctx.shell.allocator, compat.io(), .{
         .argv = cmd,
-        .max_output_bytes = 64 * 1024,
+        .stdout_limit = .limited(64 * 1024),
+
+        .stderr_limit = .limited(64 * 1024),
     }) catch {
         ctx.out.writeAll("\x1b[90mnot a git repo\x1b[0m\n") catch {};
         ctx.out.flush() catch {};
@@ -2603,10 +2614,11 @@ fn cmdShellEscape(ctx: *CommandCtx, query: []const u8) DispatchResult {
         ctx.msg_history.commitLine();
         ctx.out.flush() catch {};
 
-        const result = std.process.Child.run(.{
-            .allocator = ctx.shell.allocator,
+        const result = std.process.run(ctx.shell.allocator, compat.io(), .{
             .argv = &[_][]const u8{ "/bin/sh", "-c", cmd },
-            .max_output_bytes = 64 * 1024,
+            .stdout_limit = .limited(64 * 1024),
+
+            .stderr_limit = .limited(64 * 1024),
         }) catch {
             ctx.out.writeAll("\x1b[31mexec failed\x1b[0m\n") catch {};
             ctx.out.flush() catch {};
@@ -2641,7 +2653,7 @@ fn cmdShellEscape(ctx: *CommandCtx, query: []const u8) DispatchResult {
             ctx.out.writeAll("\x1b[0m") catch {};
         }
         // Show exit code + hint on failure
-        const exited = result.term.Exited;
+        const exited = result.term.exited;
         if (exited != 0) {
             ctx.out.print("\x1b[31mexit {d}\x1b[90m · /fix to auto-repair\x1b[0m\n", .{exited}) catch {};
         }

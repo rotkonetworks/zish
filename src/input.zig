@@ -1,5 +1,6 @@
 // input.zig - Key handling and input modes for zish
 const std = @import("std");
+const compat = @import("compat.zig");
 
 // Control key helper
 pub fn ctrlKey(comptime char_code: u8) u8 {
@@ -201,16 +202,17 @@ pub fn normalModeAction(char: u8) Action {
 
 /// Parse escape sequence from stdin
 pub fn parseEscapeSequence() !Action {
-    const stdin = std.io.getStdIn();
+    const stdin = std.Io.File.stdin();
     var temp_buf: [3]u8 = undefined;
 
-    const flags = std.posix.fcntl(stdin.handle, .F_GETFL, 0) catch 0;
-    _ = std.posix.fcntl(stdin.handle, .F_SETFL, @as(u32, @bitCast(flags)) | @as(u32, @bitCast(@as(i32, std.posix.O.NONBLOCK)))) catch {};
-    defer _ = std.posix.fcntl(stdin.handle, .F_SETFL, flags) catch {};
+    const flags = compat.posix.fcntl(stdin.handle, std.posix.F.GETFL, 0) catch 0;
+    const nonblock: usize = @as(u32, @bitCast(compat.posix.O{ .NONBLOCK = true }));
+    _ = compat.posix.fcntl(stdin.handle, std.posix.F.SETFL, flags | nonblock) catch {};
+    defer _ = compat.posix.fcntl(stdin.handle, std.posix.F.SETFL, flags) catch {};
 
-    std.time.sleep(10 * std.time.ns_per_ms);
+    compat.sleep(10 * std.time.ns_per_ms);
 
-    const bytes_read = stdin.read(&temp_buf) catch |err| {
+    const bytes_read = compat.posix.read(stdin.handle, &temp_buf) catch |err| {
         if (err == error.WouldBlock) {
             return .{ .vim_mode = .{ .set_mode = .normal } };
         }
@@ -240,14 +242,14 @@ pub fn parseEscapeSequence() !Action {
     return .none;
 }
 
-fn handleExtendedSequence(stdin: std.fs.File, first_byte: u8) Action {
+fn handleExtendedSequence(stdin: std.Io.File, first_byte: u8) Action {
     if (first_byte != ';') return .none;
 
     var temp_buf: [2]u8 = undefined;
-    const modifier_read = stdin.read(temp_buf[0..1]) catch return .none;
+    const modifier_read = compat.posix.read(stdin.handle, temp_buf[0..1]) catch return .none;
     if (modifier_read == 0 or temp_buf[0] != '5') return .none;
 
-    const direction_read = stdin.read(temp_buf[0..1]) catch return .none;
+    const direction_read = compat.posix.read(stdin.handle, temp_buf[0..1]) catch return .none;
     if (direction_read == 0) return .none;
 
     return switch (temp_buf[0]) {
@@ -431,10 +433,10 @@ pub const KeyBindings = struct {
     /// Format: {"ctrl+a": "move_line_start", "alt+b": "move_word_backward", ...}
     pub fn loadFromFile(path: []const u8) KeyBindings {
         var kb = KeyBindings{}; // start with defaults
-        const file = std.fs.cwd().openFile(path, .{}) catch return kb;
-        defer file.close();
+        const file = std.Io.Dir.cwd().openFile(compat.io(), path, .{}) catch return kb;
+        defer file.close(compat.io());
         var buf: [8192]u8 = undefined;
-        const len = file.readAll(&buf) catch return kb;
+        const len = compat.readAll(file, &buf) catch return kb;
         kb.parseJson(buf[0..len]);
         return kb;
     }

@@ -14,7 +14,8 @@
 // Same pattern as agent_queue.zig but generic.
 
 const std = @import("std");
-const posix = std.posix;
+const compat = @import("../compat.zig");
+const posix = compat.posix;
 
 /// Lock-free typed SPSC ring buffer.
 /// Works in shared memory (same process or across fork).
@@ -94,7 +95,7 @@ pub fn Ring(comptime Frame: type, comptime capacity: usize) type {
         /// Blocking push: spin until space available.
         pub fn pushWait(self: *Self, frame: Frame) void {
             while (!self.push(frame)) {
-                std.Thread.sleep(100_000); // 100μs
+                compat.sleep(100_000); // 100μs
             }
         }
     };

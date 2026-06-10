@@ -10,8 +10,9 @@
 // Special tokens: SOT=50257, EOT=50256, EN=50259, TRANSCRIBE=50358, NOTIMESTAMPS=50362
 
 const std = @import("std");
+const compat = @import("../compat.zig");
 const math = @import("math.zig");
-const posix = std.posix;
+const posix = compat.posix;
 
 const Allocator = std.mem.Allocator;
 
@@ -114,8 +115,8 @@ pub const WhisperModel = struct {
     vocab: [][]const u8,
 
     pub fn load(path: []const u8, alloc: Allocator) !WhisperModel {
-        const file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
+        const file = try std.Io.Dir.cwd().openFile(compat.io(), path, .{});
+        defer file.close(compat.io());
 
         const magic = try readU32(file);
         if (magic != 0x67676d6c) return error.BadFormat;
@@ -329,7 +330,7 @@ pub const WhisperModel = struct {
         alloc.free(enc_out);
 
         // Decode tokens to text
-        var text: std.ArrayList(u8) = .{};
+        var text: std.ArrayList(u8) = .empty;
         for (tokens[4..n_tokens]) |tok| {
             if (tok == EOT) break;
             if (tok >= self.vocab.len) continue;
@@ -650,16 +651,16 @@ const CrossKV = struct {
 
 // ── Helpers ──
 
-fn readU32(file: std.fs.File) !u32 {
+fn readU32(file: std.Io.File) !u32 {
     var buf: [4]u8 = undefined;
     try readExact(file, &buf);
     return std.mem.readInt(u32, &buf, .little);
 }
 
-fn readExact(file: std.fs.File, buf: []u8) !void {
+fn readExact(file: std.Io.File, buf: []u8) !void {
     var total: usize = 0;
     while (total < buf.len) {
-        const n = try file.read(buf[total..]);
+        const n = try file.readStreaming(compat.io(), &.{buf[total..]});
         if (n == 0) return error.EndOfStream;
         total += n;
     }

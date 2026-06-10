@@ -92,9 +92,9 @@ fn isPathCharOrColon(c: u8) bool {
 
 test "linkify detects absolute paths" {
     var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try writeLinked(fbs.writer(), "see /src/main.zig for details");
-    const out = fbs.getWritten();
+    var fbs: std.Io.Writer = .fixed(&buf);
+    try writeLinked(&fbs, "see /src/main.zig for details");
+    const out = fbs.buffered();
     // Should contain OSC 8 sequence
     try std.testing.expect(std.mem.indexOf(u8, out, "\x1b]8;;file:///src/main.zig") != null);
     // Should contain the path text
@@ -103,16 +103,16 @@ test "linkify detects absolute paths" {
 
 test "linkify detects URLs" {
     var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try writeLinked(fbs.writer(), "visit https://example.com now");
-    const out = fbs.getWritten();
+    var fbs: std.Io.Writer = .fixed(&buf);
+    try writeLinked(&fbs, "visit https://example.com now");
+    const out = fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "\x1b]8;;https://example.com") != null);
 }
 
 test "linkify passes plain text through" {
     var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try writeLinked(fbs.writer(), "just plain text");
-    const out = fbs.getWritten();
+    var fbs: std.Io.Writer = .fixed(&buf);
+    try writeLinked(&fbs, "just plain text");
+    const out = fbs.buffered();
     try std.testing.expectEqualStrings("just plain text", out);
 }

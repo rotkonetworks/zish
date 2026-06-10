@@ -1,6 +1,7 @@
 // secure_types.zig - memory-safe core types and bounds
 
 const std = @import("std");
+const compat = @import("compat.zig");
 
 // compile-time security bounds
 pub const MAX_COMMAND_LENGTH = 64 * 1024;
@@ -14,7 +15,7 @@ pub const MAX_PARSE_DEPTH = 64;
 pub const MAX_PROMPT_LENGTH =
     std.fs.max_path_bytes +
     std.fs.max_name_bytes +
-    std.posix.HOST_NAME_MAX + 265;
+    compat.posix.HOST_NAME_MAX + 265;
 
 // secure integer types to prevent overflow
 pub const LineNumber = u32;

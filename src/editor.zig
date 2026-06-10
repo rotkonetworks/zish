@@ -2,6 +2,7 @@
 // design: single source of truth, batched output, zero alloc hot path
 
 const std = @import("std");
+const compat = @import("compat.zig");
 const keywords = @import("keywords.zig");
 const render_pipeline = @import("render_pipeline.zig");
 
@@ -555,13 +556,13 @@ pub const TermView = struct {
     last_hash: u64 = 0,
     last_cursor: u16 = 0,
     last_width: u16 = 0,
-    fd: std.posix.fd_t,
+    fd: compat.posix.fd_t,
     // ghost text suggestion (set by Shell, rendered after content in dim)
     ghost_text: []const u8 = "",
 
     const Self = @This();
 
-    pub fn init(fd: std.posix.fd_t) Self {
+    pub fn init(fd: compat.posix.fd_t) Self {
         var self = Self{ .fd = fd };
         self.updateSize();
         self.last_width = self.term.width;
@@ -570,8 +571,8 @@ pub const TermView = struct {
 
     /// query terminal size via ioctl
     pub fn updateSize(self: *Self) void {
-        var ws: std.posix.winsize = undefined;
-        if (std.posix.system.ioctl(self.fd, std.posix.T.IOCGWINSZ, @intFromPtr(&ws)) == 0) {
+        var ws: compat.posix.winsize = undefined;
+        if (std.posix.system.ioctl(self.fd, compat.posix.T.IOCGWINSZ, @intFromPtr(&ws)) == 0) {
             if (ws.col > 0) self.term.width = ws.col;
             if (ws.row > 0) self.term.height = ws.row;
         }
@@ -617,7 +618,7 @@ pub const TermView = struct {
     /// flush to terminal
     pub fn flush(self: *Self) !void {
         if (self.out_len == 0) return;
-        _ = try std.posix.write(self.fd, self.out[0..self.out_len]);
+        _ = try compat.posix.write(self.fd, self.out[0..self.out_len]);
         self.out_len = 0;
     }
 

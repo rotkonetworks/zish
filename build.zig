@@ -27,14 +27,13 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            // Link libc for dlopen/dlsym (GPU Vulkan compute)
+            .link_libc = true,
         }),
         .use_llvm = true,
     });
 
     exe.root_module.addImport("clap", clap.module("clap"));
-
-    // Link libc for dlopen/dlsym (GPU Vulkan compute)
-    exe.linkLibC();
 
     exe.root_module.addAnonymousImport("build.zig.zon", .{
         .root_source_file = b.path("build.zig.zon"),
@@ -42,7 +41,7 @@ pub fn build(b: *std.Build) void {
 
     // Enable performance optimizations
     if (enable_lto and optimize != .Debug) {
-        exe.want_lto = true;
+        exe.lto = .full;
     }
 
     // Add performance-focused compile flags

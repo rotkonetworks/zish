@@ -19,6 +19,7 @@
 // The pipeline compiles down to a single function call chain.
 
 const std = @import("std");
+const compat = @import("../compat.zig");
 const ctm = @import("ctm.zig");
 const model_mod = @import("model.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -643,7 +644,7 @@ fn sampleFromLogits(logits: []f32, temperature: f32, recent: []const Token) Toke
     if (sum > 0) for (logits) |*l| { l.* /= sum; };
 
     // Multinomial
-    var rng = std.Random.DefaultPrng.init(@intCast(std.time.nanoTimestamp()));
+    var rng = std.Random.DefaultPrng.init(@intCast(compat.nanoTimestamp()));
     const r = rng.random().float(f32);
     var cumulative: f32 = 0;
     for (0..logits.len) |i| {

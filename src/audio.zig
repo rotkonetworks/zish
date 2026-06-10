@@ -6,7 +6,8 @@
 // Playback: producer → pipe → PCM frames → aplay
 
 const std = @import("std");
-const posix = std.posix;
+const compat = @import("compat.zig");
+const posix = compat.posix;
 
 /// Streaming audio capture via arecord subprocess.
 /// Produces 16kHz mono i16 PCM on stdout pipe.
@@ -18,22 +19,20 @@ pub const Capture = struct {
     /// Start capturing from default audio device.
     /// Returns immediately — read PCM from stdout_fd.
     pub fn start(alloc: std.mem.Allocator) !Capture {
+        _ = alloc;
         // Try parecord (PulseAudio/PipeWire) first, fall back to arecord (ALSA)
-        var child = std.process.Child.init(
-            &.{
+        const child = try std.process.spawn(compat.io(), .{
+            .argv = &.{
                 "parecord",
                 "--format=s16le", // signed 16-bit little-endian
                 "--rate=16000", // 16kHz
                 "--channels=1", // mono
                 "--raw", // raw PCM (no WAV header)
             },
-            alloc,
-        );
-        child.stdin_behavior = .Ignore;
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Ignore;
-
-        try child.spawn();
+            .stdin = .ignore,
+            .stdout = .pipe,
+            .stderr = .ignore,
+        });
 
         return .{
             .child = child,
@@ -62,8 +61,8 @@ pub const Capture = struct {
     /// Stop capture.
     pub fn stop(self: *Capture) void {
         if (self.running) {
-            _ = self.child.kill() catch {};
-            _ = self.child.wait() catch {};
+            // kill() blocks until termination and cleans up (wait built in)
+            self.child.kill(compat.io());
             self.running = false;
         }
     }
@@ -78,18 +77,16 @@ pub const Playback = struct {
 
     /// Start playback to default audio device.
     pub fn start(alloc: std.mem.Allocator, sample_rate: u32) !Playback {
+        _ = alloc;
         var rate_buf: [8]u8 = undefined;
         const rate_str = std.fmt.bufPrint(&rate_buf, "{d}", .{sample_rate}) catch "24000";
 
-        var child = std.process.Child.init(
-            &.{ "paplay", "--format=s16le", "--rate", rate_str, "--channels=1", "--raw" },
-            alloc,
-        );
-        child.stdin_behavior = .Pipe;
-        child.stdout_behavior = .Ignore;
-        child.stderr_behavior = .Ignore;
-
-        try child.spawn();
+        const child = try std.process.spawn(compat.io(), .{
+            .argv = &.{ "paplay", "--format=s16le", "--rate", rate_str, "--channels=1", "--raw" },
+            .stdin = .pipe,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        });
 
         return .{
             .child = child,
@@ -107,8 +104,11 @@ pub const Playback = struct {
     /// Stop playback.
     pub fn stop(self: *Playback) void {
         if (self.running) {
+            // close stdin to signal EOF so paplay drains; clear the field so
+            // wait()'s cleanup doesn't double-close the fd
             posix.close(self.stdin_fd);
-            _ = self.child.wait() catch {};
+            self.child.stdin = null;
+            _ = self.child.wait(compat.io()) catch {};
             self.running = false;
         }
     }

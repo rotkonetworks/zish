@@ -3,6 +3,7 @@
 // and main thread writes, agent thread reads (request queue)
 
 const std = @import("std");
+const compat = @import("compat.zig");
 
 pub const MAX_MSG_LEN = 4096;
 pub const QUEUE_CAPACITY = 64; // power of 2
@@ -96,7 +97,7 @@ pub fn Queue(comptime capacity: usize) type {
         /// Producer: enqueue a message, spinning until space is available.
         pub fn pushWait(self: *Self, kind: MsgKind, text: []const u8) void {
             while (!self.push(kind, text)) {
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                compat.sleep(1 * std.time.ns_per_ms);
             }
         }
 
@@ -250,7 +251,7 @@ pub const RateLimitState = struct {
                 continue; // CAS failed, retry immediately
             }
             // No slots — backoff
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            compat.sleep(100 * std.time.ns_per_ms);
         }
         return false; // timeout
     }
@@ -288,7 +289,7 @@ pub const Bulletin = struct {
                 slot.setAuthor(author);
                 slot.depth = depth;
                 slot.setData(text);
-                slot.timestamp = std.time.milliTimestamp();
+                slot.timestamp = compat.milliTimestamp();
                 slot.seq = cur_tail;
                 return;
             }

@@ -129,7 +129,7 @@ pub const Tokenizer = struct {
     /// Decode a sequence of tokens to a string.
     /// Handles BPE space markers: Ġ (GPT-2/Qwen, U+0120 = \xc4\xa0) and ▁ (SentencePiece, U+2581 = \xe2\x96\x81)
     pub fn decodeAll(self: *const Tokenizer, tokens: []const Token, alloc: Allocator) ![]u8 {
-        var result: std.ArrayList(u8) = .{};
+        var result: std.ArrayList(u8) = .empty;
         for (tokens) |tok| {
             if (self.decode(tok)) |s| {
                 var i: usize = 0;
@@ -169,7 +169,7 @@ pub const Tokenizer = struct {
     /// Encode text to tokens using BPE or SentencePiece.
     /// For our use case (small classification prompts), a greedy approach works fine.
     pub fn encode(self: *const Tokenizer, text: []const u8, add_bos: bool, alloc: Allocator) ![]Token {
-        var tokens: std.ArrayList(Token) = .{};
+        var tokens: std.ArrayList(Token) = .empty;
 
         if (add_bos) {
             tokens.append(alloc, self.bos_id) catch return error.OutOfMemory;

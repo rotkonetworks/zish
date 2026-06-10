@@ -4,9 +4,10 @@
 // Parses GGUF v3 files: header, metadata KV pairs, tensor info, mmap'd tensor data.
 
 const std = @import("std");
+const compat = @import("../compat.zig");
 
 const page_size = std.heap.page_size_min;
-const Reader = std.io.FixedBufferStream([]align(page_size) u8).Reader;
+const Reader = *std.Io.Reader;
 
 pub const Error = error{
     FileError,
@@ -65,10 +66,9 @@ pub const String = struct {
     str: []u8,
 
     fn read(reader: Reader, alloc: std.mem.Allocator) Error!String {
-        const len = reader.readInt(u64, .little) catch return Error.EOF;
+        const len = reader.takeInt(u64, .little) catch return Error.EOF;
         const buf = alloc.alloc(u8, len) catch return Error.Alloc;
-        const n_read = reader.read(buf) catch return Error.FileError;
-        if (n_read != len) return Error.FileError;
+        reader.readSliceAll(buf) catch return Error.FileError;
         return .{ .len = len, .str = buf };
     }
 };
@@ -79,10 +79,10 @@ pub const Array = struct {
     array: []Value,
 
     fn read(reader: Reader, alloc: std.mem.Allocator) Error!Array {
-        const element_type = reader.readEnum(MetadataType, .little) catch return Error.EOF;
-        const len = reader.readInt(u64, .little) catch return Error.EOF;
+        const element_type = reader.takeEnum(MetadataType, .little) catch return Error.EOF;
+        const len = reader.takeInt(u64, .little) catch return Error.EOF;
 
-        var list: std.ArrayList(Value) = .{};
+        var list: std.ArrayList(Value) = .empty;
         for (0..len) |_| {
             const val = try Value.read(element_type, reader, alloc);
             list.append(alloc, val) catch return Error.Alloc;
@@ -114,17 +114,17 @@ pub const Value = union(MetadataType) {
     fn read(value_type: MetadataType, reader: Reader, alloc: std.mem.Allocator) Error!Value {
         // zig fmt: off
         return switch (value_type) {
-            .uint8   => .{ .uint8   = reader.readInt(u8, .little)  catch return Error.EOF },
-            .int8    => .{ .int8    = reader.readInt(i8, .little)  catch return Error.EOF },
-            .uint16  => .{ .uint16  = reader.readInt(u16, .little) catch return Error.EOF },
-            .int16   => .{ .int16   = reader.readInt(i16, .little) catch return Error.EOF },
-            .uint32  => .{ .uint32  = reader.readInt(u32, .little) catch return Error.EOF },
-            .int32   => .{ .int32   = reader.readInt(i32, .little) catch return Error.EOF },
-            .uint64  => .{ .uint64  = reader.readInt(u64, .little) catch return Error.EOF },
-            .int64   => .{ .int64   = reader.readInt(i64, .little) catch return Error.EOF },
-            .boolean => .{ .boolean = (reader.readInt(u8, .little) catch return Error.EOF) == 1 },
-            .float32 => .{ .float32 = @bitCast(reader.readInt(u32, .little) catch return Error.EOF) },
-            .float64 => .{ .float64 = @bitCast(reader.readInt(u64, .little) catch return Error.EOF) },
+            .uint8   => .{ .uint8   = reader.takeInt(u8, .little)  catch return Error.EOF },
+            .int8    => .{ .int8    = reader.takeInt(i8, .little)  catch return Error.EOF },
+            .uint16  => .{ .uint16  = reader.takeInt(u16, .little) catch return Error.EOF },
+            .int16   => .{ .int16   = reader.takeInt(i16, .little) catch return Error.EOF },
+            .uint32  => .{ .uint32  = reader.takeInt(u32, .little) catch return Error.EOF },
+            .int32   => .{ .int32   = reader.takeInt(i32, .little) catch return Error.EOF },
+            .uint64  => .{ .uint64  = reader.takeInt(u64, .little) catch return Error.EOF },
+            .int64   => .{ .int64   = reader.takeInt(i64, .little) catch return Error.EOF },
+            .boolean => .{ .boolean = (reader.takeInt(u8, .little) catch return Error.EOF) == 1 },
+            .float32 => .{ .float32 = @bitCast(reader.takeInt(u32, .little) catch return Error.EOF) },
+            .float64 => .{ .float64 = @bitCast(reader.takeInt(u64, .little) catch return Error.EOF) },
             .string  => .{ .string  = try String.read(reader, alloc) },
             .array   => .{ .array   = try Array.read(reader, alloc) },
         };
@@ -138,7 +138,7 @@ pub const MetadataKV = struct {
 
     fn read(reader: Reader, alloc: std.mem.Allocator) Error!MetadataKV {
         const key = try String.read(reader, alloc);
-        const value_type = reader.readEnum(MetadataType, .little) catch return Error.EOF;
+        const value_type = reader.takeEnum(MetadataType, .little) catch return Error.EOF;
         const value = try Value.read(value_type, reader, alloc);
         return .{ .key = key, .value = value };
     }
@@ -152,12 +152,12 @@ pub const GGUFHeader = struct {
     metadata_kv_count: u64,
 
     pub fn read(reader: Reader) Error!GGUFHeader {
-        const magic = reader.readInt(u32, .little) catch return Error.EOF;
+        const magic = reader.takeInt(u32, .little) catch return Error.EOF;
         if (magic != magic_num) return Error.Format;
-        const version = reader.readInt(u32, .little) catch return Error.EOF;
+        const version = reader.takeInt(u32, .little) catch return Error.EOF;
         if (version != 3) return Error.Format;
-        const tensor_count = reader.readInt(u64, .little) catch return Error.EOF;
-        const metadata_kv_count = reader.readInt(u64, .little) catch return Error.EOF;
+        const tensor_count = reader.takeInt(u64, .little) catch return Error.EOF;
+        const metadata_kv_count = reader.takeInt(u64, .little) catch return Error.EOF;
         return .{
             .version = version,
             .tensor_count = tensor_count,
@@ -174,14 +174,14 @@ pub const TensorInfo = struct {
 
     fn read(reader: Reader, alignment: usize, alloc: std.mem.Allocator) Error!TensorInfo {
         const name = String.read(reader, alloc) catch return Error.EOF;
-        const dim = reader.readInt(u32, .little) catch return Error.EOF;
+        const dim = reader.takeInt(u32, .little) catch return Error.EOF;
         std.debug.assert(dim > 0);
         const dimensions = alloc.alloc(u64, dim) catch return Error.Alloc;
         for (0..dim) |i| {
-            dimensions[i] = reader.readInt(u64, .little) catch return Error.EOF;
+            dimensions[i] = reader.takeInt(u64, .little) catch return Error.EOF;
         }
-        const ggml_type = reader.readEnum(Type, .little) catch return Error.EOF;
-        const offset: usize = @intCast(reader.readInt(u64, .little) catch return Error.EOF);
+        const ggml_type = reader.takeEnum(Type, .little) catch return Error.EOF;
+        const offset: usize = @intCast(reader.takeInt(u64, .little) catch return Error.EOF);
 
         const aligned = alignOffset(offset, alignment);
         if (offset != aligned) return Error.FileError;
@@ -218,32 +218,32 @@ pub const GGUFFile = struct {
     tensor_data_offset: usize,
 
     arena: std.heap.ArenaAllocator,
-    fd: std.posix.fd_t,
+    fd: compat.posix.fd_t,
     mmap_ptr: []align(page_size) u8,
     file_size: usize,
 
     pub fn open(path: []const u8, alloc: std.mem.Allocator) !GGUFFile {
         // Open and mmap the file
-        const fd = std.posix.open(path, .{}, 0o440) catch return Error.FileError;
-        errdefer std.posix.close(fd);
+        const fd = compat.posix.open(path, .{}, 0o440) catch return Error.FileError;
+        errdefer compat.posix.close(fd);
 
-        const stat = std.posix.fstat(fd) catch return Error.FileError;
+        const stat = compat.posix.fstat(fd) catch return Error.FileError;
         const fsize: u64 = @intCast(stat.size);
 
-        const mmap_type: std.posix.MAP = .{
+        const mmap_type: compat.posix.MAP = .{
             .TYPE = .SHARED,
             .NORESERVE = true,
             .POPULATE = true,
         };
-        const ptr = std.posix.mmap(null, fsize, std.posix.PROT.READ, mmap_type, fd, 0) catch return Error.FileError;
-        errdefer std.posix.munmap(ptr);
+        const ptr = compat.posix.mmap(null, fsize, .{ .READ = true }, mmap_type, fd, 0) catch return Error.FileError;
+        errdefer compat.posix.munmap(ptr);
 
-        const madvise_flags = std.posix.MADV.SEQUENTIAL | std.posix.MADV.WILLNEED;
-        std.posix.madvise(ptr.ptr, fsize, madvise_flags) catch {};
+        const madvise_flags = compat.posix.MADV.SEQUENTIAL | compat.posix.MADV.WILLNEED;
+        compat.posix.madvise(ptr.ptr, fsize, madvise_flags) catch {};
 
         // Parse header and metadata
-        var stream = std.io.fixedBufferStream(ptr);
-        const reader = stream.reader();
+        var stream = std.Io.Reader.fixed(ptr);
+        const reader = &stream;
 
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
@@ -252,7 +252,7 @@ pub const GGUFFile = struct {
         const header = try GGUFHeader.read(reader);
 
         // Read metadata
-        var meta_list: std.ArrayList(MetadataKV) = .{};
+        var meta_list: std.ArrayList(MetadataKV) = .empty;
         for (0..header.metadata_kv_count) |_| {
             const kv = try MetadataKV.read(reader, a);
             meta_list.append(a, kv) catch return Error.Alloc;
@@ -268,7 +268,7 @@ pub const GGUFFile = struct {
         };
 
         // Read tensor info
-        var tensor_list: std.ArrayList(TensorInfo) = .{};
+        var tensor_list: std.ArrayList(TensorInfo) = .empty;
         for (0..header.tensor_count) |_| {
             const ti = try TensorInfo.read(reader, alignment, a);
             tensor_list.append(a, ti) catch return Error.Alloc;
@@ -276,7 +276,7 @@ pub const GGUFFile = struct {
         const tensor_info = tensor_list.toOwnedSlice(a) catch return Error.Alloc;
 
         // Calculate tensor data offset (aligned)
-        const file_offset: usize = @intCast(stream.pos);
+        const file_offset: usize = @intCast(stream.seek);
         const tensor_data_offset = std.mem.alignForward(usize, file_offset, alignment);
 
         return .{
@@ -295,8 +295,8 @@ pub const GGUFFile = struct {
         _ = self.arena.reset(.free_all);
         self.arena.deinit();
         if (self.fd != -1) {
-            std.posix.munmap(self.mmap_ptr);
-            std.posix.close(self.fd);
+            compat.posix.munmap(self.mmap_ptr);
+            compat.posix.close(self.fd);
         }
         self.fd = -1;
     }

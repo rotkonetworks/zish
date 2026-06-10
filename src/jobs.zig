@@ -1,6 +1,7 @@
 // jobs.zig - Job control for zish
 const std = @import("std");
-const posix = std.posix;
+const compat = @import("compat.zig");
+const posix = compat.posix;
 
 /// tcsetpgrp via ioctl (workaround: Zig 0.15 std.c missing tcsetpgrp binding)
 pub fn tcsetpgrp(fd: posix.fd_t, pgrp: posix.pid_t) posix.TermioSetPgrpError!void {
@@ -132,7 +133,7 @@ pub const JobTable = struct {
             @intCast(shell_pgid);
 
         return JobTable{
-            .jobs = .{},
+            .jobs = .empty,
             .allocator = allocator,
             .next_id = 1,
             .shell_pgid = pgid,
@@ -140,7 +141,7 @@ pub const JobTable = struct {
             .shell_tmodes = tmodes,
             .current_job = null,
             .previous_job = null,
-            .notifications = .{},
+            .notifications = .empty,
         };
     }
 
@@ -163,7 +164,7 @@ pub const JobTable = struct {
         const cmd_copy = try self.allocator.dupe(u8, command);
         errdefer self.allocator.free(cmd_copy);
 
-        var processes = std.ArrayListUnmanaged(Process){};
+        var processes = std.ArrayListUnmanaged(Process).empty;
         errdefer processes.deinit(self.allocator);
         try processes.append(self.allocator, .{ .pid = pid });
 
@@ -175,7 +176,7 @@ pub const JobTable = struct {
             .processes = processes,
             .foreground = foreground,
             .notified = foreground, // foreground jobs don't need notification
-            .start_time = std.time.timestamp(),
+            .start_time = compat.timestamp(),
             .tmodes = null,
         });
 
@@ -196,7 +197,7 @@ pub const JobTable = struct {
         const cmd_copy = try self.allocator.dupe(u8, command);
         errdefer self.allocator.free(cmd_copy);
 
-        var processes = std.ArrayListUnmanaged(Process){};
+        var processes = std.ArrayListUnmanaged(Process).empty;
         errdefer processes.deinit(self.allocator);
 
         for (pids) |pid| {
@@ -211,7 +212,7 @@ pub const JobTable = struct {
             .processes = processes,
             .foreground = foreground,
             .notified = foreground,
-            .start_time = std.time.timestamp(),
+            .start_time = compat.timestamp(),
             .tmodes = null,
         });
 
@@ -327,7 +328,7 @@ pub const JobTable = struct {
 
     /// Get pending notifications and clear them
     pub fn getPendingNotifications(self: *JobTable) ![]Notification {
-        var pending = std.ArrayListUnmanaged(Notification){};
+        var pending = std.ArrayListUnmanaged(Notification).empty;
         errdefer {
             // clean up any allocations made before error
             for (pending.items) |notif| {

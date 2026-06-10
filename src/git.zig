@@ -1,5 +1,6 @@
 // git.zig - git integration for prompt and completion
 const std = @import("std");
+const compat = @import("compat.zig");
 
 pub const GitInfo = struct {
     branch: []const u8,
@@ -23,10 +24,10 @@ pub const GitStatus = struct {
 
     pub fn init(allocator: std.mem.Allocator) GitStatus {
         return .{
-            .modified = .{},
-            .deleted = .{},
-            .untracked = .{},
-            .staged = .{},
+            .modified = .empty,
+            .deleted = .empty,
+            .untracked = .empty,
+            .staged = .empty,
             .allocator = allocator,
         };
     }
@@ -46,11 +47,11 @@ pub const GitStatus = struct {
 /// get basic git info for prompt (branch, commit, dirty)
 pub fn getInfo(allocator: std.mem.Allocator) ?GitInfo {
     // read HEAD for branch/commit
-    const head_file = std.fs.cwd().openFile(".git/HEAD", .{}) catch return null;
-    defer head_file.close();
+    const head_file = std.Io.Dir.cwd().openFile(compat.io(), ".git/HEAD", .{}) catch return null;
+    defer head_file.close(compat.io());
 
     var head_buf: [256]u8 = undefined;
-    const head_len = head_file.readAll(&head_buf) catch return null;
+    const head_len = compat.readAll(head_file, &head_buf) catch return null;
     const head_content = std.mem.trim(u8, head_buf[0..head_len], " \t\r\n");
 
     var branch: []const u8 = "HEAD";
@@ -65,10 +66,10 @@ pub fn getInfo(allocator: std.mem.Allocator) ?GitInfo {
         var ref_path_buf: [512]u8 = undefined;
         const ref_path = std.fmt.bufPrint(&ref_path_buf, ".git/refs/heads/{s}", .{branch}) catch return null;
 
-        if (std.fs.cwd().openFile(ref_path, .{})) |ref_file| {
-            defer ref_file.close();
+        if (std.Io.Dir.cwd().openFile(compat.io(), ref_path, .{})) |ref_file| {
+            defer ref_file.close(compat.io());
             var commit_buf: [64]u8 = undefined;
-            const commit_len = ref_file.readAll(&commit_buf) catch 0;
+            const commit_len = compat.readAll(ref_file, &commit_buf) catch 0;
             if (commit_len >= 7) {
                 commit = allocator.dupe(u8, commit_buf[0..7]) catch "";
             }
@@ -83,9 +84,9 @@ pub fn getInfo(allocator: std.mem.Allocator) ?GitInfo {
 
     // check dirty: compare index mtime vs HEAD commit time
     const dirty = blk: {
-        const index_stat = std.fs.cwd().statFile(".git/index") catch break :blk false;
-        const head_stat = std.fs.cwd().statFile(".git/HEAD") catch break :blk false;
-        break :blk index_stat.mtime > head_stat.mtime;
+        const index_stat = std.Io.Dir.cwd().statFile(compat.io(), ".git/index", .{}) catch break :blk false;
+        const head_stat = std.Io.Dir.cwd().statFile(compat.io(), ".git/HEAD", .{}) catch break :blk false;
+        break :blk index_stat.mtime.nanoseconds > head_stat.mtime.nanoseconds;
     };
 
     return GitInfo{
@@ -100,22 +101,22 @@ pub fn getInfo(allocator: std.mem.Allocator) ?GitInfo {
 /// get git status for completion (modified, deleted, untracked files)
 pub fn getStatus(allocator: std.mem.Allocator) ?GitStatus {
     // run git status --porcelain
-    var child = std.process.Child.init(&.{ "git", "status", "--porcelain" }, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-
-    _ = child.spawn() catch return null;
+    var child = std.process.spawn(compat.io(), .{
+        .argv = &.{ "git", "status", "--porcelain" },
+        .stdout = .pipe,
+        .stderr = .ignore,
+    }) catch return null;
 
     var status = GitStatus.init(allocator);
     errdefer status.deinit();
 
     const stdout = child.stdout orelse return null;
     var buf: [4096]u8 = undefined;
-    const len = stdout.readAll(&buf) catch return null;
+    const len = compat.readAll(stdout, &buf) catch return null;
 
     // Close pipe before wait — prevents deadlock if output exceeds buffer
-    if (child.stdout) |*s| { s.close(); child.stdout = null; }
-    _ = child.wait() catch return null;
+    if (child.stdout) |s| { s.close(compat.io()); child.stdout = null; }
+    _ = child.wait(compat.io()) catch return null;
 
     // parse porcelain output
     var lines = std.mem.splitScalar(u8, buf[0..len], '\n');
@@ -154,8 +155,7 @@ pub fn getStatus(allocator: std.mem.Allocator) ?GitStatus {
 
 /// check if in a git repo
 pub fn isRepo() bool {
-    const dir = std.fs.cwd().openDir(".git", .{}) catch return false;
-    var d = dir;
-    d.close();
+    const dir = std.Io.Dir.cwd().openDir(compat.io(), ".git", .{}) catch return false;
+    dir.close(compat.io());
     return true;
 }

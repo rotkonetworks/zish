@@ -5,23 +5,24 @@ const build = @import("build.zig.zon");
 const clap = @import("clap");
 const Shell = @import("Shell.zig");
 const build_options = @import("build_options");
+const compat = @import("compat.zig");
 
-pub fn main() void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) void {
+    compat.setIo(init.io);
+    const allocator = init.gpa;
 
     var diag = clap.Diagnostic{};
-    var res = clap.parse(clap.Help, &params, clap.parsers.default, .{
-        .allocator = gpa.allocator(),
+    var res = clap.parse(clap.Help, &params, clap.parsers.default, init.minimal.args, .{
+        .diagnostic = &diag,
+        .allocator = allocator,
     }) catch |err| {
-        diag.reportToFile(.stderr(), err) catch {};
+        diag.reportToFile(init.io, .stderr(), err) catch {};
         return;
     };
     defer res.deinit();
 
     if (res.args.help != 0) {
-        clap.helpToFile(.stdout(), clap.Help, &params, .{}) catch {};
+        clap.helpToFile(init.io, .stdout(), clap.Help, &params, .{}) catch {};
         return;
     }
 
@@ -46,12 +47,12 @@ pub fn main() void {
 
     if (res.args.@"debug-log-file") |log_path| {
         shell_instance.log_file = if (std.fs.path.isAbsolute(log_path))
-            std.fs.createFileAbsolute(log_path, .{}) catch |err| {
+            std.Io.Dir.createFileAbsolute(compat.io(), log_path, .{}) catch |err| {
                 std.debug.print("zish: failed to create log file: {}\n", .{err});
                 std.process.exit(1);
             }
         else
-            std.fs.cwd().createFile(log_path, .{}) catch |err| {
+            std.Io.Dir.cwd().createFile(compat.io(), log_path, .{}) catch |err| {
                 std.debug.print("zish: failed to create log file: {}\n", .{err});
                 std.process.exit(1);
             };
@@ -76,7 +77,7 @@ pub fn main() void {
 
         // Flush stdout buffer before exit
         shell_instance.stdout().flush() catch {};
-        std.posix.exit(exit_code);
+        std.process.exit(exit_code);
     } else if (res.positionals.len > 0 and res.positionals[0].len > 0) {
         // script file mode
         const script_path = res.positionals[0][0];
@@ -92,7 +93,7 @@ pub fn main() void {
             }
         }
 
-        const script_content = std.fs.cwd().readFileAlloc(allocator, script_path, 1024 * 1024) catch |err| {
+        const script_content = std.Io.Dir.cwd().readFileAlloc(compat.io(), script_path, allocator, .limited(1024 * 1024)) catch |err| {
             std.debug.print("zish: cannot read script '{s}': {}\n", .{ script_path, err });
             std.process.exit(1);
         };

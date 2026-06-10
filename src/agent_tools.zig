@@ -3,6 +3,7 @@
 // All functions are free (non-method) and take explicit parameters via ToolContext.
 
 const std = @import("std");
+const compat = @import("compat.zig");
 const q = @import("agent_queue.zig");
 const log_mod = @import("agent_log.zig");
 
@@ -153,7 +154,7 @@ pub fn waitForConfirm(queues: *AgentQueues, command_text: []const u8) ConfirmRes
             }
             if (msg.kind == .cancel) return .deny;
         }
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        compat.sleep(10 * std.time.ns_per_ms);
     }
     return .deny; // timeout
 }
@@ -214,7 +215,7 @@ pub fn shellEscape(value: []const u8, buf: []u8) ?[]const u8 {
 ///           "required":["param"]}]
 pub fn loadPluginTools(tools: *[MAX_PLUGIN_TOOLS]PluginTool) u8 {
     const alloc = std.heap.page_allocator;
-    const home = std.process.getEnvVarOwned(alloc, "HOME") catch return 0;
+    const home = compat.getEnvVarOwned(alloc, "HOME") catch return 0;
     defer alloc.free(home);
 
     var count: u8 = 0;
@@ -224,7 +225,7 @@ pub fn loadPluginTools(tools: *[MAX_PLUGIN_TOOLS]PluginTool) u8 {
         var path_buf: [512]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "{s}/.zish/agent-tools.json", .{home}) catch "";
         if (path.len > 0) {
-            const content = std.fs.cwd().readFileAlloc(alloc, path, 32768) catch null;
+            const content = std.Io.Dir.cwd().readFileAlloc(compat.io(), path, alloc, .limited(32768)) catch null;
             if (content) |c| {
                 defer alloc.free(c);
                 count = parseToolArray(c, tools, count);
@@ -237,16 +238,16 @@ pub fn loadPluginTools(tools: *[MAX_PLUGIN_TOOLS]PluginTool) u8 {
         var dir_buf: [512]u8 = undefined;
         const dir_path = std.fmt.bufPrint(&dir_buf, "{s}/.zish/tools", .{home}) catch "";
         if (dir_path.len > 0) {
-            var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return count;
-            defer dir.close();
+            var dir = std.Io.Dir.cwd().openDir(compat.io(), dir_path, .{ .iterate = true }) catch return count;
+            defer dir.close(compat.io());
             var iter = dir.iterate();
-            while (iter.next() catch null) |entry| {
+            while (iter.next(compat.io()) catch null) |entry| {
                 if (count >= MAX_PLUGIN_TOOLS) break;
                 if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
-                const content = dir.readFileAlloc(alloc, entry.name, 32768) catch continue;
+                const content = dir.readFileAlloc(compat.io(), entry.name, alloc, .limited(32768)) catch continue;
                 defer alloc.free(content);
                 // Single tool file can be either { ... } or [ { ... }, ... ]
-                const trimmed = std.mem.trimLeft(u8, content, " \t\n\r");
+                const trimmed = std.mem.trimStart(u8, content, " \t\n\r");
                 if (trimmed.len > 0 and trimmed[0] == '[') {
                     count = parseToolArray(content, tools, count);
                 } else if (trimmed.len > 0 and trimmed[0] == '{') {
@@ -315,14 +316,14 @@ pub fn parsePluginTool(json: []const u8, tool: *PluginTool) void {
     // Check "confirm":true
     if (std.mem.indexOf(u8, json, "\"confirm\"")) |idx| {
         const after = json[@min(idx + 9, json.len)..];
-        const trimmed = std.mem.trimLeft(u8, after, " \t\n\r:");
+        const trimmed = std.mem.trimStart(u8, after, " \t\n\r:");
         tool.confirm = std.mem.startsWith(u8, trimmed, "true");
     }
 
     // Parse parameters object: "parameters": { "name": {"type":"...", "description":"..."}, ... }
     if (std.mem.indexOf(u8, json, "\"parameters\"")) |param_idx| {
         const after_key = json[@min(param_idx + 12, json.len)..];
-        const trimmed = std.mem.trimLeft(u8, after_key, " \t\n\r:");
+        const trimmed = std.mem.trimStart(u8, after_key, " \t\n\r:");
         if (trimmed.len > 0 and trimmed[0] == '{') {
             // Find matching closing brace
             var pdepth: i32 = 0;
@@ -353,7 +354,7 @@ pub fn parsePluginTool(json: []const u8, tool: *PluginTool) void {
     // Parse required array
     if (std.mem.indexOf(u8, json, "\"required\"")) |req_idx| {
         const after_key = json[@min(req_idx + 10, json.len)..];
-        const trimmed = std.mem.trimLeft(u8, after_key, " \t\n\r:");
+        const trimmed = std.mem.trimStart(u8, after_key, " \t\n\r:");
         if (trimmed.len > 0 and trimmed[0] == '[') {
             const end = std.mem.indexOfScalar(u8, trimmed, ']') orelse trimmed.len;
             const arr = trimmed[1..end];
@@ -431,8 +432,7 @@ pub fn parsePluginParams(params_json: []const u8, tool: *PluginTool) void {
 
 /// Build Anthropic tools JSON array including built-in + plugin tools
 pub fn buildToolsJson(plugins: []const PluginTool, count: u8, buf: []u8, builtin_tools_json: []const u8) u16 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+    var w = std.Io.Writer.fixed(buf);
 
     // Start with built-in tools (strip outer [] from TOOLS_JSON)
     w.writeByte('[') catch return 0;
@@ -497,7 +497,7 @@ pub fn buildToolsJson(plugins: []const PluginTool, count: u8, buf: []u8, builtin
     }
 
     w.writeByte(']') catch return 0;
-    return @intCast(fbs.pos);
+    return @intCast(w.end);
 }
 
 // ============================================================
@@ -510,7 +510,7 @@ pub fn jsonGetStr(json: []const u8, key: []const u8) ?[]const u8 {
     const quoted_key = std.fmt.bufPrint(&key_buf, "\"{s}\":", .{key}) catch return null;
     const idx = std.mem.indexOf(u8, json, quoted_key) orelse return null;
     const after = json[idx + quoted_key.len..];
-    const trimmed = std.mem.trimLeft(u8, after, " \t");
+    const trimmed = std.mem.trimStart(u8, after, " \t");
     if (trimmed.len == 0 or trimmed[0] != '"') return null;
     // find closing quote (handle \")
     var i: usize = 1;
@@ -691,38 +691,37 @@ pub fn executeBash(allocator: std.mem.Allocator, queues: *AgentQueues, command: 
     var redir_buf: [8256]u8 = undefined;
     const redir_cmd = std.fmt.bufPrint(&redir_buf, "{{ {s} ; }} 2>&1", .{cmd}) catch cmd;
 
-    var child = std.process.Child.init(&[_][]const u8{
-        "/bin/sh", "-c", redir_cmd,
-    }, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore; // merged into stdout via 2>&1
-    child.stdin_behavior = .Ignore;
-    if (cwd) |c| child.cwd = c;
-    child.spawn() catch |err| {
+    var child = std.process.spawn(compat.io(), .{
+        .argv = &[_][]const u8{ "/bin/sh", "-c", redir_cmd },
+        .stdout = .pipe,
+        .stderr = .ignore, // merged into stdout via 2>&1
+        .stdin = .ignore,
+        .cwd = if (cwd) |c| .{ .path = c } else .inherit,
+    }) catch |err| {
         var errbuf: [128]u8 = undefined;
         const msg = std.fmt.bufPrint(&errbuf, "exec failed: {}", .{err}) catch "exec failed";
         return allocator.dupe(u8, msg);
     };
 
     // Read stdout incrementally, send progress to main thread
-    var output: std.ArrayList(u8) = .{};
+    var output: std.ArrayList(u8) = .empty;
     var read_buf: [4096]u8 = undefined;
     const stdout_file = child.stdout.?;
     while (true) {
         // Check for cancellation — kill child process if user pressed Ctrl+C
         if (queues.checkCancel()) {
-            _ = child.kill() catch {};
+            child.kill(compat.io());
             break;
         }
         // Poll stdout with 200ms timeout to allow cancel checks between reads
-        var poll_fds = [_]std.posix.pollfd{.{
+        var poll_fds = [_]compat.posix.pollfd{.{
             .fd = stdout_file.handle,
             .events = 1, // POLLIN
             .revents = 0,
         }};
-        const poll_n = std.posix.poll(&poll_fds, 200) catch break;
+        const poll_n = compat.posix.poll(&poll_fds, 200) catch break;
         if (poll_n == 0) continue; // timeout — loop back to check cancel
-        const n = stdout_file.read(&read_buf) catch break;
+        const n = stdout_file.readStreaming(compat.io(), &.{&read_buf}) catch break;
         if (n == 0) break;
         output.appendSlice(allocator, read_buf[0..n]) catch break;
         // Send last line as progress (tool_call updates status bar)
@@ -745,7 +744,7 @@ pub fn executeBash(allocator: std.mem.Allocator, queues: *AgentQueues, command: 
     }
 
     // stderr is merged into stdout via 2>&1, no separate read needed
-    _ = child.wait() catch {};
+    _ = child.wait(compat.io()) catch {};
 
     const owned = output.toOwnedSlice(allocator) catch {
         const empty = allocator.alloc(u8, 0) catch return error.OutOfMemory;
@@ -771,7 +770,7 @@ pub fn executeRead(allocator: std.mem.Allocator, queues: *AgentQueues, path: []c
         _ = queues.output.push(.tool_call, notif);
     }
 
-    const content = std.fs.cwd().readFileAlloc(allocator, resolved, 512 * 1024) catch |err| {
+    const content = std.Io.Dir.cwd().readFileAlloc(compat.io(), resolved, allocator, .limited(512 * 1024)) catch |err| {
         var errbuf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&errbuf, "read error: {s}: {}", .{ resolved, err }) catch "read error";
         return allocator.dupe(u8, msg);
@@ -779,7 +778,7 @@ pub fn executeRead(allocator: std.mem.Allocator, queues: *AgentQueues, path: []c
     defer allocator.free(content);
 
     // Add line numbers and apply offset/limit
-    var result_list: std.ArrayList(u8) = .{};
+    var result_list: std.ArrayList(u8) = .empty;
     var line_num: usize = 1;
     var start: usize = 0;
     const start_line = if (offset > 0) offset else 1;
@@ -793,7 +792,7 @@ pub fn executeRead(allocator: std.mem.Allocator, queues: *AgentQueues, path: []c
             content.len;
 
         if (line_num >= start_line) {
-            result_list.writer(allocator).print("{d:>6}\t", .{line_num}) catch break;
+            result_list.print(allocator, "{d:>6}\t", .{line_num}) catch break;
             if (start < content.len) {
                 result_list.appendSlice(allocator, content[start..end]) catch break;
             }
@@ -807,8 +806,7 @@ pub fn executeRead(allocator: std.mem.Allocator, queues: *AgentQueues, path: []c
     }
 
     // Push preview with line numbers for user display
-    var preview_list: std.ArrayList(u8) = .{};
-    const pw = preview_list.writer(allocator);
+    var preview_list: std.ArrayList(u8) = .empty;
     var pstart: usize = 0;
     var pline: usize = start_line;
     const preview_max: usize = 8;
@@ -819,17 +817,17 @@ pub fn executeRead(allocator: std.mem.Allocator, queues: *AgentQueues, path: []c
         const line = items[pstart..pend];
         // Line numbers are dim, content normal
         if (line.len > 6 and line[6] == '\t') {
-            pw.print("\x1b[90m{s}\x1b[0m{s}\n", .{ line[0..6], line[7..] }) catch break;
+            preview_list.print(allocator, "\x1b[90m{s}\x1b[0m{s}\n", .{ line[0..6], line[7..] }) catch break;
         } else {
-            pw.writeAll(line) catch break;
-            pw.writeByte('\n') catch break;
+            preview_list.appendSlice(allocator, line) catch break;
+            preview_list.append(allocator, '\n') catch break;
         }
         pstart = if (pend < items.len) pend + 1 else items.len;
         pline += 1;
         pcount += 1;
     }
     if (lines_output > preview_max) {
-        pw.print("\x1b[90m({d} more lines)\x1b[0m\n", .{lines_output - preview_max}) catch {};
+        preview_list.print(allocator, "\x1b[90m({d} more lines)\x1b[0m\n", .{lines_output - preview_max}) catch {};
     }
     _ = queues.output.push(.tool_done, preview_list.items);
     preview_list.deinit(allocator);
@@ -854,13 +852,13 @@ pub fn executeWrite(allocator: std.mem.Allocator, queues: *AgentQueues, session_
     // backup existing file before overwriting
     if (session_log) |sl| sl.backupFile(resolved) catch {};
 
-    const file = std.fs.cwd().createFile(resolved, .{}) catch |err| {
+    const file = std.Io.Dir.cwd().createFile(compat.io(), resolved, .{}) catch |err| {
         var errbuf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&errbuf, "write error: {s}: {}", .{ resolved, err }) catch "write error";
         return allocator.dupe(u8, msg);
     };
-    defer file.close();
-    file.writeAll(real_content) catch |err| {
+    defer file.close(compat.io());
+    compat.writeAll(file, real_content) catch |err| {
         var errbuf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&errbuf, "write error: {}", .{err}) catch "write error";
         return allocator.dupe(u8, msg);
@@ -869,21 +867,20 @@ pub fn executeWrite(allocator: std.mem.Allocator, queues: *AgentQueues, session_
     var wcount: usize = 1;
     for (real_content) |wc| { if (wc == '\n') wcount += 1; }
     // Show preview of written content (green, like a diff with all additions)
-    var wdone_result: std.ArrayList(u8) = .{};
-    const wdw = wdone_result.writer(allocator);
+    var wdone_result: std.ArrayList(u8) = .empty;
     const max_preview: usize = 4;
     var line_n: usize = 0;
     var witer = std.mem.splitScalar(u8, real_content, '\n');
     while (witer.next()) |line| {
         if (line_n >= max_preview) {
-            wdw.print("\x1b[32m+ ... ({d} more)\x1b[0m\n", .{wcount - max_preview}) catch {};
+            wdone_result.print(allocator, "\x1b[32m+ ... ({d} more)\x1b[0m\n", .{wcount - max_preview}) catch {};
             break;
         }
-        wdw.writeAll("\x1b[32m+ ") catch {};
+        wdone_result.appendSlice(allocator, "\x1b[32m+ ") catch {};
         const show = if (line.len > 60) line[0..60] else line;
-        wdw.writeAll(show) catch {};
-        if (line.len > 60) wdw.writeAll("...") catch {};
-        wdw.writeAll("\x1b[0m\n") catch {};
+        wdone_result.appendSlice(allocator, show) catch {};
+        if (line.len > 60) wdone_result.appendSlice(allocator, "...") catch {};
+        wdone_result.appendSlice(allocator, "\x1b[0m\n") catch {};
         line_n += 1;
     }
     _ = queues.output.push(.tool_done, wdone_result.items);
@@ -913,7 +910,7 @@ pub fn executeEdit(allocator: std.mem.Allocator, queues: *AgentQueues, session_l
     _ = queues.output.push(.tool_call, notif);
 
     // Read current file content
-    const content = std.fs.cwd().readFileAlloc(allocator, resolved, 512 * 1024) catch |err| {
+    const content = std.Io.Dir.cwd().readFileAlloc(compat.io(), resolved, allocator, .limited(512 * 1024)) catch |err| {
         var errbuf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&errbuf, "edit error: cannot read {s}: {}", .{ resolved, err }) catch "read error";
         return allocator.dupe(u8, msg);
@@ -938,7 +935,7 @@ pub fn executeEdit(allocator: std.mem.Allocator, queues: *AgentQueues, session_l
     if (session_log) |sl| sl.backupFile(resolved) catch {};
 
     // Build new content with replacements
-    var result_content: std.ArrayList(u8) = .{};
+    var result_content: std.ArrayList(u8) = .empty;
     defer result_content.deinit(allocator);
     var pos: usize = 0;
     var replacements: usize = 0;
@@ -961,21 +958,20 @@ pub fn executeEdit(allocator: std.mem.Allocator, queues: *AgentQueues, session_l
     }
 
     // Write back
-    const file = std.fs.cwd().createFile(resolved, .{}) catch |err| {
+    const file = std.Io.Dir.cwd().createFile(compat.io(), resolved, .{}) catch |err| {
         var errbuf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&errbuf, "edit error: cannot write {s}: {}", .{ resolved, err }) catch "write error";
         return allocator.dupe(u8, msg);
     };
-    defer file.close();
-    file.writeAll(result_content.items) catch |err| {
+    defer file.close(compat.io());
+    compat.writeAll(file, result_content.items) catch |err| {
         var errbuf: [256]u8 = undefined;
         const msg = std.fmt.bufPrint(&errbuf, "write error: {}", .{err}) catch "write error";
         return allocator.dupe(u8, msg);
     };
 
     // Show diff summary in tool output (Claude Code style)
-    var diff_result: std.ArrayList(u8) = .{};
-    const dw = diff_result.writer(allocator);
+    var diff_result: std.ArrayList(u8) = .empty;
     // Count added/removed lines
     var old_lines: usize = 1;
     for (real_old) |oc| { if (oc == '\n') old_lines += 1; }
@@ -991,35 +987,35 @@ pub fn executeEdit(allocator: std.mem.Allocator, queues: *AgentQueues, session_l
             if (cc == '\n') change_line += 1;
         }
     }
-    dw.print("\x1b[90m@@ line {d} @@\x1b[0m\n", .{change_line}) catch {};
+    diff_result.print(allocator, "\x1b[90m@@ line {d} @@\x1b[0m\n", .{change_line}) catch {};
     // Old lines in red, new lines in green, max 6 lines each
     const max_preview = 6;
     var old_count: usize = 0;
     var old_iter = std.mem.splitScalar(u8, real_old, '\n');
     while (old_iter.next()) |line| {
         if (old_count >= max_preview) {
-            dw.print("\x1b[31m- ... ({d} more)\x1b[0m\n", .{old_lines - max_preview}) catch {};
+            diff_result.print(allocator, "\x1b[31m- ... ({d} more)\x1b[0m\n", .{old_lines - max_preview}) catch {};
             break;
         }
-        dw.writeAll("\x1b[31m- ") catch {};
+        diff_result.appendSlice(allocator, "\x1b[31m- ") catch {};
         const show = if (line.len > 60) line[0..60] else line;
-        dw.writeAll(show) catch {};
-        if (line.len > 60) dw.writeAll("...") catch {};
-        dw.writeAll("\x1b[0m\n") catch {};
+        diff_result.appendSlice(allocator, show) catch {};
+        if (line.len > 60) diff_result.appendSlice(allocator, "...") catch {};
+        diff_result.appendSlice(allocator, "\x1b[0m\n") catch {};
         old_count += 1;
     }
     var new_count: usize = 0;
     var new_iter = std.mem.splitScalar(u8, real_new, '\n');
     while (new_iter.next()) |line| {
         if (new_count >= max_preview) {
-            dw.print("\x1b[32m+ ... ({d} more)\x1b[0m\n", .{new_lines - max_preview}) catch {};
+            diff_result.print(allocator, "\x1b[32m+ ... ({d} more)\x1b[0m\n", .{new_lines - max_preview}) catch {};
             break;
         }
-        dw.writeAll("\x1b[32m+ ") catch {};
+        diff_result.appendSlice(allocator, "\x1b[32m+ ") catch {};
         const show = if (line.len > 60) line[0..60] else line;
-        dw.writeAll(show) catch {};
-        if (line.len > 60) dw.writeAll("...") catch {};
-        dw.writeAll("\x1b[0m\n") catch {};
+        diff_result.appendSlice(allocator, show) catch {};
+        if (line.len > 60) diff_result.appendSlice(allocator, "...") catch {};
+        diff_result.appendSlice(allocator, "\x1b[0m\n") catch {};
         new_count += 1;
     }
 
@@ -1036,15 +1032,15 @@ pub fn executeWebFetch(allocator: std.mem.Allocator, queues: *AgentQueues, url: 
     _ = queues.output.push(.tool_call, notif);
 
     // Use curl to fetch URL content
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+    const result = std.process.run(allocator, compat.io(), .{
         .argv = &[_][]const u8{
             "curl", "-sS", "-L", "--max-time", "30",
             "-H", "User-Agent: Mozilla/5.0 (compatible; zish/1.0)",
             "-H", "Accept: text/html,application/json,text/plain",
             real_url,
         },
-        .max_output_bytes = 256 * 1024,
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(256 * 1024),
     }) catch |err| {
         var errbuf: [128]u8 = undefined;
         const msg = std.fmt.bufPrint(&errbuf, "fetch failed: {}", .{err}) catch "fetch failed";
@@ -1073,7 +1069,7 @@ pub fn executeWebFetch(allocator: std.mem.Allocator, queues: *AgentQueues, url: 
 
     if (is_html) {
         // Strip HTML tags and decode basic entities
-        var text: std.ArrayList(u8) = .{};
+        var text: std.ArrayList(u8) = .empty;
         const src = result.stdout;
         var si: usize = 0;
         var in_tag = false;
@@ -1178,7 +1174,7 @@ pub fn executeWebFetch(allocator: std.mem.Allocator, queues: *AgentQueues, url: 
 
         // Collapse multiple newlines
         const raw = text.items;
-        var clean: std.ArrayList(u8) = .{};
+        var clean: std.ArrayList(u8) = .empty;
         var ci: usize = 0;
         var consecutive_nl: u8 = 0;
         while (ci < raw.len) {
@@ -1248,14 +1244,14 @@ pub fn executeWebSearch(allocator: std.mem.Allocator, queues: *AgentQueues, quer
     var url_buf2: [2200]u8 = undefined;
     const search_url = std.fmt.bufPrint(&url_buf2, "https://html.duckduckgo.com/html/?q={s}", .{encoded_query}) catch return error.URLTooLong;
 
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+    const result = std.process.run(allocator, compat.io(), .{
         .argv = &[_][]const u8{
             "curl", "-sS", "-L", "--max-time", "15",
             "-H", "User-Agent: Mozilla/5.0 (compatible; zish/1.0)",
             search_url,
         },
-        .max_output_bytes = 256 * 1024,
+        .stdout_limit = .limited(256 * 1024),
+        .stderr_limit = .limited(256 * 1024),
     }) catch |err| {
         var errbuf: [128]u8 = undefined;
         const msg = std.fmt.bufPrint(&errbuf, "search failed: {}", .{err}) catch "search failed";
@@ -1269,8 +1265,7 @@ pub fn executeWebSearch(allocator: std.mem.Allocator, queues: *AgentQueues, quer
     }
 
     // Parse DuckDuckGo HTML results
-    var output: std.ArrayList(u8) = .{};
-    const w = output.writer(allocator);
+    var output: std.ArrayList(u8) = .empty;
     var count: usize = 0;
     const src = result.stdout;
     var si: usize = 0;
@@ -1337,13 +1332,13 @@ pub fn executeWebSearch(allocator: std.mem.Allocator, queues: *AgentQueues, quer
         }
 
         count += 1;
-        w.print("{d}. {s}\n   {s}\n", .{
+        output.print(allocator, "{d}. {s}\n   {s}\n", .{
             count, title_buf2[0..ti], href,
         }) catch break;
         if (snippet_text.len > 0) {
-            w.print("   {s}\n", .{snippet_text}) catch break;
+            output.print(allocator, "   {s}\n", .{snippet_text}) catch break;
         }
-        w.writeByte('\n') catch break;
+        output.append(allocator, '\n') catch break;
     }
 
     if (count == 0) {
@@ -1389,11 +1384,11 @@ pub fn executeGlob(allocator: std.mem.Allocator, queues: *AgentQueues, pattern: 
         break :blk std.fmt.bufPrint(&cmd_buf, "find {s} -name '{s}' -type f 2>/dev/null | head -200 | sort", .{ dir, real_pattern }) catch return error.PatternTooLong;
     };
 
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+    const result = std.process.run(allocator, compat.io(), .{
         .argv = &[_][]const u8{ "/bin/sh", "-c", cmd },
-        .max_output_bytes = 65536,
-        .cwd = cwd,
+        .stdout_limit = .limited(65536),
+        .stderr_limit = .limited(65536),
+        .cwd = if (cwd) |c| .{ .path = c } else .inherit,
     }) catch |err| {
         var errbuf: [128]u8 = undefined;
         const msg = std.fmt.bufPrint(&errbuf, "glob error: {}", .{err}) catch "glob error";
@@ -1403,20 +1398,19 @@ pub fn executeGlob(allocator: std.mem.Allocator, queues: *AgentQueues, pattern: 
     // Show file list preview (paths will be auto-linkified by display handler)
     var match_count: usize = 0;
     for (result.stdout) |sc| { if (sc == '\n') match_count += 1; }
-    var glob_preview: std.ArrayList(u8) = .{};
-    const gpw = glob_preview.writer(allocator);
+    var glob_preview: std.ArrayList(u8) = .empty;
     var gps: usize = 0;
     var gpn: usize = 0;
     const gpm: usize = 10;
     while (gps < result.stdout.len and gpn < gpm) {
         const gpe = std.mem.indexOfScalarPos(u8, result.stdout, gps, '\n') orelse result.stdout.len;
-        gpw.writeAll(result.stdout[gps..gpe]) catch break;
-        gpw.writeByte('\n') catch break;
+        glob_preview.appendSlice(allocator, result.stdout[gps..gpe]) catch break;
+        glob_preview.append(allocator, '\n') catch break;
         gps = if (gpe < result.stdout.len) gpe + 1 else result.stdout.len;
         gpn += 1;
     }
     if (match_count > gpm) {
-        gpw.print("\x1b[90m({d} more files)\x1b[0m\n", .{match_count - gpm}) catch {};
+        glob_preview.print(allocator, "\x1b[90m({d} more files)\x1b[0m\n", .{match_count - gpm}) catch {};
     }
     _ = queues.output.push(.tool_done, glob_preview.items);
     glob_preview.deinit(allocator);
@@ -1433,8 +1427,7 @@ pub fn executeGrep(allocator: std.mem.Allocator, queues: *AgentQueues, pattern: 
 
     // build grep/rg command
     var cmd_buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&cmd_buf);
-    const w = fbs.writer();
+    var w = std.Io.Writer.fixed(&cmd_buf);
     w.writeAll("grep -rn --include='*'") catch return error.CmdTooLong;
     if (file_glob) |g| {
         var g_buf: [128]u8 = undefined;
@@ -1462,13 +1455,13 @@ pub fn executeGrep(allocator: std.mem.Allocator, queues: *AgentQueues, pattern: 
     }
     w.writeAll(" 2>/dev/null | head -100") catch {};
 
-    const cmd = cmd_buf[0..fbs.pos];
+    const cmd = cmd_buf[0..w.end];
 
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+    const result = std.process.run(allocator, compat.io(), .{
         .argv = &[_][]const u8{ "/bin/sh", "-c", cmd },
-        .max_output_bytes = 65536,
-        .cwd = cwd,
+        .stdout_limit = .limited(65536),
+        .stderr_limit = .limited(65536),
+        .cwd = if (cwd) |c| .{ .path = c } else .inherit,
     }) catch |err| {
         var errbuf: [128]u8 = undefined;
         const msg = std.fmt.bufPrint(&errbuf, "grep error: {}", .{err}) catch "grep error";
@@ -1478,8 +1471,7 @@ pub fn executeGrep(allocator: std.mem.Allocator, queues: *AgentQueues, pattern: 
     var grep_count: usize = 0;
     for (result.stdout) |gc| { if (gc == '\n') grep_count += 1; }
     // Show preview of grep results (file:line:content with colored line numbers)
-    var grep_preview: std.ArrayList(u8) = .{};
-    const gw = grep_preview.writer(allocator);
+    var grep_preview: std.ArrayList(u8) = .empty;
     var gstart: usize = 0;
     var gshown: usize = 0;
     const gmax: usize = 8;
@@ -1489,19 +1481,19 @@ pub fn executeGrep(allocator: std.mem.Allocator, queues: *AgentQueues, pattern: 
         // Color the file:line: prefix dim, content normal
         if (std.mem.indexOfScalar(u8, gline, ':')) |colon1| {
             if (std.mem.indexOfScalarPos(u8, gline, colon1 + 1, ':')) |colon2| {
-                gw.print("\x1b[90m{s}\x1b[0m{s}\n", .{ gline[0 .. colon2 + 1], gline[colon2 + 1 ..] }) catch break;
+                grep_preview.print(allocator, "\x1b[90m{s}\x1b[0m{s}\n", .{ gline[0 .. colon2 + 1], gline[colon2 + 1 ..] }) catch break;
                 gshown += 1;
                 gstart = if (gend < result.stdout.len) gend + 1 else result.stdout.len;
                 continue;
             }
         }
-        gw.writeAll(gline) catch break;
-        gw.writeByte('\n') catch break;
+        grep_preview.appendSlice(allocator, gline) catch break;
+        grep_preview.append(allocator, '\n') catch break;
         gshown += 1;
         gstart = if (gend < result.stdout.len) gend + 1 else result.stdout.len;
     }
     if (grep_count > gmax) {
-        gw.print("\x1b[90m({d} more matches)\x1b[0m\n", .{grep_count - gmax}) catch {};
+        grep_preview.print(allocator, "\x1b[90m({d} more matches)\x1b[0m\n", .{grep_count - gmax}) catch {};
     }
     _ = queues.output.push(.tool_done, grep_preview.items);
     grep_preview.deinit(allocator);
@@ -1574,10 +1566,10 @@ pub fn executePluginTool(allocator: std.mem.Allocator, queues: *AgentQueues, all
     }
 
     // Execute the command
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+    const result = std.process.run(allocator, compat.io(), .{
         .argv = &[_][]const u8{ "/bin/sh", "-c", final_cmd },
-        .max_output_bytes = 65536,
+        .stdout_limit = .limited(65536),
+        .stderr_limit = .limited(65536),
     }) catch |err| {
         var errbuf: [128]u8 = undefined;
         const msg = std.fmt.bufPrint(&errbuf, "exec failed: {}", .{err}) catch "exec failed";

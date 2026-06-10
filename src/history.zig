@@ -2,6 +2,7 @@
 // Security-focused design with DoS protection and memory safety
 
 const std = @import("std");
+const compat = @import("compat.zig");
 const types = @import("types.zig");
 const crypto_mod = @import("crypto.zig");
 const log_mod = @import("history_log.zig");
@@ -121,7 +122,7 @@ pub const History = struct {
         if (self.hash_map.get(command_hash)) |existing_index| {
             var entry = self.entries.items[existing_index];
             entry.frequency = @min(65535, entry.frequency + 1);
-            entry.timestamp = @intCast(std.time.timestamp());
+            entry.timestamp = @intCast(compat.timestamp());
             entry.exit_code = exit_code;
             entry.flags = if (exit_code == 0) HistoryEntry.SUCCESSFUL_FLAG else 0;
 
@@ -167,7 +168,7 @@ pub const History = struct {
             .command_offset = command_offset,
             .command_len = @intCast(command.len),
             .frequency = 1,
-            .timestamp = @intCast(std.time.timestamp()),
+            .timestamp = @intCast(compat.timestamp()),
             .exit_code = exit_code,
             .flags = if (exit_code == 0) HistoryEntry.SUCCESSFUL_FLAG else 0,
         };
@@ -306,7 +307,7 @@ pub const History = struct {
                 score += @as(f32, @floatFromInt(entry.frequency)) * 0.1;
 
                 // Recency bonus (recent commands rank higher)
-                const now = @as(u32, @intCast(std.time.timestamp()));
+                const now = @as(u32, @intCast(compat.timestamp()));
                 const age = now - entry.timestamp;
                 if (age < 3600) {
                     score += 2.0; // Bonus for commands used in last hour
@@ -429,10 +430,10 @@ pub const History = struct {
         defer self.allocator.free(tmp_path);
 
         // write all entries to temp file in one batch
-        const file = try std.fs.createFileAbsolute(tmp_path, .{ .mode = 0o600 });
+        const file = try std.Io.Dir.createFileAbsolute(compat.io(), tmp_path, .{ .permissions = .fromMode(0o600) });
         errdefer {
-            file.close();
-            std.fs.deleteFileAbsolute(tmp_path) catch {};
+            file.close(compat.io());
+            std.Io.Dir.deleteFileAbsolute(compat.io(), tmp_path) catch {};
         }
 
         var seq: u64 = 0;
@@ -476,16 +477,16 @@ pub const History = struct {
 
             header.entry_len = @intCast(encrypted.len);
 
-            try file.writeAll(std.mem.asBytes(&header));
-            try file.writeAll(encrypted);
+            try compat.writeAll(file, std.mem.asBytes(&header));
+            try compat.writeAll(file, encrypted);
             seq += 1;
         }
 
         // one fsync, then atomic rename
-        try file.sync();
-        file.close();
+        try file.sync(compat.io());
+        file.close(compat.io());
 
-        try std.fs.renameAbsolute(tmp_path, log_path);
+        try std.Io.Dir.renameAbsolute(tmp_path, log_path, compat.io());
 
         self.log_writer.sequence = seq;
         self.log_offset = self.getLogFileSize();
@@ -499,16 +500,16 @@ pub const History = struct {
         ) catch return 0;
         defer self.allocator.free(log_path);
 
-        const file = std.fs.openFileAbsolute(log_path, .{}) catch return 0;
-        defer file.close();
+        const file = std.Io.Dir.openFileAbsolute(compat.io(), log_path, .{}) catch return 0;
+        defer file.close(compat.io());
 
-        const stat = file.stat() catch return 0;
+        const stat = file.stat(compat.io()) catch return 0;
         return stat.size;
     }
 
     /// re-encrypt all history with a new key
     pub fn reEncryptWithKey(self: *Self, new_key: [32]u8) !void {
-        const fs = std.fs;
+        const fs = std.Io.Dir;
 
         // update crypto context with new key
         self.crypto.key = new_key;
@@ -522,7 +523,7 @@ pub const History = struct {
         defer self.allocator.free(log_path);
 
         // delete old encrypted log
-        fs.deleteFileAbsolute(log_path) catch |err| {
+        fs.deleteFileAbsolute(compat.io(), log_path) catch |err| {
             if (err != error.FileNotFound) return err;
         };
 
@@ -540,7 +541,7 @@ pub const History = struct {
         const disk_ts: u32 = if (disk_entry.timestamp > 0)
             @intCast(@min(disk_entry.timestamp, std.math.maxInt(u32)))
         else
-            @intCast(std.time.timestamp());
+            @intCast(compat.timestamp());
 
         // check if exists in memory
         if (self.hash_map.get(disk_entry.command_hash)) |existing_index| {

@@ -17,6 +17,7 @@
 //           {agent-id}.meta.json  - subagent type
 
 const std = @import("std");
+const compat = @import("compat.zig");
 
 // ============================================================
 // Session ID: {unix-hex}-{random-hex} e.g. "67cfab3c-a1f2"
@@ -27,9 +28,9 @@ pub const SessionId = [SESSION_ID_LEN]u8;
 
 pub fn generateSessionId() SessionId {
     var id: SessionId = undefined;
-    const ts: u32 = @intCast(@as(u64, @bitCast(std.time.timestamp())) & 0xFFFFFFFF);
+    const ts: u32 = @intCast(@as(u64, @bitCast(compat.timestamp())) & 0xFFFFFFFF);
     var rand_bytes: [2]u8 = undefined;
-    std.crypto.random.bytes(&rand_bytes);
+    compat.io().random(&rand_bytes);
 
     _ = std.fmt.bufPrint(&id, "{x:0>8}-{x:0>4}", .{
         ts,
@@ -45,15 +46,15 @@ pub fn generateSessionId() SessionId {
 const MAX_PATH = 512;
 
 pub fn getBaseDir(buf: *[MAX_PATH]u8) ?[]const u8 {
-    const home = std.process.getEnvVarOwned(std.heap.page_allocator, "HOME") catch return null;
+    const home = compat.getEnvVarOwned(std.heap.page_allocator, "HOME") catch return null;
     defer std.heap.page_allocator.free(home);
     const len = std.fmt.bufPrint(buf, "{s}/.zish", .{home}) catch return null;
     return len;
 }
 
 fn ensureDir(path: []const u8) !void {
-    const dir = std.fs.cwd();
-    dir.makePath(path) catch |err| switch (err) {
+    const dir = std.Io.Dir.cwd();
+    dir.createDirPath(compat.io(), path) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
@@ -67,7 +68,7 @@ pub const SessionLog = struct {
     session_id: SessionId,
     dir_buf: [MAX_PATH]u8,
     dir_len: u16,
-    file: ?std.fs.File,
+    file: ?std.Io.File,
     allocator: std.mem.Allocator,
     message_count: u32,
 
@@ -85,20 +86,20 @@ pub const SessionLog = struct {
         // write meta.json
         var meta_path_buf: [MAX_PATH]u8 = undefined;
         const meta_path = std.fmt.bufPrint(&meta_path_buf, "{s}/meta.json", .{dir_path}) catch return error.PathTooLong;
-        const meta_file = try std.fs.cwd().createFile(meta_path, .{});
-        defer meta_file.close();
+        const meta_file = try std.Io.Dir.cwd().createFile(compat.io(), meta_path, .{});
+        defer meta_file.close(compat.io());
 
-        const ts = std.time.timestamp();
+        const ts = compat.timestamp();
         var meta_buf: [1024]u8 = undefined;
         const meta_json = std.fmt.bufPrint(&meta_buf,
             \\{{"id":"{s}","created":{d},"cwd":"{s}","git_branch":"{s}","provider":"{s}","model":"{s}","message_count":0,"status":"active"}}
         , .{ sid, ts, cwd, git_branch, provider, model }) catch return error.MetaTooLong;
-        try meta_file.writeAll(meta_json);
+        try compat.writeAll(meta_file, meta_json);
 
         // open conversation.jsonl
         var conv_path_buf: [MAX_PATH]u8 = undefined;
         const conv_path = std.fmt.bufPrint(&conv_path_buf, "{s}/conversation.jsonl", .{dir_path}) catch return error.PathTooLong;
-        const conv_file = try std.fs.cwd().createFile(conv_path, .{ .truncate = false });
+        const conv_file = try std.Io.Dir.cwd().createFile(compat.io(), conv_path, .{ .truncate = false });
 
         // append to global history index
         appendSessionIndex(base, &sid, ts, cwd) catch {};
@@ -125,8 +126,8 @@ pub const SessionLog = struct {
         var conv_path_buf: [MAX_PATH]u8 = undefined;
         const conv_path = std.fmt.bufPrint(&conv_path_buf, "{s}/conversation.jsonl", .{dir_path}) catch return error.PathTooLong;
 
-        const conv_file = std.fs.cwd().openFile(conv_path, .{ .mode = .write_only }) catch return error.SessionNotFound;
-        conv_file.seekFromEnd(0) catch {};
+        const conv_file = std.Io.Dir.cwd().openFile(compat.io(), conv_path, .{ .mode = .write_only }) catch return error.SessionNotFound;
+        _ = std.c.lseek(conv_file.handle, 0, std.c.SEEK.END);
 
         var log = SessionLog{
             .session_id = undefined,
@@ -144,13 +145,13 @@ pub const SessionLog = struct {
 
     pub fn close(self: *SessionLog) void {
         if (self.file) |f| {
-            f.close();
+            f.close(compat.io());
             self.file = null;
         }
         // remove ctl FIFO (signals session is no longer active)
         var ctl_buf: [MAX_PATH]u8 = undefined;
         if (self.ctlPath(&ctl_buf)) |p| {
-            std.fs.cwd().deleteFile(p) catch {};
+            std.Io.Dir.cwd().deleteFile(compat.io(), p) catch {};
         }
         // update meta.json with final message count
         self.updateMeta() catch {};
@@ -168,14 +169,14 @@ pub const SessionLog = struct {
     /// Create the ctl FIFO. Returns the fd opened for read+write (non-blocking).
     /// Opened RDWR so the agent itself keeps a writer reference, preventing
     /// EOF when an attached client disconnects.
-    pub fn createCtlFifo(self: *const SessionLog) ?std.posix.fd_t {
+    pub fn createCtlFifo(self: *const SessionLog) ?compat.posix.fd_t {
         var path_buf: [MAX_PATH]u8 = undefined;
         const path = self.ctlPath(&path_buf) orelse return null;
         // Create FIFO (named pipe) via mknod with S.IFIFO
         const path_z = toNullTerminated(path) orelse return null;
         _ = std.os.linux.mknod(path_z, std.os.linux.S.IFIFO | 0o660, 0);
         // Open RDWR non-blocking — RDWR keeps a writer ref so reads don't EOF
-        const fd = std.posix.open(path, .{ .ACCMODE = .RDWR, .NONBLOCK = true }, 0) catch return null;
+        const fd = compat.posix.open(path, .{ .ACCMODE = .RDWR, .NONBLOCK = true }, 0) catch return null;
         return fd;
     }
 
@@ -200,9 +201,9 @@ pub const SessionLog = struct {
     pub fn logToolResult(self: *SessionLog, tool: []const u8, output: []const u8, exit_code: u8) !void {
         const f = self.file orelse return;
         var buf: [8192]u8 = undefined;
-        const ts = std.time.timestamp();
-        var fbs = std.io.fixedBufferStream(&buf);
-        const w = fbs.writer();
+        const ts = compat.timestamp();
+        var fbs: std.Io.Writer = .fixed(&buf);
+        const w = &fbs;
         try w.print("{{\"t\":\"tr\",\"ts\":{d},\"tool\":", .{ts});
         try writeJsonStr(w, tool);
         try w.writeAll(",\"output\":");
@@ -211,15 +212,15 @@ pub const SessionLog = struct {
         const out_slice = if (output.len > max_out) output[0..max_out] else output;
         try writeJsonStr(w, out_slice);
         try w.print(",\"exit\":{d}}}\n", .{exit_code});
-        try f.writeAll(fbs.getWritten());
+        try compat.writeAll(f, fbs.buffered());
     }
 
     pub fn logAgentSpawn(self: *SessionLog, agent_id: []const u8, agent_type: []const u8, description: []const u8) !void {
         const f = self.file orelse return;
         var buf: [2048]u8 = undefined;
-        const ts = std.time.timestamp();
-        var fbs = std.io.fixedBufferStream(&buf);
-        const w = fbs.writer();
+        const ts = compat.timestamp();
+        var fbs: std.Io.Writer = .fixed(&buf);
+        const w = &fbs;
         try w.print("{{\"t\":\"as\",\"ts\":{d},\"agent_id\":", .{ts});
         try writeJsonStr(w, agent_id);
         try w.writeAll(",\"type\":");
@@ -227,15 +228,15 @@ pub const SessionLog = struct {
         try w.writeAll(",\"desc\":");
         try writeJsonStr(w, description);
         try w.writeAll("}\n");
-        try f.writeAll(fbs.getWritten());
+        try compat.writeAll(f, fbs.buffered());
     }
 
     pub fn logAgentResult(self: *SessionLog, agent_id: []const u8, result: []const u8) !void {
         const f = self.file orelse return;
         var buf: [8192]u8 = undefined;
-        const ts = std.time.timestamp();
-        var fbs = std.io.fixedBufferStream(&buf);
-        const w = fbs.writer();
+        const ts = compat.timestamp();
+        var fbs: std.Io.Writer = .fixed(&buf);
+        const w = &fbs;
         try w.print("{{\"t\":\"ar\",\"ts\":{d},\"agent_id\":", .{ts});
         try writeJsonStr(w, agent_id);
         try w.writeAll(",\"result\":");
@@ -243,15 +244,15 @@ pub const SessionLog = struct {
         const r_slice = if (result.len > max_r) result[0..max_r] else result;
         try writeJsonStr(w, r_slice);
         try w.writeAll("}\n");
-        try f.writeAll(fbs.getWritten());
+        try compat.writeAll(f, fbs.buffered());
     }
 
     pub fn logDone(self: *SessionLog) !void {
         const f = self.file orelse return;
         var buf: [64]u8 = undefined;
-        const ts = std.time.timestamp();
+        const ts = compat.timestamp();
         const line = std.fmt.bufPrint(&buf, "{{\"t\":\"d\",\"ts\":{d}}}\n", .{ts}) catch return;
-        try f.writeAll(line);
+        try compat.writeAll(f, line);
     }
 
     pub fn logError(self: *SessionLog, msg: []const u8) !void {
@@ -287,40 +288,40 @@ pub const SessionLog = struct {
         while (version < 100) : (version += 1) {
             var check_buf: [MAX_PATH]u8 = undefined;
             const check_path = std.fmt.bufPrint(&check_buf, "{s}/{s}@v{d}", .{ backups_dir, hex_str, version }) catch break;
-            std.fs.cwd().access(check_path, .{}) catch break; // doesn't exist = use this version
+            std.Io.Dir.cwd().access(compat.io(), check_path, .{}) catch break; // doesn't exist = use this version
         }
 
         // copy file content
         var backup_path_buf: [MAX_PATH]u8 = undefined;
         const backup_path = std.fmt.bufPrint(&backup_path_buf, "{s}/{s}@v{d}", .{ backups_dir, hex_str, version }) catch return;
 
-        const src = std.fs.cwd().openFile(file_path, .{}) catch return; // file might not exist yet
-        defer src.close();
-        const dst = std.fs.cwd().createFile(backup_path, .{}) catch return;
-        defer dst.close();
+        const src = std.Io.Dir.cwd().openFile(compat.io(), file_path, .{}) catch return; // file might not exist yet
+        defer src.close(compat.io());
+        const dst = std.Io.Dir.cwd().createFile(compat.io(), backup_path, .{}) catch return;
+        defer dst.close(compat.io());
 
         // copy in chunks
         var copy_buf: [8192]u8 = undefined;
         while (true) {
-            const n = src.read(&copy_buf) catch break;
+            const n = src.readStreaming(compat.io(), &.{&copy_buf}) catch break;
             if (n == 0) break;
-            dst.writeAll(copy_buf[0..n]) catch break;
+            compat.writeAll(dst, copy_buf[0..n]) catch break;
         }
 
         // append to index
         var idx_path_buf: [MAX_PATH]u8 = undefined;
         const idx_path = std.fmt.bufPrint(&idx_path_buf, "{s}/index.jsonl", .{backups_dir}) catch return;
-        const idx = std.fs.cwd().createFile(idx_path, .{ .truncate = false }) catch return;
-        defer idx.close();
-        idx.seekFromEnd(0) catch {};
+        const idx = std.Io.Dir.cwd().createFile(compat.io(), idx_path, .{ .truncate = false }) catch return;
+        defer idx.close(compat.io());
+        _ = std.c.lseek(idx.handle, 0, std.c.SEEK.END);
 
         var idx_line_buf: [1024]u8 = undefined;
-        const ts = std.time.timestamp();
+        const ts = compat.timestamp();
         const idx_line = std.fmt.bufPrint(&idx_line_buf,
             "{{\"hash\":\"{s}\",\"path\":\"{s}\",\"v\":{d},\"ts\":{d}}}\n",
             .{ hex_str, file_path, version, ts },
         ) catch return;
-        idx.writeAll(idx_line) catch {};
+        compat.writeAll(idx, idx_line) catch {};
     }
 
     // ── Internal helpers ──
@@ -328,23 +329,23 @@ pub const SessionLog = struct {
     fn writeEntry(self: *SessionLog, entry_type: []const u8, content: []const u8, _: anytype) !void {
         const f = self.file orelse return;
         var buf: [8192]u8 = undefined;
-        const ts = std.time.timestamp();
-        var fbs = std.io.fixedBufferStream(&buf);
-        const w = fbs.writer();
+        const ts = compat.timestamp();
+        var fbs: std.Io.Writer = .fixed(&buf);
+        const w = &fbs;
         try w.print("{{\"t\":\"{s}\",\"ts\":{d},\"content\":", .{ entry_type, ts });
         const max_c = 7000;
         const c_slice = if (content.len > max_c) content[0..max_c] else content;
         try writeJsonStr(w, c_slice);
         try w.writeAll("}\n");
-        try f.writeAll(fbs.getWritten());
+        try compat.writeAll(f, fbs.buffered());
     }
 
     fn writeToolEntry(self: *SessionLog, entry_type: []const u8, tool: []const u8, input: []const u8) !void {
         const f = self.file orelse return;
         var buf: [8192]u8 = undefined;
-        const ts = std.time.timestamp();
-        var fbs = std.io.fixedBufferStream(&buf);
-        const w = fbs.writer();
+        const ts = compat.timestamp();
+        var fbs: std.Io.Writer = .fixed(&buf);
+        const w = &fbs;
         try w.print("{{\"t\":\"{s}\",\"ts\":{d},\"tool\":", .{ entry_type, ts });
         try writeJsonStr(w, tool);
         try w.writeAll(",\"input\":");
@@ -352,7 +353,7 @@ pub const SessionLog = struct {
         const i_slice = if (input.len > max_i) input[0..max_i] else input;
         try writeJsonStr(w, i_slice);
         try w.writeAll("}\n");
-        try f.writeAll(fbs.getWritten());
+        try compat.writeAll(f, fbs.buffered());
     }
 
     fn appendHistory(self: *SessionLog, content: []const u8) !void {
@@ -362,20 +363,20 @@ pub const SessionLog = struct {
         var hist_path_buf: [MAX_PATH]u8 = undefined;
         const hist_path = std.fmt.bufPrint(&hist_path_buf, "{s}/history.jsonl", .{base}) catch return;
 
-        const f = std.fs.cwd().createFile(hist_path, .{ .truncate = false }) catch return;
-        defer f.close();
-        f.seekFromEnd(0) catch {};
+        const f = std.Io.Dir.cwd().createFile(compat.io(), hist_path, .{ .truncate = false }) catch return;
+        defer f.close(compat.io());
+        _ = std.c.lseek(f.handle, 0, std.c.SEEK.END);
 
         var buf: [4200]u8 = undefined;
-        const ts = std.time.timestamp();
-        var fbs = std.io.fixedBufferStream(&buf);
-        const w = fbs.writer();
+        const ts = compat.timestamp();
+        var fbs: std.Io.Writer = .fixed(&buf);
+        const w = &fbs;
         w.print("{{\"ts\":{d},\"sid\":\"{s}\",\"q\":", .{ ts, self.session_id }) catch return;
         const max_q = 3000;
         const q_slice = if (content.len > max_q) content[0..max_q] else content;
         writeJsonStr(w, q_slice) catch return;
         w.writeAll("}\n") catch return;
-        f.writeAll(fbs.getWritten()) catch {};
+        compat.writeAll(f, fbs.buffered()) catch {};
     }
 
     fn updateMeta(self: *SessionLog) !void {
@@ -383,24 +384,24 @@ pub const SessionLog = struct {
         const meta_path = std.fmt.bufPrint(&meta_path_buf, "{s}/meta.json", .{self.dirPath()}) catch return;
 
         // read existing meta
-        const meta_content = std.fs.cwd().readFileAlloc(self.allocator, meta_path, 4096) catch return;
+        const meta_content = std.Io.Dir.cwd().readFileAlloc(compat.io(), meta_path, self.allocator, .limited(4096)) catch return;
         defer self.allocator.free(meta_content);
 
         // rewrite with updated count and status
-        const f = std.fs.cwd().createFile(meta_path, .{}) catch return;
-        defer f.close();
+        const f = std.Io.Dir.cwd().createFile(compat.io(), meta_path, .{}) catch return;
+        defer f.close(compat.io());
 
         // simple approach: find "message_count":N and "status":"active", replace
         var buf: [2048]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        const w = fbs.writer();
+        var fbs: std.Io.Writer = .fixed(&buf);
+        const w = &fbs;
 
         // just rewrite the whole thing using known fields from original
-        const ts = std.time.timestamp();
+        const ts = compat.timestamp();
         w.print("{{\"id\":\"{s}\",\"message_count\":{d},\"status\":\"done\",\"last_active\":{d}}}", .{
             self.session_id, self.message_count, ts,
         }) catch return;
-        f.writeAll(fbs.getWritten()) catch {};
+        compat.writeAll(f, fbs.buffered()) catch {};
     }
 };
 
@@ -414,16 +415,16 @@ fn appendSessionIndex(base: []const u8, sid: *const SessionId, ts: i64, cwd: []c
 
     ensureDir(std.fmt.bufPrint(&path_buf, "{s}/sessions", .{base}) catch return) catch {};
 
-    const f = std.fs.cwd().createFile(path, .{ .truncate = false }) catch return;
-    defer f.close();
-    f.seekFromEnd(0) catch {};
+    const f = std.Io.Dir.cwd().createFile(compat.io(), path, .{ .truncate = false }) catch return;
+    defer f.close(compat.io());
+    _ = std.c.lseek(f.handle, 0, std.c.SEEK.END);
 
     var buf: [512]u8 = undefined;
     const line = std.fmt.bufPrint(&buf,
         "{{\"id\":\"{s}\",\"created\":{d},\"cwd\":\"{s}\",\"status\":\"active\"}}\n",
         .{ sid.*, ts, cwd },
     ) catch return;
-    f.writeAll(line) catch {};
+    compat.writeAll(f, line) catch {};
 }
 
 // ============================================================
@@ -516,7 +517,7 @@ pub const AgentConfig = struct {
         var path_buf: [MAX_PATH]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "{s}/agent.json", .{base}) catch return;
 
-        const content = std.fs.cwd().readFileAlloc(allocator, path, 8192) catch return;
+        const content = std.Io.Dir.cwd().readFileAlloc(compat.io(), path, allocator, .limited(8192)) catch return;
         self.trackAlloc(content);
         // simple key extraction (no full JSON parser needed)
         if (jsonExtractStr(content, "provider")) |v| self.provider = v;
@@ -530,13 +531,13 @@ pub const AgentConfig = struct {
         // Check "auto_allow": true
         if (std.mem.indexOf(u8, content, "\"auto_allow\"")) |idx| {
             const after = content[@min(idx + 12, content.len)..];
-            const trimmed = std.mem.trimLeft(u8, after, " \t\n\r:");
+            const trimmed = std.mem.trimStart(u8, after, " \t\n\r:");
             self.auto_allow = std.mem.startsWith(u8, trimmed, "true");
         }
         // Router config
         if (std.mem.indexOf(u8, content, "\"router_enabled\"")) |idx| {
             const after = content[@min(idx + 16, content.len)..];
-            const trimmed = std.mem.trimLeft(u8, after, " \t\n\r:");
+            const trimmed = std.mem.trimStart(u8, after, " \t\n\r:");
             self.router_enabled = std.mem.startsWith(u8, trimmed, "true");
         }
         if (jsonExtractStr(content, "router_model")) |v| self.router_model = v;
@@ -544,7 +545,7 @@ pub const AgentConfig = struct {
         if (jsonExtractStr(content, "router_base_url")) |v| self.router_base_url = v;
         if (std.mem.indexOf(u8, content, "\"router_local_only\"")) |idx| {
             const after = content[@min(idx + 19, content.len)..];
-            const trimmed = std.mem.trimLeft(u8, after, " \t\n\r:");
+            const trimmed = std.mem.trimStart(u8, after, " \t\n\r:");
             self.router_local_only = std.mem.startsWith(u8, trimmed, "true");
         }
         if (jsonExtractStr(content, "router_local_model")) |v| self.router_local_model = v;
@@ -555,35 +556,35 @@ pub const AgentConfig = struct {
     }
 
     fn loadFromEnv(self: *AgentConfig, allocator: std.mem.Allocator) void {
-        if (std.process.getEnvVarOwned(allocator, "ZISH_AGENT_PROVIDER") catch null) |p| {
+        if (compat.getEnvVarOwned(allocator, "ZISH_AGENT_PROVIDER") catch null) |p| {
             self.provider = p;
             self.trackAlloc(p);
         }
-        const key = (std.process.getEnvVarOwned(allocator, "ZISH_AGENT_KEY") catch null)
-            orelse (std.process.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY") catch null);
+        const key = (compat.getEnvVarOwned(allocator, "ZISH_AGENT_KEY") catch null)
+            orelse (compat.getEnvVarOwned(allocator, "ANTHROPIC_API_KEY") catch null);
         if (key) |k| {
             self.api_key = k;
             self.trackAlloc(k);
         }
-        if (std.process.getEnvVarOwned(allocator, "ZISH_AGENT_URL") catch null) |u| {
+        if (compat.getEnvVarOwned(allocator, "ZISH_AGENT_URL") catch null) |u| {
             self.base_url = u;
             self.trackAlloc(u);
         }
-        if (std.process.getEnvVarOwned(allocator, "ZISH_AGENT_MODEL") catch null) |m| {
+        if (compat.getEnvVarOwned(allocator, "ZISH_AGENT_MODEL") catch null) |m| {
             self.model = m;
             self.trackAlloc(m);
         }
     }
 
     fn resolveApiKeyCmd(self: *AgentConfig, allocator: std.mem.Allocator) void {
-        const result = std.process.Child.run(.{
-            .allocator = allocator,
+        const result = std.process.run(allocator, compat.io(), .{
             .argv = &[_][]const u8{ "/bin/sh", "-c", self.api_key_cmd },
-            .max_output_bytes = 4096,
+            .stdout_limit = .limited(4096),
+            .stderr_limit = .limited(4096),
         }) catch return;
         defer allocator.free(result.stderr);
         // trim trailing newline
-        const key = std.mem.trimRight(u8, result.stdout, "\n\r ");
+        const key = std.mem.trimEnd(u8, result.stdout, "\n\r ");
         if (key.len > 0) {
             self.api_key = key;
             self.trackAlloc(result.stdout);
@@ -595,13 +596,13 @@ pub const AgentConfig = struct {
     /// Load OAuth access token from Claude Code's credentials file (~/.claude/.credentials.json).
     /// If the token is expired, refreshes it using the refresh token and updates the file.
     fn loadClaudeCodeCredentials(self: *AgentConfig, allocator: std.mem.Allocator) void {
-        const home = std.process.getEnvVarOwned(allocator, "HOME") catch return;
+        const home = compat.getEnvVarOwned(allocator, "HOME") catch return;
         defer allocator.free(home);
 
         var path_buf: [MAX_PATH]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "{s}/.claude/.credentials.json", .{home}) catch return;
 
-        const content = std.fs.cwd().readFileAlloc(allocator, path, 8192) catch return;
+        const content = std.Io.Dir.cwd().readFileAlloc(compat.io(), path, allocator, .limited(8192)) catch return;
         self.trackAlloc(content);
 
         // extract accessToken from nested claudeAiOauth object
@@ -613,7 +614,7 @@ pub const AgentConfig = struct {
                     const expired = blk: {
                         const expires_str = jsonExtractStr(content, "expiresAt") orelse break :blk false;
                         const expires_ms = std.fmt.parseInt(i64, expires_str, 10) catch break :blk false;
-                        const now_ms: i64 = @intCast(std.time.milliTimestamp());
+                        const now_ms: i64 = @intCast(compat.milliTimestamp());
                         break :blk now_ms >= expires_ms - 300_000; // 5 min buffer
                     };
 
@@ -645,15 +646,15 @@ fn refreshOAuthToken(allocator: std.mem.Allocator, refresh_token: []const u8, cr
     const body = std.fmt.bufPrint(&body_buf, "grant_type=refresh_token&refresh_token={s}&client_id={s}", .{ refresh_token, client_id }) catch return null;
 
     // Use curl to call the token endpoint
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
+    const result = std.process.run(allocator, compat.io(), .{
         .argv = &[_][]const u8{
             "curl", "-s", "-X", "POST",
             "https://platform.claude.com/v1/oauth/token",
             "-H", "content-type: application/x-www-form-urlencoded",
             "-d", body,
         },
-        .max_output_bytes = 8192,
+        .stdout_limit = .limited(8192),
+        .stderr_limit = .limited(8192),
     }) catch return null;
     defer {
         allocator.free(result.stdout);
@@ -665,7 +666,7 @@ fn refreshOAuthToken(allocator: std.mem.Allocator, refresh_token: []const u8, cr
     const new_refresh = jsonExtractStr(result.stdout, "refresh_token") orelse refresh_token;
     const expires_in_str = jsonExtractStr(result.stdout, "expires_in") orelse "28800";
     const expires_in = std.fmt.parseInt(i64, expires_in_str, 10) catch 28800;
-    const expires_at: i64 = @intCast(std.time.milliTimestamp() + expires_in * 1000);
+    const expires_at: i64 = @intCast(compat.milliTimestamp() + expires_in * 1000);
 
     // Dupe the token so it outlives result.stdout
     const token_copy = allocator.dupe(u8, new_access) catch return null;
@@ -679,7 +680,7 @@ fn refreshOAuthToken(allocator: std.mem.Allocator, refresh_token: []const u8, cr
 /// Rewrite the Claude Code credentials file with updated OAuth tokens.
 fn rewriteCredentials(allocator: std.mem.Allocator, path: []const u8, access: []const u8, refresh: []const u8, expires_at: i64) void {
     // Read existing file to preserve other fields (scopes, subscriptionType, etc.)
-    const existing = std.fs.cwd().readFileAlloc(allocator, path, 8192) catch return;
+    const existing = std.Io.Dir.cwd().readFileAlloc(compat.io(), path, allocator, .limited(8192)) catch return;
     defer allocator.free(existing);
 
     // Extract preserved fields
@@ -711,9 +712,9 @@ fn rewriteCredentials(allocator: std.mem.Allocator, path: []const u8, access: []
         \\{{"claudeAiOauth":{{"accessToken":"{s}","refreshToken":"{s}","expiresAt":{s},"scopes":{s},"subscriptionType":"{s}","rateLimitTier":"{s}"}}}}
     , .{ access, refresh, ea_str, scopes_str, sub_type, rate_tier }) catch return;
 
-    const file = std.fs.cwd().createFile(path, .{}) catch return;
-    defer file.close();
-    file.writeAll(json) catch {};
+    const file = std.Io.Dir.cwd().createFile(compat.io(), path, .{}) catch return;
+    defer file.close(compat.io());
+    compat.writeAll(file, json) catch {};
 }
 
 // ============================================================
@@ -743,7 +744,7 @@ pub fn listSessions(allocator: std.mem.Allocator, out: *std.ArrayList(SessionInf
     var path_buf: [MAX_PATH]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/sessions/index.jsonl", .{base}) catch return;
 
-    const content = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch return;
+    const content = std.Io.Dir.cwd().readFileAlloc(compat.io(), path, allocator, .limited(1024 * 1024)) catch return;
     defer allocator.free(content);
 
     var iter = std.mem.splitScalar(u8, content, '\n');
@@ -806,7 +807,7 @@ pub fn jsonExtractStr(json: []const u8, key: []const u8) ?[]const u8 {
     const quoted_key = std.fmt.bufPrint(&key_buf, "\"{s}\":", .{key}) catch return null;
     const idx = std.mem.indexOf(u8, json, quoted_key) orelse return null;
     const after = json[idx + quoted_key.len..];
-    const trimmed = std.mem.trimLeft(u8, after, " \t");
+    const trimmed = std.mem.trimStart(u8, after, " \t");
     if (trimmed.len == 0 or trimmed[0] != '"') return null;
     var i: usize = 1;
     while (i < trimmed.len) : (i += 1) {
@@ -824,7 +825,7 @@ pub fn jsonExtractInt(json: []const u8, key: []const u8) ?u32 {
     const quoted_key = std.fmt.bufPrint(&key_buf, "\"{s}\":", .{key}) catch return null;
     const idx = std.mem.indexOf(u8, json, quoted_key) orelse return null;
     const after = json[idx + quoted_key.len..];
-    const trimmed = std.mem.trimLeft(u8, after, " \t");
+    const trimmed = std.mem.trimStart(u8, after, " \t");
     // find end of number
     var end: usize = 0;
     while (end < trimmed.len and trimmed[end] >= '0' and trimmed[end] <= '9') : (end += 1) {}

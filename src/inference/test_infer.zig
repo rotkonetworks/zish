@@ -3,15 +3,16 @@
 // Run: ./test_infer [model_path] [prompt]
 
 const std = @import("std");
+const compat = @import("../compat.zig");
 const gguf = @import("gguf.zig");
 const model = @import("model.zig");
 const tokenizer = @import("tokenizer.zig");
 const math = @import("math.zig");
 const ctm = @import("ctm.zig");
 
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     const alloc = std.heap.page_allocator;
-    const args = try std.process.argsAlloc(alloc);
+    const args = try init.args.toSlice(alloc);
     const model_path = if (args.len > 1) args[1] else "/home/alice/.zish/models/qwen25_ctm_k32.gguf";
     const prompt = if (args.len > 2) args[2] else "ls -la";
 
@@ -149,7 +150,7 @@ pub fn main() !void {
     // Run forward passes
     std.debug.print("\n  Running forward pass...\n", .{});
     ctm.CTMBlock.debug_ctm = false;
-    var timer = try std.time.Timer.start();
+    var timer = try compat.Timer.start();
 
     var pos: usize = 0;
     for (tokens) |t| {

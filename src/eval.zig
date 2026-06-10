@@ -1,5 +1,6 @@
 // eval.zig - AST evaluation for zish
 const std = @import("std");
+const compat = @import("compat.zig");
 const ast = @import("ast.zig");
 const glob = @import("glob.zig");
 const Shell = @import("Shell.zig");
@@ -118,11 +119,11 @@ inline fn fastParseI64(s: []const u8) ?i64 {
 fn cleanupProcessSubst(shell: *Shell) void {
     for (0..shell.proc_subst_count) |i| {
         if (shell.proc_subst_fds[i] >= 0) {
-            std.posix.close(shell.proc_subst_fds[i]);
+            compat.posix.close(shell.proc_subst_fds[i]);
             shell.proc_subst_fds[i] = -1;
         }
         if (shell.proc_subst_pids[i] != 0) {
-            _ = std.posix.waitpid(shell.proc_subst_pids[i], std.posix.W.NOHANG);
+            _ = compat.posix.waitpid(shell.proc_subst_pids[i], compat.posix.W.NOHANG);
             shell.proc_subst_pids[i] = 0;
         }
     }
@@ -142,11 +143,11 @@ fn expandProcessSubst(shell: *Shell, arg: []const u8) !?[:0]const u8 {
     if (cmd.len == 0) return null;
 
     // create pipe
-    const pipe_fds = std.posix.pipe() catch return null;
+    const pipe_fds = compat.posix.pipe() catch return null;
 
-    const pid = std.posix.fork() catch {
-        std.posix.close(pipe_fds[0]);
-        std.posix.close(pipe_fds[1]);
+    const pid = compat.posix.fork() catch {
+        compat.posix.close(pipe_fds[0]);
+        compat.posix.close(pipe_fds[1]);
         return null;
     };
 
@@ -156,27 +157,27 @@ fn expandProcessSubst(shell: *Shell, arg: []const u8) !?[:0]const u8 {
 
         if (is_input) {
             // <(cmd): redirect stdout to pipe write end
-            std.posix.dup2(pipe_fds[1], std.posix.STDOUT_FILENO) catch std.posix.exit(1);
+            compat.posix.dup2(pipe_fds[1], compat.posix.STDOUT_FILENO) catch compat.posix.exit(1);
         } else {
             // >(cmd): redirect stdin from pipe read end
-            std.posix.dup2(pipe_fds[0], std.posix.STDIN_FILENO) catch std.posix.exit(1);
+            compat.posix.dup2(pipe_fds[0], compat.posix.STDIN_FILENO) catch compat.posix.exit(1);
         }
-        std.posix.close(pipe_fds[0]);
-        std.posix.close(pipe_fds[1]);
+        compat.posix.close(pipe_fds[0]);
+        compat.posix.close(pipe_fds[1]);
 
         // run command using /bin/sh for simplicity and safety
-        const cmd_z = shell.allocator.dupeZ(u8, cmd) catch std.posix.exit(1);
+        const cmd_z = shell.allocator.dupeZ(u8, cmd) catch compat.posix.exit(1);
         const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", cmd_z.ptr, null };
-        std.posix.execvpeZ("/bin/sh", &argv, @ptrCast(std.os.environ.ptr)) catch {};
-        std.posix.exit(127);
+        compat.posix.execvpeZ("/bin/sh", &argv, @ptrCast(std.c.environ)) catch {};
+        compat.posix.exit(127);
     }
 
     // parent - close unused end and return /dev/fd/N
-    const fd: std.posix.fd_t = if (is_input) blk: {
-        std.posix.close(pipe_fds[1]); // close write end
+    const fd: compat.posix.fd_t = if (is_input) blk: {
+        compat.posix.close(pipe_fds[1]); // close write end
         break :blk pipe_fds[0]; // return read end
     } else blk: {
-        std.posix.close(pipe_fds[0]); // close read end
+        compat.posix.close(pipe_fds[0]); // close read end
         break :blk pipe_fds[1]; // return write end
     };
 
@@ -200,13 +201,17 @@ fn buildEnvironment(shell: *Shell) ![*:null]const ?[*:0]const u8 {
     var count: usize = 0;
 
     // Count system env vars (excluding ones we'll override)
-    for (std.os.environ) |entry| {
-        const entry_slice = std.mem.sliceTo(entry, 0);
-        const eq_pos = std.mem.indexOfScalar(u8, entry_slice, '=') orelse continue;
-        const name = entry_slice[0..eq_pos];
-        // Skip if shell has override
-        if (shell.variables.contains(name)) continue;
-        count += 1;
+    {
+        const env_ptr = std.c.environ;
+        var ei: usize = 0;
+        while (env_ptr[ei]) |entry| : (ei += 1) {
+            const entry_slice = std.mem.sliceTo(entry, 0);
+            const eq_pos = std.mem.indexOfScalar(u8, entry_slice, '=') orelse continue;
+            const name = entry_slice[0..eq_pos];
+            // Skip if shell has override
+            if (shell.variables.contains(name)) continue;
+            count += 1;
+        }
     }
 
     // Add shell variables
@@ -218,13 +223,17 @@ fn buildEnvironment(shell: *Shell) ![*:null]const ?[*:0]const u8 {
     var idx: usize = 0;
 
     // Add system env vars (not overridden)
-    for (std.os.environ) |entry| {
-        const entry_slice = std.mem.sliceTo(entry, 0);
-        const eq_pos = std.mem.indexOfScalar(u8, entry_slice, '=') orelse continue;
-        const name = entry_slice[0..eq_pos];
-        if (shell.variables.contains(name)) continue;
-        env_ptrs[idx] = entry;
-        idx += 1;
+    {
+        const env_ptr = std.c.environ;
+        var ei: usize = 0;
+        while (env_ptr[ei]) |entry| : (ei += 1) {
+            const entry_slice = std.mem.sliceTo(entry, 0);
+            const eq_pos = std.mem.indexOfScalar(u8, entry_slice, '=') orelse continue;
+            const name = entry_slice[0..eq_pos];
+            if (shell.variables.contains(name)) continue;
+            env_ptrs[idx] = entry;
+            idx += 1;
+        }
     }
 
     // Add shell variables
@@ -361,7 +370,7 @@ fn expandArithmeticVars(shell: *Shell, expr: []const u8, dest: *[256]u8) !usize 
                     if (value.len > 256 - out_pos) return error.BufferTooSmall;
                     @memcpy(dest[out_pos..][0..value.len], value);
                     out_pos += value.len;
-                } else if (std.posix.getenv(var_name)) |value| {
+                } else if (compat.posix.getenv(var_name)) |value| {
                     if (value.len > 256 - out_pos) return error.BufferTooSmall;
                     @memcpy(dest[out_pos..][0..value.len], value);
                     out_pos += value.len;
@@ -448,7 +457,7 @@ fn expandVariableFast(shell: *Shell, input: []const u8, dest: *[256]u8) !usize {
                     if (value.len > 256 - out_pos) return error.BufferTooSmall;
                     @memcpy(dest[out_pos..][0..value.len], value);
                     out_pos += value.len;
-                } else if (std.posix.getenv(var_name)) |value| {
+                } else if (compat.posix.getenv(var_name)) |value| {
                     if (value.len > 256 - out_pos) return error.BufferTooSmall;
                     @memcpy(dest[out_pos..][0..value.len], value);
                     out_pos += value.len;
@@ -711,7 +720,7 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
         // skip expansion if alias is self-referencing (e.g., ls -> ls --color=auto)
         if (!std.mem.eql(u8, first_word, cmd_name)) {
             // build new command: alias_value + remaining args
-            var new_cmd = std.ArrayListUnmanaged(u8){};
+            var new_cmd: std.ArrayListUnmanaged(u8) = .empty;
             defer new_cmd.deinit(shell.allocator);
 
             try new_cmd.appendSlice(shell.allocator, alias_value);
@@ -884,7 +893,7 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
                 if (shell.history) |h| {
                     // generate new random key
                     var new_key: [32]u8 = undefined;
-                    std.crypto.random.bytes(&new_key);
+                    compat.io().random(&new_key);
 
                     // re-encrypt history with new key
                     try h.reEncryptWithKey(new_key);
@@ -1017,7 +1026,7 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     // external command
     // restore terminal to normal mode so child can handle signals properly
     // only do this if stdin is a tty
-    const is_tty = std.posix.isatty(std.posix.STDIN_FILENO);
+    const is_tty = compat.posix.isatty(compat.posix.STDIN_FILENO);
     if (is_tty) {
         shell.disableRawMode();
     }
@@ -1044,9 +1053,9 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     // In pipeline context, exec directly (we're already forked)
     if (shell.in_pipeline) {
         // Build environment in child process (after fork, safe from parent interference)
-        const envp = buildEnvironment(shell) catch @as([*:null]const ?[*:0]const u8, @ptrCast(std.os.environ.ptr));
-        std.posix.execvpeZ(argv[0].?, argv, envp) catch {
-            std.posix.exit(127);
+        const envp = buildEnvironment(shell) catch @as([*:null]const ?[*:0]const u8, @ptrCast(std.c.environ));
+        compat.posix.execvpeZ(argv[0].?, argv, envp) catch {
+            compat.posix.exit(127);
         };
         unreachable;
     }
@@ -1055,7 +1064,7 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     // Flush stdout buffer before forking
     shell.stdout().flush() catch {};
 
-    const pid = std.posix.fork() catch {
+    const pid = compat.posix.fork() catch {
         try shell.stdout().print("zish: fork failed\n", .{});
         return 1;
     };
@@ -1064,49 +1073,49 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
         // child: create own process group and take terminal control
         // this allows TUI apps (like claude) to work properly
         const child_pid = std.os.linux.getpid();
-        std.posix.setpgid(0, 0) catch {};
+        compat.posix.setpgid(0, 0) catch {};
         if (is_tty) {
-            jobs.tcsetpgrp(std.posix.STDIN_FILENO, child_pid) catch {};
+            jobs.tcsetpgrp(compat.posix.STDIN_FILENO, child_pid) catch {};
         }
 
         // Build environment in child process (after fork, safe from parent interference)
-        const envp = buildEnvironment(shell) catch @as([*:null]const ?[*:0]const u8, @ptrCast(std.os.environ.ptr));
-        std.posix.execvpeZ(argv[0].?, argv, envp) catch {
-            std.posix.exit(127);
+        const envp = buildEnvironment(shell) catch @as([*:null]const ?[*:0]const u8, @ptrCast(std.c.environ));
+        compat.posix.execvpeZ(argv[0].?, argv, envp) catch {
+            compat.posix.exit(127);
         };
     }
 
     // parent: also set child's pgrp (race avoidance)
-    std.posix.setpgid(pid, pid) catch {};
+    compat.posix.setpgid(pid, pid) catch {};
 
     // parent - ignore SIGINT while child runs
-    var old_sigint: std.posix.Sigaction = undefined;
-    const ignore_action = std.posix.Sigaction{
-        .handler = .{ .handler = std.posix.SIG.IGN },
-        .mask = std.mem.zeroes(std.posix.sigset_t),
+    var old_sigint: compat.posix.Sigaction = undefined;
+    const ignore_action = compat.posix.Sigaction{
+        .handler = .{ .handler = compat.posix.SIG.IGN },
+        .mask = std.mem.zeroes(compat.posix.sigset_t),
         .flags = 0,
     };
-    std.posix.sigaction(std.posix.SIG.INT, &ignore_action, &old_sigint);
-    defer std.posix.sigaction(std.posix.SIG.INT, &old_sigint, null);
+    compat.posix.sigaction(compat.posix.SIG.INT, &ignore_action, &old_sigint);
+    defer compat.posix.sigaction(compat.posix.SIG.INT, &old_sigint, null);
 
     // wait for child
-    const result = std.posix.waitpid(pid, 0);
+    const result = compat.posix.waitpid(pid, 0);
 
     // take back terminal control
     if (is_tty) {
-        const shell_pgid: std.posix.pid_t = @intCast(std.os.linux.syscall1(.getpgid, 0));
-        jobs.tcsetpgrp(std.posix.STDIN_FILENO, shell_pgid) catch {};
+        const shell_pgid: compat.posix.pid_t = @intCast(std.os.linux.syscall1(.getpgid, 0));
+        jobs.tcsetpgrp(compat.posix.STDIN_FILENO, shell_pgid) catch {};
     }
 
-    if (std.posix.W.IFEXITED(result.status)) {
-        const code = std.posix.W.EXITSTATUS(result.status);
+    if (compat.posix.W.IFEXITED(result.status)) {
+        const code = compat.posix.W.EXITSTATUS(result.status);
         if (code == 127) {
             try shell.stdout().print("zish: {s}: command not found\n", .{cmd_name});
             suggestCommand(shell, cmd_name);
         }
         return code;
-    } else if (std.posix.W.IFSIGNALED(result.status)) {
-        return @truncate(128 + std.posix.W.TERMSIG(result.status));
+    } else if (compat.posix.W.IFSIGNALED(result.status)) {
+        return @truncate(128 + @as(u32, @intCast(@intFromEnum(compat.posix.W.TERMSIG(result.status)))));
     }
     return 127;
 }
@@ -1149,9 +1158,9 @@ fn execSimpleCommand(shell: *Shell, node: *const ast.AstNode) void {
     argv_buf[arg_count] = null;
 
     const argv = argv_buf[0..arg_count :null];
-    const envp = buildEnvironment(shell) catch @as([*:null]const ?[*:0]const u8, @ptrCast(std.os.environ.ptr));
-    std.posix.execvpeZ(argv[0].?, argv, envp) catch {};
-    std.posix.exit(127);
+    const envp = buildEnvironment(shell) catch @as([*:null]const ?[*:0]const u8, @ptrCast(std.c.environ));
+    compat.posix.execvpeZ(argv[0].?, argv, envp) catch {};
+    compat.posix.exit(127);
 }
 
 pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
@@ -1160,19 +1169,19 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
     const num_commands = node.children.len;
 
     // Use stack allocation for small pipelines (up to 8 commands)
-    var stack_pipes: [7][2]std.posix.fd_t = undefined;
-    var stack_pids: [8]std.posix.pid_t = undefined;
+    var stack_pipes: [7][2]compat.posix.fd_t = undefined;
+    var stack_pids: [8]compat.posix.pid_t = undefined;
 
     const pipes = if (num_commands <= 8)
         stack_pipes[0 .. num_commands - 1]
     else
-        try shell.allocator.alloc([2]std.posix.fd_t, num_commands - 1);
+        try shell.allocator.alloc([2]compat.posix.fd_t, num_commands - 1);
     defer if (num_commands > 8) shell.allocator.free(pipes);
 
     const pids = if (num_commands <= 8)
         stack_pids[0..num_commands]
     else
-        try shell.allocator.alloc(std.posix.pid_t, num_commands);
+        try shell.allocator.alloc(compat.posix.pid_t, num_commands);
     defer if (num_commands > 8) shell.allocator.free(pids);
 
     // initialize to invalid fd for safe cleanup on error
@@ -1182,7 +1191,7 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
     }
 
     for (pipes) |*pipe_fds| {
-        pipe_fds.* = try std.posix.pipe();
+        pipe_fds.* = try compat.posix.pipe();
     }
 
     // initialize pids to 0 so we can track which children were forked
@@ -1198,26 +1207,26 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
     errdefer {
         // close all pipe fds first (children have their own copies via dup2)
         for (pipes) |pipe_fds| {
-            if (pipe_fds[0] != -1) std.posix.close(pipe_fds[0]);
-            if (pipe_fds[1] != -1) std.posix.close(pipe_fds[1]);
+            if (pipe_fds[0] != -1) compat.posix.close(pipe_fds[0]);
+            if (pipe_fds[1] != -1) compat.posix.close(pipe_fds[1]);
         }
         // kill and reap any children that were already forked
         // use WNOHANG to avoid blocking forever on stuck children
         for (pids) |pid| {
             if (pid != 0) {
-                std.posix.kill(pid, std.posix.SIG.TERM) catch {};
+                compat.posix.kill(pid, compat.posix.SIG.TERM) catch {};
             }
         }
         // brief sleep to let children handle SIGTERM
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        compat.sleep(10 * std.time.ns_per_ms);
         // reap with WNOHANG, escalate to SIGKILL if needed
         for (pids) |pid| {
             if (pid != 0) {
-                const result = std.posix.waitpid(pid, std.posix.W.NOHANG);
+                const result = compat.posix.waitpid(pid, compat.posix.W.NOHANG);
                 if (result.pid == 0) {
                     // child still running, force kill
-                    std.posix.kill(pid, std.posix.SIG.KILL) catch {};
-                    _ = std.posix.waitpid(pid, 0);
+                    compat.posix.kill(pid, compat.posix.SIG.KILL) catch {};
+                    _ = compat.posix.waitpid(pid, 0);
                 }
             }
         }
@@ -1228,18 +1237,18 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
     shell.stdout().flush() catch {};
 
     for (node.children, 0..) |child, i| {
-        const pid = try std.posix.fork();
+        const pid = try compat.posix.fork();
         if (pid == 0) {
             // Setup pipes first
             if (i > 0) {
-                try std.posix.dup2(pipes[i - 1][0], std.posix.STDIN_FILENO);
+                try compat.posix.dup2(pipes[i - 1][0], compat.posix.STDIN_FILENO);
             }
             if (i < num_commands - 1) {
-                try std.posix.dup2(pipes[i][1], std.posix.STDOUT_FILENO);
+                try compat.posix.dup2(pipes[i][1], compat.posix.STDOUT_FILENO);
             }
             for (pipes) |pipe_fds| {
-                std.posix.close(pipe_fds[0]);
-                std.posix.close(pipe_fds[1]);
+                compat.posix.close(pipe_fds[0]);
+                compat.posix.close(pipe_fds[1]);
             }
 
             // Fast path: simple external command - exec directly without evaluateAst
@@ -1263,30 +1272,30 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
     }
 
     for (pipes) |pipe_fds| {
-        std.posix.close(pipe_fds[0]);
-        std.posix.close(pipe_fds[1]);
+        compat.posix.close(pipe_fds[0]);
+        compat.posix.close(pipe_fds[1]);
     }
 
     // ignore SIGINT in shell while waiting for pipeline (children will receive it)
-    var old_sigint: std.posix.Sigaction = undefined;
-    const ignore_action = std.posix.Sigaction{
-        .handler = .{ .handler = std.posix.SIG.IGN },
-        .mask = std.mem.zeroes(std.posix.sigset_t),
+    var old_sigint: compat.posix.Sigaction = undefined;
+    const ignore_action = compat.posix.Sigaction{
+        .handler = .{ .handler = compat.posix.SIG.IGN },
+        .mask = std.mem.zeroes(compat.posix.sigset_t),
         .flags = 0,
     };
-    std.posix.sigaction(std.posix.SIG.INT, &ignore_action, &old_sigint);
-    defer std.posix.sigaction(std.posix.SIG.INT, &old_sigint, null);
+    compat.posix.sigaction(compat.posix.SIG.INT, &ignore_action, &old_sigint);
+    defer compat.posix.sigaction(compat.posix.SIG.INT, &old_sigint, null);
 
     var last_status: u8 = 0;
     var pipefail_status: u8 = 0; // first non-zero status for pipefail
 
     for (pids) |pid| {
-        const result = std.posix.waitpid(pid, 0);
+        const result = compat.posix.waitpid(pid, 0);
         var status: u8 = 0;
-        if (std.posix.W.IFEXITED(result.status)) {
-            status = std.posix.W.EXITSTATUS(result.status);
-        } else if (std.posix.W.IFSIGNALED(result.status)) {
-            status = @truncate(128 + std.posix.W.TERMSIG(result.status));
+        if (compat.posix.W.IFEXITED(result.status)) {
+            status = compat.posix.W.EXITSTATUS(result.status);
+        } else if (compat.posix.W.IFSIGNALED(result.status)) {
+            status = @truncate(128 + @as(u32, @intCast(@intFromEnum(compat.posix.W.TERMSIG(result.status)))));
         } else {
             status = 127;
         }
@@ -1334,69 +1343,69 @@ pub fn evaluateRedirect(shell: *Shell, node: *const ast.AstNode) !u8 {
         try shell.expandVariables(target.value);
     defer shell.allocator.free(expanded_target);
 
-    const stdin_backup = try std.posix.dup(std.posix.STDIN_FILENO);
-    const stdout_backup = try std.posix.dup(std.posix.STDOUT_FILENO);
-    const stderr_backup = try std.posix.dup(std.posix.STDERR_FILENO);
+    const stdin_backup = try compat.posix.dup(compat.posix.STDIN_FILENO);
+    const stdout_backup = try compat.posix.dup(compat.posix.STDOUT_FILENO);
+    const stderr_backup = try compat.posix.dup(compat.posix.STDERR_FILENO);
     defer {
-        std.posix.dup2(stdin_backup, std.posix.STDIN_FILENO) catch {};
-        std.posix.dup2(stdout_backup, std.posix.STDOUT_FILENO) catch {};
-        std.posix.dup2(stderr_backup, std.posix.STDERR_FILENO) catch {};
-        std.posix.close(stdin_backup);
-        std.posix.close(stdout_backup);
-        std.posix.close(stderr_backup);
+        compat.posix.dup2(stdin_backup, compat.posix.STDIN_FILENO) catch {};
+        compat.posix.dup2(stdout_backup, compat.posix.STDOUT_FILENO) catch {};
+        compat.posix.dup2(stderr_backup, compat.posix.STDERR_FILENO) catch {};
+        compat.posix.close(stdin_backup);
+        compat.posix.close(stdout_backup);
+        compat.posix.close(stderr_backup);
     }
 
     if (std.mem.eql(u8, redirect_type, ">")) {
-        const file = try std.fs.cwd().createFile(expanded_target, .{ .truncate = true });
-        defer file.close();
-        try std.posix.dup2(file.handle, std.posix.STDOUT_FILENO);
+        const file = try std.Io.Dir.cwd().createFile(compat.io(), expanded_target, .{ .truncate = true });
+        defer file.close(compat.io());
+        try compat.posix.dup2(file.handle, compat.posix.STDOUT_FILENO);
     } else if (std.mem.eql(u8, redirect_type, ">>")) {
         // create file if doesn't exist, don't truncate if exists
-        const file = try std.fs.cwd().createFile(expanded_target, .{ .truncate = false });
-        defer file.close();
-        try file.seekFromEnd(0);
-        try std.posix.dup2(file.handle, std.posix.STDOUT_FILENO);
+        const file = try std.Io.Dir.cwd().createFile(compat.io(), expanded_target, .{ .truncate = false });
+        defer file.close(compat.io());
+        if (std.c.lseek(file.handle, 0, std.c.SEEK.END) < 0) return error.Unseekable;
+        try compat.posix.dup2(file.handle, compat.posix.STDOUT_FILENO);
     } else if (std.mem.eql(u8, redirect_type, "<")) {
-        const file = try std.fs.cwd().openFile(expanded_target, .{ .mode = .read_only });
-        defer file.close();
-        try std.posix.dup2(file.handle, std.posix.STDIN_FILENO);
+        const file = try std.Io.Dir.cwd().openFile(compat.io(), expanded_target, .{ .mode = .read_only });
+        defer file.close(compat.io());
+        try compat.posix.dup2(file.handle, compat.posix.STDIN_FILENO);
     } else if (std.mem.eql(u8, redirect_type, "2>")) {
-        const file = try std.fs.cwd().createFile(expanded_target, .{ .truncate = true });
-        defer file.close();
-        try std.posix.dup2(file.handle, std.posix.STDERR_FILENO);
+        const file = try std.Io.Dir.cwd().createFile(compat.io(), expanded_target, .{ .truncate = true });
+        defer file.close(compat.io());
+        try compat.posix.dup2(file.handle, compat.posix.STDERR_FILENO);
     } else if (std.mem.eql(u8, redirect_type, "2>>")) {
-        const file = try std.fs.cwd().createFile(expanded_target, .{ .truncate = false });
-        defer file.close();
-        try file.seekFromEnd(0);
-        try std.posix.dup2(file.handle, std.posix.STDERR_FILENO);
+        const file = try std.Io.Dir.cwd().createFile(compat.io(), expanded_target, .{ .truncate = false });
+        defer file.close(compat.io());
+        if (std.c.lseek(file.handle, 0, std.c.SEEK.END) < 0) return error.Unseekable;
+        try compat.posix.dup2(file.handle, compat.posix.STDERR_FILENO);
     } else if (std.mem.eql(u8, redirect_type, "2>&1")) {
-        try std.posix.dup2(std.posix.STDOUT_FILENO, std.posix.STDERR_FILENO);
+        try compat.posix.dup2(compat.posix.STDOUT_FILENO, compat.posix.STDERR_FILENO);
     } else if (std.mem.eql(u8, redirect_type, ">&2")) {
-        try std.posix.dup2(std.posix.STDERR_FILENO, std.posix.STDOUT_FILENO);
+        try compat.posix.dup2(compat.posix.STDERR_FILENO, compat.posix.STDOUT_FILENO);
     } else if (std.mem.eql(u8, redirect_type, "&>")) {
-        const file = try std.fs.cwd().createFile(expanded_target, .{ .truncate = true });
-        defer file.close();
-        try std.posix.dup2(file.handle, std.posix.STDOUT_FILENO);
-        try std.posix.dup2(file.handle, std.posix.STDERR_FILENO);
+        const file = try std.Io.Dir.cwd().createFile(compat.io(), expanded_target, .{ .truncate = true });
+        defer file.close(compat.io());
+        try compat.posix.dup2(file.handle, compat.posix.STDOUT_FILENO);
+        try compat.posix.dup2(file.handle, compat.posix.STDERR_FILENO);
     } else if (std.mem.eql(u8, redirect_type, "&>>")) {
-        const file = try std.fs.cwd().createFile(expanded_target, .{ .truncate = false });
-        defer file.close();
-        try file.seekFromEnd(0);
-        try std.posix.dup2(file.handle, std.posix.STDOUT_FILENO);
-        try std.posix.dup2(file.handle, std.posix.STDERR_FILENO);
+        const file = try std.Io.Dir.cwd().createFile(compat.io(), expanded_target, .{ .truncate = false });
+        defer file.close(compat.io());
+        if (std.c.lseek(file.handle, 0, std.c.SEEK.END) < 0) return error.Unseekable;
+        try compat.posix.dup2(file.handle, compat.posix.STDOUT_FILENO);
+        try compat.posix.dup2(file.handle, compat.posix.STDERR_FILENO);
     } else if (std.mem.eql(u8, redirect_type, "<<<")) {
         // here string: create pipe, write string, connect to stdin
-        const pipe_fds = try std.posix.pipe();
-        defer std.posix.close(pipe_fds[0]);
+        const pipe_fds = try compat.posix.pipe();
+        defer compat.posix.close(pipe_fds[0]);
 
         // write string to write end of pipe
         const content_with_newline = try std.fmt.allocPrint(shell.allocator, "{s}\n", .{expanded_target});
         defer shell.allocator.free(content_with_newline);
-        _ = try std.posix.write(pipe_fds[1], content_with_newline);
-        std.posix.close(pipe_fds[1]);
+        _ = try compat.posix.write(pipe_fds[1], content_with_newline);
+        compat.posix.close(pipe_fds[1]);
 
         // connect read end to stdin
-        try std.posix.dup2(pipe_fds[0], std.posix.STDIN_FILENO);
+        try compat.posix.dup2(pipe_fds[0], compat.posix.STDIN_FILENO);
     }
 
     return evaluateAst(shell, command);
@@ -1454,7 +1463,7 @@ pub fn evaluateAssignment(shell: *Shell, node: *const ast.AstNode) !u8 {
         const array_content = value[1 .. value.len - 1];
 
         // parse array elements (space-separated, respecting quotes)
-        var elements = std.ArrayListUnmanaged([]const u8){};
+        var elements: std.ArrayListUnmanaged([]const u8) = .empty;
         defer {
             for (elements.items) |elem| shell.allocator.free(elem);
             elements.deinit(shell.allocator);
@@ -1840,7 +1849,7 @@ pub fn evaluateBackground(shell: *Shell, node: *const ast.AstNode) !u8 {
     const command = node.children[0];
 
     // get command string for job display by serializing AST
-    var cmd_buf = std.ArrayListUnmanaged(u8){};
+    var cmd_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer cmd_buf.deinit(shell.allocator);
     serializeAst(shell.allocator, &cmd_buf, command) catch {};
     const cmd_str = if (cmd_buf.items.len > 0) cmd_buf.items else command.value;
@@ -1849,7 +1858,7 @@ pub fn evaluateBackground(shell: *Shell, node: *const ast.AstNode) !u8 {
     shell.stdout().flush() catch {};
 
     // fork to run command in background
-    const pid = std.posix.fork() catch {
+    const pid = compat.posix.fork() catch {
         try shell.stdout().writeAll("zish: fork failed\n");
         return 1;
     };
@@ -1862,7 +1871,7 @@ pub fn evaluateBackground(shell: *Shell, node: *const ast.AstNode) !u8 {
         shell.allocator = std.heap.page_allocator;
 
         // set up process group for job control
-        jobs.launchProcess(0, 0, false, std.posix.STDIN_FILENO);
+        jobs.launchProcess(0, 0, false, compat.posix.STDIN_FILENO);
 
         // Mark as in_pipeline so external commands exec directly
         // instead of forking again (avoids double-fork for bg jobs)
@@ -1871,13 +1880,13 @@ pub fn evaluateBackground(shell: *Shell, node: *const ast.AstNode) !u8 {
         // evaluate command and exit with its status
         const status = evaluateAst(shell, command) catch 127;
         shell.stdout().flush() catch {};
-        std.posix.exit(status);
+        compat.posix.exit(status);
     }
 
     // === PARENT PROCESS ===
     // both parent and child call setpgid to avoid race condition
     // (whichever runs first establishes the group)
-    std.posix.setpgid(pid, pid) catch |err| {
+    compat.posix.setpgid(pid, pid) catch |err| {
         // EACCES: child already exec'd (fine, it set its own pgrp)
         // ESRCH: child already exited (fine, we'll reap it)
         if (err != error.PermissionDenied and err != error.ProcessNotFound) {
@@ -1974,45 +1983,45 @@ fn evaluateTestPrimary(args: []const []const u8) bool {
     // unary file tests: -x, -f, -d, -e, -r, -w, -s
     if (first.len == 2 and first[0] == '-' and args.len >= 2) {
         const path = args[1];
-        const fs = std.fs;
+        const cwd = std.Io.Dir.cwd();
 
         return switch (first[1]) {
             'e', 'a' => blk: {
                 // file exists (-e or -a)
-                fs.cwd().access(path, .{}) catch break :blk false;
+                cwd.access(compat.io(), path, .{}) catch break :blk false;
                 break :blk true;
             },
             'f' => blk: {
                 // regular file
-                const stat = fs.cwd().statFile(path) catch break :blk false;
+                const stat = cwd.statFile(compat.io(), path, .{}) catch break :blk false;
                 break :blk stat.kind == .file;
             },
             'd' => blk: {
                 // directory
-                const stat = fs.cwd().statFile(path) catch break :blk false;
+                const stat = cwd.statFile(compat.io(), path, .{}) catch break :blk false;
                 break :blk stat.kind == .directory;
             },
             'r' => blk: {
                 // readable
-                fs.cwd().access(path, .{ .mode = .read_only }) catch break :blk false;
+                cwd.access(compat.io(), path, .{ .read = true }) catch break :blk false;
                 break :blk true;
             },
             'w' => blk: {
                 // writable
-                fs.cwd().access(path, .{ .mode = .write_only }) catch break :blk false;
+                cwd.access(compat.io(), path, .{ .write = true }) catch break :blk false;
                 break :blk true;
             },
             'x' => blk: {
                 // executable - check if file exists and has execute permission
-                const file = fs.cwd().openFile(path, .{}) catch break :blk false;
-                defer file.close();
-                const stat = file.stat() catch break :blk false;
+                const file = cwd.openFile(compat.io(), path, .{}) catch break :blk false;
+                defer file.close(compat.io());
+                const stat = file.stat(compat.io()) catch break :blk false;
                 // check execute bit for owner
-                break :blk (stat.mode & 0o100) != 0;
+                break :blk (stat.permissions.toMode() & 0o100) != 0;
             },
             's' => blk: {
                 // file exists and has size > 0
-                const stat = fs.cwd().statFile(path) catch break :blk false;
+                const stat = cwd.statFile(compat.io(), path, .{}) catch break :blk false;
                 break :blk stat.size > 0;
             },
             'z' => blk: {
