@@ -88,8 +88,8 @@ pub const TrapTable = struct {
         SYS = 31,
 
         pub fn fromName(sig_str: []const u8) ?Signal {
+            var buf: [16]u8 = undefined;
             const upper = blk: {
-                var buf: [16]u8 = undefined;
                 if (sig_str.len > 16) break :blk sig_str;
                 for (sig_str, 0..) |c, i| {
                     buf[i] = std.ascii.toUpper(c);
@@ -168,6 +168,8 @@ pub const GhostState = struct {
     candidate_idx: u8 = 0,
     infer_input: [512]u8 = undefined,
     infer_input_len: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    infer_prev_cmd: [512]u8 = undefined,
+    infer_prev_len: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     infer_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     infer_result: [512]u8 = undefined,
     infer_result_len: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -198,6 +200,10 @@ opt_xtrace: bool = false, // -x: print commands before execution
 opt_pipefail: bool = false, // pipefail: pipeline fails if any command fails
 // when true, external commands exec directly instead of fork+exec (for pipeline children)
 in_pipeline: bool = false,
+// names of variables currently used as for-loop scratch (value points at a
+// stack buffer in an active evaluateFor frame, must not be freed)
+for_scratch_names: [16][]const u8 = [_][]const u8{""} ** 16,
+for_scratch_depth: usize = 0,
 // process substitution tracking
 proc_subst_pids: [16]posix.pid_t = [_]posix.pid_t{0} ** 16,
 proc_subst_fds: [16]posix.fd_t = [_]posix.fd_t{-1} ** 16,
@@ -2915,6 +2921,7 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
 
                     // Execute command and capture output
                     const cmd_output = self.executeCommandAndCapture(command) catch "";
+                    defer if (cmd_output.len > 0) self.allocator.free(cmd_output);
                     try result.appendSlice(self.allocator, std.mem.trimEnd(u8, cmd_output, "\n\r"));
                     continue;
                 } else {
@@ -3247,6 +3254,7 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
 
                 // Execute command and capture output
                 const cmd_output = self.executeCommandAndCapture(command) catch "";
+                defer if (cmd_output.len > 0) self.allocator.free(cmd_output);
                 try result.appendSlice(self.allocator, std.mem.trimEnd(u8, cmd_output, "\n\r"));
             } else {
                 // Unmatched backtick, treat as regular text

@@ -396,7 +396,8 @@ pub fn handleTabCompletion(self: *Shell) !void {
         break :blk false;
     };
 
-    const dir = std.Io.Dir.cwd().openDir(compat.io(), search_dir, .{ .iterate = true }) catch return;
+    var dir = std.Io.Dir.cwd().openDir(compat.io(), search_dir, .{ .iterate = true }) catch return;
+    defer dir.close(compat.io());
     var iter = dir.iterate();
     const show_hidden = pattern.len > 0 and pattern[0] == '.';
     while (try iter.next(compat.io())) |entry| {
@@ -1176,7 +1177,8 @@ fn tryCommandCompletion(self: *Shell, word_result: WordResult) !bool {
     while (path_iter.next()) |path_dir| {
         if (path_dir.len == 0) continue;
 
-        const dir = std.Io.Dir.cwd().openDir(compat.io(), path_dir, .{ .iterate = true }) catch continue;
+        var dir = std.Io.Dir.cwd().openDir(compat.io(), path_dir, .{ .iterate = true }) catch continue;
+        defer dir.close(compat.io());
         var iter = dir.iterate();
         while (iter.next(compat.io()) catch null) |entry| {
             if (entry.kind != .file and entry.kind != .sym_link) continue;
@@ -1674,15 +1676,21 @@ fn tryHistoryCompletion(self: *Shell, current_input: []const u8) !bool {
     }
 
     // show as completion menu — use full command as match
+    // (free old owned strings first)
+    for (self.completion.matches.items) |old| {
+        self.allocator.free(old);
+    }
     self.completion.matches.deinit(self.allocator);
     self.completion.matches = .empty;
     for (matches.items) |m| {
         const owned = try self.allocator.dupe(u8, m);
         try self.completion.matches.append(self.allocator, owned);
     }
+    self.completion.mode = true;
     self.completion.index = 0;
     self.completion.word_start = 0;
     self.completion.word_end = @intCast(self.edit_buf.len);
+    self.completion.original_len = self.edit_buf.len;
     self.completion.pattern_len = @intCast(prefix.len);
 
     try displayCompletions(self);
@@ -2144,16 +2152,21 @@ fn extractFlagDescription(text: []const u8, flag_end: usize) []const u8 {
 fn showFlagCompletionsWithDesc(self: *Shell, matches: *std.ArrayList([]const u8), match_indices: []const usize, word_result: WordResult, pattern: []const u8) !bool {
     if (matches.items.len == 0) return false;
 
-    // store matches for cycling
+    // store matches for cycling (free old owned strings first)
+    for (self.completion.matches.items) |old| {
+        self.allocator.free(old);
+    }
     self.completion.matches.deinit(self.allocator);
     self.completion.matches = .empty;
     for (matches.items) |m| {
         const owned = try self.allocator.dupe(u8, m);
         try self.completion.matches.append(self.allocator, owned);
     }
+    self.completion.mode = true;
     self.completion.index = 0;
     self.completion.word_start = word_result.start;
     self.completion.word_end = word_result.end;
+    self.completion.original_len = self.edit_buf.len;
     self.completion.pattern_len = pattern.len;
 
     // display with descriptions
@@ -2900,9 +2913,13 @@ pub fn updateGhostText(self: *Shell) void {
         if (rlen > 0) {
             const n = @min(rlen, self.ghost.buf.len);
             @memcpy(self.ghost.buf[0..n], self.ghost.infer_result[0..n]);
-            self.ghost.len = n;
-            self.ghost.from_ctm = true;
-            self.ghost.last_result_seq = res_seq;
+            // Seqlock re-validation: if the writer published a newer result
+            // while we copied, the copy may be torn — discard it this round.
+            if (self.ghost.infer_result_seq.load(.acquire) == res_seq) {
+                self.ghost.len = n;
+                self.ghost.from_ctm = true;
+                self.ghost.last_result_seq = res_seq;
+            }
             // Don't return — still submit new request for updated input
         }
     }
@@ -2914,6 +2931,19 @@ pub fn updateGhostText(self: *Shell) void {
         const len: u32 = @intCast(cmd.len);
         @memcpy(self.ghost.infer_input[0..cmd.len], cmd);
         self.ghost.infer_input_len.store(len, .monotonic);
+        // Publish the previous history command too — the inference thread
+        // must not touch shell.history (ArrayList realloc on main thread
+        // would be a use-after-free there).
+        var prev_len: u32 = 0;
+        if (self.history) |hh| {
+            if (hh.entries.items.len > 0) {
+                const hcmd = hh.getCommand(hh.entries.items[hh.entries.items.len - 1]);
+                const n = @min(hcmd.len, self.ghost.infer_prev_cmd.len);
+                @memcpy(self.ghost.infer_prev_cmd[0..n], hcmd[0..n]);
+                prev_len = @intCast(n);
+            }
+        }
+        self.ghost.infer_prev_len.store(prev_len, .monotonic);
         self.ghost.infer_seq.store(new_seq, .release);
     }
 
@@ -3130,7 +3160,13 @@ fn ghostInferThread(ctx: anytype) void {
     const ghost_svc = @import("ghost_service.zig");
 
     const shell = ctx.shell;
-    const model_path = ctx.path[0..ctx.path_len];
+    // Copy the path to a stack buffer local to this thread function: ctx is
+    // destroyed below, but model_path is stored in ghost_ctx and used later
+    // for ForkServer respawn.
+    var path_buf: [256]u8 = undefined;
+    const path_len = ctx.path_len;
+    @memcpy(path_buf[0..path_len], ctx.path[0..path_len]);
+    const model_path = path_buf[0..path_len];
     const alloc = shell.allocator;
 
     // Spawn ForkServer for inference
@@ -3168,19 +3204,23 @@ fn ghostInferThread(ctx: anytype) void {
         compat.sleep(100 * std.time.ns_per_ms);
         if (shell.ghost.infer_seq.load(.monotonic) != seq) continue;
 
-        // Read input
+        // Read input + previous command (published together under infer_seq)
         const ilen = shell.ghost.infer_input_len.load(.monotonic);
         if (ilen == 0 or ilen > 512) continue;
         var input_buf: [512]u8 = undefined;
         @memcpy(input_buf[0..ilen], shell.ghost.infer_input[0..ilen]);
 
-        // Update context with latest history command
-        if (shell.history) |h| {
-            if (h.entries.items.len > 0) {
-                const hcmd = h.getCommand(h.entries.items[h.entries.items.len - 1]);
-                ghost_ctx.last_cmd = hcmd;
-            }
+        const plen = shell.ghost.infer_prev_len.load(.monotonic);
+        var prev_buf: [512]u8 = undefined;
+        if (plen > 0 and plen <= prev_buf.len) {
+            @memcpy(prev_buf[0..plen], shell.ghost.infer_prev_cmd[0..plen]);
         }
+
+        // Seqlock re-validation: if the main thread published a newer input
+        // while we copied, the copies may be torn — skip this round.
+        if (shell.ghost.infer_seq.load(.acquire) != seq) continue;
+
+        ghost_ctx.last_cmd = if (plen > 0 and plen <= prev_buf.len) prev_buf[0..plen] else &.{};
 
         // Run the composable pipeline: staleness >> prompt >> infer >> sanitize
         const signal = ghost_svc.pipeline(&ghost_ctx, .{

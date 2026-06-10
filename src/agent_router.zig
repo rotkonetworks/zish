@@ -562,7 +562,7 @@ pub fn classifyWithModel(
         .argv = argv[0..argc],
         .stdin = .pipe,
         .stdout = .pipe,
-        .stderr = .pipe,
+        .stderr = .ignore, // never read — a .pipe here can deadlock wait() if curl writes >64KB
     }) catch return null;
 
     // Write body
@@ -802,7 +802,13 @@ pub fn classifyWithLocalModel(
     if (!srv.isAlive()) {
         // Respawn
         srv.shutdown();
-        srv.* = inference.ForkServer.spawn(model_path) catch return null;
+        srv.* = inference.ForkServer.spawn(model_path) catch {
+            // Already shut down — drop the dead server so later cleanup
+            // doesn't shutdown() it a second time (double-close/waitpid).
+            allocator.destroy(srv);
+            config.fork_server = null;
+            return null;
+        };
     }
 
     // Build prompt

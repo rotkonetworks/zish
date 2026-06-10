@@ -1504,9 +1504,16 @@ const AgentThread = struct {
         for (0..drop) |i| {
             self.allocator.free(self.history.messages[i].content[0..self.history.messages[i].alloc_len]);
         }
-        // Shift kept messages to make room for summary at front
+        // Shift kept messages to make room for summary at front.
+        // Copy direction matters: src starts at `drop`, dest at 2 — when drop < 2
+        // dest > src (overlap), so we must copy backwards to avoid smearing.
         if (drop > 0) {
-            std.mem.copyForwards(Message, self.history.messages[2..2 + keep], self.history.messages[drop..drop + keep]);
+            if (drop > 2) {
+                std.mem.copyForwards(Message, self.history.messages[2 .. 2 + keep], self.history.messages[drop .. drop + keep]);
+            } else if (drop < 2) {
+                std.mem.copyBackwards(Message, self.history.messages[2 .. 2 + keep], self.history.messages[drop .. drop + keep]);
+            }
+            // drop == 2: messages already in place
             self.history.count = 2 + keep;
         } else {
             // Need to make room — shift everything right by 2
@@ -1842,6 +1849,7 @@ const AgentThread = struct {
     fn doStreamRequest(self: *AgentThread, url: []const u8, body: []const u8, provider: Provider) !APIResponse {
         // Output accumulator
         var text_buf = try self.allocator.alloc(u8, MAX_CONTENT_LEN);
+        errdefer self.allocator.free(text_buf);
         var text_len: usize = 0;
         var tool_cmd_buf: [4096]u8 = undefined;
         var tool_cmd_len: usize = 0;
@@ -1856,7 +1864,6 @@ const AgentThread = struct {
         // Acquire rate limit slot — blocks until a concurrent request slot is available.
         // This prevents all subagents from hammering the API simultaneously.
         if (!self.queues.bulletin.rate_limit.acquire()) {
-            self.allocator.free(text_buf);
             _ = self.queues.output.push(.error_msg, "Rate limit — waiting for cooldown");
             return error.RateLimited;
         }
@@ -2024,7 +2031,6 @@ const AgentThread = struct {
         outer: while (true) {
             if (self.queues.checkCancel()) {
                 child.kill(compat.io()); // kills, waits, and cleans up all resources
-                self.allocator.free(text_buf);
                 return error.Cancelled;
             }
 
@@ -2102,13 +2108,11 @@ const AgentThread = struct {
                 const remaining = sse_buf[0..sse_pos];
                 if (std.mem.indexOf(u8, remaining, "\"error\"")) |_| {
                     _ = self.queues.output.push(.error_msg, remaining);
-                    self.allocator.free(text_buf);
                     return error.HTTPError;
                 }
             }
             // Empty response with no tool call — likely auth failure or network issue
             _ = self.queues.output.push(.error_msg, "API returned empty response — check authentication or network");
-            self.allocator.free(text_buf);
             return error.EmptyResponse;
         }
 
@@ -3124,7 +3128,9 @@ pub const AgentContext = struct {
 
     pub fn stop(self: *AgentContext) void {
         if (self.thread) |t| {
-            _ = self.queues.request.push(.cancel, "");
+            // pushWait: a plain push drops the cancel when the queue is full,
+            // leaving join() hanging forever. pushWait is bounded (~5s).
+            self.queues.request.pushWait(.cancel, "");
             t.join();
             self.thread = null;
         }

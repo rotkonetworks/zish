@@ -667,7 +667,8 @@ fn read(shell: *Shell, args: []const []const u8) !u8 {
 
     var buf: [4096]u8 = undefined;
     var pos: usize = 0;
-    const max_chars = nchars orelse (buf.len - 1);
+    // clamp so buf[pos] writes can never run past the buffer
+    const max_chars = @min(nchars orelse (buf.len - 1), buf.len - 1);
 
     // set up timeout using poll
     const timeout_ms: i32 = if (timeout_secs) |t| @intCast(t * 1000) else -1;
@@ -1963,6 +1964,9 @@ fn runTimedCommand(shell: *Shell, cmd_args: []const []const u8) !BenchSample {
     if (pid == 0) {
         // child - exec the command
         var argv_buf: [256]?[*:0]const u8 = undefined;
+        if (cmd_args.len >= argv_buf.len) {
+            compat.posix.exit(126);
+        }
         for (cmd_args, 0..) |arg, i| {
             const arg_z = shell.allocator.dupeZ(u8, arg) catch compat.posix.exit(127);
             argv_buf[i] = arg_z.ptr;
@@ -2695,7 +2699,7 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
             var base_buf2: [512]u8 = undefined;
             if (agent_log.getBaseDir(&base_buf2)) |base| {
                 var p_buf: [512]u8 = undefined;
-                if (std.fmt.bufPrint(&p_buf, "{s}/sessions/{s}/conversation.jsonl", .{ base, sid })) |conv_path| {
+                if (std.fmt.bufPrint(&p_buf, "{s}/sessions/{s}/conversation.jsonl", .{ base, @as([]const u8, &sid) })) |conv_path| {
                     if (std.Io.Dir.cwd().readFileAlloc(compat.io(), conv_path, shell.allocator, .limited(512 * 1024))) |content| {
                         defer shell.allocator.free(content);
                         var iter = std.mem.splitScalar(u8, content, '\n');
@@ -5094,6 +5098,7 @@ fn agentLog(shell: *Shell, args: []const []const u8) !u8 {
 
     // Determine session ID: arg or latest
     var session_id: []const u8 = "";
+    var id_buf: agent_log.SessionId = undefined;
     if (args.len >= 3) {
         session_id = args[2];
     } else {
@@ -5106,8 +5111,9 @@ fn agentLog(shell: *Shell, args: []const []const u8) !u8 {
             try out.flush();
             return 1;
         }
-        const last = &sessions.items[sessions.items.len - 1];
-        session_id = &last.id;
+        // copy by value: sessions is freed when this block ends
+        id_buf = sessions.items[sessions.items.len - 1].id;
+        session_id = &id_buf;
     }
 
     // Read conversation.jsonl for this session
@@ -5164,12 +5170,13 @@ fn agentLog(shell: *Shell, args: []const []const u8) !u8 {
     return 0;
 }
 
-fn agentLatestSession(shell: *Shell) ?[]const u8 {
+fn agentLatestSession(shell: *Shell) ?agent_log.SessionId {
     var sessions: std.ArrayList(agent_log.SessionInfo) = .empty;
     defer sessions.deinit(shell.allocator);
     agent_log.listSessions(shell.allocator, &sessions) catch return null;
     if (sessions.items.len == 0) return null;
-    return &sessions.items[sessions.items.len - 1].id;
+    // return by value: sessions backing memory is freed on return
+    return sessions.items[sessions.items.len - 1].id;
 }
 
 /// Attach to a running agent session — like screen/tmux.
@@ -5179,6 +5186,7 @@ fn agentAttach(shell: *Shell, args: []const []const u8) !u8 {
 
     // Determine session ID
     var session_id: []const u8 = "";
+    var id_buf: agent_log.SessionId = undefined;
     if (args.len >= 3) {
         session_id = args[2];
     } else {
@@ -5198,7 +5206,9 @@ fn agentAttach(shell: *Shell, args: []const []const u8) !u8 {
             var ctl_check: [512]u8 = undefined;
             const ctl_p = std.fmt.bufPrint(&ctl_check, "{s}/sessions/{s}/ctl", .{ base, @as([]const u8, &info.id) }) catch continue;
             std.Io.Dir.cwd().access(compat.io(), ctl_p, .{}) catch continue;
-            session_id = &info.id;
+            // copy by value: sessions is freed when this block ends
+            id_buf = info.id;
+            session_id = &id_buf;
             found = true;
             break;
         }

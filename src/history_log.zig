@@ -152,16 +152,17 @@ pub const LogWriter = struct {
         defer self.allocator.free(plaintext);
 
         // create header (entry_len will be set after encryption)
-        var header = EntryHeader{
-            .magic = MAGIC[0..4].*,
-            .version = VERSION,
-            .reserved = 0,
-            .entry_len = 0, // placeholder
-            .instance = self.instance_id,
-            .sequence = self.sequence,
-            .timestamp = if (entry.timestamp > 0) entry.timestamp else @intCast(compat.timestamp()),
-            .padding = [_]u8{0} ** 6,
-        };
+        // zero-initialize so implicit extern-struct padding bytes are not
+        // undefined stack garbage written to disk
+        var header = std.mem.zeroes(EntryHeader);
+        header.magic = MAGIC[0..4].*;
+        header.version = VERSION;
+        header.reserved = 0;
+        header.entry_len = 0; // placeholder
+        header.instance = self.instance_id;
+        header.sequence = self.sequence;
+        header.timestamp = if (entry.timestamp > 0) entry.timestamp else @intCast(compat.timestamp());
+        header.padding = [_]u8{0} ** 6;
 
         // create AAD from metadata fields (manual serialization to avoid padding issues)
         var aad_buf: [24]u8 = undefined;

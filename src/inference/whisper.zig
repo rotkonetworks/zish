@@ -259,12 +259,14 @@ pub const WhisperModel = struct {
 
         // 2. Encoder forward pass
         const enc_out = try self.runEncoder(alloc, mel.frames, n_frames);
-        // enc_out: [seq_len, d] — don't free, decoder needs it
+        defer alloc.free(enc_out); // decoder needs it until generation is done
 
         const enc_seq_len = @min((n_frames + 1) / 2, 1500);
 
         // 3. Pre-compute cross-attention K/V (once per audio)
         const cross_kv = try self.precomputeCrossKV(alloc, enc_out, enc_seq_len);
+        defer alloc.free(cross_kv.k);
+        defer alloc.free(cross_kv.v);
 
         // 4. Decoder: greedy autoregressive generation
         var tokens: [MAX_TOKENS + 4]u32 = undefined;
@@ -326,8 +328,6 @@ pub const WhisperModel = struct {
             n_tokens += 1;
             if (best == EOT) break;
         }
-
-        alloc.free(enc_out);
 
         // Decode tokens to text
         var text: std.ArrayList(u8) = .empty;

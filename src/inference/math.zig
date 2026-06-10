@@ -735,7 +735,11 @@ pub fn matmulParallel(
     for (0..actual_threads - 1) |ti| {
         const start = ti * rows_per_thread;
         const end = (ti + 1) * rows_per_thread;
-        threads[ti] = std.Thread.spawn(.{}, threadedRowCompute, .{ out, start, end, ctx }) catch null;
+        threads[ti] = std.Thread.spawn(.{}, threadedRowCompute, .{ out, start, end, ctx }) catch blk: {
+            // Spawn failed — compute this chunk inline so no rows are dropped
+            threadedRowCompute(out, start, end, ctx);
+            break :blk null;
+        };
     }
 
     // Last chunk on calling thread

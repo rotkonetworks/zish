@@ -452,16 +452,17 @@ pub const History = struct {
             const plaintext = try log_entry.serialize(self.allocator);
             defer self.allocator.free(plaintext);
 
-            var header = log_mod.EntryHeader{
-                .magic = "ZENT".*,
-                .version = 1,
-                .reserved = 0,
-                .entry_len = 0,
-                .instance = self.log_writer.instance_id,
-                .sequence = seq,
-                .timestamp = entry.timestamp,
-                .padding = [_]u8{0} ** 6,
-            };
+            // zero-initialize so implicit extern-struct padding bytes are not
+            // undefined stack garbage written to disk
+            var header = std.mem.zeroes(log_mod.EntryHeader);
+            header.magic = "ZENT".*;
+            header.version = 1;
+            header.reserved = 0;
+            header.entry_len = 0;
+            header.instance = self.log_writer.instance_id;
+            header.sequence = seq;
+            header.timestamp = entry.timestamp;
+            header.padding = [_]u8{0} ** 6;
 
             var aad_buf: [24]u8 = undefined;
             @memcpy(aad_buf[0..4], &header.magic);

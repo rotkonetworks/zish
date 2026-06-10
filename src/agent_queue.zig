@@ -94,9 +94,14 @@ pub fn Queue(comptime capacity: usize) type {
             return true;
         }
 
-        /// Producer: enqueue a message, spinning until space is available.
+        /// Producer: enqueue a message, waiting (bounded) for space.
+        /// Gives up after ~5s and drops the message — a queue nobody drains
+        /// (e.g. subagent dummy queues) must not wedge the producer forever.
         pub fn pushWait(self: *Self, kind: MsgKind, text: []const u8) void {
+            var attempts: u32 = 0;
             while (!self.push(kind, text)) {
+                attempts += 1;
+                if (attempts >= 5000) return; // drop after ~5s
                 compat.sleep(1 * std.time.ns_per_ms);
             }
         }
@@ -184,7 +189,8 @@ pub const Post = struct {
     len: u16 = 0,
     /// Monotonic timestamp (millis)
     timestamp: i64 = 0,
-    /// Sequence number (set by bulletin on write)
+    /// Seqlock word (set by bulletin on write, accessed atomically):
+    /// pos*2+1 = write in progress, pos*2+2 = valid. 0 = never written.
     seq: u64 = 0,
 
     pub fn authorSlice(self: *const Post) []const u8 {
@@ -283,14 +289,16 @@ pub const Bulletin = struct {
         while (true) {
             const cur_tail = @atomicLoad(usize, &self.tail, .acquire);
             if (@cmpxchgWeak(usize, &self.tail, cur_tail, cur_tail +% 1, .release, .monotonic) == null) {
-                // Won the slot at cur_tail
+                // Won the slot at cur_tail — seqlock protocol:
+                // mark write-in-progress, write payload, mark valid.
                 const slot = &self.slots[cur_tail & BULLETIN_MASK];
+                @atomicStore(u64, &slot.seq, @as(u64, cur_tail) *% 2 +% 1, .release);
                 slot.kind = kind;
                 slot.setAuthor(author);
                 slot.depth = depth;
                 slot.setData(text);
                 slot.timestamp = compat.milliTimestamp();
-                slot.seq = cur_tail;
+                @atomicStore(u64, &slot.seq, @as(u64, cur_tail) *% 2 +% 2, .release);
                 return;
             }
             // Lost CAS race, retry
@@ -310,10 +318,17 @@ pub const Bulletin = struct {
                 pos = current_tail -% BULLETIN_CAPACITY;
                 continue;
             }
-            out[count] = self.slots[pos & BULLETIN_MASK];
-            // Verify the post we read is the one we expected (not overwritten mid-read)
-            if (out[count].seq == pos) {
-                count += 1;
+            // Seqlock read: slot must be valid (pos*2+2) before AND after the copy,
+            // otherwise it was being (re)written mid-read — discard it.
+            const slot = &self.slots[pos & BULLETIN_MASK];
+            const expected_seq = @as(u64, pos) *% 2 +% 2;
+            const seq_before = @atomicLoad(u64, &slot.seq, .acquire);
+            if (seq_before == expected_seq) {
+                out[count] = slot.*;
+                const seq_after = @atomicLoad(u64, &slot.seq, .acquire);
+                if (seq_after == expected_seq) {
+                    count += 1;
+                }
             }
             pos +%= 1;
         }

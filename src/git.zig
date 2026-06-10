@@ -59,8 +59,12 @@ pub fn getInfo(allocator: std.mem.Allocator) ?GitInfo {
     var owns_branch: bool = false;
 
     if (std.mem.startsWith(u8, head_content, "ref: refs/heads/")) {
-        branch = allocator.dupe(u8, head_content[16..]) catch "HEAD";
-        owns_branch = true;
+        if (allocator.dupe(u8, head_content[16..])) |owned| {
+            branch = owned;
+            owns_branch = true;
+        } else |_| {
+            branch = "HEAD";
+        }
 
         // read commit from refs/heads/<branch>
         var ref_path_buf: [512]u8 = undefined;

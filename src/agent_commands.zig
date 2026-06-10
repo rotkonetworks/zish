@@ -702,7 +702,8 @@ pub fn TeeWriter(comptime W: type) type {
             try self.inner.print(fmt, args);
             var fmt_buf: [4096]u8 = undefined;
             const formatted = std.fmt.bufPrint(&fmt_buf, fmt, args) catch {
-                self.hist.appendSlice(&fmt_buf);
+                // Formatted output exceeded the buffer — don't append undefined bytes
+                self.hist.appendSlice("[output truncated]\n");
                 return;
             };
             self.hist.appendSlice(formatted);

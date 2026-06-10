@@ -707,10 +707,12 @@ pub fn executeBash(allocator: std.mem.Allocator, queues: *AgentQueues, command: 
     var output: std.ArrayList(u8) = .empty;
     var read_buf: [4096]u8 = undefined;
     const stdout_file = child.stdout.?;
+    var killed = false;
     while (true) {
         // Check for cancellation — kill child process if user pressed Ctrl+C
         if (queues.checkCancel()) {
-            child.kill(compat.io());
+            child.kill(compat.io()); // kill() reaps the child; do not wait() again below
+            killed = true;
             break;
         }
         // Poll stdout with 200ms timeout to allow cancel checks between reads
@@ -744,7 +746,7 @@ pub fn executeBash(allocator: std.mem.Allocator, queues: *AgentQueues, command: 
     }
 
     // stderr is merged into stdout via 2>&1, no separate read needed
-    _ = child.wait(compat.io()) catch {};
+    if (!killed) _ = child.wait(compat.io()) catch {};
 
     const owned = output.toOwnedSlice(allocator) catch {
         const empty = allocator.alloc(u8, 0) catch return error.OutOfMemory;

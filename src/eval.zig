@@ -586,6 +586,7 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     var prefix_had_old: [16]bool = undefined;
     var prefix_old_vals: [16][]const u8 = undefined;
     var prefix_tmp_vals: [16][]const u8 = undefined;
+    var prefix_tmp_owned: [16]bool = undefined;
     const actual_prefix = @min(n_prefix, 16);
 
     for (0..actual_prefix) |i| {
@@ -594,13 +595,20 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
             prefix_had_old[i] = false;
             prefix_names[i] = "";
             prefix_tmp_vals[i] = "";
+            prefix_tmp_owned[i] = false;
             continue;
         }
         const name = assign.children[0].value;
         const raw_val = assign.children[1].value;
 
         // expand variables in the value
-        const expanded = shell.expandVariables(raw_val) catch shell.allocator.dupe(u8, raw_val) catch raw_val;
+        prefix_tmp_owned[i] = true;
+        const expanded = shell.expandVariables(raw_val) catch
+            shell.allocator.dupe(u8, raw_val) catch blk: {
+                // fall back to AST-owned memory; mark non-owned so cleanup skips freeing
+                prefix_tmp_owned[i] = false;
+                break :blk raw_val;
+            };
 
         prefix_names[i] = name;
         prefix_tmp_vals[i] = expanded;
@@ -618,23 +626,31 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
         }
     }
 
-    // cleanup: restore or remove prefix vars after command
-    defer for (0..actual_prefix) |i| {
-        if (prefix_names[i].len == 0) continue;
-        if (prefix_had_old[i]) {
-            // restore old value, free the temp
-            if (shell.variables.getPtr(prefix_names[i])) |val_ptr| {
-                val_ptr.* = prefix_old_vals[i];
-            }
-            shell.allocator.free(prefix_tmp_vals[i]);
-        } else {
-            // remove the var we added (fetchRemove frees key for us)
-            if (shell.variables.fetchRemove(prefix_names[i])) |kv| {
-                shell.allocator.free(kv.key);
-                shell.allocator.free(kv.value);
+    // cleanup: restore or remove prefix vars after command.
+    // Iterate in REVERSE so duplicate names (A=1 A=2 cmd) restore innermost
+    // first and each allocation is freed exactly once.
+    defer {
+        var i = actual_prefix;
+        while (i > 0) {
+            i -= 1;
+            if (prefix_names[i].len == 0) continue;
+            if (prefix_had_old[i]) {
+                // restore old value, free the temp
+                if (shell.variables.getPtr(prefix_names[i])) |val_ptr| {
+                    val_ptr.* = prefix_old_vals[i];
+                }
+                if (prefix_tmp_owned[i]) shell.allocator.free(prefix_tmp_vals[i]);
+            } else {
+                // remove the var we added (fetchRemove frees key for us)
+                if (shell.variables.fetchRemove(prefix_names[i])) |kv| {
+                    shell.allocator.free(kv.key);
+                    // skip free if the stored value is the non-owned AST fallback
+                    if (prefix_tmp_owned[i] or kv.value.ptr != prefix_tmp_vals[i].ptr)
+                        shell.allocator.free(kv.value);
+                }
             }
         }
-    };
+    }
 
     // command children start after prefix assignments
     const cmd_children = node.children[n_prefix..];
@@ -1036,14 +1052,23 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
 
     // use cached path lookup for faster execution
     if (shell.lookupCommand(cmd_name)) |full_path| {
-        // free original and replace with duped cached path
-        shell.allocator.free(expanded_args.items[0]);
-        expanded_args.items[0] = shell.allocator.dupeZ(u8, full_path) catch return 1;
+        // dupe first; only free the original and replace on success
+        // (freeing first would leave items[0] dangling for the cleanup defer)
+        if (shell.allocator.dupeZ(u8, full_path)) |duped| {
+            shell.allocator.free(expanded_args.items[0]);
+            expanded_args.items[0] = duped;
+        } else |_| {
+            return 1;
+        }
     }
 
     // build null-terminated argv on stack
     // expanded_args contains [:0]const u8 (null-terminated slices)
     var argv_buf: [256]?[*:0]const u8 = undefined;
+    if (expanded_args.items.len >= argv_buf.len) {
+        try shell.stdout().print("zish: too many arguments\n", .{});
+        return 1;
+    }
     for (expanded_args.items, 0..) |arg, i| {
         argv_buf[i] = arg.ptr;
     }
@@ -1647,14 +1672,49 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
     var heap_buf: ?[]u8 = null;
     defer if (heap_buf) |hb| shell.allocator.free(hb);
 
+    // Pre-existing heap value: take ownership so we can free it exactly once
+    // when the loop is done (setForVariableFast overwrites the slot without freeing).
+    // EXCEPT when an enclosing for-loop uses the same variable name: then the
+    // current value points at THAT frame's stack buffer and must not be freed.
+    var pre_existing_value: ?[]const u8 = null;
+    const var_is_active_scratch = blk: {
+        for (shell.for_scratch_names[0..shell.for_scratch_depth]) |n| {
+            if (std.mem.eql(u8, n, variable.value)) break :blk true;
+        }
+        break :blk false;
+    };
+
     // Ensure variable exists with preallocated buffer
     if (shell.variables.getPtr(variable.value)) |ptr| {
         cached_value_ptr = ptr;
+        if (!var_is_active_scratch) pre_existing_value = ptr.*;
     } else {
         // Create new variable with stack buffer backing
         const name_copy = try shell.allocator.dupe(u8, variable.value);
         try shell.variables.put(name_copy, loop_buf[0..0]);
         cached_value_ptr = shell.variables.getPtr(variable.value);
+    }
+
+    // Mark this variable as scratch for the duration of the loop
+    const pushed_scratch = shell.for_scratch_depth < shell.for_scratch_names.len;
+    if (pushed_scratch) {
+        shell.for_scratch_names[shell.for_scratch_depth] = variable.value;
+        shell.for_scratch_depth += 1;
+    }
+    defer if (pushed_scratch) {
+        shell.for_scratch_depth -= 1;
+    };
+
+    // On EVERY exit path (normal or error): the map value points at
+    // loop_buf/heap_buf, which die with this frame. Replace it with a heap
+    // dupe of the final value so no dangling slice escapes, then free the
+    // pre-existing value we took ownership of above.
+    // NOTE: runs before the heap_buf defer (LIFO), so the source is still alive.
+    defer {
+        if (shell.variables.getPtr(variable.value)) |ptr| {
+            ptr.* = shell.allocator.dupe(u8, ptr.*) catch "";
+        }
+        if (pre_existing_value) |old| shell.allocator.free(old);
     }
 
     outer: for (values) |value_node| {

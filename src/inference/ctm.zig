@@ -51,9 +51,10 @@ pub const SuperLinear = struct {
         const N = self.n_neurons;
         const flops = N * self.out_dims * self.in_dims;
         if (N >= 8 and flops >= 500_000) {
+            var threads: [32]std.Thread = undefined;
             const max_threads = math.cpuCount();
             const ideal = flops / 200_000;
-            const n_threads = @min(max_threads, @max(2, @min(ideal, N / 2)));
+            const n_threads = @min(max_threads, @max(2, @min(ideal, N / 2)), threads.len);
             const NlmCtx = struct {
                 sl: *const SuperLinear,
                 xp: []const f32,
@@ -66,7 +67,6 @@ pub const SuperLinear = struct {
             // Split N across threads
             const chunk = N / n_threads;
             const remainder = N % n_threads;
-            var threads: [32]std.Thread = undefined;
             var t_count: usize = 0;
             var start: usize = 0;
             for (0..n_threads) |t| {
@@ -891,7 +891,8 @@ pub const CTMBlock = struct {
         // U-NET scratch: skip storage + 2 work buffers (with room for concat)
         // concat_max could be up to 3*D in worst case; use 4*D as generous upper bound
         const unet_scratch = 2 * D * cfg.synapse_depth + 8 * D;
-        return base + unet_scratch;
+        // + D: dream() stores prev_state immediately after the unet scratch
+        return base + unet_scratch + D;
     }
 
     // ============================================================

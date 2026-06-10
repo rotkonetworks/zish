@@ -562,9 +562,11 @@ pub const Transformer = struct {
                 }
             }
 
-            // RoPE
-            applyRoPE(state.q, state.sin, state.cos, c.n_heads, head_size, n_tok, c.rope_sequential);
-            applyRoPE(state.k, state.sin, state.cos, c.n_kv_heads, head_size, n_tok, c.rope_sequential);
+            // RoPE (wrap position like the KV cache does — sin/cos tables only
+            // cover max_seq_length positions)
+            const rope_pos = n_tok % c.max_seq_length;
+            applyRoPE(state.q, state.sin, state.cos, c.n_heads, head_size, rope_pos, c.rope_sequential);
+            applyRoPE(state.k, state.sin, state.cos, c.n_kv_heads, head_size, rope_pos, c.rope_sequential);
 
             // Post-QK-norm scaling: sharpens attention patterns
             if (c.qk_scale != 1.0) {
@@ -859,7 +861,13 @@ pub const Transformer = struct {
         const dim = c.dim;
         const kv_dim = (c.dim * c.n_kv_heads) / c.n_heads;
         const head_size = c.dim / c.n_heads;
-        const n_tok = tokens.len;
+        // Clamp to the cache/attention capacity: keep only the LAST
+        // max_seq_length tokens (matches KV cache wrap semantics).
+        const toks = if (tokens.len > c.max_seq_length)
+            tokens[tokens.len - c.max_seq_length ..]
+        else
+            tokens;
+        const n_tok = toks.len;
         if (n_tok == 0) return state.output;
 
         // Allocate batch buffers: [n_tok][dim] for embeddings/hidden states
@@ -868,7 +876,7 @@ pub const Transformer = struct {
 
         // Look up all embeddings
         for (0..n_tok) |t| {
-            self.applyEmbedding(x[t * dim ..][0..dim], tokens[t]);
+            self.applyEmbedding(x[t * dim ..][0..dim], toks[t]);
         }
 
         // Per-token Q, K, V buffers

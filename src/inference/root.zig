@@ -53,6 +53,10 @@ pub const ForkServer = struct {
     /// Pipe to read responses from child (child writes, parent reads)
     resp_read: posix.fd_t,
     alive: bool = true,
+    /// Pipe fds have been closed (shutdown ran at least once)
+    fds_closed: bool = false,
+    /// Child has been reaped via waitpid (avoid double-reap -> ECHILD)
+    reaped: bool = false,
 
     /// Spawn a forked inference server for the given model.
     /// The child process loads the model and enters a request loop.
@@ -159,11 +163,13 @@ pub const ForkServer = struct {
     /// Check if the child process is still alive.
     pub fn isAlive(self: *ForkServer) bool {
         if (!self.alive) return false;
+        if (self.reaped) return false;
         // Non-blocking waitpid to check if child exited
         const result = posix.waitpid(self.child_pid, std.os.linux.W.NOHANG);
         if (result.pid != 0) {
-            // Child exited
+            // Child exited (and is now reaped)
             self.alive = false;
+            self.reaped = true;
             return false;
         }
         return true;
@@ -171,21 +177,28 @@ pub const ForkServer = struct {
 
     /// Shut down the inference server.
     /// Closes pipes (child sees EOF and exits), then reaps the child.
+    /// Idempotent: safe to call multiple times, and still closes fds /
+    /// reaps the child even if `alive` was already cleared by an I/O error.
     pub fn shutdown(self: *ForkServer) void {
-        if (!self.alive) return;
         self.alive = false;
 
         // Close our pipe ends — child will get EOF/SIGPIPE and exit
-        posix.close(self.req_write);
-        posix.close(self.resp_read);
+        if (!self.fds_closed) {
+            self.fds_closed = true;
+            posix.close(self.req_write);
+            posix.close(self.resp_read);
+        }
 
         // Reap child (non-blocking first, then SIGTERM if needed)
-        const result = posix.waitpid(self.child_pid, std.os.linux.W.NOHANG);
-        if (result.pid == 0) {
-            // Still running, send SIGTERM
-            posix.kill(self.child_pid, std.os.linux.SIG.TERM) catch {};
-            // Wait with timeout — use blocking waitpid
-            _ = posix.waitpid(self.child_pid, 0);
+        if (!self.reaped) {
+            self.reaped = true;
+            const result = posix.waitpid(self.child_pid, std.os.linux.W.NOHANG);
+            if (result.pid == 0) {
+                // Still running, send SIGTERM
+                posix.kill(self.child_pid, std.os.linux.SIG.TERM) catch {};
+                // Wait with timeout — use blocking waitpid
+                _ = posix.waitpid(self.child_pid, 0);
+            }
         }
     }
 };
