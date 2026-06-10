@@ -2327,6 +2327,12 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
     // Handle -m <model> flag (must be before subcommand)
     if (std.mem.eql(u8, subcmd, "-m") and args.len >= 3) {
         const model = args[2];
+
+        // Local GGUF inference: agent -m <path>.gguf [query...]
+        if (std.mem.endsWith(u8, model, ".gguf")) {
+            return agentLocalGguf(shell, model, args[3..]);
+        }
+
         // Resolve model aliases
         const resolved = if (std.mem.eql(u8, model, "opus") or std.mem.eql(u8, model, "large"))
             "claude-opus-4-6"
@@ -2749,6 +2755,7 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
             \\
             \\  agent <query>      Send a one-shot query
             \\  agent -m <model> [query]  Use specific model (opus/sonnet/haiku)
+            \\  agent -m <path>.gguf [query]  Local GGUF inference (no query: line REPL)
             \\
             \\Interactive mode commands:
             \\  /compact           Summarize conversation to save context
@@ -3150,6 +3157,102 @@ fn parseEscSequence() EscAction {
             break :blk .none;
         },
     };
+}
+
+/// agent -m <path>.gguf [query...] — run the query on the local GGUF
+/// inference engine (in-process, no API). Without a query, reads one
+/// prompt per line from stdin until EOF.
+fn agentLocalGguf(shell: *Shell, model_arg: []const u8, query_args: []const []const u8) !u8 {
+    const out = shell.stdout();
+    const inference = @import("inference/root.zig");
+
+    // expand ~/
+    var path_buf: [512]u8 = undefined;
+    const model_path = if (std.mem.startsWith(u8, model_arg, "~/")) blk: {
+        const home = compat.posix.getenv("HOME") orelse break :blk model_arg;
+        break :blk std.fmt.bufPrint(&path_buf, "{s}{s}", .{ home, model_arg[1..] }) catch model_arg;
+    } else model_arg;
+
+    std.Io.Dir.cwd().access(compat.io(), model_path, .{}) catch {
+        try out.print("agent: model not found: {s}\n", .{model_path});
+        try out.flush();
+        return 1;
+    };
+
+    try out.print("\x1b[90mLoading {s}...\x1b[0m\n", .{model_path});
+    try out.flush();
+
+    var ctx = inference.InferenceContext.load(model_path, shell.allocator) catch |e| {
+        try out.print("agent: failed to load model: {}\n", .{e});
+        try out.flush();
+        return 1;
+    };
+    defer ctx.deinit();
+
+    const info = ctx.modelInfo();
+    try out.print("\x1b[90m{s}: {} layers, dim={}, vocab={} ({s})\x1b[0m\n", .{
+        info.arch, info.layers, info.dim, info.vocab,
+        if (ctx.gpu_ctx != null) "gpu" else "cpu",
+    });
+    try out.flush();
+
+    if (query_args.len > 0) {
+        // one-shot: join args into a single prompt
+        var prompt: std.ArrayList(u8) = .empty;
+        defer prompt.deinit(shell.allocator);
+        for (query_args, 0..) |a, i| {
+            if (i > 0) try prompt.append(shell.allocator, ' ');
+            try prompt.appendSlice(shell.allocator, a);
+        }
+
+        const reply = ctx.generate(prompt.items, 512, 0.7) catch |e| {
+            try out.print("agent: inference failed: {}\n", .{e});
+            try out.flush();
+            return 1;
+        };
+        defer shell.allocator.free(reply);
+        try out.print("{s}\n", .{reply});
+        try out.flush();
+        return 0;
+    }
+
+    // simple REPL: one prompt per line, EOF/empty Ctrl+D exits
+    try out.writeAll("\x1b[90mlocal inference repl — Ctrl+D to exit\x1b[0m\n");
+    try out.flush();
+    const stdin = std.Io.File.stdin();
+    var line_buf: [4096]u8 = undefined;
+    while (true) {
+        try out.writeAll("> ");
+        try out.flush();
+        var len: usize = 0;
+        while (len < line_buf.len) {
+            var b: [1]u8 = undefined;
+            const n = compat.readAll(stdin, &b) catch 0;
+            if (n == 0) {
+                if (len == 0) {
+                    try out.writeAll("\n");
+                    try out.flush();
+                    return 0;
+                }
+                break;
+            }
+            if (b[0] == '\n') break;
+            line_buf[len] = b[0];
+            len += 1;
+        }
+        const line = std.mem.trim(u8, line_buf[0..len], " \t\r");
+        if (line.len == 0) continue;
+
+        const reply = ctx.generate(line, 512, 0.7) catch |e| {
+            try out.print("agent: inference failed: {}\n", .{e});
+            try out.flush();
+            continue;
+        };
+        defer shell.allocator.free(reply);
+        try out.print("{s}\n", .{reply});
+        try out.flush();
+        ctx.reset();
+    }
 }
 
 fn agentInteractive(shell: *Shell) !u8 {

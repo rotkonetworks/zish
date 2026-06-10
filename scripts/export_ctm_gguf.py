@@ -36,7 +36,7 @@ import numpy as np
 import torch
 
 # GGUF constants
-GGUF_MAGIC = 0x46475547  # 'GGUF'
+GGUF_MAGIC = 0x46554747  # 'GGUF'
 GGUF_VERSION = 3
 ALIGNMENT = 32
 
