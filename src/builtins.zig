@@ -2328,30 +2328,24 @@ fn agentCmd(shell: *Shell, args: []const []const u8) !u8 {
     if (std.mem.eql(u8, subcmd, "-m") and args.len >= 3) {
         const model = args[2];
 
-        // Local GGUF inference: agent -m <path>.gguf [query...]
+        // Bare local GGUF one-shot/REPL: `agent -m <path>.gguf [query...]`
+        // (direct pure-Zig engine, no agent thread/tools). Use `local:<path>`
+        // or `ollama:<name>` to run a GGUF as the full agent instead.
         if (std.mem.endsWith(u8, model, ".gguf")) {
             return agentLocalGguf(shell, model, args[3..]);
         }
 
-        // Resolve model aliases
-        const resolved = if (std.mem.eql(u8, model, "opus") or std.mem.eql(u8, model, "large"))
-            "claude-opus-4-6"
-        else if (std.mem.eql(u8, model, "sonnet") or std.mem.eql(u8, model, "medium"))
-            "claude-sonnet-4-6"
-        else if (std.mem.eql(u8, model, "haiku") or std.mem.eql(u8, model, "small"))
-            "claude-haiku-4-5-20251001"
-        else
-            model;
-
-        // Set model override and restart agent
-        shell.agent.setModel(resolved);
+        // Provider-aware selection (ollama:/openai:/local:/aliases). This also
+        // sets the request format, so a non-anthropic model never gets sent to
+        // the anthropic endpoint as a bogus model name.
+        const resolved = shell.agent.setModelSpec(model);
         shell.agent.stop();
         try out.print("\x1b[90mSwitching to {s}\x1b[0m\n", .{resolved});
         try out.flush();
 
         arg_start = 3;
         if (args.len < 4) {
-            // agent -m opus (no further args) — enter interactive mode
+            // agent -m <model> (no further args) — enter interactive mode
             return agentInteractive(shell);
         }
         subcmd = args[3];

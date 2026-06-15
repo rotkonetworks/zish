@@ -798,6 +798,7 @@ const commands = [_]Command{
     .{ .name = "compact", .has_arg = false, .handler = cmdCompact },
     .{ .name = "/cost", .has_arg = false, .handler = cmdCost },
     .{ .name = "/model", .has_arg = true, .handler = cmdModel },
+    .{ .name = "/backend", .has_arg = true, .handler = cmdBackend },
     .{ .name = "/diff", .has_arg = false, .handler = cmdDiff },
     .{ .name = "/commit", .has_arg = true, .handler = cmdCommit },
     .{ .name = "/review", .has_arg = false, .handler = cmdReview },
@@ -1526,7 +1527,25 @@ fn cmdModel(ctx: *CommandCtx, arg: []const u8) DispatchResult {
             }
         }
 
-        ctx.shell.agent.setModel(arg);
+        // "gemma"/"local" -> ollama server (model from $ZISH_OLLAMA_MODEL,
+        // default gemma4dbg:latest); "claude"/"anthropic" -> anthropic;
+        // "ollama:<name>"/"openai:<name>"/"<path>.gguf" -> that backend;
+        // anything else -> claude model on the anthropic endpoint.
+        if (std.mem.eql(u8, arg, "local") or std.mem.eql(u8, arg, "gemma")) {
+            const om = compat.getEnvVarOwned(ctx.shell.allocator, "ZISH_OLLAMA_MODEL") catch null;
+            defer if (om) |m| ctx.shell.allocator.free(m);
+            const name = om orelse "gemma4dbg:latest";
+            var spec_buf: [128]u8 = undefined;
+            const spec = std.fmt.bufPrint(&spec_buf, "ollama:{s}", .{name}) catch "ollama:gemma4dbg:latest";
+            _ = ctx.shell.agent.setModelSpec(spec);
+            ctx.shell.agent.stop();
+        } else if (std.mem.eql(u8, arg, "claude") or std.mem.eql(u8, arg, "anthropic")) {
+            _ = ctx.shell.agent.setModelSpec("sonnet");
+            ctx.shell.agent.stop();
+        } else {
+            _ = ctx.shell.agent.setModelSpec(arg);
+            ctx.shell.agent.stop();
+        }
         const src = ctx.shell.agent.getModelOverride() orelse arg;
         const clen = @min(src.len, ctx.model_buf.len);
         @memcpy(ctx.model_buf[0..clen], src[0..clen]);
@@ -1540,6 +1559,7 @@ fn cmdModel(ctx: *CommandCtx, arg: []const u8) DispatchResult {
             .{ .name = "opus", .alias = "large" },
             .{ .name = "sonnet", .alias = "medium" },
             .{ .name = "haiku", .alias = "small" },
+            .{ .name = "local", .alias = "gemma · local GPU" },
         };
         for (models) |m| {
             const is_current = std.mem.indexOf(u8, ctx.model_name, m.name) != null;
@@ -1551,6 +1571,33 @@ fn cmdModel(ctx: *CommandCtx, arg: []const u8) DispatchResult {
         }
         ctx.out.writeAll("\x1b[90m  /model <name> or ^T to cycle\x1b[0m\n") catch {};
         ctx.historyNote("Model info displayed");
+    }
+    ctx.out.flush() catch {};
+    return .handled;
+}
+
+fn cmdBackend(ctx: *CommandCtx, arg: []const u8) DispatchResult {
+    Layout.goOutput(ctx.out, ctx.out_last.*);
+    if (arg.len == 0) {
+        const cur = ctx.shell.agent.getBaseUrlOverride() orelse "(config default)";
+        ctx.out.print("\x1b[90m  backend base_url: \x1b[33m{s}\x1b[0m\n", .{cur}) catch {};
+        ctx.out.writeAll("\x1b[90m  /backend local   -> gemma_serve @127.0.0.1:8080 (run `gemma start` first)\x1b[0m\n") catch {};
+        ctx.out.writeAll("\x1b[90m  /backend claude  -> api.anthropic.com\x1b[0m\n") catch {};
+        ctx.out.flush() catch {};
+        return .handled;
+    }
+    if (ctx.shell.agent.setBackend(arg)) {
+        ctx.shell.agent.stop(); // next query starts a fresh thread on the new backend
+        // reflect the new model in the status line (setBackend also set a model)
+        if (ctx.shell.agent.getModelOverride()) |src| {
+            const clen = @min(src.len, ctx.model_buf.len);
+            @memcpy(ctx.model_buf[0..clen], src[0..clen]);
+            ctx.model_name = ctx.model_buf[0..clen];
+        }
+        ctx.out.print("\x1b[90mBackend -> \x1b[33m{s}\x1b[90m ({s})\x1b[0m\n", .{ arg, ctx.model_name }) catch {};
+        ctx.historyNote("Backend switched");
+    } else {
+        ctx.out.print("\x1b[91munknown backend '{s}' -- use: local | claude\x1b[0m\n", .{arg}) catch {};
     }
     ctx.out.flush() catch {};
     return .handled;

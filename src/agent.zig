@@ -2034,7 +2034,18 @@ const AgentThread = struct {
                 return error.Cancelled;
             }
 
-            const n = stdout_file.readStreaming(compat.io(), &.{sse_buf[sse_pos..]}) catch break;
+            const n = stdout_file.readStreaming(compat.io(), &.{sse_buf[sse_pos..]}) catch |err| switch (err) {
+                // Non-blocking pipe with no data yet. Local/reasoning models can
+                // "think" for several seconds before the first token, so a bare
+                // break here would end the stream early and look like an empty
+                // response. Poll briefly (cancellable) and retry instead.
+                error.WouldBlock => {
+                    var pfd = [_]compat.posix.pollfd{.{ .fd = stdout_file.handle, .events = compat.posix.POLL.IN, .revents = 0 }};
+                    _ = compat.posix.poll(&pfd, 200) catch {};
+                    continue;
+                },
+                else => break, // EndOfStream or real error
+            };
             if (n == 0) break;
             sse_pos += n;
 
@@ -2237,8 +2248,15 @@ fn parseOpenAIDelta(
     text_len: *usize,
     queues: *AgentQueues,
 ) void {
-    // Extract delta.content from OpenAI streaming format
-    if (jsonGetStr(data, "content")) |text| {
+    // Extract delta.content from OpenAI streaming format. Some models
+    // (reasoning/debug builds, e.g. ollama gemma "*dbg") leave content empty
+    // and stream into delta.reasoning instead — fall back to that so the
+    // output isn't silently dropped (parsed as an EmptyResponse).
+    var text = jsonGetStr(data, "content") orelse "";
+    if (text.len == 0) {
+        text = jsonGetStr(data, "reasoning") orelse "";
+    }
+    if (text.len > 0) {
         if (unescapeJSON(text, text_buf.*[text_len.*..])) |decoded| {
             text_len.* += decoded.len;
             queues.output.pushWait(.text_delta, decoded);
@@ -3092,6 +3110,15 @@ pub const AgentContext = struct {
     allocator: std.mem.Allocator,
     model_override: [64]u8 = undefined,
     model_override_len: u8 = 0,
+    // Provider override (set by setModelSpec): "ollama"/"openai"/"local"/"" .
+    // Empty means use the configured provider (anthropic by default).
+    provider_override: [16]u8 = undefined,
+    provider_override_len: u8 = 0,
+    // Backend override (set by /backend): base_url + api_key for local vs claude.
+    base_url_override: [256]u8 = undefined,
+    base_url_override_len: u16 = 0,
+    api_key_override: [128]u8 = undefined,
+    api_key_override_len: u8 = 0,
     bulletin: *q.Bulletin,
     pub fn getTotalInputTokens(self: *const AgentContext) u32 {
         return self.queues.shared_input_tokens.load(.monotonic);
@@ -3121,9 +3148,107 @@ pub const AgentContext = struct {
         return self.model_override[0..self.model_override_len];
     }
 
+    pub fn getProviderOverride(self: *const AgentContext) ?[]const u8 {
+        if (self.provider_override_len == 0) return null;
+        return self.provider_override[0..self.provider_override_len];
+    }
+
+    fn setProviderOverride(self: *AgentContext, provider: []const u8) void {
+        const n = @min(provider.len, self.provider_override.len);
+        @memcpy(self.provider_override[0..n], provider[0..n]);
+        self.provider_override_len = @intCast(n);
+    }
+
+    /// Select a model with an optional provider prefix. Applied at next thread
+    /// start (caller stops the thread). Forms:
+    ///   "ollama:<name>"  -> ollama server (default http://localhost:11434)
+    ///   "openai:<name>"  -> OpenAI-compatible server (base_url from config)
+    ///   "local:<path>" / "<path>.gguf" -> in-process pure-Zig GGUF engine
+    ///   "opus"/"sonnet"/"haiku"/"claude-*"/other -> anthropic
+    /// Returns a short human label for the resolved selection.
+    pub fn setModelSpec(self: *AgentContext, spec: []const u8) []const u8 {
+        if (std.mem.startsWith(u8, spec, "ollama:")) {
+            self.setProviderOverride("ollama");
+            self.clearBackend(); // let ollama default base_url apply
+            self.setModel(spec["ollama:".len..]);
+            return self.getModelOverride() orelse spec;
+        } else if (std.mem.startsWith(u8, spec, "openai:")) {
+            self.setProviderOverride("openai");
+            self.setModel(spec["openai:".len..]);
+            return self.getModelOverride() orelse spec;
+        } else if (std.mem.startsWith(u8, spec, "local:") or std.mem.endsWith(u8, spec, ".gguf")) {
+            const path = if (std.mem.startsWith(u8, spec, "local:")) spec["local:".len..] else spec;
+            self.setProviderOverride("local");
+            self.clearBackend();
+            self.setModel(path);
+            return self.getModelOverride() orelse spec;
+        }
+        // anthropic alias / model id
+        self.provider_override_len = 0;
+        self.clearBackend();
+        const resolved = if (std.mem.eql(u8, spec, "opus") or std.mem.eql(u8, spec, "large"))
+            "claude-opus-4-6"
+        else if (std.mem.eql(u8, spec, "sonnet") or std.mem.eql(u8, spec, "medium"))
+            "claude-sonnet-4-6"
+        else if (std.mem.eql(u8, spec, "haiku") or std.mem.eql(u8, spec, "small"))
+            "claude-haiku-4-5-20251001"
+        else
+            spec;
+        self.setModel(resolved);
+        return resolved;
+    }
+
+    /// Switch backend: "local"/"gemma" -> gemma_serve @127.0.0.1:8080,
+    /// "claude"/"anthropic" -> api.anthropic.com. Applied at next thread start.
+    pub fn setBackend(self: *AgentContext, name: []const u8) bool {
+        if (std.mem.eql(u8, name, "local") or std.mem.eql(u8, name, "gemma")) {
+            // Local endpoint + model are configurable via env; default to gemma_serve.
+            // ZISH_LOCAL_URL (e.g. http://127.0.0.1:8080), ZISH_LOCAL_MODEL (any name).
+            const url = compat.getEnvVarOwned(self.allocator, "ZISH_LOCAL_URL") catch null;
+            defer if (url) |u| self.allocator.free(u);
+            const url_s = url orelse "http://127.0.0.1:8080";
+            const un = @min(url_s.len, self.base_url_override.len);
+            @memcpy(self.base_url_override[0..un], url_s[0..un]);
+            self.base_url_override_len = @intCast(un);
+            const key = "local";
+            @memcpy(self.api_key_override[0..key.len], key);
+            self.api_key_override_len = @intCast(key.len);
+            const lm = compat.getEnvVarOwned(self.allocator, "ZISH_LOCAL_MODEL") catch null;
+            defer if (lm) |m| self.allocator.free(m);
+            const lm_s = lm orelse "local";
+            const mn = @min(lm_s.len, 64);
+            self.setModel(lm_s[0..mn]);
+            return true;
+        } else if (std.mem.eql(u8, name, "claude") or std.mem.eql(u8, name, "anthropic")) {
+            const url = "https://api.anthropic.com";
+            @memcpy(self.base_url_override[0..url.len], url);
+            self.base_url_override_len = @intCast(url.len);
+            self.api_key_override_len = 0; // fall back to configured api_key
+            self.setModel("claude-sonnet-4-6");
+            return true;
+        }
+        return false;
+    }
+
+    pub fn getBaseUrlOverride(self: *const AgentContext) ?[]const u8 {
+        if (self.base_url_override_len == 0) return null;
+        return self.base_url_override[0..self.base_url_override_len];
+    }
+
+    pub fn getApiKeyOverride(self: *const AgentContext) ?[]const u8 {
+        if (self.api_key_override_len == 0) return null;
+        return self.api_key_override[0..self.api_key_override_len];
+    }
+
+    /// Clear the backend override — revert to the configured (anthropic) endpoint.
+    pub fn clearBackend(self: *AgentContext) void {
+        self.base_url_override_len = 0;
+        self.api_key_override_len = 0;
+    }
+
     pub fn start(self: *AgentContext) !void {
         if (self.thread != null) return;
-        self.thread = try std.Thread.spawn(.{}, agentThreadFn, .{ self.allocator, &self.queues, self.getModelOverride() });
+        self.thread = try std.Thread.spawn(.{}, agentThreadFn, .{ self.allocator, &self.queues, self.getModelOverride(), self.getBaseUrlOverride(), self.getApiKeyOverride(), self.getProviderOverride() });
     }
 
     pub fn stop(self: *AgentContext) void {
@@ -3411,10 +3536,19 @@ fn subAgentThreadFn(
     agent.broadcast(if (status == .done) .discovery else .escalate, if (final_text.len > 0) final_text[0..@min(final_text.len, 256)] else "failed");
 }
 
-fn agentThreadFn(allocator: std.mem.Allocator, queues: *AgentQueues, model_override: ?[]const u8) void {
+fn agentThreadFn(allocator: std.mem.Allocator, queues: *AgentQueues, model_override: ?[]const u8, base_url_override: ?[]const u8, api_key_override: ?[]const u8, provider_override: ?[]const u8) void {
     var ac = log_mod.AgentConfig.load(allocator);
+    // Provider override must apply before fromAgentConfig so the provider enum,
+    // ollama base_url default, etc. all flow from it.
+    if (provider_override) |p| ac.provider = p;
     var config = Config.fromAgentConfig(ac);
     if (model_override) |m| config.model = m;
+    if (base_url_override) |u| config.base_url = u;
+    if (api_key_override) |k| config.api_key = k;
+    // For the in-process pure-Zig engine, callLocal reads config.local_model.
+    if (config.provider == .local) {
+        if (model_override) |m| config.local_model = m;
+    }
     const rc = Config.buildRouterConfig(ac);
 
     // Learn from past corrections before loading patterns
