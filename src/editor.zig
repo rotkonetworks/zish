@@ -686,9 +686,20 @@ pub const TermView = struct {
         const w = self.term.width;
         const cont_marker_len: u16 = 2; // "│ "
 
+        // When the prompt is wider than the terminal it is truncated on emit to
+        // (w-4) visible chars + ".. " (see the prompt-emit branch below), so it
+        // occupies that many columns on screen, NOT prompt_visible_len. Seed the
+        // position trackers with the on-screen width or the wrap math is off by
+        // (prompt_visible_len - effective) columns — a horizontal desync in
+        // narrow windows.
+        const effective_prompt_vis: u16 = if (w > 0 and prompt_visible_len >= w)
+            (w -| 4) + 3
+        else
+            prompt_visible_len;
+
         // compute cursor position in content
         var cursor_row: u16 = 0;
-        var cursor_col: u16 = prompt_visible_len;
+        var cursor_col: u16 = effective_prompt_vis;
 
         for (text[0..buf.cursor]) |c| {
             if (c == '\n') {
@@ -703,9 +714,16 @@ pub const TermView = struct {
             }
         }
 
-        // move to start of our region
+        // move to start of our region. Clamp the cursor-up to (height-1): if our
+        // content is taller than the screen the prompt-start scrolled off the
+        // top, so moving up by more than that saturates at the top margin and the
+        // following \x1b[J would erase the whole viewport (the small-window
+        // blank-flash). positionCursor already clamps term.row; this is a
+        // defensive backstop in case it was set elsewhere.
         if (self.term.row > 0) {
-            _ = self.emitCSI("{d}A", .{self.term.row});
+            const max_up: u16 = if (self.term.height > 0) self.term.height - 1 else self.term.row;
+            const up = @min(self.term.row, max_up);
+            if (up > 0) _ = self.emitCSI("{d}A", .{up});
         }
         _ = self.emit("\r");
 
@@ -738,9 +756,10 @@ pub const TermView = struct {
             _ = self.emit(prompt);
         }
 
-        // track rendering position as we emit
+        // track rendering position as we emit (seed with the on-screen prompt
+        // width, matching cursor_col above — see effective_prompt_vis note)
         var render_row: u16 = 0;
-        var render_col: u16 = prompt_visible_len;
+        var render_col: u16 = effective_prompt_vis;
 
         // emit content with syntax highlighting and continuation markers
         var hl = SyntaxHighlighter{};

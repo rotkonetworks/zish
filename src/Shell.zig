@@ -816,10 +816,20 @@ fn handleResize(self: *Shell) !void {
         return; // spurious SIGWINCH, nothing changed
     }
 
-    // debounce rapid resizes
+    // Debounce rapid resizes to avoid redraw storms during a window drag.
+    //
+    // A WIDTH change must NOT be debounced into a "do nothing" return:
+    // TermView.render() runs its own updateSize() on the very next keystroke and
+    // adopts the new width regardless. If we have not reset the row/col tracking
+    // by then, that render moves the cursor up by a now-stale term.row and erases
+    // content it then fails to repaint — the screen blanks until the next key
+    // (the resize-related blank). So a width change always runs the
+    // geometry-coherent redraw below (cheap, a single render); the debounce only
+    // throttles height-only changes, where no reflow happens.
     const now = compat.milliTimestamp();
     const debounce_ms = 50; // wait 50ms between redraws
-    if (now - self.last_resize_time < debounce_ms) {
+    const width_changed = new_size.width != self.terminal_width;
+    if (!width_changed and now - self.last_resize_time < debounce_ms) {
         // schedule another check by keeping the flag set
         @atomicStore(bool, &self.terminal_resized, true, .release);
         return;
@@ -833,13 +843,20 @@ fn handleResize(self: *Shell) !void {
     // update term_view dimensions
     self.term_view.term.width = @intCast(new_size.width);
     self.term_view.term.height = @intCast(new_size.height);
+    self.term_view.last_width = @intCast(new_size.width); // keep render()'s own size check in sync
 
-    // Clear from prompt start down and redraw everything
+    // Move to the top of our region. term.row is still the valid pre-reflow
+    // offset (no render has run at the new width yet). We do NOT erase here: the
+    // erase is left to render(), which emits \x1b[J atomically with the content
+    // in a single stderr write. Erasing on stdout and flushing it separately
+    // opens a cross-FD window where the screen is blank between the stdout-erase
+    // flush and the stderr redraw. Repositioning only (no erase) is safe to
+    // flush across FDs because it leaves the screen contents intact.
     if (self.term_view.term.row > 0) {
         try self.stdout().print("\x1b[{d}A", .{self.term_view.term.row});
     }
-    try self.stdout().writeAll("\r\x1b[J");
-    try self.stdout().flush(); // flush erase before redraw (stderr) to prevent stale buffer blanking screen
+    try self.stdout().writeAll("\r");
+    try self.stdout().flush(); // sync cursor move before the stderr redraw
     self.term_view.term.row = 0;
     self.term_view.term.col = 0;
     self.term_view.last_hash = 0;
