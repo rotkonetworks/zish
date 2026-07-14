@@ -473,13 +473,22 @@ pub const Parser = struct {
         return node;
     }
 
+    // A control-structure condition. `[[ ]]` is dispatched to parsetest so it
+    // works as an if/while/until test; everything else is a simple command.
+    fn parseconditioncommand(self: *Self) parsererror!*const ast.AstNode {
+        if (self.current_token.ty == .TestOpen) {
+            return self.parsetest();
+        }
+        return self.parsesimplecommand();
+    }
+
     // control structure parsing with bounds checking
     fn parseif(self: *Self) parsererror!*const ast.AstNode {
         const if_token = self.current_token;
         try self.nextToken(); // consume 'if'
 
         // parse condition
-        const condition = try self.parsesimplecommand();
+        const condition = try self.parseconditioncommand();
 
         // skip optional semicolon/newline before 'then'
         if (self.current_token.ty == .Semicolon or self.current_token.ty == .NewLine) {
@@ -531,7 +540,7 @@ pub const Parser = struct {
         const while_token = self.current_token;
         try self.nextToken(); // consume 'while'
 
-        const condition = try self.parsesimplecommand();
+        const condition = try self.parseconditioncommand();
 
         // skip optional semicolon/newline before 'do'
         if (self.current_token.ty == .Semicolon or self.current_token.ty == .NewLine) {
@@ -562,7 +571,7 @@ pub const Parser = struct {
         const until_token = self.current_token;
         try self.nextToken(); // consume 'until'
 
-        const condition = try self.parsesimplecommand();
+        const condition = try self.parseconditioncommand();
 
         // skip optional semicolon/newline before 'do'
         if (self.current_token.ty == .Semicolon or self.current_token.ty == .NewLine) {
@@ -817,52 +826,119 @@ pub const Parser = struct {
     }
 
     fn parsetest(self: *Self) parsererror!*const ast.AstNode {
-        const test_token = self.current_token;
         try self.nextToken(); // consume '[['
 
-        // collect all words until ]]
-        var words = try std.ArrayList(*const ast.AstNode).initCapacity(self.builder.arena.allocator(), 16);
+        // skip leading newlines
+        while (self.current_token.ty == .NewLine) try self.nextToken();
 
-        while (self.current_token.ty != .TestClose and self.current_token.ty != .Eof) {
-            switch (self.current_token.ty) {
-                .Word, .String, .DoubleQuotedString, .ParameterExpansion, .CommandSubstitution, .ProcessSubstIn, .ProcessSubstOut => {
-                    const word = try self.parseword();
-                    try words.append(self.builder.arena.allocator(), word);
-                },
-                .NewLine => {
-                    try self.nextToken();
-                },
-                else => {
-                    // unexpected token in test expression
-                    return error.UnexpectedToken;
-                },
-            }
+        if (self.current_token.ty == .TestClose) {
+            return error.UnexpectedToken; // empty [[ ]]
         }
+
+        const expr = try self.parsetestOr();
+
+        // skip trailing newlines
+        while (self.current_token.ty == .NewLine) try self.nextToken();
 
         if (self.current_token.ty != .TestClose) {
             return error.UnexpectedToken; // expected ]]
         }
         try self.nextToken(); // consume ']]'
 
-        // store test expression as space-separated string
-        var expr_buf: [1024]u8 = undefined;
-        var expr_len: usize = 0;
-        for (words.items, 0..) |word, i| {
-            if (i > 0 and expr_len < expr_buf.len) {
-                expr_buf[expr_len] = ' ';
-                expr_len += 1;
-            }
-            const to_copy = @min(word.value.len, expr_buf.len - expr_len);
-            @memcpy(expr_buf[expr_len..][0..to_copy], word.value[0..to_copy]);
-            expr_len += to_copy;
+        return expr;
+    }
+
+    // or_expr := and_expr ( '||' and_expr )*
+    fn parsetestOr(self: *Self) parsererror!*const ast.AstNode {
+        var left = try self.parsetestAnd();
+        while (self.current_token.ty == .Or) {
+            const tok = self.current_token;
+            try self.nextToken(); // consume '||'
+            while (self.current_token.ty == .NewLine) try self.nextToken();
+            const right = try self.parsetestAnd();
+            left = try self.builder.createlogicalor(left, right, tok.line, tok.column);
         }
+        return left;
+    }
+
+    // and_expr := unary ( '&&' unary )*
+    fn parsetestAnd(self: *Self) parsererror!*const ast.AstNode {
+        var left = try self.parsetestUnary();
+        while (self.current_token.ty == .And) {
+            const tok = self.current_token;
+            try self.nextToken(); // consume '&&'
+            while (self.current_token.ty == .NewLine) try self.nextToken();
+            const right = try self.parsetestUnary();
+            left = try self.builder.createlogicaland(left, right, tok.line, tok.column);
+        }
+        return left;
+    }
+
+    // unary := '!' unary | '(' or_expr ')' | primary
+    // Note: a leading `!` is lexed as a plain Word token here.
+    fn parsetestUnary(self: *Self) parsererror!*const ast.AstNode {
+        while (self.current_token.ty == .NewLine) try self.nextToken();
+
+        // negation: `!` as a standalone word negates the following sub-expression
+        if (self.current_token.ty == .Word and std.mem.eql(u8, self.current_token.value, "!")) {
+            const tok = self.current_token;
+            try self.nextToken(); // consume '!'
+            const sub = try self.parsetestUnary();
+            const children = [_]*const ast.AstNode{sub};
+            return self.builder.createnode(.test_expression, "!", &children, tok.line, tok.column);
+        }
+
+        // parenthesized grouping
+        if (self.current_token.ty == .LeftParen) {
+            try self.nextToken(); // consume '('
+            while (self.current_token.ty == .NewLine) try self.nextToken();
+            const inner = try self.parsetestOr();
+            while (self.current_token.ty == .NewLine) try self.nextToken();
+            if (self.current_token.ty != .RightParen) return error.UnexpectedToken;
+            try self.nextToken(); // consume ')'
+            return inner;
+        }
+
+        return self.parsetestPrimary();
+    }
+
+    // primary := operand+ where operands are words/strings/expansions.
+    // `<` and `>` inside [[ ]] are string-comparison operators, not redirections,
+    // so they are folded into the primary as operator words.
+    fn parsetestPrimary(self: *Self) parsererror!*const ast.AstNode {
+        const start = self.current_token;
+        var words = try std.ArrayList(*const ast.AstNode).initCapacity(self.builder.arena.allocator(), 4);
+
+        loop: while (true) {
+            switch (self.current_token.ty) {
+                .Word, .String, .DoubleQuotedString, .ParameterExpansion, .CommandSubstitution, .ProcessSubstIn, .ProcessSubstOut => {
+                    const word = try self.parseword();
+                    try words.append(self.builder.arena.allocator(), word);
+                },
+                .RedirectInput => {
+                    const tok = self.current_token;
+                    const node = try self.builder.createword("<", tok.line, tok.column);
+                    try words.append(self.builder.arena.allocator(), node);
+                    try self.nextToken();
+                },
+                .RedirectOutput => {
+                    const tok = self.current_token;
+                    const node = try self.builder.createword(">", tok.line, tok.column);
+                    try words.append(self.builder.arena.allocator(), node);
+                    try self.nextToken();
+                },
+                else => break :loop,
+            }
+        }
+
+        if (words.items.len == 0) return error.UnexpectedToken;
 
         return self.builder.createnode(
             .test_expression,
-            expr_buf[0..expr_len],
+            "",
             words.items,
-            test_token.line,
-            test_token.column,
+            start.line,
+            start.column,
         );
     }
 };
