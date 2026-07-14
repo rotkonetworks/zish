@@ -428,6 +428,9 @@ pub const Parser = struct {
                 .RedirectAllAppend => "&>>",
                 .RedirectHereDoc => "<<<",
                 .RedirectHereDocLiteral => "<<",
+                // generic fd redirect (n>, n>>, n>&, n<, n<&, >|, >&): the exact
+                // operator is carried in the token value; dupe it into the arena.
+                .RedirectFd => try self.builder.arena.allocator().dupe(u8, self.current_token.value),
                 else => break,
             };
 
