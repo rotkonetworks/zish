@@ -8,6 +8,7 @@ pub const NodeType = enum {
     pipeline,
     logical_and, // &&
     logical_or, // ||
+    negate, // ! pipeline
     list,
     subshell,
     background, // &
@@ -216,6 +217,19 @@ pub const AstBuilder = struct {
 
         const children = [_]*const AstNode{ condition, body };
         return self.createnode(.while_loop, "", &children, line, column);
+    }
+
+    pub fn createuntil(self: *Self, condition: *const AstNode, body: *const AstNode, line: u32, column: u32) !*const AstNode {
+        self.depth += 1;
+        defer self.depth -= 1;
+
+        const children = [_]*const AstNode{ condition, body };
+        return self.createnode(.until_loop, "", &children, line, column);
+    }
+
+    pub fn createnegate(self: *Self, command: *const AstNode, line: u32, column: u32) !*const AstNode {
+        const children = [_]*const AstNode{command};
+        return self.createnode(.negate, "!", &children, line, column);
     }
 
     pub fn createfor(self: *Self, variable: *const AstNode, values: []const *const AstNode, body: *const AstNode, line: u32, column: u32) !*const AstNode {

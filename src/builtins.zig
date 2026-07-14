@@ -673,6 +673,10 @@ fn read(shell: *Shell, args: []const []const u8) !u8 {
     // set up timeout using poll
     const timeout_ms: i32 = if (timeout_secs) |t| @intCast(t * 1000) else -1;
 
+    // track EOF so we can report failure (like bash: read returns non-zero at
+    // end of input). without this, `while read x` never terminates on a pipe.
+    var hit_eof = false;
+
     while (pos < max_chars) {
         // use poll for timeout support
         var fds = [_]compat.posix.pollfd{.{
@@ -689,7 +693,10 @@ fn read(shell: *Shell, args: []const []const u8) !u8 {
 
         var c: [1]u8 = undefined;
         const n = compat.posix.read(stdin_fd, &c) catch return 1;
-        if (n == 0) break; // EOF
+        if (n == 0) {
+            hit_eof = true;
+            break; // EOF
+        }
 
         // handle newline (end of input unless -n specified)
         if (c[0] == '\n') {
@@ -703,7 +710,10 @@ fn read(shell: *Shell, args: []const []const u8) !u8 {
         if (!raw and c[0] == '\\' and pos < max_chars) {
             // read next char
             const n2 = compat.posix.read(stdin_fd, &c) catch break;
-            if (n2 == 0) break;
+            if (n2 == 0) {
+                hit_eof = true;
+                break;
+            }
             // in non-raw mode, backslash-newline continues line
             if (c[0] == '\n') continue;
             // otherwise keep the escaped char
@@ -719,16 +729,52 @@ fn read(shell: *Shell, args: []const []const u8) !u8 {
     const value = buf[0..pos];
 
     // assign to variable(s)
-    if (varnames_start < args.len) {
-        // single variable gets whole line
-        try setVar(shell, args[varnames_start], value);
-        // TODO: multiple variables split on IFS
-    } else {
+    if (varnames_start >= args.len) {
         // no variable specified, use REPLY
         try setVar(shell, "REPLY", value);
+    } else {
+        const varnames = args[varnames_start..];
+        if (varnames.len == 1) {
+            // single variable gets the whole line with leading/trailing IFS
+            // whitespace stripped (bash behaviour)
+            try setVar(shell, varnames[0], stripIfs(value));
+        } else {
+            // multiple variables: split on IFS whitespace; the last variable
+            // gets all remaining fields (with internal separators preserved),
+            // matching bash/POSIX `read a b c` behaviour.
+            var rest = value;
+            for (varnames, 0..) |name, vi| {
+                const is_last = vi == varnames.len - 1;
+                if (is_last) {
+                    try setVar(shell, name, stripIfs(rest));
+                    break;
+                }
+                // skip leading IFS whitespace
+                var start: usize = 0;
+                while (start < rest.len and isIfsWhitespace(rest[start])) start += 1;
+                // find end of field
+                var end = start;
+                while (end < rest.len and !isIfsWhitespace(rest[end])) end += 1;
+                try setVar(shell, name, rest[start..end]);
+                rest = rest[end..];
+            }
+        }
     }
 
-    return 0;
+    // bash/POSIX: read fails (non-zero) when EOF is reached and no data was read.
+    return if (hit_eof and pos == 0) 1 else 0;
+}
+
+fn isIfsWhitespace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n';
+}
+
+fn stripIfs(s: []const u8) []const u8 {
+    var start: usize = 0;
+    var end = s.len;
+    while (start < end and isIfsWhitespace(s[start])) start += 1;
+    while (end > start and isIfsWhitespace(s[end - 1])) end -= 1;
+    return s[start..end];
 }
 
 // ============ test builtin ============

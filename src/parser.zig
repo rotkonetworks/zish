@@ -127,7 +127,7 @@ pub const Parser = struct {
                 return error.TooManyCommands;
             }
 
-            var cmd = try self.parselogicalor();
+            var cmd = try self.parseandor();
 
             // handle & (background) - acts as both modifier AND separator
             if (self.current_token.ty == .Background) {
@@ -166,37 +166,40 @@ pub const Parser = struct {
         );
     }
 
-    fn parselogicalor(self: *Self) parsererror!*const ast.AstNode {
-        var left = try self.parselogicaland();
-
-        while (self.current_token.ty == .Or) {
-            const op_line = self.current_token.line;
-            const op_column = self.current_token.column;
-            try self.nextToken(); // consume ||
-
-            const right = try self.parselogicaland();
-            left = try self.builder.createlogicalor(left, right, op_line, op_column);
-        }
-
-        return left;
-    }
-
-    fn parselogicaland(self: *Self) parsererror!*const ast.AstNode {
+    // and-or list: pipelines joined by && / ||. POSIX gives these operators
+    // EQUAL precedence and LEFT associativity, so parse them in one flat loop.
+    fn parseandor(self: *Self) parsererror!*const ast.AstNode {
         var left = try self.parsepipeline();
 
-        while (self.current_token.ty == .And) {
+        while (self.current_token.ty == .And or self.current_token.ty == .Or) {
+            const is_and = self.current_token.ty == .And;
             const op_line = self.current_token.line;
             const op_column = self.current_token.column;
-            try self.nextToken(); // consume &&
+            try self.nextToken(); // consume && or ||
+
+            // newlines are allowed after && / || (continuation)
+            while (self.current_token.ty == .NewLine) try self.nextToken();
 
             const right = try self.parsepipeline();
-            left = try self.builder.createlogicaland(left, right, op_line, op_column);
+            left = if (is_and)
+                try self.builder.createlogicaland(left, right, op_line, op_column)
+            else
+                try self.builder.createlogicalor(left, right, op_line, op_column);
         }
 
         return left;
     }
 
     fn parsepipeline(self: *Self) parsererror!*const ast.AstNode {
+        // leading `!` negates the pipeline's exit status
+        var negate = false;
+        while (self.current_token.ty == .Word and
+            self.current_token.value.len == 1 and self.current_token.value[0] == '!')
+        {
+            negate = !negate;
+            try self.nextToken(); // consume '!'
+        }
+
         var pipeline_commands = try std.ArrayList(*const ast.AstNode).initCapacity(self.builder.arena.allocator(), 32);
 
         // Parse first command
@@ -226,6 +229,9 @@ pub const Parser = struct {
             );
 
         // Note: & is handled in parsecommandlist as it acts as separator
+        if (negate) {
+            return self.builder.createnegate(result, result.line, result.column);
+        }
         return result;
     }
 
@@ -474,17 +480,45 @@ pub const Parser = struct {
     }
 
     // control structure parsing with bounds checking
+    // Parse a condition (for if/while/until) as a full and-or list, allowing
+    // pipelines, && / ||, [[ ]], and `!` negation. Consumes ; / newline
+    // separators and stops at the terminator keyword (then / do).
+    fn parseconditionlist(self: *Self, terminator: lexer.TokenType) parsererror!*const ast.AstNode {
+        var commands = try std.ArrayList(*const ast.AstNode).initCapacity(self.builder.arena.allocator(), 8);
+
+        while (true) {
+            // skip empty statements
+            while (self.current_token.ty == .Semicolon or self.current_token.ty == .NewLine) {
+                try self.nextToken();
+            }
+            if (self.current_token.ty == terminator or self.current_token.ty == .Eof) break;
+
+            const cmd = try self.parseandor();
+            try commands.append(self.builder.arena.allocator(), cmd);
+
+            // require a separator unless the terminator follows directly
+            if (self.current_token.ty == .Semicolon or self.current_token.ty == .NewLine) {
+                try self.nextToken();
+            } else if (self.current_token.ty != terminator) {
+                return error.UnexpectedToken;
+            }
+        }
+
+        if (commands.items.len == 0) return error.EmptyCommand;
+        if (commands.items.len == 1) return commands.items[0];
+        return self.builder.createlist(
+            commands.items,
+            commands.items[0].line,
+            commands.items[0].column,
+        );
+    }
+
     fn parseif(self: *Self) parsererror!*const ast.AstNode {
         const if_token = self.current_token;
         try self.nextToken(); // consume 'if'
 
-        // parse condition
-        const condition = try self.parsesimplecommand();
-
-        // skip optional semicolon/newline before 'then'
-        if (self.current_token.ty == .Semicolon or self.current_token.ty == .NewLine) {
-            try self.nextToken();
-        }
+        // parse condition (full and-or list up to 'then')
+        const condition = try self.parseconditionlist(.Then);
 
         // expect 'then'
         if (self.current_token.ty != .Then) {
@@ -531,12 +565,7 @@ pub const Parser = struct {
         const while_token = self.current_token;
         try self.nextToken(); // consume 'while'
 
-        const condition = try self.parsesimplecommand();
-
-        // skip optional semicolon/newline before 'do'
-        if (self.current_token.ty == .Semicolon or self.current_token.ty == .NewLine) {
-            try self.nextToken();
-        }
+        const condition = try self.parseconditionlist(.Do);
 
         if (self.current_token.ty != .Do) {
             return error.UnexpectedToken;
@@ -562,12 +591,7 @@ pub const Parser = struct {
         const until_token = self.current_token;
         try self.nextToken(); // consume 'until'
 
-        const condition = try self.parsesimplecommand();
-
-        // skip optional semicolon/newline before 'do'
-        if (self.current_token.ty == .Semicolon or self.current_token.ty == .NewLine) {
-            try self.nextToken();
-        }
+        const condition = try self.parseconditionlist(.Do);
 
         if (self.current_token.ty != .Do) {
             return error.UnexpectedToken;
@@ -581,7 +605,7 @@ pub const Parser = struct {
         }
         try self.nextToken(); // consume 'done'
 
-        return self.builder.createwhile( // until is like while with negated condition
+        return self.builder.createuntil(
             condition,
             body,
             until_token.line,
@@ -596,13 +620,33 @@ pub const Parser = struct {
         // parse variable name
         const variable = try self.parseword();
 
+        var values = try std.ArrayList(*const ast.AstNode).initCapacity(self.builder.arena.allocator(), 32);
+
+        // `for x; do ...` / `for x do ...` (no `in`) iterates over "$@"
         if (self.current_token.ty != .In) {
+            if (self.current_token.ty == .Semicolon or self.current_token.ty == .NewLine or self.current_token.ty == .Do) {
+                const at = try self.builder.createword("\"$@\"", for_token.line, for_token.column);
+                try values.append(self.builder.arena.allocator(), at);
+                // skip optional separator, then expect 'do'
+                if (self.current_token.ty == .Semicolon or self.current_token.ty == .NewLine) {
+                    try self.nextToken();
+                }
+                if (self.current_token.ty != .Do) {
+                    return error.UnexpectedToken;
+                }
+                try self.nextToken(); // consume 'do'
+                const body = try self.parsecommandlist();
+                if (self.current_token.ty != .Done) {
+                    return error.UnexpectedToken;
+                }
+                try self.nextToken(); // consume 'done'
+                return self.builder.createfor(variable, values.items, body, for_token.line, for_token.column);
+            }
             return error.UnexpectedToken;
         }
         try self.nextToken(); // consume 'in'
 
         // parse value list
-        var values = try std.ArrayList(*const ast.AstNode).initCapacity(self.builder.arena.allocator(), 32);
         while (self.current_token.ty != .Semicolon and
             self.current_token.ty != .NewLine and
             self.current_token.ty != .Do and
