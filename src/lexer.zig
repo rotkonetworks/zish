@@ -356,12 +356,26 @@ pub const Lexer = struct {
                             return self.makeTokenValue(.RightBrace, "}");
                         },
                         '[' => {
-                            _ = self.advance();
-                            if (self.peek() == @as(u8, '[')) {
+                            // '[[' is the test-open keyword.
+                            if (self.peekN(1) == @as(u8, '[')) {
+                                _ = self.advance();
                                 _ = self.advance();
                                 return self.makeTokenValue(.TestOpen, "[[");
                             }
-                            return self.makeTokenValue(.Word, "[");
+                            // A lone '[' followed by whitespace/operator/EOF is the
+                            // `test` builtin command word. Otherwise '[' begins a
+                            // glob character class (e.g. [abc]*) — lex the whole
+                            // word so pathname expansion sees the pattern.
+                            if (self.peekN(1)) |nxt| {
+                                if (isOperator(nxt)) {
+                                    _ = self.advance();
+                                    return self.makeTokenValue(.Word, "[");
+                                }
+                                self.state = .word;
+                            } else {
+                                _ = self.advance();
+                                return self.makeTokenValue(.Word, "[");
+                            }
                         },
                         ']' => {
                             _ = self.advance();
