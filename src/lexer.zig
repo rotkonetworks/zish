@@ -395,7 +395,14 @@ pub const Lexer = struct {
                                 _ = self.advance();
                                 return self.makeTokenValue(.TestOpen, "[[");
                             }
-                            return self.makeTokenValue(.Word, "[");
+                            // A lone `[` followed by whitespace/operator/EOF is the
+                            // `[` test builtin. Otherwise `[` begins a word (glob
+                            // char class `[ab]`, or a `[[ ]]` pattern like `[0-9]+`).
+                            const nxt = self.peek();
+                            if (nxt == null or isOperator(nxt.?)) {
+                                return self.makeTokenValue(.Word, "[");
+                            }
+                            self.state = .word;
                         },
                         ']' => {
                             _ = self.advance();

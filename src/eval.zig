@@ -319,8 +319,58 @@ fn evaluateTestBuiltinFast(shell: *Shell, node: *const ast.AstNode) !u8 {
     }
 
     // Evaluate test expression with stack-allocated args
-    const result = evaluateTestExpr(arg_slices[0..arg_count]);
+    const result = evaluateTestExprFlat(shell, arg_slices[0..arg_count]);
     return if (result) 0 else 1;
+}
+
+// Flat positional evaluator for the `test` / `[` builtin (POSIX test).
+// Unlike [[ ]], `=` here is a literal string comparison (no globbing).
+fn evaluateTestExprFlat(shell: *Shell, args: []const []const u8) bool {
+    if (args.len == 0) return false;
+
+    var i: usize = 0;
+    var negate = false;
+    while (i < args.len and std.mem.eql(u8, args[i], "!")) {
+        negate = !negate;
+        i += 1;
+    }
+    if (i >= args.len) return negate;
+
+    const rest = args[i..];
+    var result = false;
+
+    if (rest.len >= 3) {
+        const left = rest[0];
+        const op = rest[1];
+        const right = rest[2];
+        if (std.mem.eql(u8, op, "=") or std.mem.eql(u8, op, "==")) {
+            result = std.mem.eql(u8, left, right);
+        } else if (std.mem.eql(u8, op, "!=")) {
+            result = !std.mem.eql(u8, left, right);
+        } else if (std.mem.eql(u8, op, "-eq") or std.mem.eql(u8, op, "-ne") or
+            std.mem.eql(u8, op, "-lt") or std.mem.eql(u8, op, "-gt") or
+            std.mem.eql(u8, op, "-le") or std.mem.eql(u8, op, "-ge"))
+        {
+            const l = fastParseI64(left);
+            const r = fastParseI64(right);
+            if (l != null and r != null) {
+                const lv = l.?;
+                const rv = r.?;
+                result = if (std.mem.eql(u8, op, "-eq")) lv == rv else if (std.mem.eql(u8, op, "-ne")) lv != rv else if (std.mem.eql(u8, op, "-lt")) lv < rv else if (std.mem.eql(u8, op, "-gt")) lv > rv else if (std.mem.eql(u8, op, "-le")) lv <= rv else lv >= rv;
+            }
+        } else if (std.mem.eql(u8, op, "-nt") or std.mem.eql(u8, op, "-ot") or std.mem.eql(u8, op, "-ef")) {
+            result = fileCompare(op, left, right);
+        }
+        return if (negate) !result else result;
+    }
+
+    if (rest[0].len == 2 and rest[0][0] == '-' and rest.len >= 2) {
+        result = evaluateUnaryTest(shell, rest[0][1], rest[1]);
+        return if (negate) !result else result;
+    }
+
+    result = rest[0].len > 0;
+    return if (negate) !result else result;
 }
 
 // Check if string contains command substitution $(cmd) but not $((arith))
@@ -2225,111 +2275,98 @@ pub fn evaluateCase(shell: *Shell, node: *const ast.AstNode) !u8 {
 }
 
 pub fn evaluateTest(shell: *Shell, node: *const ast.AstNode) !u8 {
-    // expand variables in children
-    var args = try std.ArrayList([]const u8).initCapacity(shell.allocator, 16);
+    const result = try evaluateTestNode(shell, node);
+    return if (result) 0 else 1;
+}
+
+// Recursively evaluate a [[ ]] expression tree built by parsetest.
+// The tree uses:
+//   - .logical_and / .logical_or (2 children) for && / ||
+//   - .test_expression with value "!" (1 child) for negation
+//   - .test_expression with value "" (operand children) for a primary
+fn evaluateTestNode(shell: *Shell, node: *const ast.AstNode) anyerror!bool {
+    switch (node.node_type) {
+        .logical_and => {
+            if (node.children.len != 2) return false;
+            if (!try evaluateTestNode(shell, node.children[0])) return false; // short-circuit
+            return try evaluateTestNode(shell, node.children[1]);
+        },
+        .logical_or => {
+            if (node.children.len != 2) return false;
+            if (try evaluateTestNode(shell, node.children[0])) return true; // short-circuit
+            return try evaluateTestNode(shell, node.children[1]);
+        },
+        .test_expression => {
+            if (node.value.len == 1 and node.value[0] == '!') {
+                if (node.children.len != 1) return false;
+                return !(try evaluateTestNode(shell, node.children[0]));
+            }
+            return evaluateTestPrimaryNode(shell, node.children);
+        },
+        else => return false,
+    }
+}
+
+// Evaluate a primary: a sequence of operand nodes.
+// Variables are expanded on every operand. The RHS of ==/!=/=~ keeps its glob/
+// regex metacharacters (it is a pattern), unless the operand was quoted, in which
+// case it is matched literally.
+fn evaluateTestPrimaryNode(shell: *Shell, operands: []const *const ast.AstNode) !bool {
+    if (operands.len == 0) return false;
+
+    var args = try std.ArrayList([]const u8).initCapacity(shell.allocator, operands.len);
     defer {
         for (args.items) |arg| shell.allocator.free(arg);
         args.deinit(shell.allocator);
     }
-
-    for (node.children) |child| {
+    for (operands) |child| {
         const expanded = try shell.expandVariables(child.value);
         try args.append(shell.allocator, expanded);
     }
 
-    const result = evaluateTestExpr(args.items);
-    return if (result) 0 else 1;
-}
-
-fn evaluateTestExpr(args: []const []const u8) bool {
-    if (args.len == 0) return false;
-
-    var i: usize = 0;
+    // Leading `!` may still ride along inside a primary (e.g. `[[ ! -f x ]]`
+    // where `!` is folded into the primary rather than a separate unary node).
+    var base: usize = 0;
     var negate = false;
-
-    // check for negation
-    if (args.len > 0 and std.mem.eql(u8, args[0], "!")) {
-        negate = true;
-        i = 1;
+    while (base < args.items.len and std.mem.eql(u8, args.items[base], "!")) {
+        negate = !negate;
+        base += 1;
     }
+    const view = args.items[base..];
+    const op_nodes = operands[base..];
 
-    if (i >= args.len) return negate;
-
-    const result = evaluateTestPrimary(args[i..]);
+    const result = try evaluateTestPrimary(shell, view, op_nodes);
     return if (negate) !result else result;
 }
 
-fn evaluateTestPrimary(args: []const []const u8) bool {
+fn testRhsIsQuoted(node: *const ast.AstNode) bool {
+    return node.node_type == .double_quoted or node.node_type == .string;
+}
+
+fn evaluateTestPrimary(shell: *Shell, args: []const []const u8, op_nodes: []const *const ast.AstNode) !bool {
     if (args.len == 0) return false;
 
     const first = args[0];
 
-    // unary file tests: -x, -f, -d, -e, -r, -w, -s
-    if (first.len == 2 and first[0] == '-' and args.len >= 2) {
-        const path = args[1];
-        const cwd = std.Io.Dir.cwd();
-
-        return switch (first[1]) {
-            'e', 'a' => blk: {
-                // file exists (-e or -a)
-                cwd.access(compat.io(), path, .{}) catch break :blk false;
-                break :blk true;
-            },
-            'f' => blk: {
-                // regular file
-                const stat = cwd.statFile(compat.io(), path, .{}) catch break :blk false;
-                break :blk stat.kind == .file;
-            },
-            'd' => blk: {
-                // directory
-                const stat = cwd.statFile(compat.io(), path, .{}) catch break :blk false;
-                break :blk stat.kind == .directory;
-            },
-            'r' => blk: {
-                // readable
-                cwd.access(compat.io(), path, .{ .read = true }) catch break :blk false;
-                break :blk true;
-            },
-            'w' => blk: {
-                // writable
-                cwd.access(compat.io(), path, .{ .write = true }) catch break :blk false;
-                break :blk true;
-            },
-            'x' => blk: {
-                // executable - check if file exists and has execute permission
-                const file = cwd.openFile(compat.io(), path, .{}) catch break :blk false;
-                defer file.close(compat.io());
-                const stat = file.stat(compat.io()) catch break :blk false;
-                // check execute bit for owner
-                break :blk (stat.permissions.toMode() & 0o100) != 0;
-            },
-            's' => blk: {
-                // file exists and has size > 0
-                const stat = cwd.statFile(compat.io(), path, .{}) catch break :blk false;
-                break :blk stat.size > 0;
-            },
-            'z' => blk: {
-                // string is empty (unary on second arg)
-                break :blk args[1].len == 0;
-            },
-            'n' => blk: {
-                // string is non-empty
-                break :blk args[1].len > 0;
-            },
-            else => false,
-        };
-    }
-
-    // binary operators: ==, !=, -eq, -ne, -lt, -gt, -le, -ge
+    // binary operators (checked first so `==`, `<`, `=~` are not mistaken for unary)
     if (args.len >= 3) {
         const left = args[0];
         const op = args[1];
         const right = args[2];
+        const rhs_literal = testRhsIsQuoted(op_nodes[2]);
 
         if (std.mem.eql(u8, op, "==") or std.mem.eql(u8, op, "=")) {
-            return std.mem.eql(u8, left, right);
+            if (rhs_literal) return std.mem.eql(u8, left, right);
+            return glob.matchGlob(right, left);
         } else if (std.mem.eql(u8, op, "!=")) {
-            return !std.mem.eql(u8, left, right);
+            if (rhs_literal) return !std.mem.eql(u8, left, right);
+            return !glob.matchGlob(right, left);
+        } else if (std.mem.eql(u8, op, "=~")) {
+            return matchRegex(right, left);
+        } else if (std.mem.eql(u8, op, "<")) {
+            return std.mem.order(u8, left, right) == .lt;
+        } else if (std.mem.eql(u8, op, ">")) {
+            return std.mem.order(u8, left, right) == .gt;
         } else if (std.mem.eql(u8, op, "-eq")) {
             const l = fastParseI64(left) orelse return false;
             const r = fastParseI64(right) orelse return false;
@@ -2354,11 +2391,250 @@ fn evaluateTestPrimary(args: []const []const u8) bool {
             const l = fastParseI64(left) orelse return false;
             const r = fastParseI64(right) orelse return false;
             return l >= r;
+        } else if (std.mem.eql(u8, op, "-nt") or std.mem.eql(u8, op, "-ot") or std.mem.eql(u8, op, "-ef")) {
+            return fileCompare(op, left, right);
         }
+    }
+
+    // unary operators: -<c> operand
+    if (first.len == 2 and first[0] == '-' and args.len >= 2) {
+        return evaluateUnaryTest(shell, first[1], args[1]);
     }
 
     // single arg: non-empty string is true
     return first.len > 0;
+}
+
+fn evaluateUnaryTest(shell: *Shell, opc: u8, operand: []const u8) bool {
+    const cwd = std.Io.Dir.cwd();
+    return switch (opc) {
+        'z' => operand.len == 0,
+        'n' => operand.len > 0,
+        'e', 'a' => blk: {
+            cwd.access(compat.io(), operand, .{}) catch break :blk false;
+            break :blk true;
+        },
+        'f' => blk: {
+            const stat = cwd.statFile(compat.io(), operand, .{}) catch break :blk false;
+            break :blk stat.kind == .file;
+        },
+        'd' => blk: {
+            const stat = cwd.statFile(compat.io(), operand, .{}) catch break :blk false;
+            break :blk stat.kind == .directory;
+        },
+        'h', 'L' => isSymlink(operand),
+        'p' => statKindIs(cwd, operand, .named_pipe),
+        'S' => statKindIs(cwd, operand, .unix_domain_socket),
+        'b' => statKindIs(cwd, operand, .block_device),
+        'c' => statKindIs(cwd, operand, .character_device),
+        'r' => blk: {
+            cwd.access(compat.io(), operand, .{ .read = true }) catch break :blk false;
+            break :blk true;
+        },
+        'w' => blk: {
+            cwd.access(compat.io(), operand, .{ .write = true }) catch break :blk false;
+            break :blk true;
+        },
+        'x' => blk: {
+            const file = cwd.openFile(compat.io(), operand, .{}) catch break :blk false;
+            defer file.close(compat.io());
+            const stat = file.stat(compat.io()) catch break :blk false;
+            break :blk (stat.permissions.toMode() & 0o111) != 0;
+        },
+        's' => blk: {
+            const stat = cwd.statFile(compat.io(), operand, .{}) catch break :blk false;
+            break :blk stat.size > 0;
+        },
+        'g' => statModeBit(cwd, operand, 0o2000),
+        'u' => statModeBit(cwd, operand, 0o4000),
+        'k' => statModeBit(cwd, operand, 0o1000),
+        'O' => blk: {
+            const st = statPosix(operand) orelse break :blk false;
+            break :blk st.uid == std.os.linux.geteuid();
+        },
+        'G' => blk: {
+            const st = statPosix(operand) orelse break :blk false;
+            break :blk st.gid == std.os.linux.getegid();
+        },
+        'v' => shell.variables.contains(operand),
+        'o' => isShellOption(shell, operand),
+        else => false,
+    };
+}
+
+fn isSymlink(path: []const u8) bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (path.len >= buf.len) return false;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    const pathz: [*:0]const u8 = @ptrCast(&buf);
+    var st: std.os.linux.Statx = undefined;
+    const mask: std.os.linux.STATX = .{ .TYPE = true };
+    const rc = std.os.linux.statx(std.os.linux.AT.FDCWD, pathz, std.os.linux.AT.SYMLINK_NOFOLLOW, mask, &st);
+    if (rc != 0) return false;
+    return (st.mode & 0o170000) == 0o120000; // S_IFLNK
+}
+
+fn statKindIs(cwd: std.Io.Dir, path: []const u8, kind: std.Io.File.Kind) bool {
+    const stat = cwd.statFile(compat.io(), path, .{}) catch return false;
+    return stat.kind == kind;
+}
+
+fn statModeBit(cwd: std.Io.Dir, path: []const u8, bit: u32) bool {
+    const file = cwd.openFile(compat.io(), path, .{}) catch return false;
+    defer file.close(compat.io());
+    const stat = file.stat(compat.io()) catch return false;
+    return (stat.permissions.toMode() & bit) != 0;
+}
+
+fn statPosix(path: []const u8) ?std.os.linux.Statx {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (path.len >= buf.len) return null;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    const pathz: [*:0]const u8 = @ptrCast(&buf);
+    var st: std.os.linux.Statx = undefined;
+    const mask: std.os.linux.STATX = .{ .UID = true, .GID = true, .INO = true, .MTIME = true };
+    const rc = std.os.linux.statx(std.os.linux.AT.FDCWD, pathz, 0, mask, &st);
+    if (rc != 0) return null;
+    return st;
+}
+
+fn isShellOption(shell: *Shell, name: []const u8) bool {
+    if (std.mem.eql(u8, name, "errexit")) return shell.opt_errexit;
+    if (std.mem.eql(u8, name, "nounset")) return shell.opt_nounset;
+    if (std.mem.eql(u8, name, "xtrace")) return shell.opt_xtrace;
+    if (std.mem.eql(u8, name, "pipefail")) return shell.opt_pipefail;
+    return false;
+}
+
+// -nt / -ot / -ef file comparisons
+fn fileCompare(op: []const u8, a: []const u8, b: []const u8) bool {
+    const sa = statPosix(a);
+    const sb = statPosix(b);
+    if (std.mem.eql(u8, op, "-ef")) {
+        if (sa == null or sb == null) return false;
+        return sa.?.dev_major == sb.?.dev_major and sa.?.dev_minor == sb.?.dev_minor and sa.?.ino == sb.?.ino;
+    }
+    const ta: i128 = if (sa) |s| mtimeNs(s) else if (std.mem.eql(u8, op, "-ot")) std.math.maxInt(i128) else std.math.minInt(i128);
+    const tb: i128 = if (sb) |s| mtimeNs(s) else if (std.mem.eql(u8, op, "-nt")) std.math.maxInt(i128) else std.math.minInt(i128);
+    if (std.mem.eql(u8, op, "-nt")) return ta > tb;
+    return ta < tb; // -ot
+}
+
+fn mtimeNs(st: std.os.linux.Statx) i128 {
+    return @as(i128, st.mtime.sec) * std.time.ns_per_s + @as(i128, st.mtime.nsec);
+}
+
+// Minimal POSIX ERE matcher for the `=~` operator. Supports: literals, `.`,
+// anchors `^`/`$`, character classes `[...]`/`[^...]` (with ranges), and the
+// quantifiers `*`, `+`, `?` applied to the preceding atom. Returns true if the
+// pattern matches any substring of `text` (unanchored, like bash). Grouping `()`
+// and alternation `|` are NOT supported and are treated as literals.
+fn matchRegex(pattern: []const u8, text: []const u8) bool {
+    if (pattern.len == 0) return true;
+    if (pattern[0] == '^') {
+        return reMatchHere(pattern[1..], text);
+    }
+    var i: usize = 0;
+    while (true) {
+        if (reMatchHere(pattern, text[i..])) return true;
+        if (i >= text.len) return false;
+        i += 1;
+    }
+}
+
+// Match pattern anchored at the start of text.
+fn reMatchHere(pattern: []const u8, text: []const u8) bool {
+    if (pattern.len == 0) return true;
+    if (pattern.len == 1 and pattern[0] == '$') return text.len == 0;
+
+    // determine the length of the first atom (a single char, `.`, or `[...]`)
+    const atom_len = reAtomLen(pattern);
+    const has_quant = atom_len < pattern.len and (pattern[atom_len] == '*' or pattern[atom_len] == '+' or pattern[atom_len] == '?');
+
+    if (has_quant) {
+        const quant = pattern[atom_len];
+        const rest = pattern[atom_len + 1 ..];
+        return reMatchQuant(pattern[0..atom_len], quant, rest, text);
+    }
+
+    if (text.len > 0 and reAtomMatches(pattern[0..atom_len], text[0])) {
+        return reMatchHere(pattern[atom_len..], text[1..]);
+    }
+    return false;
+}
+
+fn reMatchQuant(atom: []const u8, quant: u8, rest: []const u8, text: []const u8) bool {
+    switch (quant) {
+        '?' => {
+            if (text.len > 0 and reAtomMatches(atom, text[0])) {
+                if (reMatchHere(rest, text[1..])) return true;
+            }
+            return reMatchHere(rest, text);
+        },
+        '*', '+' => {
+            var count: usize = 0;
+            while (count < text.len and reAtomMatches(atom, text[count])) : (count += 1) {}
+            // for `+` require at least one match
+            var n = count;
+            const min: usize = if (quant == '+') 1 else 0;
+            while (n + 1 > min) : (n -= 1) {
+                if (reMatchHere(rest, text[n..])) return true;
+                if (n == 0) break;
+            }
+            if (min == 0) return reMatchHere(rest, text);
+            return false;
+        },
+        else => return false,
+    }
+}
+
+// Length in bytes of the first regex atom in pattern.
+fn reAtomLen(pattern: []const u8) usize {
+    if (pattern.len == 0) return 0;
+    if (pattern[0] == '\\' and pattern.len >= 2) return 2;
+    if (pattern[0] == '[') {
+        var j: usize = 1;
+        if (j < pattern.len and pattern[j] == '^') j += 1;
+        if (j < pattern.len and pattern[j] == ']') j += 1; // ] as first member
+        while (j < pattern.len and pattern[j] != ']') j += 1;
+        if (j < pattern.len) j += 1; // include closing ]
+        return j;
+    }
+    return 1;
+}
+
+fn reAtomMatches(atom: []const u8, ch: u8) bool {
+    if (atom.len == 0) return false;
+    if (atom[0] == '\\' and atom.len >= 2) return atom[1] == ch;
+    if (atom[0] == '.') return true;
+    if (atom[0] == '[') return reClassMatches(atom, ch);
+    return atom[0] == ch;
+}
+
+fn reClassMatches(class: []const u8, ch: u8) bool {
+    // class is like "[...]" or "[^...]"
+    if (class.len < 2) return false;
+    var i: usize = 1;
+    var negate = false;
+    if (i < class.len and class[i] == '^') {
+        negate = true;
+        i += 1;
+    }
+    const end = class.len - 1; // index of closing ]
+    var matched = false;
+    while (i < end) {
+        // range a-b
+        if (i + 2 < end and class[i + 1] == '-') {
+            if (ch >= class[i] and ch <= class[i + 2]) matched = true;
+            i += 3;
+        } else {
+            if (class[i] == ch) matched = true;
+            i += 1;
+        }
+    }
+    return matched != negate;
 }
 
 fn setShellVar(shell: *Shell, name: []const u8, value: []const u8) !void {
@@ -2438,12 +2714,39 @@ fn serializeAst(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), 
         },
         .test_expression => {
             try buf.appendSlice(allocator, "[[ ");
-            try buf.appendSlice(allocator, node.value);
+            try serializeTestInner(allocator, buf, node);
             try buf.appendSlice(allocator, " ]]");
         },
         else => {
             try buf.appendSlice(allocator, node.value);
         },
+    }
+}
+
+fn serializeTestInner(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged(u8), node: *const ast.AstNode) !void {
+    switch (node.node_type) {
+        .logical_and => {
+            try serializeTestInner(allocator, buf, node.children[0]);
+            try buf.appendSlice(allocator, " && ");
+            try serializeTestInner(allocator, buf, node.children[1]);
+        },
+        .logical_or => {
+            try serializeTestInner(allocator, buf, node.children[0]);
+            try buf.appendSlice(allocator, " || ");
+            try serializeTestInner(allocator, buf, node.children[1]);
+        },
+        .test_expression => {
+            if (node.value.len == 1 and node.value[0] == '!') {
+                try buf.appendSlice(allocator, "! ");
+                try serializeTestInner(allocator, buf, node.children[0]);
+            } else {
+                for (node.children, 0..) |child, i| {
+                    if (i > 0) try buf.append(allocator, ' ');
+                    try buf.appendSlice(allocator, child.value);
+                }
+            }
+        },
+        else => {},
     }
 }
 
