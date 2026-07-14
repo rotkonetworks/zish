@@ -4,6 +4,13 @@
 const std = @import("std");
 const types = @import("types.zig");
 
+// Sentinel bytes for backslash-escaped characters that must survive expansion as
+// literals. The expander converts these back to '$' / '`' in its output and never
+// treats them as expansion triggers. Chosen from the control range so they cannot
+// appear in normal shell input (validateShellSafe rejects raw control bytes).
+pub const LIT_DOLLAR: u8 = 0x01;
+pub const LIT_BACKTICK: u8 = 0x02;
+
 pub const TokenType = enum {
     Word,
     String,              // quoted string content (for highlighting)
@@ -30,6 +37,7 @@ pub const TokenType = enum {
     RedirectToStderr,    // >&2
     RedirectAll,         // &>
     RedirectAllAppend,   // &>>
+    RedirectFd,          // generic: n>, n>>, n<, n>&m, n<&m, n>&-, >|, >&word
 
     // process substitution
     ProcessSubstIn,      // <(
@@ -82,6 +90,7 @@ const State = enum {
     dollar_brace,
     dollar_paren,
     dollar_dparen,  // $((
+    dollar_sq,      // $'...' ANSI-C quoting
     // backtick
     tick,
     tick_esc,
@@ -203,6 +212,31 @@ pub const Lexer = struct {
             .line = self.token_line,
             .column = self.token_col,
         };
+    }
+
+    // Build a static-lifetime "n<op>" string (e.g. "3>>", "1>&") for fd redirects.
+    fn fdOpStr(fd: u8, op: []const u8) []const u8 {
+        return switch (fd) {
+            '0' => opFor("0", op),
+            '1' => opFor("1", op),
+            '2' => opFor("2", op),
+            '3' => opFor("3", op),
+            '4' => opFor("4", op),
+            '5' => opFor("5", op),
+            '6' => opFor("6", op),
+            '7' => opFor("7", op),
+            '8' => opFor("8", op),
+            '9' => opFor("9", op),
+            else => op,
+        };
+    }
+    fn opFor(comptime d: []const u8, op: []const u8) []const u8 {
+        if (std.mem.eql(u8, op, ">")) return d ++ ">";
+        if (std.mem.eql(u8, op, ">>")) return d ++ ">>";
+        if (std.mem.eql(u8, op, ">&")) return d ++ ">&";
+        if (std.mem.eql(u8, op, "<")) return d ++ "<";
+        if (std.mem.eql(u8, op, "<&")) return d ++ "<&";
+        return op;
     }
 
     fn makeTokenValue(self: *Self, ty: TokenType, value: []const u8) Token {
@@ -381,12 +415,20 @@ pub const Lexer = struct {
                                 _ = self.advance();
                                 return self.makeTokenValue(.RedirectAppend, ">>");
                             }
+                            if (self.peek() == @as(u8, '|')) {
+                                // >| force truncate (noclobber override)
+                                _ = self.advance();
+                                return self.makeTokenValue(.RedirectFd, ">|");
+                            }
                             if (self.peek() == @as(u8, '&')) {
                                 if (self.peekN(1) == @as(u8, '2')) {
                                     _ = self.advance(); // &
                                     _ = self.advance(); // 2
                                     return self.makeTokenValue(.RedirectToStderr, ">&2");
                                 }
+                                // >&word or >&digit or >&- : consume '&', target parsed as word
+                                _ = self.advance(); // &
+                                return self.makeTokenValue(.RedirectFd, ">&");
                             }
                             return self.makeTokenValue(.RedirectOutput, ">");
                         },
@@ -407,25 +449,38 @@ pub const Lexer = struct {
                             return self.makeTokenValue(.RedirectInput, "<");
                         },
                         '0'...'9' => {
-                            // check for fd redirect like 2> or 2>>
-                            if (self.peekN(1) == @as(u8, '>')) {
+                            // fd redirect: n> n>> n>&m n>&- n< n<&m n<&-
+                            if (self.peekN(1) == @as(u8, '>') or self.peekN(1) == @as(u8, '<')) {
                                 const fd = ch;
+                                const is_out = self.peekN(1) == @as(u8, '>');
                                 _ = self.advance(); // digit
-                                _ = self.advance(); // first >
-                                if (fd == '2') {
-                                    // check for 2>&1
-                                    if (self.peek() == @as(u8, '&') and self.peekN(1) == @as(u8, '1')) {
+                                _ = self.advance(); // > or <
+
+                                // keep existing token identities for the common stderr cases
+                                if (is_out) {
+                                    if (self.peek() == @as(u8, '&') and self.peekN(1) == @as(u8, '1') and fd == '2') {
                                         _ = self.advance();
                                         _ = self.advance();
                                         return self.makeTokenValue(.RedirectBoth, "2>&1");
                                     }
-                                    // check for 2>>
                                     if (self.peek() == @as(u8, '>')) {
                                         _ = self.advance();
-                                        return self.makeTokenValue(.RedirectStderrAppend, "2>>");
+                                        if (fd == '2') return self.makeTokenValue(.RedirectStderrAppend, "2>>");
+                                        return self.makeTokenValue(.RedirectFd, fdOpStr(fd, ">>"));
                                     }
+                                    if (self.peek() == @as(u8, '&')) {
+                                        _ = self.advance(); // &
+                                        return self.makeTokenValue(.RedirectFd, fdOpStr(fd, ">&"));
+                                    }
+                                    if (fd == '2') return self.makeTokenValue(.RedirectStderr, "2>");
+                                    return self.makeTokenValue(.RedirectFd, fdOpStr(fd, ">"));
+                                } else {
+                                    if (self.peek() == @as(u8, '&')) {
+                                        _ = self.advance(); // &
+                                        return self.makeTokenValue(.RedirectFd, fdOpStr(fd, "<&"));
+                                    }
+                                    return self.makeTokenValue(.RedirectFd, fdOpStr(fd, "<"));
                                 }
-                                return self.makeTokenValue(.RedirectStderr, &[_]u8{fd});
                             }
                             self.state = .word;
                             _ = self.advance();
@@ -622,15 +677,20 @@ pub const Lexer = struct {
                 .dq_esc => {
                     if (c == null) return error.UnterminatedString;
                     const ch = c.?;
-                    // in double quotes: \$, \`, \", \\, \newline are special
-                    const escaped = switch (ch) {
-                        '$', '`', '"', '\\' => ch,
-                        'n' => '\n',
-                        't' => '\t',
-                        'r' => '\r',
-                        else => ch,
-                    };
-                    if (self.use_buf) self.bufAppend(escaped);
+                    // In double quotes only \$ \` \" \\ (and \newline) are escapes; any
+                    // other backslash is kept literally. Escaped $ and ` become sentinels
+                    // so the expander leaves them literal.
+                    switch (ch) {
+                        '$' => self.bufAppend(LIT_DOLLAR),
+                        '`' => self.bufAppend(LIT_BACKTICK),
+                        '"', '\\' => self.bufAppend(ch),
+                        '\n' => {}, // line continuation: drop
+                        else => {
+                            // Not a recognized escape: keep the backslash literally.
+                            self.bufAppend('\\');
+                            self.bufAppend(ch);
+                        },
+                    }
                     self.state = .dq;
                     _ = self.advance();
                 },
@@ -655,16 +715,27 @@ pub const Lexer = struct {
                             self.state = .dq_dollar_paren;
                             _ = self.advance();
                         },
-                        'a'...'z', 'A'...'Z', '_', '?', '!', '#', '*', '@', '-', '0'...'9' => {
+                        'a'...'z', 'A'...'Z', '_' => {
+                            // Named variable inside double quotes: the closing quote (or
+                            // any non-name char) ends the name. Wrap as ${name} so the
+                            // boundary survives quote-stripping (e.g. "$x"c -> ${x}c, not $xc).
+                            // A '$' was already appended by the .dq state.
+                            self.bufAppend('{');
                             self.bufAppend(ch);
                             _ = self.advance();
-                            // continue reading var name
                             while (self.peek()) |nc| {
                                 if (std.ascii.isAlphanumeric(nc) or nc == '_') {
                                     self.bufAppend(nc);
                                     _ = self.advance();
                                 } else break;
                             }
+                            self.bufAppend('}');
+                            self.state = .dq;
+                        },
+                        '?', '!', '#', '*', '@', '-', '0'...'9' => {
+                            // Single-char special parameters: boundary is implicit (one char).
+                            self.bufAppend(ch);
+                            _ = self.advance();
                             self.state = .dq;
                         },
                         else => self.state = .dq,
@@ -703,6 +774,20 @@ pub const Lexer = struct {
                     }
                     const ch = c.?;
                     switch (ch) {
+                        '\'' => {
+                            // $'...' ANSI-C quoting: process C escapes, produce literal bytes.
+                            // Copy any word prefix but drop the '$' itself.
+                            if (!self.use_buf) {
+                                const prefix = self.input[self.token_start .. self.pos - 1];
+                                @memcpy(self.buf[self.buf_idx][0..prefix.len], prefix);
+                                self.buf_len = prefix.len;
+                                self.use_buf = true;
+                            } else if (self.buf_len > 0 and self.buf[self.buf_idx][self.buf_len - 1] == '$') {
+                                self.buf_len -= 1;
+                            }
+                            self.state = .dollar_sq;
+                            _ = self.advance();
+                        },
                         '{' => {
                             self.bufAppend('{');
                             self.brace_depth = 1;
@@ -832,6 +917,81 @@ pub const Lexer = struct {
                     _ = self.advance();
                 },
 
+                .dollar_sq => {
+                    // $'...' ANSI-C quoting: decode C escape sequences into literal bytes.
+                    if (c == null) return error.UnterminatedString;
+                    const ch = c.?;
+                    if (ch == '\'') {
+                        _ = self.advance();
+                        if (self.peek()) |next| {
+                            if (!isOperator(next)) {
+                                self.state = .word;
+                                continue;
+                            }
+                        }
+                        self.state = .normal;
+                        return self.makeToken(.String);
+                    }
+                    if (ch == '\\') {
+                        _ = self.advance();
+                        const e = self.peek() orelse {
+                            self.bufAppend('\\');
+                            continue;
+                        };
+                        switch (e) {
+                            'n' => { self.bufAppend('\n'); _ = self.advance(); },
+                            't' => { self.bufAppend('\t'); _ = self.advance(); },
+                            'r' => { self.bufAppend('\r'); _ = self.advance(); },
+                            'a' => { self.bufAppend(0x07); _ = self.advance(); },
+                            'b' => { self.bufAppend(0x08); _ = self.advance(); },
+                            'f' => { self.bufAppend(0x0C); _ = self.advance(); },
+                            'v' => { self.bufAppend(0x0B); _ = self.advance(); },
+                            'e', 'E' => { self.bufAppend(0x1B); _ = self.advance(); },
+                            '\\' => { self.bufAppend('\\'); _ = self.advance(); },
+                            '\'' => { self.bufAppend('\''); _ = self.advance(); },
+                            '"' => { self.bufAppend('"'); _ = self.advance(); },
+                            '?' => { self.bufAppend('?'); _ = self.advance(); },
+                            'x' => {
+                                _ = self.advance();
+                                var val: u16 = 0;
+                                var digits: u8 = 0;
+                                while (digits < 2) : (digits += 1) {
+                                    const hc = self.peek() orelse break;
+                                    const d = hexDigit(hc) orelse break;
+                                    val = val * 16 + d;
+                                    _ = self.advance();
+                                }
+                                if (digits == 0) {
+                                    self.bufAppend('\\');
+                                    self.bufAppend('x');
+                                } else {
+                                    self.bufAppend(@intCast(val & 0xFF));
+                                }
+                            },
+                            '0'...'7' => {
+                                var val: u16 = 0;
+                                var digits: u8 = 0;
+                                while (digits < 3) : (digits += 1) {
+                                    const oc = self.peek() orelse break;
+                                    if (oc < '0' or oc > '7') break;
+                                    val = val * 8 + (oc - '0');
+                                    _ = self.advance();
+                                }
+                                self.bufAppend(@intCast(val & 0xFF));
+                            },
+                            else => {
+                                // Unknown escape: keep the backslash and the char literally.
+                                self.bufAppend('\\');
+                                self.bufAppend(e);
+                                _ = self.advance();
+                            },
+                        }
+                        continue;
+                    }
+                    self.bufAppend(ch);
+                    _ = self.advance();
+                },
+
                 .tick => {
                     if (c == null) return error.UnterminatedString;
                     const ch = c.?;
@@ -886,7 +1046,23 @@ pub const Lexer = struct {
                             self.state = .normal;
                         }
                     } else {
-                        if (self.use_buf) self.bufAppend(ch);
+                        // A backslash escapes the next char, making it literal. We build
+                        // into the buffer, dropping the backslash itself. Chars that would
+                        // otherwise trigger later expansion ($, `) are emitted as sentinels
+                        // so the expander leaves them literal.
+                        if (!self.use_buf) {
+                            // Copy any word prefix, excluding the backslash (which sits at
+                            // pos-1, since it was already consumed on entry to .esc).
+                            const prefix = self.input[self.token_start .. self.pos - 1];
+                            @memcpy(self.buf[self.buf_idx][0..prefix.len], prefix);
+                            self.buf_len = prefix.len;
+                            self.use_buf = true;
+                        }
+                        switch (ch) {
+                            '$' => self.bufAppend(LIT_DOLLAR),
+                            '`' => self.bufAppend(LIT_BACKTICK),
+                            else => self.bufAppend(ch),
+                        }
                         self.state = .word;
                         _ = self.advance();
                     }
@@ -1004,6 +1180,15 @@ const operator_table: [256]bool = blk: {
 
 inline fn isOperator(c: u8) bool {
     return operator_table[c];
+}
+
+fn hexDigit(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
 }
 
 // Fast keyword classification using length-based dispatch

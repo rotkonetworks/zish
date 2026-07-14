@@ -261,6 +261,7 @@ pub fn evaluateAst(shell: *Shell, node: *const ast.AstNode) anyerror!u8 {
         .pipeline => evaluatePipeline(shell, node),
         .logical_and => evaluateLogicalAnd(shell, node),
         .logical_or => evaluateLogicalOr(shell, node),
+        .negate => evaluateNegate(shell, node),
         .redirect => evaluateRedirect(shell, node),
         .list => evaluateList(shell, node),
         .assignment => evaluateAssignment(shell, node),
@@ -399,6 +400,12 @@ fn expandArithmeticVars(shell: *Shell, expr: []const u8, dest: *[256]u8) !usize 
 // Fast variable expansion that writes to a provided buffer (no allocation)
 // Returns error.BufferTooSmall if result would be truncated - caller should fall back to full expansion
 fn expandVariableFast(shell: *Shell, input: []const u8, dest: *[256]u8) !usize {
+    // Escaped-literal sentinels need translating; defer to the full expander.
+    if (std.mem.indexOfScalar(u8, input, Shell.LIT_DOLLAR) != null or
+        std.mem.indexOfScalar(u8, input, Shell.LIT_BACKTICK) != null)
+    {
+        return error.BufferTooSmall;
+    }
     // Fast path: no variables
     if (std.mem.indexOfScalar(u8, input, '$') == null) {
         if (input.len > 256) return error.BufferTooSmall;
@@ -662,8 +669,26 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     if (raw_cmd.len <= 8 and cmd_children.len == 1) {
         if (std.mem.eql(u8, raw_cmd, "true") or (raw_cmd.len == 1 and raw_cmd[0] == ':')) return 0;
         if (std.mem.eql(u8, raw_cmd, "false")) return 1;
-        if (std.mem.eql(u8, raw_cmd, "continue")) return 253;
-        if (std.mem.eql(u8, raw_cmd, "break")) return 254;
+        if (std.mem.eql(u8, raw_cmd, "continue")) {
+            shell.loop_continue = 1;
+            return 253;
+        }
+        if (std.mem.eql(u8, raw_cmd, "break")) {
+            shell.loop_break = 1;
+            return 254;
+        }
+    }
+    // break N / continue N: break out of N enclosing loops
+    if ((std.mem.eql(u8, raw_cmd, "break") or std.mem.eql(u8, raw_cmd, "continue")) and cmd_children.len == 2) {
+        const n = std.fmt.parseInt(u32, cmd_children[1].value, 10) catch 1;
+        const level = if (n == 0) 1 else n;
+        if (raw_cmd[0] == 'b') {
+            shell.loop_break = level;
+            return 254;
+        } else {
+            shell.loop_continue = level;
+            return 253;
+        }
     }
 
     // Fast path for test builtin - avoid allocations in tight loops
@@ -697,13 +722,31 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
                 needs_full_expansion = true;
                 break;
             }
+            // Special params $#, $@, $* and any braced expansion (incl. ${10}, ${@})
+            // are not handled by the fast path.
+            if (std.mem.indexOf(u8, arg, "${") != null) {
+                needs_full_expansion = true;
+                break;
+            }
+            if (std.mem.indexOfScalar(u8, arg, '$')) |dp| {
+                if (dp + 1 < arg.len and (arg[dp + 1] == '#' or arg[dp + 1] == '@' or arg[dp + 1] == '*')) {
+                    needs_full_expansion = true;
+                    break;
+                }
+            }
             // Check for ${...} with modifiers (contains ${...#, ${...%, ${.../, ${...:, ${...[)
             // Also need full path for array access ${arr[...]}
             if (std.mem.indexOf(u8, arg, "${")) |dollar_brace| {
                 const rest = arg[dollar_brace + 2 ..];
                 for (rest) |c| {
                     if (c == '}') break;
-                    if (c == '#' or c == '%' or c == '/' or c == ':' or c == '[') {
+                    // Any operator inside ${...} requires the full expansion path:
+                    // # % / : [ (substr/strip/subst/array), - + ? = (default/alt/assign/error),
+                    // ^ , (case modification).
+                    if (c == '#' or c == '%' or c == '/' or c == ':' or c == '[' or
+                        c == '-' or c == '+' or c == '?' or c == '=' or
+                        c == '^' or c == ',')
+                    {
                         needs_full_expansion = true;
                         break;
                     }
@@ -1335,6 +1378,14 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
     return if (shell.opt_pipefail and pipefail_status != 0) pipefail_status else last_status;
 }
 
+pub fn evaluateNegate(shell: *Shell, node: *const ast.AstNode) !u8 {
+    if (node.children.len != 1) return 1;
+    const status = try evaluateAst(shell, node.children[0]);
+    // control-flow sentinels (break/continue) must pass through untouched
+    if (status == 253 or status == 254) return status;
+    return if (status == 0) 1 else 0;
+}
+
 pub fn evaluateLogicalAnd(shell: *Shell, node: *const ast.AstNode) !u8 {
     if (node.children.len != 2) return 1;
 
@@ -1358,7 +1409,49 @@ pub fn evaluateLogicalOr(shell: *Shell, node: *const ast.AstNode) !u8 {
 pub fn evaluateRedirect(shell: *Shell, node: *const ast.AstNode) !u8 {
     if (node.children.len != 2) return 1;
 
-    const command = node.children[0];
+    // Redirect nodes nest with the LAST parsed (rightmost in source) redirect as
+    // the outermost node. To match bash, redirects must be applied strictly
+    // left-to-right, so unwind the chain and apply from innermost to outermost.
+    var chain: [16]*const ast.AstNode = undefined;
+    var n: usize = 0;
+    var cur = node;
+    while (cur.node_type == .redirect and cur.children.len == 2 and n < chain.len) {
+        chain[n] = cur;
+        n += 1;
+        cur = cur.children[0];
+    }
+    const command = cur; // the actual command at the bottom of the chain
+
+    // Flush any buffered stdout to the real terminal before swapping fds, so
+    // pre-redirect output isn't diverted into the redirect target.
+    shell.stdout().flush() catch {};
+
+    const stdin_backup = try compat.posix.dup(compat.posix.STDIN_FILENO);
+    const stdout_backup = try compat.posix.dup(compat.posix.STDOUT_FILENO);
+    const stderr_backup = try compat.posix.dup(compat.posix.STDERR_FILENO);
+    defer {
+        // Builtins write through a buffered writer on fd 1; flush it into the
+        // redirect target before restoring the original fds.
+        shell.stdout().flush() catch {};
+        compat.posix.dup2(stdin_backup, compat.posix.STDIN_FILENO) catch {};
+        compat.posix.dup2(stdout_backup, compat.posix.STDOUT_FILENO) catch {};
+        compat.posix.dup2(stderr_backup, compat.posix.STDERR_FILENO) catch {};
+        compat.posix.close(stdin_backup);
+        compat.posix.close(stdout_backup);
+        compat.posix.close(stderr_backup);
+    }
+
+    // apply in source order (innermost redirect node = leftmost in source)
+    var idx = n;
+    while (idx > 0) {
+        idx -= 1;
+        try applyRedirect(shell, chain[idx]);
+    }
+
+    return evaluateAst(shell, command);
+}
+
+fn applyRedirect(shell: *Shell, node: *const ast.AstNode) !void {
     const target = node.children[1];
     const redirect_type = node.value;
 
@@ -1368,19 +1461,7 @@ pub fn evaluateRedirect(shell: *Shell, node: *const ast.AstNode) !u8 {
         try shell.expandVariables(target.value);
     defer shell.allocator.free(expanded_target);
 
-    const stdin_backup = try compat.posix.dup(compat.posix.STDIN_FILENO);
-    const stdout_backup = try compat.posix.dup(compat.posix.STDOUT_FILENO);
-    const stderr_backup = try compat.posix.dup(compat.posix.STDERR_FILENO);
-    defer {
-        compat.posix.dup2(stdin_backup, compat.posix.STDIN_FILENO) catch {};
-        compat.posix.dup2(stdout_backup, compat.posix.STDOUT_FILENO) catch {};
-        compat.posix.dup2(stderr_backup, compat.posix.STDERR_FILENO) catch {};
-        compat.posix.close(stdin_backup);
-        compat.posix.close(stdout_backup);
-        compat.posix.close(stderr_backup);
-    }
-
-    if (std.mem.eql(u8, redirect_type, ">")) {
+    if (std.mem.eql(u8, redirect_type, ">") or std.mem.eql(u8, redirect_type, ">|")) {
         const file = try std.Io.Dir.cwd().createFile(compat.io(), expanded_target, .{ .truncate = true });
         defer file.close(compat.io());
         try compat.posix.dup2(file.handle, compat.posix.STDOUT_FILENO);
@@ -1431,9 +1512,74 @@ pub fn evaluateRedirect(shell: *Shell, node: *const ast.AstNode) !u8 {
 
         // connect read end to stdin
         try compat.posix.dup2(pipe_fds[0], compat.posix.STDIN_FILENO);
+    } else {
+        try applyFdRedirect(redirect_type, expanded_target);
+    }
+}
+
+/// Handle generic fd redirects carried by RedirectFd tokens:
+///   >|          force-truncate stdout to file
+///   >&word      stdout+stderr to file, or stdout dup of fd `word`
+///   n>file n>>file n<file
+///   n>&m n<&m    duplicate fd m into fd n
+///   n>&-  n<&-   close fd n
+fn applyFdRedirect(op: []const u8, target: []const u8) !void {
+    const STDOUT = compat.posix.STDOUT_FILENO;
+    const STDERR = compat.posix.STDERR_FILENO;
+
+    if (std.mem.eql(u8, op, ">|")) {
+        const file = try std.Io.Dir.cwd().createFile(compat.io(), target, .{ .truncate = true });
+        defer file.close(compat.io());
+        try compat.posix.dup2(file.handle, STDOUT);
+        return;
     }
 
-    return evaluateAst(shell, command);
+    if (std.mem.eql(u8, op, ">&")) {
+        // >&digit -> dup that fd into stdout; >&file -> both stdout+stderr to file
+        if (target.len > 0 and allDigits(target)) {
+            const src = std.fmt.parseInt(i32, target, 10) catch return;
+            try compat.posix.dup2(src, STDOUT);
+        } else {
+            const file = try std.Io.Dir.cwd().createFile(compat.io(), target, .{ .truncate = true });
+            defer file.close(compat.io());
+            try compat.posix.dup2(file.handle, STDOUT);
+            try compat.posix.dup2(file.handle, STDERR);
+        }
+        return;
+    }
+
+    // op begins with a single fd digit
+    if (op.len < 2) return;
+    const fd: i32 = @as(i32, op[0] - '0');
+    const rest = op[1..];
+
+    if (std.mem.eql(u8, rest, ">")) {
+        const file = try std.Io.Dir.cwd().createFile(compat.io(), target, .{ .truncate = true });
+        defer file.close(compat.io());
+        try compat.posix.dup2(file.handle, fd);
+    } else if (std.mem.eql(u8, rest, ">>")) {
+        const file = try std.Io.Dir.cwd().createFile(compat.io(), target, .{ .truncate = false });
+        defer file.close(compat.io());
+        if (std.c.lseek(file.handle, 0, std.c.SEEK.END) < 0) return error.Unseekable;
+        try compat.posix.dup2(file.handle, fd);
+    } else if (std.mem.eql(u8, rest, "<")) {
+        const file = try std.Io.Dir.cwd().openFile(compat.io(), target, .{ .mode = .read_only });
+        defer file.close(compat.io());
+        try compat.posix.dup2(file.handle, fd);
+    } else if (std.mem.eql(u8, rest, ">&") or std.mem.eql(u8, rest, "<&")) {
+        if (target.len == 1 and target[0] == '-') {
+            compat.posix.close(fd); // n>&- / n<&- : close fd n
+        } else if (allDigits(target)) {
+            const src = std.fmt.parseInt(i32, target, 10) catch return;
+            try compat.posix.dup2(src, fd);
+        }
+    }
+}
+
+fn allDigits(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |c| if (c < '0' or c > '9') return false;
+    return true;
 }
 
 pub fn evaluateList(shell: *Shell, node: *const ast.AstNode) !u8 {
@@ -1597,59 +1743,74 @@ pub fn evaluateIf(shell: *Shell, node: *const ast.AstNode) !u8 {
     return 0;
 }
 
+// LoopAction: how the enclosing loop should react to a body's exit status.
+const LoopAction = enum { normal, continue_loop, break_loop };
+
+// Consult break/continue sentinels + level counters. Decrements the level so
+// that `break N` / `continue N` propagate through N enclosing loops. When this
+// loop is the target (level reaches 1) the sentinel is consumed here; otherwise
+// the caller must re-propagate the sentinel to the outer loop.
+fn loopControl(shell: *Shell, status: u8) LoopAction {
+    if (status == 254) { // break
+        if (shell.loop_break > 1) {
+            shell.loop_break -= 1;
+            return .break_loop; // still targeting an outer loop
+        }
+        shell.loop_break = 0;
+        return .break_loop;
+    }
+    if (status == 253) { // continue
+        if (shell.loop_continue > 1) {
+            shell.loop_continue -= 1;
+            return .break_loop; // outer loop is the continue target: unwind this one
+        }
+        shell.loop_continue = 0;
+        return .continue_loop;
+    }
+    return .normal;
+}
+
 pub fn evaluateWhile(shell: *Shell, node: *const ast.AstNode) !u8 {
     if (node.children.len != 2) return 1;
 
     var last_status: u8 = 0;
-    var iterations: u32 = 0;
-    const max_iterations: u32 = 10000;
 
-    while (iterations < max_iterations) {
+    while (true) {
         const condition = try evaluateAst(shell, node.children[0]);
         if (condition != 0) break;
 
-        last_status = try evaluateAst(shell, node.children[1]);
-        if (last_status == 254) break; // break
-        if (last_status == 253) { // continue
-            last_status = 0;
-            iterations += 1;
-            continue;
+        const body_status = try evaluateAst(shell, node.children[1]);
+        switch (loopControl(shell, body_status)) {
+            .break_loop => return if (shell.loop_break > 0 or shell.loop_continue > 0) body_status else 0,
+            .continue_loop => {
+                last_status = 0;
+                continue;
+            },
+            .normal => last_status = body_status,
         }
-        iterations += 1;
     }
 
-    if (iterations >= max_iterations) {
-        try shell.stdout().writeAll("while: iteration limit reached\n");
-        return 1;
-    }
-
-    return if (last_status == 254) 0 else last_status;
+    return last_status;
 }
 
 pub fn evaluateUntil(shell: *Shell, node: *const ast.AstNode) !u8 {
     if (node.children.len != 2) return 1;
 
     var last_status: u8 = 0;
-    var iterations: u32 = 0;
-    const max_iterations: u32 = 10000;
 
-    while (iterations < max_iterations) {
+    while (true) {
         const condition = try evaluateAst(shell, node.children[0]);
         if (condition == 0) break;
 
-        last_status = try evaluateAst(shell, node.children[1]);
-        if (last_status == 254) break; // break
-        if (last_status == 253) { // continue
-            last_status = 0;
-            iterations += 1;
-            continue;
+        const body_status = try evaluateAst(shell, node.children[1]);
+        switch (loopControl(shell, body_status)) {
+            .break_loop => return if (shell.loop_break > 0 or shell.loop_continue > 0) body_status else 0,
+            .continue_loop => {
+                last_status = 0;
+                continue;
+            },
+            .normal => last_status = body_status,
         }
-        iterations += 1;
-    }
-
-    if (iterations >= max_iterations) {
-        try shell.stdout().writeAll("until: iteration limit reached\n");
-        return 1;
     }
 
     return last_status;
@@ -1728,7 +1889,10 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
                 should_break = true;
                 break :outer;
             }
-            if (last_status == 253) last_status = 0;
+            if (last_status == 253) {
+                if (shell.loop_continue > 1) { should_break = true; break :outer; }
+                last_status = 0;
+            }
             continue;
         }
 
@@ -1742,7 +1906,10 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
                 should_break = true;
                 break :outer;
             }
-            if (last_status == 253) last_status = 0;
+            if (last_status == 253) {
+                if (shell.loop_continue > 1) { should_break = true; break :outer; }
+                last_status = 0;
+            }
             continue;
         }
 
@@ -1759,7 +1926,10 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
                 should_break = true;
                 break :outer;
             }
-            if (last_status == 253) last_status = 0;
+            if (last_status == 253) {
+                if (shell.loop_continue > 1) { should_break = true; break :outer; }
+                last_status = 0;
+            }
             continue;
         }
 
@@ -1796,13 +1966,13 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
                             setForVariableFast(cached_value_ptr.?, item, &loop_buf, &heap_buf, shell.allocator);
                             last_status = try evaluateAst(shell, body);
                             if (last_status == 254) { should_break = true; break :outer; }
-                            if (last_status == 253) { last_status = 0; continue; }
+                            if (last_status == 253) { if (shell.loop_continue > 1) { should_break = true; break :outer; } last_status = 0; continue; }
                         }
                     } else {
                         setForVariableFast(cached_value_ptr.?, word, &loop_buf, &heap_buf, shell.allocator);
                         last_status = try evaluateAst(shell, body);
                         if (last_status == 254) { should_break = true; break :outer; }
-                        if (last_status == 253) { last_status = 0; continue; }
+                        if (last_status == 253) { if (shell.loop_continue > 1) { should_break = true; break :outer; } last_status = 0; continue; }
                     }
                 }
                 continue;
@@ -1826,6 +1996,7 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
                         break :outer;
                     }
                     if (last_status == 253) {
+                        if (shell.loop_continue > 1) { should_break = true; break :outer; }
                         last_status = 0;
                         continue;
                     }
@@ -1838,13 +2009,22 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
                     break :outer;
                 }
                 if (last_status == 253) {
+                    if (shell.loop_continue > 1) { should_break = true; break :outer; }
                     last_status = 0;
                 }
             }
         }
     }
 
-    return if (should_break) 0 else last_status;
+    if (should_break) {
+        // last_status holds the break sentinel (254). Honour break N by
+        // re-propagating to enclosing loops when more levels remain.
+        switch (loopControl(shell, last_status)) {
+            .break_loop => return if (shell.loop_break > 0 or shell.loop_continue > 0) last_status else 0,
+            else => return 0,
+        }
+    }
+    return last_status;
 }
 
 // Ultra-fast variable assignment using cached pointer - no hash lookup per iteration
@@ -1900,7 +2080,51 @@ fn setForVariable(shell: *Shell, name: []const u8, value: []const u8) !void {
 
 pub fn evaluateSubshell(shell: *Shell, node: *const ast.AstNode) !u8 {
     if (node.children.len == 0) return 1;
-    return evaluateAst(shell, node.children[0]);
+
+    // A subshell runs in a forked child so cwd, variables, traps, etc. are
+    // isolated from the parent shell (POSIX ( ... ) semantics).
+    // Inside an existing pipeline stage we are already a forked child, so run
+    // in-process to avoid an extra fork (isolation is already provided).
+    if (shell.in_pipeline) {
+        return evaluateAst(shell, node.children[0]);
+    }
+
+    // flush buffered output so the child doesn't inherit and re-emit it
+    shell.stdout().flush() catch {};
+
+    const pid = compat.posix.fork() catch {
+        try shell.stdout().writeAll("zish: fork failed\n");
+        return 1;
+    };
+
+    if (pid == 0) {
+        // === CHILD ===
+        // page_allocator is stateless and safe post-fork
+        shell.allocator = std.heap.page_allocator;
+        shell.in_pipeline = true; // external commands exec directly
+        const status = evaluateAst(shell, node.children[0]) catch 127;
+        shell.stdout().flush() catch {};
+        compat.posix.exit(status);
+    }
+
+    // === PARENT ===
+    // ignore SIGINT while the subshell runs (it receives it directly)
+    var old_sigint: compat.posix.Sigaction = undefined;
+    const ignore_action = compat.posix.Sigaction{
+        .handler = .{ .handler = compat.posix.SIG.IGN },
+        .mask = std.mem.zeroes(compat.posix.sigset_t),
+        .flags = 0,
+    };
+    compat.posix.sigaction(compat.posix.SIG.INT, &ignore_action, &old_sigint);
+    defer compat.posix.sigaction(compat.posix.SIG.INT, &old_sigint, null);
+
+    const result = compat.posix.waitpid(pid, 0);
+    if (compat.posix.W.IFEXITED(result.status)) {
+        return compat.posix.W.EXITSTATUS(result.status);
+    } else if (compat.posix.W.IFSIGNALED(result.status)) {
+        return @truncate(128 + @as(u32, @intCast(@intFromEnum(compat.posix.W.TERMSIG(result.status)))));
+    }
+    return 127;
 }
 
 pub fn evaluateBackground(shell: *Shell, node: *const ast.AstNode) !u8 {

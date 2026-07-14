@@ -5,6 +5,10 @@ const compat = @import("compat.zig");
 const posix = compat.posix;
 const types = @import("types.zig");
 const lexer = @import("lexer.zig");
+
+// Re-exported escaped-literal sentinels (defined in the lexer) for use by eval.
+pub const LIT_DOLLAR = lexer.LIT_DOLLAR;
+pub const LIT_BACKTICK = lexer.LIT_BACKTICK;
 const parser = @import("parser.zig");
 const ast = @import("ast.zig");
 const glob = @import("glob.zig");
@@ -200,6 +204,10 @@ opt_xtrace: bool = false, // -x: print commands before execution
 opt_pipefail: bool = false, // pipefail: pipeline fails if any command fails
 // when true, external commands exec directly instead of fork+exec (for pipeline children)
 in_pipeline: bool = false,
+// loop control: number of enclosing loops to break/continue out of. 0 = none.
+// set by the break/continue builtins, consumed by loop evaluators.
+loop_break: u32 = 0,
+loop_continue: u32 = 0,
 // names of variables currently used as for-loop scratch (value points at a
 // stack buffer in an active evaluateFor frame, must not be freed)
 for_scratch_names: [16][]const u8 = [_][]const u8{""} ** 16,
@@ -1252,7 +1260,7 @@ fn handleAction(self: *Shell, action: Action) !void {
 
                     // Preprocess heredoc: convert << DELIM ... DELIM to <<< "content"
                     const processed_cmd = if (findHeredocDelimiter(command)) |delim|
-                        preprocessHeredoc(self.allocator, command, delim) catch command
+                        self.preprocessHeredoc(command, delim) catch command
                     else
                         command;
                     defer if (processed_cmd.ptr != command.ptr) self.allocator.free(processed_cmd);
@@ -2657,7 +2665,7 @@ pub fn executeCommand(self: *Shell, command: []const u8) !u8 {
     // Preprocess heredoc: convert << DELIM ... DELIM to file redirect
     const processed = if (findHeredocDelimiter(trimmed)) |delim|
         (if (heredocComplete(trimmed, delim))
-            preprocessHeredoc(self.allocator, trimmed, delim) catch trimmed
+            self.preprocessHeredoc(trimmed, delim) catch trimmed
         else
             trimmed)
     else
@@ -2809,6 +2817,10 @@ const expansion_char_table: [256]bool = blk: {
     var table = [_]bool{false} ** 256;
     table['$'] = true;
     table['`'] = true;
+    // Escaped-literal sentinels (from the lexer) must not take the no-op fast path;
+    // they need converting back to '$' / '`' during expansion.
+    table[lexer.LIT_DOLLAR] = true;
+    table[lexer.LIT_BACKTICK] = true;
     break :blk table;
 };
 
@@ -2854,6 +2866,22 @@ pub fn expandVariables(self: *Shell, input: []const u8) ![]const u8 {
     return self.expandVariablesAlloc(input);
 }
 
+/// Append the positional parameters ($1, $2, ...) joined by a single space.
+/// Used for unquoted $@ and $*; the count is tracked in the "#" variable.
+fn appendPositionalParams(self: *Shell, result: *std.ArrayList(u8)) !void {
+    const count_str = self.variables.get("#") orelse return;
+    const count = std.fmt.parseInt(usize, count_str, 10) catch return;
+    var idx: usize = 1;
+    while (idx <= count) : (idx += 1) {
+        var num_buf: [16]u8 = undefined;
+        const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{idx}) catch continue;
+        if (self.variables.get(num_str)) |val| {
+            if (idx > 1) try result.append(self.allocator, ' ');
+            try result.appendSlice(self.allocator, val);
+        }
+    }
+}
+
 fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
 
     // Simple variable expansion - replace $VAR with variable value
@@ -2883,6 +2911,21 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
                 const exit_code_str = std.fmt.bufPrint(&exit_code_buf, "{d}", .{self.last_exit_code}) catch "0";
                 try result.appendSlice(self.allocator, exit_code_str);
                 i += 1; // consume the ?
+                continue;
+            }
+
+            // $# - number of positional parameters
+            if (i < input.len and input[i] == '#') {
+                const count = self.variables.get("#") orelse "0";
+                try result.appendSlice(self.allocator, count);
+                i += 1;
+                continue;
+            }
+
+            // $@ and $* - all positional parameters joined with a space
+            if (i < input.len and (input[i] == '@' or input[i] == '*')) {
+                try self.appendPositionalParams(&result);
+                i += 1;
                 continue;
             }
 
@@ -2964,6 +3007,13 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
                     const var_name = input[name_start..i];
                     if (i < input.len and input[i] == '}') i += 1;
 
+                    // ${#} is the positional-parameter count ($#), not a length.
+                    if (var_name.len == 0) {
+                        const count = self.variables.get("#") orelse "0";
+                        try result.appendSlice(self.allocator, count);
+                        continue;
+                    }
+
                     var var_len: usize = 0;
 
                     // check for array length: ${#arr[@]} or ${#arr[*]}
@@ -2998,13 +3048,27 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
                     continue;
                 }
 
+                // ${@} and ${*} - all positional parameters
+                if (i < input.len and (input[i] == '@' or input[i] == '*')) {
+                    i += 1;
+                    if (i < input.len and input[i] == '}') {
+                        i += 1;
+                        try self.appendPositionalParams(&result);
+                        continue;
+                    }
+                    // Not a plain ${@}/${*}; rewind and fall through.
+                    i -= 1;
+                }
+
                 const name_start = i;
 
-                // Find end of variable name or modifier
-                // Stop at: } : - + ? # % /
+                // Find end of variable name or modifier.
+                // Stop at: } : - + ? = # % / ^ , (but not '[' so array subscripts stay
+                // part of the name)
                 while (i < input.len and input[i] != '}' and input[i] != ':' and
                     input[i] != '-' and input[i] != '+' and input[i] != '?' and
-                    input[i] != '#' and input[i] != '%' and input[i] != '/')
+                    input[i] != '=' and input[i] != '#' and input[i] != '%' and
+                    input[i] != '/' and input[i] != '^' and input[i] != ',')
                 {
                     i += 1;
                 }
@@ -3087,10 +3151,19 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
                         try result.appendSlice(self.allocator, stripped);
                     }
                 } else if (i < input.len and input[i] == '/') {
-                    // ${VAR/pattern/replacement} or ${VAR//pattern/replacement}
+                    // ${VAR/pattern/replacement}   - replace first match
+                    // ${VAR//pattern/replacement}  - replace all matches
+                    // ${VAR/#pattern/replacement}  - anchor at start
+                    // ${VAR/%pattern/replacement}  - anchor at end
                     i += 1;
                     const replace_all = i < input.len and input[i] == '/';
                     if (replace_all) i += 1;
+
+                    var anchor: u8 = 0; // 0 = none, '#' = start, '%' = end
+                    if (!replace_all and i < input.len and (input[i] == '#' or input[i] == '%')) {
+                        anchor = input[i];
+                        i += 1;
+                    }
 
                     const pattern_start = i;
                     while (i < input.len and input[i] != '/' and input[i] != '}') i += 1;
@@ -3106,38 +3179,30 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
                     if (i < input.len and input[i] == '}') i += 1;
 
                     if (var_value) |v| {
-                        const replaced = try patternReplace(self.allocator, v, pattern, replacement, replace_all);
+                        const replaced = try patternReplaceAnchored(self.allocator, v, pattern, replacement, replace_all, anchor);
                         defer self.allocator.free(replaced);
                         try result.appendSlice(self.allocator, replaced);
                     }
-                } else if (i < input.len and input[i] == ':' and i + 1 < input.len and
-                    (std.ascii.isDigit(input[i + 1]) or input[i + 1] == '-'))
-                {
-                    // ${VAR:offset} or ${VAR:offset:length} - substring
+                } else if (i < input.len and input[i] == ':' and isSubstringOffset(input[i + 1 ..])) {
+                    // ${VAR:offset} or ${VAR:offset:length} - substring.
+                    // Note: ${VAR:-x}, ${VAR:=x}, ${VAR:+x}, ${VAR:?x} are default/alt/assign/error
+                    // operators, NOT substring; a negative offset must be written as `${VAR: -n}`
+                    // (with a space) or `${VAR:(-n)}`.
                     i += 1;
-                    const offset_start = i;
-                    var negative_offset = false;
-                    if (i < input.len and input[i] == '-') {
-                        negative_offset = true;
-                        i += 1;
-                    }
-                    while (i < input.len and std.ascii.isDigit(input[i])) i += 1;
-                    const offset_str = input[offset_start..i];
-                    const offset = std.fmt.parseInt(i32, offset_str, 10) catch 0;
+                    // Skip optional leading whitespace before the offset expression.
+                    while (i < input.len and (input[i] == ' ' or input[i] == '\t')) i += 1;
+                    const offset = parseOffsetExpr(input, &i);
 
-                    var length: ?usize = null;
+                    var length: ?i64 = null;
                     if (i < input.len and input[i] == ':') {
                         i += 1;
-                        const len_start = i;
-                        while (i < input.len and std.ascii.isDigit(input[i])) i += 1;
-                        if (i > len_start) {
-                            length = std.fmt.parseInt(usize, input[len_start..i], 10) catch null;
-                        }
+                        while (i < input.len and (input[i] == ' ' or input[i] == '\t')) i += 1;
+                        length = parseOffsetExpr(input, &i);
                     }
                     if (i < input.len and input[i] == '}') i += 1;
 
                     if (var_value) |v| {
-                        // Handle negative offset (from end)
+                        // Handle negative offset (from end).
                         var start: usize = 0;
                         if (offset < 0) {
                             const abs_offset: usize = @intCast(-offset);
@@ -3146,8 +3211,44 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
                             start = @min(@as(usize, @intCast(offset)), v.len);
                         }
 
-                        const end = if (length) |l| @min(start + l, v.len) else v.len;
+                        var end = v.len;
+                        if (length) |l| {
+                            if (l < 0) {
+                                // Negative length: offset from end of string.
+                                const from_end: usize = @intCast(-l);
+                                end = if (from_end > v.len) start else @max(start, v.len - from_end);
+                            } else {
+                                end = @min(start + @as(usize, @intCast(l)), v.len);
+                            }
+                        }
                         try result.appendSlice(self.allocator, v[start..end]);
+                    }
+                } else if (i < input.len and (input[i] == '^' or input[i] == ',')) {
+                    // ${VAR^} ${VAR^^} ${VAR,} ${VAR,,} - case modification (bash).
+                    const op = input[i];
+                    i += 1;
+                    const all = i < input.len and input[i] == op;
+                    if (all) i += 1;
+                    // Optional pattern (only the pattern's matching chars are converted); we
+                    // support the common no-pattern form and treat any pattern as "match all".
+                    while (i < input.len and input[i] != '}') i += 1;
+                    if (i < input.len and input[i] == '}') i += 1;
+
+                    if (var_value) |v| {
+                        const upper = op == '^';
+                        if (all) {
+                            for (v) |ch| {
+                                try result.append(self.allocator, if (upper) std.ascii.toUpper(ch) else std.ascii.toLower(ch));
+                            }
+                        } else {
+                            for (v, 0..) |ch, idx| {
+                                if (idx == 0) {
+                                    try result.append(self.allocator, if (upper) std.ascii.toUpper(ch) else std.ascii.toLower(ch));
+                                } else {
+                                    try result.append(self.allocator, ch);
+                                }
+                            }
+                        }
                     }
                 } else {
                     // Original modifier handling: ${VAR:-default}, ${VAR:+alt}, ${VAR:?error}
@@ -3160,7 +3261,7 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
                         i += 1;
                     }
 
-                    if (i < input.len and (input[i] == '-' or input[i] == '+' or input[i] == '?')) {
+                    if (i < input.len and (input[i] == '-' or input[i] == '+' or input[i] == '?' or input[i] == '=')) {
                         modifier = input[i];
                         i += 1;
 
@@ -3203,10 +3304,29 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
                                 try result.appendSlice(self.allocator, expanded_alt);
                             }
                         },
+                        '=' => {
+                            // ${VAR:=word} or ${VAR=word} - assign default if unset (or empty w/ colon)
+                            if (use_default) {
+                                const expanded_default = try self.expandVariablesAlloc(default_value);
+                                // Assign to the shell variable, then use it.
+                                const name_copy = try self.allocator.dupe(u8, var_name);
+                                if (self.variables.fetchRemove(name_copy)) |old| {
+                                    self.allocator.free(old.key);
+                                    self.allocator.free(old.value);
+                                }
+                                self.variables.put(name_copy, expanded_default) catch {
+                                    self.allocator.free(name_copy);
+                                    self.allocator.free(expanded_default);
+                                };
+                                try result.appendSlice(self.allocator, expanded_default);
+                            } else if (var_value) |v| {
+                                try result.appendSlice(self.allocator, v);
+                            }
+                        },
                         '?' => {
                             // ${VAR:?error} or ${VAR?error}
                             if (use_default) {
-                                try self.stdout().print("zish: {s}: {s}\n", .{ var_name, if (default_value.len > 0) default_value else "parameter not set" });
+                                std.debug.print("zish: {s}: {s}\n", .{ var_name, if (default_value.len > 0) default_value else "parameter not set" });
                                 return error.ParameterNotSet;
                             } else if (var_value) |v| {
                                 try result.appendSlice(self.allocator, v);
@@ -3278,6 +3398,14 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
                 try result.append(self.allocator, '`');
                 i = cmd_start;
             }
+        } else if (input[i] == lexer.LIT_DOLLAR) {
+            // Escaped '$' - emit literally, do not expand.
+            try result.append(self.allocator, '$');
+            i += 1;
+        } else if (input[i] == lexer.LIT_BACKTICK) {
+            // Escaped '`' - emit literally, do not run as command substitution.
+            try result.append(self.allocator, '`');
+            i += 1;
         } else {
             try result.append(self.allocator, input[i]);
             i += 1;
@@ -3376,51 +3504,80 @@ fn tryFastArithmetic(expr: []const u8, shell: *Shell) ?i64 {
 }
 
 fn executeCommandAndCapture(self: *Shell, command: []const u8) ![]const u8 {
-    // Execute a command and capture its output
+    // Execute a command and capture its output using zish's own evaluator so
+    // that shell-local variables, functions, nested substitutions and builtins
+    // (echo, printf, ...) behave exactly as in an interactive session.
     const trimmed_cmd = std.mem.trim(u8, command, " \t\n\r");
+    if (trimmed_cmd.len == 0) return self.allocator.dupe(u8, "");
 
-    // Fast path for simple built-ins (no pipes/redirects)
-    if (std.mem.indexOfAny(u8, trimmed_cmd, "|<>&;") == null) {
-        // pwd builtin
-        if (std.mem.eql(u8, trimmed_cmd, "pwd")) {
-            var buf: [4096]u8 = undefined;
-            const cwd = posix.getcwd(&buf) catch return self.allocator.dupe(u8, "");
-            return self.allocator.dupe(u8, cwd);
-        }
-
-        // echo builtin - very common in command substitution
-        if (std.mem.startsWith(u8, trimmed_cmd, "echo ") or std.mem.eql(u8, trimmed_cmd, "echo")) {
-            const args = if (trimmed_cmd.len > 5) trimmed_cmd[5..] else "";
-            // Handle -n flag
-            if (std.mem.startsWith(u8, args, "-n ")) {
-                return self.allocator.dupe(u8, args[3..]);
-            } else if (std.mem.eql(u8, args, "-n")) {
-                return self.allocator.dupe(u8, "");
-            }
-            // Normal echo - just return args with newline (no expansion needed for simple case)
-            var result = try std.ArrayList(u8).initCapacity(self.allocator, args.len + 1);
-            try result.appendSlice(self.allocator, args);
-            try result.append(self.allocator, '\n');
-            return result.toOwnedSlice(self.allocator);
-        }
-
-        // printf builtin - simple version
-        if (std.mem.startsWith(u8, trimmed_cmd, "printf ")) {
-            const args = trimmed_cmd[7..];
-            return self.allocator.dupe(u8, args);
-        }
-
-        // true/false
-        if (std.mem.eql(u8, trimmed_cmd, "true") or std.mem.eql(u8, trimmed_cmd, ":")) {
-            return self.allocator.dupe(u8, "");
-        }
-        if (std.mem.eql(u8, trimmed_cmd, "false")) {
-            return self.allocator.dupe(u8, "");
-        }
+    // pwd fast path (pure builtin, no output-affecting state)
+    if (std.mem.eql(u8, trimmed_cmd, "pwd")) {
+        var buf: [4096]u8 = undefined;
+        const cwd = posix.getcwd(&buf) catch return self.allocator.dupe(u8, "");
+        return self.allocator.dupe(u8, cwd);
     }
 
-    // For all other commands (including pipelines), execute via shell
-    return self.executeExternalAndCapture(trimmed_cmd) catch self.allocator.dupe(u8, "");
+    return self.captureInternal(trimmed_cmd) catch
+        self.executeExternalAndCapture(trimmed_cmd) catch
+        self.allocator.dupe(u8, "");
+}
+
+/// Run a command through zish's own evaluator with stdout redirected to a pipe,
+/// returning the captured output. stdout is restored afterwards.
+fn captureInternal(self: *Shell, command: []const u8) ![]const u8 {
+    const pipe_fds = try compat.posix.pipe();
+    // pipe_fds[0] = read end, pipe_fds[1] = write end
+
+    const stdout_backup = try compat.posix.dup(compat.posix.STDOUT_FILENO);
+    defer compat.posix.close(stdout_backup);
+
+    // Flush any pending buffered stdout before swapping the fd so it lands on
+    // the terminal rather than in the captured buffer.
+    self.stdout().flush() catch {};
+
+    try compat.posix.dup2(pipe_fds[1], compat.posix.STDOUT_FILENO);
+    compat.posix.close(pipe_fds[1]);
+
+    // Drain the pipe on a background thread so large output can't deadlock by
+    // filling the pipe buffer while the writer is still running.
+    var buffer: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buffer.deinit(self.allocator);
+
+    const Reader = struct {
+        fn run(alloc: std.mem.Allocator, fd: compat.posix.fd_t, out: *std.ArrayListUnmanaged(u8)) void {
+            var tmp: [4096]u8 = undefined;
+            while (true) {
+                const n = compat.posix.read(fd, &tmp) catch break;
+                if (n == 0) break;
+                out.appendSlice(alloc, tmp[0..n]) catch break;
+            }
+        }
+    };
+    const thread = std.Thread.spawn(.{}, Reader.run, .{ self.allocator, pipe_fds[0], &buffer }) catch {
+        // Fall back to synchronous drain if a thread can't be spawned.
+        _ = self.executeCommandInternal(command) catch {};
+        self.stdout().flush() catch {};
+        compat.posix.dup2(stdout_backup, compat.posix.STDOUT_FILENO) catch {};
+        var tmp: [4096]u8 = undefined;
+        while (true) {
+            const n = compat.posix.read(pipe_fds[0], &tmp) catch break;
+            if (n == 0) break;
+            buffer.appendSlice(self.allocator, tmp[0..n]) catch break;
+        }
+        compat.posix.close(pipe_fds[0]);
+        return buffer.toOwnedSlice(self.allocator);
+    };
+
+    _ = self.executeCommandInternal(command) catch {};
+    self.stdout().flush() catch {};
+
+    // Restore stdout and close the write end so the reader sees EOF.
+    compat.posix.dup2(stdout_backup, compat.posix.STDOUT_FILENO) catch {};
+
+    thread.join();
+    compat.posix.close(pipe_fds[0]);
+
+    return buffer.toOwnedSlice(self.allocator);
 }
 
 fn executeExternalAndCapture(self: *Shell, command: []const u8) ![]const u8 {
@@ -3600,8 +3757,25 @@ fn findHeredocDelimiter(command: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Detect heredoc operator flags at position `pos` (which points at the first
+/// '<' of a "<<"). Returns whether it is <<- (strip tabs) and whether the
+/// delimiter was quoted (no expansion of the body).
+const HeredocFlags = struct { dash: bool, quoted: bool };
+fn heredocFlags(command: []const u8, pos: usize) HeredocFlags {
+    var j = pos + 2;
+    var dash = false;
+    if (j < command.len and command[j] == '-') {
+        dash = true;
+        j += 1;
+    }
+    while (j < command.len and (command[j] == ' ' or command[j] == '\t')) : (j += 1) {}
+    const quoted = j < command.len and (command[j] == '\'' or command[j] == '"');
+    return .{ .dash = dash, .quoted = quoted };
+}
+
 /// Preprocess heredoc: convert "cmd << DELIM\ncontent\nDELIM" to "cmd < /tmp/zish_heredoc_XXXX"
-fn preprocessHeredoc(allocator: std.mem.Allocator, command: []const u8, delimiter: []const u8) ![]const u8 {
+fn preprocessHeredoc(self: *Shell, command: []const u8, delimiter: []const u8) ![]const u8 {
+    const allocator = self.allocator;
     // Find << position
     var heredoc_pos: usize = 0;
     var i: usize = 0;
@@ -3615,6 +3789,8 @@ fn preprocessHeredoc(allocator: std.mem.Allocator, command: []const u8, delimite
             break;
         }
     }
+
+    const flags = heredocFlags(command, heredoc_pos);
 
     // Get part before <<
     const prefix = command[0..heredoc_pos];
@@ -3636,8 +3812,11 @@ fn preprocessHeredoc(allocator: std.mem.Allocator, command: []const u8, delimite
         var line_end = line_start;
         while (line_end < command.len and command[line_end] != '\n') : (line_end += 1) {}
 
-        const line = std.mem.trim(u8, command[line_start..line_end], " \t");
-        if (std.mem.eql(u8, line, delimiter)) {
+        // For <<- the closing delimiter may be preceded by tabs; otherwise it
+        // must match exactly (POSIX: leading tabs stripped only with <<-).
+        const raw_line = command[line_start..line_end];
+        const cmp_line = if (flags.dash) std.mem.trimStart(u8, raw_line, "\t") else raw_line;
+        if (std.mem.eql(u8, cmp_line, delimiter)) {
             // This line is the delimiter - content ends before this line
             content_end = line_start;
             found_delim = true;
@@ -3663,7 +3842,36 @@ fn preprocessHeredoc(allocator: std.mem.Allocator, command: []const u8, delimite
         content_end = command.len;
     }
 
-    const content = command[content_start..content_end];
+    var content = command[content_start..content_end];
+
+    // <<- : strip leading tabs from every body line.
+    var stripped_owned: ?[]u8 = null;
+    defer if (stripped_owned) |s| allocator.free(s);
+    if (flags.dash and content.len > 0) {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+        var ls: usize = 0;
+        while (ls <= content.len) {
+            var le = ls;
+            while (le < content.len and content[le] != '\n') : (le += 1) {}
+            const l = std.mem.trimStart(u8, content[ls..le], "\t");
+            try out.appendSlice(allocator, l);
+            if (le < content.len) try out.append(allocator, '\n');
+            if (le >= content.len) break;
+            ls = le + 1;
+        }
+        stripped_owned = try out.toOwnedSlice(allocator);
+        content = stripped_owned.?;
+    }
+
+    // Unquoted delimiter: expand variables and command substitutions in body.
+    var expanded_owned: ?[]const u8 = null;
+    defer if (expanded_owned) |e| allocator.free(e);
+    if (!flags.quoted and content.len > 0) {
+        expanded_owned = try self.expandVariables(content);
+        content = expanded_owned.?;
+    }
+
     const suffix = std.mem.trim(u8, command[suffix_start..], " \t\r\n");
 
     // Write content to a temp file (use timestamp for uniqueness)
@@ -3871,6 +4079,40 @@ pub fn freeBraceResults(allocator: std.mem.Allocator, results: [][]const u8) voi
 
 /// Strip prefix from string using glob pattern matching
 /// If greedy is true, removes longest match; otherwise removes shortest match
+/// After a ':' in ${VAR:...}, decide whether it introduces a substring offset
+/// rather than a default/alt/assign/error operator. `rest` is the text after the ':'.
+/// Substring: digit, '(' (arithmetic), or whitespace (e.g. `${VAR: -1}`). A bare
+/// leading '-'/'+'/'?'/'=' is an operator, not substring.
+fn isSubstringOffset(rest: []const u8) bool {
+    if (rest.len == 0) return false;
+    const c = rest[0];
+    if (std.ascii.isDigit(c)) return true;
+    if (c == '(') return true;
+    if (c == ' ' or c == '\t') return true;
+    return false;
+}
+
+/// Parse a substring offset/length expression starting at input[i.*], advancing i.
+/// Handles an optional '(' ... ')' arithmetic wrapper and a leading sign.
+fn parseOffsetExpr(input: []const u8, i: *usize) i64 {
+    var paren = false;
+    if (i.* < input.len and input[i.*] == '(') {
+        paren = true;
+        i.* += 1;
+        while (i.* < input.len and (input[i.*] == ' ' or input[i.*] == '\t')) i.* += 1;
+    }
+    const start = i.*;
+    if (i.* < input.len and (input[i.*] == '-' or input[i.*] == '+')) i.* += 1;
+    while (i.* < input.len and std.ascii.isDigit(input[i.*])) i.* += 1;
+    const num_str = input[start..i.*];
+    const val = std.fmt.parseInt(i64, num_str, 10) catch 0;
+    if (paren) {
+        while (i.* < input.len and input[i.*] != ')') i.* += 1;
+        if (i.* < input.len and input[i.*] == ')') i.* += 1;
+    }
+    return val;
+}
+
 fn stripPrefix(str: []const u8, pattern: []const u8, greedy: bool) []const u8 {
     if (str.len == 0 or pattern.len == 0) return str;
 
@@ -3956,12 +4198,61 @@ fn patternReplace(allocator: std.mem.Allocator, str: []const u8, pattern: []cons
     return try result.toOwnedSlice(allocator);
 }
 
-/// Check if input contains brace expansion patterns
+/// Pattern substitution with optional anchoring.
+/// anchor: 0 = unanchored (delegates to patternReplace), '#' = match only at
+/// the start of the string, '%' = match only at the end.
+fn patternReplaceAnchored(allocator: std.mem.Allocator, str: []const u8, pattern: []const u8, replacement: []const u8, replace_all: bool, anchor: u8) ![]const u8 {
+    if (anchor == 0) return patternReplace(allocator, str, pattern, replacement, replace_all);
+    if (pattern.len == 0) return allocator.dupe(u8, str);
+
+    var result: std.ArrayListUnmanaged(u8) = .empty;
+    defer result.deinit(allocator);
+
+    if (anchor == '#') {
+        // Longest match anchored at start.
+        var match_len = str.len;
+        while (true) : (match_len -= 1) {
+            if (glob.matchGlob(pattern, str[0..match_len])) {
+                try result.appendSlice(allocator, replacement);
+                try result.appendSlice(allocator, str[match_len..]);
+                return result.toOwnedSlice(allocator);
+            }
+            if (match_len == 0) break;
+        }
+    } else { // '%' - longest match anchored at end
+        var start: usize = 0;
+        while (start <= str.len) : (start += 1) {
+            if (glob.matchGlob(pattern, str[start..])) {
+                try result.appendSlice(allocator, str[0..start]);
+                try result.appendSlice(allocator, replacement);
+                return result.toOwnedSlice(allocator);
+            }
+        }
+    }
+    return allocator.dupe(u8, str);
+}
+
+/// Check if input contains brace expansion patterns.
+/// A `${...}` parameter expansion is NOT a brace group: its `{` is preceded by `$`,
+/// and any commas/dots inside it (e.g. ${x,,}, ${x/a,b/c}) must not be mistaken for a
+/// brace-list/range. Such groups are skipped whole.
 pub fn hasBracePattern(input: []const u8) bool {
     var depth: u32 = 0;
     var has_content = false;
-    for (input, 0..) |c, i| {
+    var i: usize = 0;
+    while (i < input.len) : (i += 1) {
+        const c = input[i];
         if (c == '{') {
+            // Parameter expansion `${` — skip the balanced group.
+            if (i > 0 and input[i - 1] == '$') {
+                var pdepth: u32 = 1;
+                i += 1;
+                while (i < input.len and pdepth > 0) : (i += 1) {
+                    if (input[i] == '{') pdepth += 1 else if (input[i] == '}') pdepth -= 1;
+                    if (pdepth == 0) break;
+                }
+                continue;
+            }
             depth += 1;
         } else if (c == '}') {
             if (depth > 0) {
@@ -3981,6 +4272,7 @@ pub fn hasBracePattern(input: []const u8) bool {
 fn heredocComplete(command: []const u8, delimiter: []const u8) bool {
     // find where heredoc content starts (after first newline after <<)
     var found_heredoc = false;
+    var dash = false;
     var i: usize = 0;
     while (i + 1 < command.len) : (i += 1) {
         if (command[i] == '<' and command[i + 1] == '<') {
@@ -3989,6 +4281,7 @@ fn heredocComplete(command: []const u8, delimiter: []const u8) bool {
                 continue;
             }
             found_heredoc = true;
+            dash = i + 2 < command.len and command[i + 2] == '-';
             // skip to end of line
             while (i < command.len and command[i] != '\n') : (i += 1) {}
             break;
@@ -4007,9 +4300,10 @@ fn heredocComplete(command: []const u8, delimiter: []const u8) bool {
         while (i < command.len and command[i] != '\n') : (i += 1) {}
         const line = command[line_start..i];
 
-        // check if line is exactly the delimiter (trimmed)
-        const trimmed = std.mem.trim(u8, line, " \t");
-        if (std.mem.eql(u8, trimmed, delimiter)) {
+        // <<- allows leading tabs before the closing delimiter; otherwise the
+        // line must match the delimiter exactly.
+        const cmp = if (dash) std.mem.trimStart(u8, line, "\t") else line;
+        if (std.mem.eql(u8, cmp, delimiter)) {
             return true;
         }
     }
