@@ -494,7 +494,10 @@ fn expandVariableFast(shell: *Shell, input: []const u8, dest: *[256]u8) !usize {
                     // Expand variables within the arithmetic expression first
                     var expr_buf: [256]u8 = undefined;
                     const expanded_expr_len = try expandArithmeticVars(shell, expr, &expr_buf);
-                    const arith_result = try shell.evaluateArithmetic(expr_buf[0..expanded_expr_len]);
+                    const arith_result = shell.evaluateArithmetic(expr_buf[0..expanded_expr_len]) catch {
+                        std.debug.print("zish: division by 0\n", .{});
+                        break;
+                    };
                     const result_str = std.fmt.bufPrint(dest[out_pos..], "{d}", .{arith_result}) catch break;
                     out_pos += result_str.len;
                     continue;
@@ -784,6 +787,17 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
                     break;
                 }
             }
+            // Glob patterns (* ? [) must go through pathname expansion, not the
+            // literal fast path — otherwise `echo *` prints the pattern verbatim.
+            if (arg_node.node_type != .string and glob.hasGlobChars(arg)) {
+                needs_full_expansion = true;
+                break;
+            }
+            // Leading tilde (~ ~/ ~user ~+ ~-) needs the full expansion path.
+            if (arg_node.node_type != .string and arg.len > 0 and arg[0] == '~') {
+                needs_full_expansion = true;
+                break;
+            }
             // Check for ${...} with modifiers (contains ${...#, ${...%, ${.../, ${...:, ${...[)
             // Also need full path for array access ${arr[...]}
             if (std.mem.indexOf(u8, arg, "${")) |dollar_brace| {
@@ -885,9 +899,10 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
             continue;
         }
 
-        // Double-quoted strings: expand vars/cmds but no word splitting or glob
+        // Double-quoted strings: expand vars/cmds but no word splitting, glob,
+        // or tilde (bash leaves '~' literal inside double quotes).
         if (arg_node.node_type == .double_quoted) {
-            const var_expanded_result = try shell.expandVariablesZ(arg);
+            const var_expanded_result = try shell.expandVariablesNoTildeZ(arg);
             defer var_expanded_result.deinit(shell.allocator);
             try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, var_expanded_result.slice));
             continue;
@@ -1946,10 +1961,11 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
             continue;
         }
 
-        // Double-quoted: expand vars/cmds but no word splitting
+        // Double-quoted: expand vars/cmds but no word splitting or tilde
         if (value_node.node_type == .double_quoted) {
-            const var_expanded = try shell.expandVariables(raw_value);
-            defer shell.allocator.free(var_expanded);
+            const var_expanded_res = try shell.expandVariablesNoTildeZ(raw_value);
+            defer var_expanded_res.deinit(shell.allocator);
+            const var_expanded = var_expanded_res.slice;
             setForVariableFast(cached_value_ptr.?, var_expanded, &loop_buf, &heap_buf, shell.allocator);
             last_status = try evaluateAst(shell, body);
             if (last_status == 254) {
@@ -1964,7 +1980,8 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
         }
 
         const has_brace = Shell.hasBracePattern(raw_value);
-        const needs_var_expansion = std.mem.indexOfScalar(u8, raw_value, '$') != null;
+        const has_tilde = raw_value.len > 0 and raw_value[0] == '~';
+        const needs_var_expansion = has_tilde or std.mem.indexOfScalar(u8, raw_value, '$') != null;
         const has_glob = glob.hasGlobChars(raw_value);
         const needs_word_split = hasCommandSubstitution(raw_value);
 

@@ -390,19 +390,27 @@ pub const Lexer = struct {
                             return self.makeTokenValue(.RightBrace, "}");
                         },
                         '[' => {
-                            _ = self.advance();
-                            if (self.peek() == @as(u8, '[')) {
+                            // '[[' is the test-open keyword.
+                            if (self.peekN(1) == @as(u8, '[')) {
+                                _ = self.advance();
                                 _ = self.advance();
                                 return self.makeTokenValue(.TestOpen, "[[");
                             }
-                            // A lone `[` followed by whitespace/operator/EOF is the
-                            // `[` test builtin. Otherwise `[` begins a word (glob
-                            // char class `[ab]`, or a `[[ ]]` pattern like `[0-9]+`).
-                            const nxt = self.peek();
-                            if (nxt == null or isOperator(nxt.?)) {
+                            // A lone '[' followed by whitespace/operator/EOF is the
+                            // `test` builtin command word. Otherwise '[' begins a
+                            // glob character class (e.g. [abc]*), or a `[[ ]]`
+                            // pattern like [0-9]+ — lex the whole word so pathname
+                            // expansion / the test evaluator sees the pattern.
+                            if (self.peekN(1)) |nxt| {
+                                if (isOperator(nxt)) {
+                                    _ = self.advance();
+                                    return self.makeTokenValue(.Word, "[");
+                                }
+                                self.state = .word;
+                            } else {
+                                _ = self.advance();
                                 return self.makeTokenValue(.Word, "[");
                             }
-                            self.state = .word;
                         },
                         ']' => {
                             _ = self.advance();

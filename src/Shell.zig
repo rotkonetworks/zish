@@ -2843,7 +2843,24 @@ pub fn expandVariablesZ(self: *Shell, input: []const u8) !ExpandResult {
     }
 
     // Need expansion - allocate
-    const expanded = try self.expandVariablesAlloc(input);
+    const expanded = try self.expandVariablesAllocOpt(input, true);
+    return .{ .slice = expanded, .owned = true };
+}
+
+/// Like expandVariablesZ but never performs tilde expansion (for content
+/// inside double quotes, where bash leaves '~' literal).
+pub fn expandVariablesNoTildeZ(self: *Shell, input: []const u8) !ExpandResult {
+    var needs_expansion = false;
+    for (input) |c| {
+        if (expansion_char_table[c]) {
+            needs_expansion = true;
+            break;
+        }
+    }
+    if (!needs_expansion) {
+        return .{ .slice = input, .owned = false };
+    }
+    const expanded = try self.expandVariablesAllocOpt(input, false);
     return .{ .slice = expanded, .owned = true };
 }
 
@@ -2863,7 +2880,7 @@ pub fn expandVariables(self: *Shell, input: []const u8) ![]const u8 {
         }
     }
 
-    return self.expandVariablesAlloc(input);
+    return self.expandVariablesAllocOpt(input, true);
 }
 
 /// Append the positional parameters ($1, $2, ...) joined by a single space.
@@ -2882,7 +2899,44 @@ fn appendPositionalParams(self: *Shell, result: *std.ArrayList(u8)) !void {
     }
 }
 
-fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
+/// Resolve a tilde-prefix name (the text between '~' and the first '/') to a
+/// home/directory path. Returns an owned allocation, or null when the prefix
+/// is not a recognised tilde form (caller then leaves the '~' literal).
+///   ""     -> $HOME
+///   "+"    -> $PWD
+///   "-"    -> $OLDPWD
+///   "user" -> that user's home via getpwnam
+fn tildePrefixHome(self: *Shell, name: []const u8) ?[]u8 {
+    if (name.len == 0) {
+        const home = compat.getEnvVarOwned(self.allocator, "HOME") catch return null;
+        return home;
+    }
+    if (name.len == 1 and name[0] == '+') {
+        if (self.getVarValue("PWD")) |pwd| return self.allocator.dupe(u8, pwd) catch null;
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = compat.posix.getcwd(&buf) catch return null;
+        return self.allocator.dupe(u8, cwd) catch null;
+    }
+    if (name.len == 1 and name[0] == '-') {
+        const old = self.getVarValue("OLDPWD") orelse
+            (compat.posix.getenv("OLDPWD") orelse return null);
+        return self.allocator.dupe(u8, old) catch null;
+    }
+    // ~user via getpwnam
+    var name_buf: [256]u8 = undefined;
+    if (name.len >= name_buf.len) return null;
+    @memcpy(name_buf[0..name.len], name);
+    name_buf[name.len] = 0;
+    const pw = std.c.getpwnam(name_buf[0..name.len :0]) orelse return null;
+    const dir = pw.dir orelse return null;
+    return self.allocator.dupe(u8, std.mem.sliceTo(dir, 0)) catch null;
+}
+
+fn getVarValue(self: *Shell, key: []const u8) ?[]const u8 {
+    return self.variables.get(key);
+}
+
+fn expandVariablesAllocOpt(self: *Shell, input: []const u8, expand_tilde: bool) ![]const u8 {
 
     // Simple variable expansion - replace $VAR with variable value
     var result = try std.ArrayList(u8).initCapacity(self.allocator, input.len);
@@ -2890,13 +2944,15 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
 
     var i: usize = 0;
 
-    // Tilde expansion at start of input
-    if (input.len > 0 and input[0] == '~') {
-        if (input.len == 1 or input[1] == '/') {
-            const home = compat.getEnvVarOwned(self.allocator, "HOME") catch "";
-            defer if (home.len > 0) self.allocator.free(home);
+    // Tilde expansion at start of input: ~ ~/ ~user ~+ ~-
+    if (expand_tilde and input.len > 0 and input[0] == '~') {
+        // the prefix runs to the first '/' (or end of word)
+        const slash = std.mem.indexOfScalar(u8, input, '/') orelse input.len;
+        const name = input[1..slash]; // text between '~' and '/'
+        if (self.tildePrefixHome(name)) |home| {
+            defer self.allocator.free(home);
             try result.appendSlice(self.allocator, home);
-            i = 1; // skip the ~
+            i = slash; // continue after the prefix (keep the '/')
         }
     }
 
@@ -3289,7 +3345,7 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
                             // ${VAR:-default} or ${VAR-default}
                             if (use_default) {
                                 // Recursively expand the default value
-                                const expanded_default = try self.expandVariablesAlloc(default_value);
+                                const expanded_default = try self.expandVariablesAllocOpt(default_value, true);
                                 defer self.allocator.free(expanded_default);
                                 try result.appendSlice(self.allocator, expanded_default);
                             } else if (var_value) |v| {
@@ -3299,7 +3355,7 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
                         '+' => {
                             // ${VAR:+alternate} or ${VAR+alternate}
                             if (!use_default) {
-                                const expanded_alt = try self.expandVariablesAlloc(default_value);
+                                const expanded_alt = try self.expandVariablesAllocOpt(default_value, true);
                                 defer self.allocator.free(expanded_alt);
                                 try result.appendSlice(self.allocator, expanded_alt);
                             }
@@ -3307,7 +3363,7 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
                         '=' => {
                             // ${VAR:=word} or ${VAR=word} - assign default if unset (or empty w/ colon)
                             if (use_default) {
-                                const expanded_default = try self.expandVariablesAlloc(default_value);
+                                const expanded_default = try self.expandVariablesAllocOpt(default_value, expand_tilde);
                                 // Assign to the shell variable, then use it.
                                 const name_copy = try self.allocator.dupe(u8, var_name);
                                 if (self.variables.fetchRemove(name_copy)) |old| {
@@ -3416,91 +3472,441 @@ fn expandVariablesAlloc(self: *Shell, input: []const u8) ![]const u8 {
 }
 
 pub fn evaluateArithmetic(self: *Shell, expr: []const u8) !i64 {
-    const trimmed = std.mem.trim(u8, expr, " \t\n\r");
-    if (trimmed.len == 0) return 0;
-
-    // SectorLambda-inspired: fast path for common simple expressions
-    // Pattern: "var + num", "num + var", "var + var", "num OP num"
-    if (tryFastArithmetic(trimmed, self)) |result| {
-        return result;
-    }
-
-    // Slow path: recursive evaluation for complex expressions
-    for ([_]u8{ '+', '-', '*', '/' }) |op| {
-        if (std.mem.lastIndexOfScalar(u8, trimmed, op)) |op_pos| {
-            if (op_pos > 0 and op_pos < trimmed.len - 1) {
-                const left = try self.evaluateArithmetic(trimmed[0..op_pos]);
-                const right = try self.evaluateArithmetic(trimmed[op_pos + 1 ..]);
-                return switch (op) {
-                    '+' => left + right,
-                    '-' => left - right,
-                    '*' => left * right,
-                    '/' => if (right != 0) @divTrunc(left, right) else 0,
-                    else => 0,
-                };
-            }
-        }
-    }
-
-    // try to parse as number
-    if (std.fmt.parseInt(i64, trimmed, 10)) |num| {
-        return num;
-    } else |_| {
-        // try as variable
-        if (self.variables.get(trimmed)) |val| {
-            return std.fmt.parseInt(i64, val, 10) catch 0;
-        }
-        // unknown variable defaults to 0
-        return 0;
-    }
+    var p = ArithParser{ .shell = self, .src = expr, .pos = 0 };
+    p.skipSpace();
+    if (p.pos >= p.src.len) return 0;
+    const v = p.parseComma() catch |e| switch (e) {
+        error.DivideByZero => return error.DivideByZero,
+        else => return 0,
+    };
+    return v;
 }
 
-// Fast path for simple binary expressions - avoids recursion overhead
-// Handles: "a + b", "1 + 2", "i + 1", etc.
-fn tryFastArithmetic(expr: []const u8, shell: *Shell) ?i64 {
-    // Find operator (only handle single operator case)
-    var op_pos: ?usize = null;
-    var op_char: u8 = 0;
-    var op_count: usize = 0;
+/// Recursive-descent integer arithmetic evaluator matching bash `$(( ))`
+/// semantics: full C-style operator set and precedence, assignment (writes
+/// back into shell variables), pre/post inc-dec, ternary, comma, and number
+/// bases (0x.., 0.. octal, base#n). Bare identifiers resolve to shell
+/// variables (recursively evaluated, undefined -> 0).
+const ArithParser = struct {
+    shell: *Shell,
+    src: []const u8,
+    pos: usize,
 
-    for (expr, 0..) |c, i| {
-        if (c == '+' or c == '-' or c == '*' or c == '/') {
-            if (i > 0 and i < expr.len - 1) {
-                op_count += 1;
-                if (op_count > 1) return null; // Multiple operators - use slow path
-                op_pos = i;
-                op_char = c;
-            }
-        }
+    const Error = error{ SyntaxError, DivideByZero, OutOfMemory };
+
+    fn skipSpace(self: *ArithParser) void {
+        while (self.pos < self.src.len and (self.src[self.pos] == ' ' or
+            self.src[self.pos] == '\t' or self.src[self.pos] == '\n' or
+            self.src[self.pos] == '\r')) self.pos += 1;
     }
 
-    const pos = op_pos orelse return null;
+    fn peek(self: *ArithParser) u8 {
+        return if (self.pos < self.src.len) self.src[self.pos] else 0;
+    }
+    fn peek2(self: *ArithParser) u8 {
+        return if (self.pos + 1 < self.src.len) self.src[self.pos + 1] else 0;
+    }
 
-    // Parse left operand
-    const left_str = std.mem.trim(u8, expr[0..pos], " \t");
-    const left = if (std.fmt.parseInt(i64, left_str, 10)) |n|
-        n
-    else |_| blk: {
-        const val = shell.variables.get(left_str) orelse return null;
-        break :blk std.fmt.parseInt(i64, val, 10) catch return null;
-    };
+    // returns true and consumes if the next non-space chars match `s`
+    fn eat(self: *ArithParser, s: []const u8) bool {
+        self.skipSpace();
+        if (self.pos + s.len <= self.src.len and std.mem.eql(u8, self.src[self.pos .. self.pos + s.len], s)) {
+            self.pos += s.len;
+            return true;
+        }
+        return false;
+    }
 
-    // Parse right operand
-    const right_str = std.mem.trim(u8, expr[pos + 1 ..], " \t");
-    const right = if (std.fmt.parseInt(i64, right_str, 10)) |n|
-        n
-    else |_| blk: {
-        const val = shell.variables.get(right_str) orelse return null;
-        break :blk std.fmt.parseInt(i64, val, 10) catch return null;
-    };
+    // level 0: comma operator (lowest precedence)
+    fn parseComma(self: *ArithParser) Error!i64 {
+        var v = try self.parseAssign();
+        while (true) {
+            self.skipSpace();
+            if (self.peek() == ',') {
+                self.pos += 1;
+                v = try self.parseAssign();
+            } else break;
+        }
+        return v;
+    }
 
-    return switch (op_char) {
-        '+' => left + right,
-        '-' => left - right,
-        '*' => left * right,
-        '/' => if (right != 0) @divTrunc(left, right) else 0,
-        else => null,
+    // level 1: assignment (right-assoc). Detect an lvalue followed by an
+    // assignment operator; otherwise fall through to ternary.
+    fn parseAssign(self: *ArithParser) Error!i64 {
+        const save = self.pos;
+        self.skipSpace();
+        const name_start = self.pos;
+        if (self.readIdent()) |name| {
+            self.skipSpace();
+            const c = self.peek();
+            const c2 = self.peek2();
+            // plain '=' (but not '==')
+            if (c == '=' and c2 != '=') {
+                self.pos += 1;
+                const rhs = try self.parseAssign();
+                try self.storeVar(name, rhs);
+                return rhs;
+            }
+            // compound: += -= *= /= %= &= |= ^= <<= >>=
+            const compound: ?u8 = switch (c) {
+                '+', '-', '*', '/', '%', '&', '|', '^' => if (c2 == '=') c else null,
+                else => null,
+            };
+            if (compound) |op| {
+                self.pos += 2;
+                const rhs = try self.parseAssign();
+                const cur = self.readVar(name);
+                const res = try applyBinary(op, cur, rhs);
+                try self.storeVar(name, res);
+                return res;
+            }
+            if ((c == '<' and c2 == '<' and self.peekN(2) == '=') or
+                (c == '>' and c2 == '>' and self.peekN(2) == '='))
+            {
+                const is_left = c == '<';
+                self.pos += 3;
+                const rhs = try self.parseAssign();
+                const cur = self.readVar(name);
+                const res = if (is_left) cur << @intCast(@as(u6, @truncate(@as(u64, @bitCast(rhs)))))
+                else cur >> @intCast(@as(u6, @truncate(@as(u64, @bitCast(rhs)))));
+                try self.storeVar(name, res);
+                return res;
+            }
+            _ = name_start;
+        }
+        // not an assignment — rewind and parse a ternary
+        self.pos = save;
+        return self.parseTernary();
+    }
+
+    fn peekN(self: *ArithParser, n: usize) u8 {
+        return if (self.pos + n < self.src.len) self.src[self.pos + n] else 0;
+    }
+
+    // level 2: ternary ?:
+    fn parseTernary(self: *ArithParser) Error!i64 {
+        const cond = try self.parseLogicalOr();
+        self.skipSpace();
+        if (self.peek() == '?') {
+            self.pos += 1;
+            const then_v = try self.parseAssign();
+            self.skipSpace();
+            if (self.peek() != ':') return error.SyntaxError;
+            self.pos += 1;
+            const else_v = try self.parseAssign();
+            return if (cond != 0) then_v else else_v;
+        }
+        return cond;
+    }
+
+    fn parseLogicalOr(self: *ArithParser) Error!i64 {
+        var v = try self.parseLogicalAnd();
+        while (self.eat("||")) {
+            const r = try self.parseLogicalAnd();
+            v = if (v != 0 or r != 0) 1 else 0;
+        }
+        return v;
+    }
+    fn parseLogicalAnd(self: *ArithParser) Error!i64 {
+        var v = try self.parseBitOr();
+        while (self.eat("&&")) {
+            const r = try self.parseBitOr();
+            v = if (v != 0 and r != 0) 1 else 0;
+        }
+        return v;
+    }
+    fn parseBitOr(self: *ArithParser) Error!i64 {
+        var v = try self.parseBitXor();
+        while (true) {
+            self.skipSpace();
+            if (self.peek() == '|' and self.peek2() != '|') {
+                self.pos += 1;
+                v |= try self.parseBitXor();
+            } else break;
+        }
+        return v;
+    }
+    fn parseBitXor(self: *ArithParser) Error!i64 {
+        var v = try self.parseBitAnd();
+        while (true) {
+            self.skipSpace();
+            if (self.peek() == '^') {
+                self.pos += 1;
+                v ^= try self.parseBitAnd();
+            } else break;
+        }
+        return v;
+    }
+    fn parseBitAnd(self: *ArithParser) Error!i64 {
+        var v = try self.parseEquality();
+        while (true) {
+            self.skipSpace();
+            if (self.peek() == '&' and self.peek2() != '&') {
+                self.pos += 1;
+                v &= try self.parseEquality();
+            } else break;
+        }
+        return v;
+    }
+    fn parseEquality(self: *ArithParser) Error!i64 {
+        var v = try self.parseRelational();
+        while (true) {
+            if (self.eat("==")) {
+                v = if (v == try self.parseRelational()) 1 else 0;
+            } else if (self.eat("!=")) {
+                v = if (v != try self.parseRelational()) 1 else 0;
+            } else break;
+        }
+        return v;
+    }
+    fn parseRelational(self: *ArithParser) Error!i64 {
+        var v = try self.parseShift();
+        while (true) {
+            if (self.eat("<=")) {
+                v = if (v <= try self.parseShift()) 1 else 0;
+            } else if (self.eat(">=")) {
+                v = if (v >= try self.parseShift()) 1 else 0;
+            } else if (self.peek() == '<' and self.peek2() != '<') {
+                self.pos += 1;
+                v = if (v < try self.parseShift()) 1 else 0;
+            } else if (self.peek() == '>' and self.peek2() != '>') {
+                self.pos += 1;
+                v = if (v > try self.parseShift()) 1 else 0;
+            } else break;
+        }
+        return v;
+    }
+    fn parseShift(self: *ArithParser) Error!i64 {
+        var v = try self.parseAdditive();
+        while (true) {
+            if (self.eat("<<")) {
+                const r = try self.parseAdditive();
+                v <<= @intCast(@as(u6, @truncate(@as(u64, @bitCast(r)))));
+            } else if (self.eat(">>")) {
+                const r = try self.parseAdditive();
+                v >>= @intCast(@as(u6, @truncate(@as(u64, @bitCast(r)))));
+            } else break;
+        }
+        return v;
+    }
+    fn parseAdditive(self: *ArithParser) Error!i64 {
+        var v = try self.parseMultiplicative();
+        while (true) {
+            self.skipSpace();
+            const c = self.peek();
+            if (c == '+' and self.peek2() != '+') {
+                self.pos += 1;
+                v +%= try self.parseMultiplicative();
+            } else if (c == '-' and self.peek2() != '-') {
+                self.pos += 1;
+                v -%= try self.parseMultiplicative();
+            } else break;
+        }
+        return v;
+    }
+    fn parseMultiplicative(self: *ArithParser) Error!i64 {
+        var v = try self.parsePower();
+        while (true) {
+            self.skipSpace();
+            const c = self.peek();
+            if (c == '*' and self.peek2() != '*') {
+                self.pos += 1;
+                v *%= try self.parsePower();
+            } else if (c == '/') {
+                self.pos += 1;
+                const r = try self.parsePower();
+                if (r == 0) return error.DivideByZero;
+                v = @divTrunc(v, r);
+            } else if (c == '%') {
+                self.pos += 1;
+                const r = try self.parsePower();
+                if (r == 0) return error.DivideByZero;
+                v = @rem(v, r);
+            } else break;
+        }
+        return v;
+    }
+    // exponentiation (right-assoc, higher than unary in bash)
+    fn parsePower(self: *ArithParser) Error!i64 {
+        const base = try self.parseUnary();
+        if (self.eat("**")) {
+            const exp = try self.parsePower();
+            return ipow(base, exp);
+        }
+        return base;
+    }
+    fn parseUnary(self: *ArithParser) Error!i64 {
+        self.skipSpace();
+        const c = self.peek();
+        if (c == '+' and self.peek2() != '+') {
+            self.pos += 1;
+            return self.parseUnary();
+        }
+        if (c == '-' and self.peek2() != '-') {
+            self.pos += 1;
+            return -%(try self.parseUnary());
+        }
+        if (c == '!') {
+            self.pos += 1;
+            return if ((try self.parseUnary()) == 0) 1 else 0;
+        }
+        if (c == '~') {
+            self.pos += 1;
+            return ~(try self.parseUnary());
+        }
+        // pre-increment / pre-decrement
+        if (c == '+' and self.peek2() == '+') {
+            self.pos += 2;
+            self.skipSpace();
+            const name = self.readIdent() orelse return error.SyntaxError;
+            const nv = self.readVar(name) +% 1;
+            try self.storeVar(name, nv);
+            return nv;
+        }
+        if (c == '-' and self.peek2() == '-') {
+            self.pos += 2;
+            self.skipSpace();
+            const name = self.readIdent() orelse return error.SyntaxError;
+            const nv = self.readVar(name) -% 1;
+            try self.storeVar(name, nv);
+            return nv;
+        }
+        return self.parsePrimary();
+    }
+    fn parsePrimary(self: *ArithParser) Error!i64 {
+        self.skipSpace();
+        const c = self.peek();
+        if (c == '(') {
+            self.pos += 1;
+            const v = try self.parseComma();
+            self.skipSpace();
+            if (self.peek() != ')') return error.SyntaxError;
+            self.pos += 1;
+            return v;
+        }
+        if (std.ascii.isDigit(c)) {
+            return self.parseNumber();
+        }
+        if (std.ascii.isAlphabetic(c) or c == '_') {
+            const name = self.readIdent() orelse return error.SyntaxError;
+            // post-increment / post-decrement
+            self.skipSpace();
+            if (self.peek() == '+' and self.peek2() == '+') {
+                self.pos += 2;
+                const old = self.readVar(name);
+                try self.storeVar(name, old +% 1);
+                return old;
+            }
+            if (self.peek() == '-' and self.peek2() == '-') {
+                self.pos += 2;
+                const old = self.readVar(name);
+                try self.storeVar(name, old -% 1);
+                return old;
+            }
+            return self.readVar(name);
+        }
+        return error.SyntaxError;
+    }
+
+    fn parseNumber(self: *ArithParser) Error!i64 {
+        const start = self.pos;
+        // hex / explicit octal 0x / 0 prefix
+        if (self.peek() == '0' and (self.peek2() == 'x' or self.peek2() == 'X')) {
+            self.pos += 2;
+            const ds = self.pos;
+            while (self.pos < self.src.len and std.ascii.isHex(self.src[self.pos])) self.pos += 1;
+            return std.fmt.parseInt(i64, self.src[ds..self.pos], 16) catch error.SyntaxError;
+        }
+        // read a run of alphanumerics (covers decimal, octal, and base#digits)
+        while (self.pos < self.src.len and (std.ascii.isAlphanumeric(self.src[self.pos]) or self.src[self.pos] == '#')) {
+            self.pos += 1;
+        }
+        const tok = self.src[start..self.pos];
+        if (std.mem.indexOfScalar(u8, tok, '#')) |h| {
+            const base = std.fmt.parseInt(u8, tok[0..h], 10) catch return error.SyntaxError;
+            if (base < 2 or base > 36) return error.SyntaxError;
+            return parseInBase(tok[h + 1 ..], base) catch error.SyntaxError;
+        }
+        if (tok.len > 1 and tok[0] == '0') {
+            return std.fmt.parseInt(i64, tok[1..], 8) catch error.SyntaxError;
+        }
+        return std.fmt.parseInt(i64, tok, 10) catch error.SyntaxError;
+    }
+
+    fn readIdent(self: *ArithParser) ?[]const u8 {
+        self.skipSpace();
+        const start = self.pos;
+        if (self.pos >= self.src.len) return null;
+        if (!(std.ascii.isAlphabetic(self.src[self.pos]) or self.src[self.pos] == '_')) return null;
+        self.pos += 1;
+        while (self.pos < self.src.len and (std.ascii.isAlphanumeric(self.src[self.pos]) or self.src[self.pos] == '_')) {
+            self.pos += 1;
+        }
+        return self.src[start..self.pos];
+    }
+
+    fn readVar(self: *ArithParser, name: []const u8) i64 {
+        const val = self.shell.variables.get(name) orelse
+            (compat.posix.getenv(name) orelse return 0);
+        // bash: variable value is itself an arithmetic expression
+        return self.shell.evaluateArithmetic(val) catch 0;
+    }
+
+    fn storeVar(self: *ArithParser, name: []const u8, value: i64) Error!void {
+        var buf: [24]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "{d}", .{value}) catch return;
+        if (self.shell.variables.getPtr(name)) |ptr| {
+            self.shell.allocator.free(ptr.*);
+            ptr.* = try self.shell.allocator.dupe(u8, s);
+        } else {
+            const nk = try self.shell.allocator.dupe(u8, name);
+            const nv = try self.shell.allocator.dupe(u8, s);
+            try self.shell.variables.put(nk, nv);
+        }
+    }
+};
+
+fn applyBinary(op: u8, a: i64, b: i64) ArithParser.Error!i64 {
+    return switch (op) {
+        '+' => a +% b,
+        '-' => a -% b,
+        '*' => a *% b,
+        '/' => if (b == 0) error.DivideByZero else @divTrunc(a, b),
+        '%' => if (b == 0) error.DivideByZero else @rem(a, b),
+        '&' => a & b,
+        '|' => a | b,
+        '^' => a ^ b,
+        else => error.SyntaxError,
     };
+}
+
+fn ipow(base: i64, exp: i64) i64 {
+    if (exp < 0) return 0; // integer arithmetic: negative exponent -> 0
+    var result: i64 = 1;
+    var b = base;
+    var e = exp;
+    while (e > 0) : (e >>= 1) {
+        if (e & 1 == 1) result *%= b;
+        b *%= b;
+    }
+    return result;
+}
+
+fn parseInBase(digits: []const u8, base: u8) !i64 {
+    var v: i64 = 0;
+    for (digits) |c| {
+        const d: i64 = switch (c) {
+            '0'...'9' => c - '0',
+            'a'...'z' => c - 'a' + 10,
+            'A'...'Z' => c - 'A' + 10,
+            '@' => 62,
+            '_' => 63,
+            else => return error.InvalidCharacter,
+        };
+        if (d >= base) return error.InvalidCharacter;
+        v = v * base + d;
+    }
+    return v;
 }
 
 fn executeCommandAndCapture(self: *Shell, command: []const u8) ![]const u8 {
@@ -3911,6 +4317,37 @@ const BRACE_MAX_RESULTS: u32 = 100000; // max total expansion results
 
 /// Expand brace patterns like {a,b,c} and {1..5}
 /// Returns array of expanded strings (caller owns memory)
+/// An endpoint is "zero-padded" (bash sense) when its digit part after an
+/// optional sign is >= 2 chars and starts with '0'.
+fn braceIsPadded(s: []const u8) bool {
+    var t = s;
+    if (t.len > 0 and (t[0] == '-' or t[0] == '+')) t = t[1..];
+    return t.len >= 2 and t[0] == '0';
+}
+
+/// bash pads a numeric range when either endpoint is zero-padded; the field
+/// width is the widest raw endpoint (sign included). Returns 0 for no padding.
+fn bracePadWidth(a: []const u8, b: []const u8) usize {
+    const a_pad = braceIsPadded(a);
+    const b_pad = braceIsPadded(b);
+    if (!a_pad and !b_pad) return 0;
+    return @max(a.len, b.len);
+}
+
+/// Format an integer into a field of `width` chars, zero-padded, with the sign
+/// occupying one slot inside the width (bash: -05, 000, 005 all width 3).
+fn formatPadded(buf: []u8, n: i64, width: usize) ![]const u8 {
+    if (width == 0) return std.fmt.bufPrint(buf, "{d}", .{n});
+    const neg = n < 0;
+    const mag: u64 = if (neg) @intCast(-n) else @intCast(n);
+    const digits = if (neg and width > 0) width - 1 else width;
+    if (neg) {
+        return std.fmt.bufPrint(buf, "-{d:0>[1]}", .{ mag, digits });
+    } else {
+        return std.fmt.bufPrint(buf, "{d:0>[1]}", .{ mag, digits });
+    }
+}
+
 pub fn expandBraces(allocator: std.mem.Allocator, input: []const u8) ![][]const u8 {
     return expandBracesWithDepth(allocator, input, 0);
 }
@@ -3975,46 +4412,81 @@ fn expandBracesWithDepth(allocator: std.mem.Allocator, input: []const u8, depth:
         expansions.deinit(allocator);
     }
 
-    // check for range pattern like 1..5 or a..z
+    // check for range pattern like {1..5}, {1..10..2}, {a..z}, {z..a..2}
     if (std.mem.indexOf(u8, brace_content, "..")) |range_pos| {
         const range_start_str = brace_content[0..range_pos];
-        const range_end_str = brace_content[range_pos + 2 ..];
+        const rest = brace_content[range_pos + 2 ..];
+
+        // optional step: second ".." splits end from step
+        var range_end_str = rest;
+        var step_str: ?[]const u8 = null;
+        if (std.mem.indexOf(u8, rest, "..")) |step_pos| {
+            range_end_str = rest[0..step_pos];
+            step_str = rest[step_pos + 2 ..];
+        }
 
         // try numeric range
-        if (std.fmt.parseInt(i32, range_start_str, 10)) |start_num| {
-            if (std.fmt.parseInt(i32, range_end_str, 10)) |end_num| {
-                // calculate range size and enforce limit
-                const range_size: u32 = @intCast(@abs(@as(i64, end_num) - @as(i64, start_num)) + 1);
+        if (std.fmt.parseInt(i64, range_start_str, 10)) |start_num| {
+            if (std.fmt.parseInt(i64, range_end_str, 10)) |end_num| {
+                // parse step magnitude (bash: sign of step is ignored, direction
+                // is derived from the endpoints). Default step is 1.
+                var step_mag: i64 = 1;
+                if (step_str) |ss| {
+                    if (std.fmt.parseInt(i64, ss, 10)) |sv| {
+                        step_mag = if (sv < 0) -sv else sv;
+                    } else |_| {}
+                }
+                if (step_mag == 0) step_mag = 1;
+
+                // zero-padding: bash pads output to the widest endpoint when
+                // either endpoint has a leading zero (after optional sign).
+                const pad_width = bracePadWidth(range_start_str, range_end_str);
+
+                const span: i64 = if (end_num >= start_num) end_num - start_num else start_num - end_num;
+                const range_size: u64 = @as(u64, @intCast(@divFloor(span, step_mag))) + 1;
                 if (range_size > BRACE_MAX_RANGE) {
-                    // range too large, treat as literal
                     const result = try allocator.alloc([]const u8, 1);
                     result[0] = try allocator.dupe(u8, input);
                     return result;
                 }
 
-                const step: i32 = if (start_num <= end_num) 1 else -1;
+                const step: i64 = if (start_num <= end_num) step_mag else -step_mag;
                 var n = start_num;
                 while (true) {
-                    var buf: [16]u8 = undefined;
-                    const num_str = std.fmt.bufPrint(&buf, "{d}", .{n}) catch break;
+                    var buf: [32]u8 = undefined;
+                    const num_str = formatPadded(&buf, n, pad_width) catch break;
                     try expansions.append(allocator, try allocator.dupe(u8, num_str));
-                    if (n == end_num) break;
+                    // stop once we would pass end_num (step may overshoot)
+                    if (step > 0) {
+                        if (n + step > end_num) break;
+                    } else {
+                        if (n + step < end_num) break;
+                    }
                     n += step;
                 }
             } else |_| {}
         } else |_| {
-            // try character range (always limited to 256 max)
+            // character range (single-char endpoints)
             if (range_start_str.len == 1 and range_end_str.len == 1) {
                 const start_char = range_start_str[0];
                 const end_char = range_end_str[0];
-                if (std.ascii.isAlphabetic(start_char) and std.ascii.isAlphabetic(end_char)) {
-                    const step: i8 = if (start_char <= end_char) 1 else -1;
-                    var c = start_char;
-                    while (true) {
-                        try expansions.append(allocator, try allocator.dupe(u8, &[_]u8{c}));
-                        if (c == end_char) break;
-                        c = @intCast(@as(i16, c) + step);
+                var step_mag: i32 = 1;
+                if (step_str) |ss| {
+                    if (std.fmt.parseInt(i32, ss, 10)) |sv| {
+                        step_mag = if (sv < 0) -sv else sv;
+                    } else |_| {}
+                }
+                if (step_mag == 0) step_mag = 1;
+                const step: i32 = if (start_char <= end_char) step_mag else -step_mag;
+                var c: i32 = start_char;
+                while (true) {
+                    try expansions.append(allocator, try allocator.dupe(u8, &[_]u8{@intCast(c)}));
+                    if (step > 0) {
+                        if (c + step > end_char) break;
+                    } else {
+                        if (c + step < end_char) break;
                     }
+                    c += step;
                 }
             }
         }

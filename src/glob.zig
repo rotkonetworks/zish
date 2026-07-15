@@ -55,9 +55,14 @@ fn expandSimpleGlob(allocator: std.mem.Allocator, pattern: []const u8) ![][]cons
     };
     defer dir.close(compat.io());
 
+    // A leading '.' in a filename is only matched when the pattern's first
+    // char is a literal '.' (POSIX: hidden files hidden from wildcards).
+    const pattern_matches_dot = file_pattern.len > 0 and file_pattern[0] == '.';
+
     // iterate and match
     var iter = dir.iterate();
     while (try iter.next(compat.io())) |entry| {
+        if (entry.name.len > 0 and entry.name[0] == '.' and !pattern_matches_dot) continue;
         if (matchGlob(file_pattern, entry.name)) {
             const full_path = if (std.mem.eql(u8, dir_path, "."))
                 try allocator.dupe(u8, entry.name)
