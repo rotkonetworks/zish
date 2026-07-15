@@ -1752,7 +1752,7 @@ pub fn evaluateAssignment(shell: *Shell, node: *const ast.AstNode) !u8 {
     }
 
     // fast path for pure arithmetic assignments like i=$((i+1))
-    if (value.len >= 5 and std.mem.startsWith(u8, value, "$((") and value[value.len - 2] == ')' and value[value.len - 1] == ')') {
+    if (!is_append and value.len >= 5 and std.mem.startsWith(u8, value, "$((") and value[value.len - 2] == ')' and value[value.len - 1] == ')') {
         const expr = value[3 .. value.len - 2];
         const arith_result = shell.evaluateArithmetic(expr) catch 0;
 
@@ -1783,11 +1783,19 @@ pub fn evaluateAssignment(shell: *Shell, node: *const ast.AstNode) !u8 {
     defer shell.allocator.free(expanded_value);
 
     if (shell.variables.getPtr(name)) |value_ptr| {
-        shell.allocator.free(value_ptr.*);
-        value_ptr.* = try shell.allocator.dupe(u8, expanded_value);
+        if (is_append) {
+            // x+=y : append to the existing value
+            const combined = try std.mem.concat(shell.allocator, u8, &.{ value_ptr.*, expanded_value });
+            shell.allocator.free(value_ptr.*);
+            value_ptr.* = combined;
+        } else {
+            shell.allocator.free(value_ptr.*);
+            value_ptr.* = try shell.allocator.dupe(u8, expanded_value);
+        }
         return 0;
     }
 
+    // appending to an unset variable is a plain assignment
     const name_copy = try shell.allocator.dupe(u8, name);
     const value_copy = try shell.allocator.dupe(u8, expanded_value);
     try shell.variables.put(name_copy, value_copy);

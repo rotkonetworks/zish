@@ -258,6 +258,27 @@ pub const Parser = struct {
         };
     }
 
+    // A leading word is a variable assignment only when the name left of '=' is a
+    // valid identifier ([A-Za-z_][A-Za-z0-9_]*), optionally with a '+' (append) or
+    // an array subscript name[..]. Otherwise it's an ordinary command word — e.g.
+    // `a-b=c cmd` runs the command `a-b=c`, it is not an assignment.
+    fn isAssignmentWord(text: []const u8) bool {
+        const eq = std.mem.indexOfScalar(u8, text, '=') orelse return false;
+        if (eq == 0) return false;
+        // strip a trailing '+' (the += append form)
+        var name_end = eq;
+        if (text[eq - 1] == '+') name_end -= 1;
+        // an array-subscript assignment ends the identifier at '['
+        var id_end = name_end;
+        if (std.mem.indexOfScalar(u8, text[0..name_end], '[')) |br| id_end = br;
+        if (id_end == 0) return false;
+        if (!(std.ascii.isAlphabetic(text[0]) or text[0] == '_')) return false;
+        for (text[1..id_end]) |c| {
+            if (!(std.ascii.isAlphanumeric(c) or c == '_')) return false;
+        }
+        return true;
+    }
+
     fn parsesimplecommand(self: *Self) parsererror!*const ast.AstNode {
         var words = try std.ArrayList(*const ast.AstNode).initCapacity(self.builder.arena.allocator(), 32);
 
@@ -290,7 +311,7 @@ pub const Parser = struct {
 
                     // Check if this word is an assignment (contains =)
                     // Only treat as assignment if no command words yet
-                    if (words.items.len == 0 and std.mem.indexOfScalar(u8, self.current_token.value, '=') != null) {
+                    if (words.items.len == 0 and isAssignmentWord(self.current_token.value)) {
                         const eq_pos = std.mem.indexOfScalar(u8, self.current_token.value, '=').?;
                         const token = self.current_token;
 
@@ -312,7 +333,7 @@ pub const Parser = struct {
                 .String, .DoubleQuotedString => {
                     // Check if this quoted token is an assignment (VAR="value")
                     // Only treat as assignment if no command words yet
-                    if (words.items.len == 0 and std.mem.indexOfScalar(u8, self.current_token.value, '=') != null) {
+                    if (words.items.len == 0 and isAssignmentWord(self.current_token.value)) {
                         const eq_pos = std.mem.indexOfScalar(u8, self.current_token.value, '=').?;
                         const token = self.current_token;
 
