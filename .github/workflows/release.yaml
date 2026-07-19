@@ -78,15 +78,27 @@ jobs:
       - name: checkout (for packaging/PKGBUILD)
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+      # Skip AUR publish (don't fail the release) when no deploy key is set —
+      # e.g. before a dedicated AUR-only key has been registered. Use a DEDICATED
+      # key, never a shared infra/ansible key: a CI compromise would expose it.
+      - name: guard on AUR_SSH_KEY
+        id: guard
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          if [ -z "${AUR_SSH_KEY:-}" ]; then
+            echo "::warning::AUR_SSH_KEY not set — skipping AUR publish (GitHub release still done)"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: configure ssh (pinned host keys, no TOFU)
+        if: steps.guard.outputs.skip == 'false'
         env:
           AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
         run: |
           set -euo pipefail
-          if [ -z "${AUR_SSH_KEY:-}" ]; then
-            echo "::error::secret AUR_SSH_KEY is not set — add the AUR deploy key to repo secrets"
-            exit 1
-          fi
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           # AUR host keys pinned from `ssh-keyscan aur.archlinux.org` (verify before trusting).
           cat > ~/.ssh/known_hosts <<'EOF'
@@ -105,6 +117,7 @@ jobs:
           chmod 600 ~/.ssh/config
 
       - name: build AUR commit and push
+        if: steps.guard.outputs.skip == 'false'
         run: |
           set -euo pipefail
           ver="${GITHUB_REF_NAME#v}"

@@ -22,10 +22,11 @@ build() {
     zig build --release=fast
 }
 
-check() {
-    cd "$pkgname-$pkgver"
-    zig build test
-}
+# No check(): `zig build test` builds the test exe in Debug (all modules +
+# debug info), which is heavy on RAM/disk; on a constrained builder Zig 0.16.0
+# can abort ungracefully mid-write ("DWARF TODO: 'DiskQuota' ...") instead of
+# reporting cleanly. Tests are run in CI (.github/workflows) with adequate
+# resources; packaging shouldn't gate a user's install on it.
 
 package() {
     cd "$pkgname-$pkgver"
