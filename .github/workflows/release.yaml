@@ -1,41 +1,133 @@
 name: release
 
+# Cut a release by pushing a tag:  git tag v0.14.0 && git push origin v0.14.0
+# The tag is the single source of truth. This workflow refuses to publish if
+# the tag and build.zig.zon disagree, if tests fail, or if any build fails —
+# then creates the GitHub release and updates the AUR package in lockstep so
+# the released artifact and the packaged source can never drift apart again.
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ['v*']
 
 permissions:
   contents: write
 
 jobs:
+  # ── Gate: tag == build.zig.zon version, and the tree passes tests ──────────
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: version consistency (tag == build.zig.zon)
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          zon="$(grep -oP '\.version\s*=\s*"\K[^"]+' build.zig.zon)"
+          echo "tag=$tag  build.zig.zon=$zon"
+          if [ "$tag" != "$zon" ]; then
+            echo "::error::tag v$tag does not match build.zig.zon version $zon — bump build.zig.zon before tagging"
+            exit 1
+          fi
+
+      - name: setup zig 0.16.0
+        uses: mlugg/setup-zig@7dccf5e6d09267c55f815f2db29495f30ba2ebca # v2.0.1
+        with:
+          version: 0.16.0
+
+      - name: test
+        run: zig build test
+
+  # ── Build per-arch binaries and attach them to the GitHub release ──────────
   build:
+    needs: verify
+    runs-on: ubuntu-latest
     strategy:
       matrix:
-        include:
-          - target: x86_64-linux
-            os: ubuntu-latest
-          - target: aarch64-linux
-            os: ubuntu-latest
-
-    runs-on: ${{ matrix.os }}
+        target: [x86_64-linux, aarch64-linux]
     steps:
-      - uses: actions/checkout@v4
+      - name: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: setup zig
-        uses: goto-bus-stop/setup-zig@v2
+      - name: setup zig 0.16.0
+        uses: mlugg/setup-zig@7dccf5e6d09267c55f815f2db29495f30ba2ebca # v2.0.1
         with:
-          version: 0.15.2
+          version: 0.16.0
 
       - name: build ${{ matrix.target }}
-        run: zig build --release=fast -Dtarget=${{ matrix.target }} -Dlto=false
+        run: |
+          zig build --release=fast -Dtarget=${{ matrix.target }} -Dlto=false
+          mv zig-out/bin/zish zig-out/bin/zish-${{ matrix.target }}
 
-      - name: rename binary
-        run: mv zig-out/bin/zish zig-out/bin/zish-${{ matrix.target }}
-
-      - name: release
-        uses: softprops/action-gh-release@v2
+      - name: attach to release
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
         with:
           files: zig-out/bin/zish-${{ matrix.target }}
+          fail_on_unmatched_files: true
+
+  # ── Publish to the AUR from the canonical in-repo PKGBUILD ─────────────────
+  aur:
+    needs: build
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel   # makepkg/updpkgsums need an Arch userland
+    steps:
+      - name: install tooling
+        run: pacman -Sy --noconfirm --needed git openssh pacman-contrib
+
+      - name: checkout (for packaging/PKGBUILD)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: configure ssh (pinned host keys, no TOFU)
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AUR_SSH_KEY:-}" ]; then
+            echo "::error::secret AUR_SSH_KEY is not set — add the AUR deploy key to repo secrets"
+            exit 1
+          fi
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          # AUR host keys pinned from `ssh-keyscan aur.archlinux.org` (verify before trusting).
+          cat > ~/.ssh/known_hosts <<'EOF'
+          aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN
+          aur.archlinux.org ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDKF9vAFWdgm9Bi8uc+tYRBmXASBb5cB5iZsB7LOWWFeBrLp3r14w0/9S2vozjgqY5sJLDPONWoTTaVTbhe3vwO8CBKZTEt1AcWxuXNlRnk9FliR1/eNB9uz/7y1R0+c1Md+P98AJJSJWKN12nqIDIhjl2S1vOUvm7FNY43fU2knIhEbHybhwWeg+0wxpKwcAd/JeL5i92Uv03MYftOToUijd1pqyVFdJvQFhqD4v3M157jxS5FTOBrccAEjT+zYmFyD8WvKUa9vUclRddNllmBJdy4NyLB8SvVZULUPrP3QOlmzemeKracTlVOUG1wsDbxknF1BwSCU7CmU6UFP90kpWIyz66bP0bl67QAvlIc52Yix7pKJPbw85+zykvnfl2mdROsaT8p8R9nwCdFsBc9IiD0NhPEHcyHRwB8fokXTajk2QnGhL+zP5KnkmXnyQYOCUYo3EKMXIlVOVbPDgRYYT/XqvBuzq5S9rrU70KoI/S5lDnFfx/+lPLdtcnnEPk=
+          EOF
+          chmod 600 ~/.ssh/known_hosts
+          printf '%s\n' "$AUR_SSH_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          cat > ~/.ssh/config <<'EOF'
+          Host aur.archlinux.org
+            User aur
+            IdentityFile ~/.ssh/aur
+            IdentitiesOnly yes
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: build AUR commit and push
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+
+          # makepkg/updpkgsums refuse to run as root — use an unprivileged user.
+          useradd -m builder
+          git config --global --add safe.directory '*'
+
+          git clone ssh://aur@aur.archlinux.org/zish.git /tmp/aur
+          cp packaging/PKGBUILD /tmp/aur/PKGBUILD
+          sed -i "s/^pkgver=.*/pkgver=${ver}/" /tmp/aur/PKGBUILD
+
+          chown -R builder:builder /tmp/aur
+          # updpkgsums downloads the real GitHub tarball for v$ver and rewrites
+          # sha256sums; makepkg --printsrcinfo regenerates .SRCINFO. Both as builder.
+          su builder -c 'cd /tmp/aur && updpkgsums && makepkg --printsrcinfo > .SRCINFO'
+
+          cd /tmp/aur
+          git config user.name  'Rotko Networks'
+          git config user.email 'hq@rotko.net'
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "AUR already up to date for $ver — nothing to push"
+            exit 0
+          fi
+          git commit -am "release $ver"
+          git push origin master

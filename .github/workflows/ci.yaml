@@ -1,0 +1,38 @@
+name: ci
+
+# Build + test on every push/PR to main so main is always known-good against
+# the exact Zig the release uses. This is the guard that was missing when a
+# tag built fine on 0.15 but the code had moved to a 0.16-only build.zig.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Least privilege: CI only reads the tree.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      # Actions pinned to full commit SHAs (supply-chain: mutable tags can move).
+      - name: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: setup zig 0.16.0
+        uses: mlugg/setup-zig@7dccf5e6d09267c55f815f2db29495f30ba2ebca # v2.0.1
+        with:
+          version: 0.16.0
+
+      # LTO off in CI for speed; -Doptimize path exercised the same as release.
+      - name: build (release)
+        run: zig build --release=fast -Dlto=false
+
+      - name: test
+        run: zig build test
