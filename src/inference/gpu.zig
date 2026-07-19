@@ -365,9 +365,11 @@ pub const GpuContext = struct {
         self.lib = std.c.dlopen("libvulkan.so.1", .{ .LAZY = true }) orelse
             std.c.dlopen("libvulkan.so", .{ .LAZY = true }) orelse return null;
 
-        const getAddr: PFN_vkGetInstanceProcAddr = @ptrCast(
+        // dlsym returns *anyopaque (alignment 1); function pointers are aligned,
+        // so assert it. @ptrCast alone fails the alignment check on aarch64.
+        const getAddr: PFN_vkGetInstanceProcAddr = @ptrCast(@alignCast(
             std.c.dlsym(self.lib.?, "vkGetInstanceProcAddr") orelse return null,
-        );
+        ));
 
         self.vk.createInstance = @ptrCast(getAddr(null, "vkCreateInstance") orelse return null);
 
