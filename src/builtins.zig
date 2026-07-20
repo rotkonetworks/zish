@@ -384,26 +384,36 @@ fn printf(shell: *Shell, args: []const []const u8) !u8 {
     var arg_idx: usize = 2;
     const writer = shell.stdout();
 
-    var i: usize = 0;
-    while (i < format.len) {
-        if (format[i] == '\\' and i + 1 < format.len) {
-            const escaped = printfParseEscape(format[i + 1 ..]);
-            try writer.writeByte(escaped.char);
-            i += 1 + escaped.len;
-        } else if (format[i] == '%') {
-            const spec = printfParseSpec(format[i..]);
-            if (spec.specifier == '%') {
-                try writer.writeByte('%');
+    // POSIX: the format is reused as often as necessary to consume all the
+    // arguments (`printf '%s\n' a b c` prints three lines). Repeat until every
+    // argument is consumed; break if a whole pass consumes no argument (the
+    // format has no conversions) so a format like "hi\n" prints exactly once
+    // instead of looping forever.
+    while (true) {
+        const pass_start = arg_idx;
+        var i: usize = 0;
+        while (i < format.len) {
+            if (format[i] == '\\' and i + 1 < format.len) {
+                const escaped = printfParseEscape(format[i + 1 ..]);
+                try writer.writeByte(escaped.char);
+                i += 1 + escaped.len;
+            } else if (format[i] == '%') {
+                const spec = printfParseSpec(format[i..]);
+                if (spec.specifier == '%') {
+                    try writer.writeByte('%');
+                } else {
+                    const arg = if (arg_idx < args.len) args[arg_idx] else "";
+                    if (arg_idx < args.len) arg_idx += 1;
+                    try printfFormatArg(writer, spec, arg);
+                }
+                i += spec.len;
             } else {
-                const arg = if (arg_idx < args.len) args[arg_idx] else "";
-                if (arg_idx < args.len) arg_idx += 1;
-                try printfFormatArg(writer, spec, arg);
+                try writer.writeByte(format[i]);
+                i += 1;
             }
-            i += spec.len;
-        } else {
-            try writer.writeByte(format[i]);
-            i += 1;
         }
+        if (arg_idx >= args.len) break; // all arguments consumed
+        if (arg_idx == pass_start) break; // format has no conversions — avoid infinite loop
     }
     return 0;
 }
