@@ -1405,6 +1405,24 @@ fn handleAction(self: *Shell, action: Action) !void {
         .exit_search_mode => |execute| {
             self.search_mode = false;
 
+            // The search UI ["(reverse-i-search): ..."] is drawn with raw stdout
+            // writes that never update the TermView hash, so renderLine()'s
+            // skip-guard can early-return and leave that text on screen when the
+            // edit buffer is unchanged (e.g. Ctrl+R then Esc with no typing).
+            // Force a full repaint, as the .vim_mode handler does.
+            self.term_view.last_hash = 0xDEADBEEF;
+
+            // Esc cancelled the search: land in vi normal mode so the cursor
+            // and subsequent keys behave as expected (i → insert). Without this
+            // the user stays in whatever mode Ctrl+R was entered from and the
+            // block-cursor / mode is inconsistent.
+            if (!execute) {
+                self.vim_mode = .normal;
+                self.vi.mode = .normal;
+                self.paste_mode = false;
+                self.setCursorStyle(.block) catch {};
+            }
+
             if (execute and self.search_len > 0 and self.history != null) {
                 const search_term = self.search_buffer[0..self.search_len];
                 const matches = self.history.?.fuzzySearch(search_term, self.allocator) catch {
@@ -2321,6 +2339,12 @@ fn escapeSequenceAction(self: *Shell) !Action {
     // Try to read - if nothing there (EAGAIN), it's just ESC
     const result = std.posix.system.read(stdin_fd, &temp_buf, temp_buf.len);
     if (result <= 0) {
+        // Bare Esc. In reverse-i-search this MUST cancel the search — the
+        // search_mode check in readNextAction sits after the \x1b interception,
+        // so getSearchModeAction never sees Esc. Returning set_mode=.normal here
+        // would flip vim_mode while leaving search_mode set, and every following
+        // key would still route to the search handler (stuck-in-search loop).
+        if (self.search_mode) return .{ .exit_search_mode = false };
         return .{ .vim_mode = .{ .set_mode = .normal } };
     }
     const bytes_read: usize = @intCast(result);
@@ -2328,12 +2352,16 @@ fn escapeSequenceAction(self: *Shell) !Action {
     if (temp_buf[0] != '[') {
         // Alt+key: look up in keybindings table
         if (self.keybindings.lookupAlt(temp_buf[0])) |action| return action;
+        if (self.search_mode) return .{ .exit_search_mode = false };
         return .{ .vim_mode = .{ .set_mode = .normal } };
     }
 
     // Need at least 2 bytes for a valid escape sequence
     // If incomplete, treat as just ESC (vim normal mode)
-    if (bytes_read < 2) return .{ .vim_mode = .{ .set_mode = .normal } };
+    if (bytes_read < 2) {
+        if (self.search_mode) return .{ .exit_search_mode = false };
+        return .{ .vim_mode = .{ .set_mode = .normal } };
+    }
 
     const cmd_byte = temp_buf[1];
 
