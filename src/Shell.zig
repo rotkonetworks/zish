@@ -2240,7 +2240,10 @@ fn readNextAction(self: *Shell) !Action {
         if (char == '\n' or char == '\r') {
             return .{ .input_char = '\n' };
         }
-        if (char >= 32 and char <= 126) {
+        // Printable ASCII or any UTF-8 byte (>= 0x80). Dropping non-ASCII here
+        // is why pasted commands with accents / CJK / a stray non-breaking space
+        // or em-dash from a web page get silently corrupted.
+        if ((char >= 32 and char <= 126) or char >= 0x80) {
             return .{ .input_char = char };
         }
         return .none;
@@ -2264,6 +2267,8 @@ fn resolveInsertAction(self: *Shell, char: u8) Action {
         '\t' => .tap_complete, // Tab (ctrl+i)
         0x08, 127 => .backspace, // Backspace (ctrl+h / DEL)
         32...126 => .{ .input_char = char },
+        // UTF-8 lead/continuation bytes — insert so accents/CJK/emoji work.
+        0x80...0xFF => .{ .input_char = char },
         // Ctrl keys — look up in configurable keybindings table
         0x01...0x07, 0x0B...0x0C, 0x0E...0x1A => self.keybindings.lookupCtrl(char) orelse .none,
         else => .none,
