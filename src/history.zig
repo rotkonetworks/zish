@@ -107,6 +107,18 @@ pub const History = struct {
         self.allocator.destroy(self);
     }
 
+    /// Ensure the string pool has room for `needed` more bytes, growing it if
+    /// necessary. Commands are referenced by offset (see getCommand), so a
+    /// realloc that moves the buffer keeps every stored entry valid. This
+    /// replaces the old fixed-256KB pool that returned StringPoolFull once full
+    /// — which silently froze history (new + cross-session commands dropped).
+    fn ensurePoolSpace(self: *Self, needed: usize) !void {
+        if (self.string_pool_used + needed <= self.string_pool.len) return;
+        var new_size = self.string_pool.len;
+        while (self.string_pool_used + needed > new_size) new_size *|= 2;
+        self.string_pool = try self.allocator.realloc(self.string_pool, new_size);
+    }
+
     pub fn addCommand(self: *Self, command: []const u8, exit_code: u8) !void {
         // Security: Input validation
         if (command.len == 0) return;
@@ -152,11 +164,8 @@ pub const History = struct {
             try self.evictOldestEntry();
         }
 
-        // Check if we have space in string pool
-        if (self.string_pool_used + command.len > self.string_pool.len) {
-            // String pool full - compact or error
-            return error.StringPoolFull;
-        }
+        // Grow the string pool if needed (offsets survive realloc).
+        try self.ensurePoolSpace(command.len);
 
         // Store command in string pool for cache efficiency
         const command_offset: u32 = @intCast(self.string_pool_used);
@@ -200,8 +209,13 @@ pub const History = struct {
         try self.log_writer.append(log_entry);
         self.dirty = false; // just saved
 
-        // track our own writes so sync() skips them
-        self.log_offset = self.getLogFileSize();
+        // Do NOT advance log_offset here. Setting it to the current file size
+        // skips not only our own entry but any commands OTHER shells appended
+        // since our last sync() — so a long-running window permanently loses
+        // what was typed in other windows (broken shared history). sync() reads
+        // from log_offset and mergeEntry dedups our own entry by hash, so
+        // leaving the offset put lets the next sync() re-read from there and
+        // pick up every session's writes; it advances log_offset itself.
     }
 
     /// import new entries written by other sessions since last read
@@ -235,9 +249,12 @@ pub const History = struct {
     fn isCommandSafe(command: []const u8) bool {
         for (command) |c| {
             switch (c) {
-                // Allow printable ASCII, tab, and newline
-                32...126, '\t', '\n' => {},
-                else => return false, // Reject control characters
+                // Printable ASCII, tab, newline, and UTF-8 bytes (>= 0x80).
+                // Only C0 control characters are rejected (escape-injection
+                // into the history display); accented/CJK/emoji commands are
+                // valid and must be recorded now that UTF-8 input is accepted.
+                32...126, '\t', '\n', 0x80...0xFF => {},
+                else => return false, // reject control characters
             }
         }
         return true;
@@ -554,10 +571,8 @@ pub const History = struct {
             memory_entry.flags |= disk_entry.flags;
             memory_entry.exit_code = disk_entry.exit_code;
         } else {
-            // add new entry from disk
-            if (self.string_pool_used + disk_entry.command.len > self.string_pool.len) {
-                return error.StringPoolFull;
-            }
+            // add new entry from disk (grow the pool if needed)
+            try self.ensurePoolSpace(disk_entry.command.len);
 
             const command_offset: u32 = @intCast(self.string_pool_used);
             @memcpy(
