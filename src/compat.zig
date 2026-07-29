@@ -437,9 +437,12 @@ pub const posix = struct {
             switch (errno(rc)) {
                 .SUCCESS => return .{ .pid = @intCast(rc), .status = @bitCast(status) },
                 .INTR => continue,
-                .CHILD => unreachable, // race condition
-                .INVAL => unreachable, // invalid flags
-                else => unreachable,
+                // No (more) children. Callers signal this via pid <= 0 (e.g. the
+                // `wait` builtin's reap loop); crashing here aborted the whole
+                // shell on `sleep 0.1 & wait`.
+                .CHILD => return .{ .pid = -1, .status = 0 },
+                .INVAL => unreachable, // invalid flags (we only pass 0 / NOHANG)
+                else => return .{ .pid = -1, .status = 0 },
             }
         }
     }
