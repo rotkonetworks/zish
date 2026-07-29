@@ -71,6 +71,8 @@ pub fn main(init: std.process.Init) void {
                 shell_instance.variables.put(key_copy, val_copy) catch {};
             }
         }
+        // $# = count of $1..$n ($0 excluded). Without this $#/$@/$* were empty.
+        setPositionalCount(shell_instance, allocator, res.positionals);
 
         const exit_code = shell_instance.executeCommand(command) catch |err| {
             std.debug.print("zish: error executing command: {}\n", .{err});
@@ -95,6 +97,8 @@ pub fn main(init: std.process.Init) void {
                 shell_instance.variables.put(key_copy, val_copy) catch {};
             }
         }
+        // $# = count of $1..$n ($0/script name excluded).
+        setPositionalCount(shell_instance, allocator, res.positionals);
 
         const script_content = std.Io.Dir.cwd().readFileAlloc(compat.io(), script_path, allocator, .limited(1024 * 1024)) catch |err| {
             std.debug.print("zish: cannot read script '{s}': {}\n", .{ script_path, err });
@@ -116,6 +120,27 @@ pub fn main(init: std.process.Init) void {
             std.process.exit(1);
         };
     }
+}
+
+// Set $# to the number of positional parameters ($1..$n). The loops above key
+// arguments as $0 (command/script name), $1, $2, … so the count is the total
+// number of arguments minus one. Without $#, $@/$*/$# and `for a in "$@"` were
+// all empty in -c and script modes.
+fn setPositionalCount(shell: *Shell, allocator: std.mem.Allocator, positionals: anytype) void {
+    var total: usize = 0;
+    inline for (positionals) |ps| total += ps.len;
+    const n = if (total > 0) total - 1 else 0;
+    var buf: [16]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{d}", .{n}) catch return;
+    const key = allocator.dupe(u8, "#") catch return;
+    const val = allocator.dupe(u8, s) catch {
+        allocator.free(key);
+        return;
+    };
+    shell.variables.put(key, val) catch {
+        allocator.free(key);
+        allocator.free(val);
+    };
 }
 
 const params = clap.parseParamsComptime(
