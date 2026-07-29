@@ -241,6 +241,7 @@ clipboard: []u8,
 clipboard_len: usize = 0,
 // search state
 search_mode: bool = false,
+in_prompt_command: bool = false, // re-entrancy guard for $PROMPT_COMMAND
 search_buffer: []u8,
 search_len: usize = 0,
 // which match to show (0 = most recent); Ctrl+R steps to older matches
@@ -841,6 +842,7 @@ pub fn run(self: *Shell) !void {
         }
     }
 
+    self.runPromptCommand();
     try self.renderLine();
 
     var last_action: Action = .none;
@@ -1472,6 +1474,7 @@ fn handleAction(self: *Shell, action: Action) !void {
                 if (self.running) {
                     // sync history from other sessions before next prompt
                     if (self.history) |h| h.sync();
+                    self.runPromptCommand();
                     try self.renderLine();
                 }
             }
@@ -2950,6 +2953,27 @@ pub fn executeCommand(self: *Shell, command: []const u8) !u8 {
     const exit_code = try self.executeCommandInternal(processed);
     self.last_exit_code = exit_code;
     return exit_code;
+}
+
+/// Run $PROMPT_COMMAND (if set) just before displaying an interactive prompt,
+/// matching bash. $? is preserved across its execution.
+fn runPromptCommand(self: *Shell) void {
+    const pc = self.variables.get("PROMPT_COMMAND") orelse (posix.getenv("PROMPT_COMMAND") orelse return);
+    if (pc.len == 0) return;
+    // guard against re-entrancy (a PROMPT_COMMAND that itself triggers a prompt)
+    if (self.in_prompt_command) return;
+    self.in_prompt_command = true;
+    defer self.in_prompt_command = false;
+    // dupe: executing the command can mutate `variables` and reallocate the
+    // hashmap, invalidating the pc slice.
+    const cmd = self.allocator.dupe(u8, pc) catch return;
+    const saved = self.last_exit_code;
+    _ = self.executeCommand(cmd) catch {};
+    self.allocator.free(cmd);
+    self.last_exit_code = saved;
+    // Flush its output so it lands before the prompt (drawn to stderr), matching
+    // bash where PROMPT_COMMAND output precedes the prompt line.
+    self.stdout().flush() catch {};
 }
 
 /// Execute a trap handler for a signal
