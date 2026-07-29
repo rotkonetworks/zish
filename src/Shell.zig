@@ -161,6 +161,9 @@ const Colors = struct {
     const insert_mode = tty.Color.yellow;
 };
 
+// One shadowed variable saved by `local` (see local_scopes field below).
+pub const SavedLocal = struct { name: []u8, existed: bool, value: []u8 };
+
 pub const GhostState = struct {
     enabled: bool = true,
     buf: [512]u8 = undefined,
@@ -197,6 +200,12 @@ functions: std.StringHashMap(*const ast.AstNode), // name -> body AST
 traps: TrapTable = .{}, // signal handlers
 last_exit_code: u8 = 0,
 last_bg_pid: compat.posix.pid_t = 0, // PID of the most recent background command ($!)
+
+// local-variable scoping. Each active function call pushes a frame; `local x`
+// records x's prior state into the top frame, and callFunction restores every
+// recorded var when the function returns. Managed by eval.pushLocalScope /
+// popLocalScope / declareLocal.
+local_scopes: std.ArrayList(std.ArrayList(SavedLocal)) = .empty,
 
 // shell options (set -e, -u, -x, -o pipefail)
 opt_errexit: bool = false, // -e: exit on error

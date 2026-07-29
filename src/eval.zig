@@ -2863,6 +2863,51 @@ fn serializeTestInner(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged
     }
 }
 
+// --- local variable scoping ------------------------------------------------
+
+// Begin a new local scope (one per function call).
+pub fn pushLocalScope(shell: *Shell) !void {
+    try shell.local_scopes.append(shell.allocator, .empty);
+}
+
+// End the current local scope, restoring every variable that `local` shadowed.
+pub fn popLocalScope(shell: *Shell) void {
+    var frame = shell.local_scopes.pop() orelse return;
+    // Restore in reverse declaration order.
+    var i = frame.items.len;
+    while (i > 0) {
+        i -= 1;
+        const sv = frame.items[i];
+        if (sv.existed) {
+            setShellVar(shell, sv.name, sv.value) catch {};
+        } else if (shell.variables.fetchRemove(sv.name)) |kv| {
+            shell.allocator.free(kv.key);
+            shell.allocator.free(kv.value);
+        }
+        shell.allocator.free(sv.name);
+        shell.allocator.free(sv.value);
+    }
+    frame.deinit(shell.allocator);
+}
+
+// Mark `name` as local to the current function call, saving its prior state so
+// popLocalScope can restore it. No-op (returns false) outside any function.
+pub fn declareLocal(shell: *Shell, name: []const u8) !bool {
+    if (shell.local_scopes.items.len == 0) return false;
+    const frame = &shell.local_scopes.items[shell.local_scopes.items.len - 1];
+    // Only the first `local x` in a frame records the caller's value.
+    for (frame.items) |sv| {
+        if (std.mem.eql(u8, sv.name, name)) return true;
+    }
+    const existed = shell.variables.get(name);
+    try frame.append(shell.allocator, .{
+        .name = try shell.allocator.dupe(u8, name),
+        .existed = existed != null,
+        .value = try shell.allocator.dupe(u8, existed orelse ""),
+    });
+    return true;
+}
+
 // Number of positional parameters ($#), 0 if unset.
 fn positionalCount(shell: *Shell) usize {
     const c = shell.variables.get("#") orelse return 0;
@@ -2928,6 +2973,10 @@ pub fn callFunction(shell: *Shell, name: []const u8, args: []const []const u8) !
     // Install the function's arguments as $1..$n and $#.
     clearPositionals(shell);
     try setPositionals(shell, args);
+
+    // Give the body its own local-variable scope (restored on return).
+    try pushLocalScope(shell);
+    defer popLocalScope(shell);
 
     const result = evaluateAst(shell, body);
 

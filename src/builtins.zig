@@ -899,13 +899,20 @@ fn unset(shell: *Shell, args: []const []const u8) !u8 {
 }
 
 fn local(shell: *Shell, args: []const []const u8) !u8 {
+    const eval_mod = @import("eval.zig");
     for (args[1..]) |arg| {
+        const name = if (std.mem.indexOfScalar(u8, arg, '=')) |eq_pos|
+            arg[0..eq_pos]
+        else
+            arg;
+        // Register the variable as local to the current function call so its
+        // prior (global) value is restored on return. Outside a function this
+        // returns false and `local` degrades to a plain assignment.
+        _ = try eval_mod.declareLocal(shell, name);
         if (std.mem.indexOfScalar(u8, arg, '=')) |eq_pos| {
-            const name = arg[0..eq_pos];
-            const value = arg[eq_pos + 1 ..];
-            try setVar(shell, name, value);
+            try setVar(shell, name, arg[eq_pos + 1 ..]);
         } else {
-            try setVar(shell, arg, "");
+            try setVar(shell, name, "");
         }
     }
     return 0;
