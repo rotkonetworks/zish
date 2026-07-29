@@ -1374,19 +1374,36 @@ fn execSimpleCommand(shell: *Shell, node: *const ast.AstNode) void {
     var argv_buf: [256]?[*:0]const u8 = undefined;
     var arg_count: usize = 0;
 
+    // AST node values (and lookupCommand results) are plain []const u8 — NOT
+    // null-terminated. Passing their .ptr straight to execvpeZ reads past the
+    // slice into whatever bytes follow in memory, so argv[0] becomes e.g.
+    // "/tmp/x.sh\4&\220" and exec fails with 127. Whether the trailing byte
+    // happens to be \0 depends on adjacent memory (what the previous pipeline
+    // stage left behind), which is why the failure looked left-command
+    // dependent. Copy every argument into a local buffer with a real \0.
+    var str_buf: [16384]u8 = undefined;
+    var str_pos: usize = 0;
+    const addZ = struct {
+        fn f(buf: []u8, pos: *usize, s: []const u8) ?[*:0]const u8 {
+            if (pos.* + s.len + 1 > buf.len) return null;
+            @memcpy(buf[pos.*..][0..s.len], s);
+            buf[pos.* + s.len] = 0;
+            const p: [*:0]const u8 = @ptrCast(buf[pos.*..].ptr);
+            pos.* += s.len + 1;
+            return p;
+        }
+    }.f;
+
     // First arg might need path lookup
     const cmd_name = node.children[0].value;
-    if (shell.lookupCommand(cmd_name)) |full_path| {
-        argv_buf[0] = @ptrCast(full_path.ptr);
-    } else {
-        argv_buf[0] = @ptrCast(cmd_name.ptr);
-    }
+    const path = if (shell.lookupCommand(cmd_name)) |full_path| full_path else cmd_name;
+    argv_buf[0] = addZ(&str_buf, &str_pos, path) orelse compat.posix.exit(127);
     arg_count = 1;
 
     // Rest of args as-is
     for (node.children[1..]) |child| {
         if (arg_count >= 255) break;
-        argv_buf[arg_count] = @ptrCast(child.value.ptr);
+        argv_buf[arg_count] = addZ(&str_buf, &str_pos, child.value) orelse break;
         arg_count += 1;
     }
     argv_buf[arg_count] = null;
