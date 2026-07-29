@@ -33,7 +33,7 @@ pub fn isBuiltin(name: []const u8) bool {
         // directory
         "cd", "pwd", "pushd", "popd", "dirs", "..", "...", "-",
         // io
-        "echo", "printf", "read",
+        "echo", "printf", "read", "mapfile", "readarray",
         // test
         "test", "[",
         // variables
@@ -83,6 +83,7 @@ pub fn dispatch(shell: *Shell, cmd_name: []const u8, args: []const []const u8) !
     if (std.mem.eql(u8, cmd_name, "echo")) return try echo(shell, args);
     if (std.mem.eql(u8, cmd_name, "printf")) return try printf(shell, args);
     if (std.mem.eql(u8, cmd_name, "read")) return try read(shell, args);
+    if (std.mem.eql(u8, cmd_name, "mapfile") or std.mem.eql(u8, cmd_name, "readarray")) return try mapfile(shell, args);
 
     // test builtin
     if (std.mem.eql(u8, cmd_name, "test") or std.mem.eql(u8, cmd_name, "[")) return try testCmd(shell, args);
@@ -799,6 +800,110 @@ fn read(shell: *Shell, args: []const []const u8) !u8 {
 
     // bash/POSIX: read fails (non-zero) when EOF is reached and no data was read.
     return if (hit_eof and pos == 0) 1 else 0;
+}
+
+// mapfile / readarray — read lines of stdin into an array variable.
+// Supports: -t (strip trailing newline), -n count, -s skip, -O origin,
+// -d delim (line delimiter). Default array name is MAPFILE.
+fn mapfile(shell: *Shell, args: []const []const u8) !u8 {
+    var strip = false; // -t
+    var max_count: usize = 0; // -n (0 = all)
+    var skip: usize = 0; // -s
+    var origin: ?usize = null; // -O (null = clear + start at 0)
+    var delim: u8 = '\n'; // -d
+    var name: []const u8 = "MAPFILE";
+
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (arg.len == 0 or arg[0] != '-' or std.mem.eql(u8, arg, "-")) break;
+        if (std.mem.eql(u8, arg, "--")) {
+            i += 1;
+            break;
+        }
+        if (std.mem.eql(u8, arg, "-t")) {
+            strip = true;
+        } else if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "-c")) {
+            i += 1;
+            if (i >= args.len) return 1;
+            max_count = std.fmt.parseInt(usize, args[i], 10) catch return 1;
+        } else if (std.mem.eql(u8, arg, "-s")) {
+            i += 1;
+            if (i >= args.len) return 1;
+            skip = std.fmt.parseInt(usize, args[i], 10) catch return 1;
+        } else if (std.mem.eql(u8, arg, "-O")) {
+            i += 1;
+            if (i >= args.len) return 1;
+            origin = std.fmt.parseInt(usize, args[i], 10) catch return 1;
+        } else if (std.mem.eql(u8, arg, "-d")) {
+            i += 1;
+            if (i >= args.len) return 1;
+            delim = if (args[i].len > 0) args[i][0] else 0;
+        } else if (std.mem.startsWith(u8, arg, "-") and (std.mem.indexOfScalar(u8, "utnc", arg[1]) != null)) {
+            // ignore unsupported flags that take no arg (e.g. -u fd handled loosely)
+        } else {
+            break;
+        }
+    }
+
+    if (i < args.len) name = args[i];
+
+    // Collect lines (each retains its trailing delimiter, like bash).
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (lines.items) |l| shell.allocator.free(l);
+        lines.deinit(shell.allocator);
+    }
+
+    const stdin_fd = compat.posix.STDIN_FILENO;
+    var cur: std.ArrayList(u8) = .empty;
+    defer cur.deinit(shell.allocator);
+
+    var skipped: usize = 0;
+    var kept: usize = 0;
+    read_loop: while (true) {
+        if (max_count != 0 and kept >= max_count) break;
+        var c: [1]u8 = undefined;
+        const n = compat.posix.read(stdin_fd, &c) catch break;
+        if (n == 0) {
+            // flush any trailing partial line (no delimiter at EOF)
+            if (cur.items.len > 0) {
+                if (skipped < skip) {
+                    skipped += 1;
+                } else {
+                    try lines.append(shell.allocator, try shell.allocator.dupe(u8, cur.items));
+                    kept += 1;
+                }
+                cur.clearRetainingCapacity();
+            }
+            break;
+        }
+        try cur.append(shell.allocator, c[0]);
+        if (c[0] == delim) {
+            if (skipped < skip) {
+                skipped += 1;
+            } else {
+                var line = cur.items;
+                if (strip and line.len > 0 and line[line.len - 1] == delim) {
+                    line = line[0 .. line.len - 1];
+                }
+                try lines.append(shell.allocator, try shell.allocator.dupe(u8, line));
+                kept += 1;
+            }
+            cur.clearRetainingCapacity();
+            if (max_count != 0 and kept >= max_count) break :read_loop;
+        }
+    }
+
+    if (origin) |o| {
+        // -O: assign starting at index origin, keeping existing elements.
+        for (lines.items, 0..) |line, idx| {
+            try shell.setArrayElement(name, o + idx, line);
+        }
+    } else {
+        try shell.setArray(name, lines.items);
+    }
+    return 0;
 }
 
 fn isIfsWhitespace(c: u8) bool {

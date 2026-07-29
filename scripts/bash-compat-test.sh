@@ -173,5 +173,16 @@ t 'hd cmdsubst'      $'cat <<C\n$(echo sub)\nC'
 t 'hd loop reexpand' $'for x in a b c; do cat <<E\nitem $x\nE\ndone'
 t 'hd prior cmd'     $'printf "%s\\n" pre; cat <<C\nmid tag\nC'
 
+# --- mapfile / readarray ---
+ti 'mapfile basic'   'a\nb\nc\n'    'mapfile -t arr; echo "${#arr[@]} [${arr[1]}]"'
+ti 'mapfile no-nl'   'a\nb\nc'      'mapfile -t arr; echo "${#arr[@]}:${arr[*]}"'
+ti 'mapfile keepnl'  'a\nb\n'       'mapfile arr; echo "${#arr[@]}:${arr[0]}${arr[1]}"'
+ti 'mapfile -n2'     'a\nb\nc\nd\n' 'mapfile -t -n 2 arr; echo "${#arr[@]}:${arr[*]}"'
+ti 'mapfile -s1'     'a\nb\nc\nd\n' 'mapfile -t -s 1 arr; echo "${#arr[@]}:${arr[*]}"'
+ti 'mapfile default' 'p\nq\n'       'mapfile -t; echo "${MAPFILE[*]}"'
+ti 'readarray'       'a\nb\n'       'readarray -t arr; echo "${#arr[@]}"'
+ti 'mapfile empty'   ''            'mapfile -t arr; echo "${#arr[@]}"'
+ti 'mapfile -O0'     'x\ny\n'       'mapfile -t -O 0 arr; echo "${arr[*]}"'
+
 echo "-------------------------------------------"
 echo "PASS=$pass FAIL=$fail"
