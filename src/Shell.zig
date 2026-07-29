@@ -3247,8 +3247,16 @@ fn expandVariablesAllocOpt(self: *Shell, input: []const u8, expand_tilde: bool) 
 
                     const pattern_start = i;
                     while (i < input.len and input[i] != '}') i += 1;
-                    const pattern = input[pattern_start..i];
+                    const raw_pattern = input[pattern_start..i];
                     if (i < input.len and input[i] == '}') i += 1;
+
+                    // The pattern may reference variables (${f#$PREFIX}).
+                    const pat_expanded = if (std.mem.indexOfScalar(u8, raw_pattern, '$') != null)
+                        self.expandVariablesAllocOpt(raw_pattern, false) catch null
+                    else
+                        null;
+                    defer if (pat_expanded) |p| self.allocator.free(p);
+                    const pattern = pat_expanded orelse raw_pattern;
 
                     if (var_value) |v| {
                         const stripped = stripPrefix(v, pattern, greedy);
@@ -3262,8 +3270,16 @@ fn expandVariablesAllocOpt(self: *Shell, input: []const u8, expand_tilde: bool) 
 
                     const pattern_start = i;
                     while (i < input.len and input[i] != '}') i += 1;
-                    const pattern = input[pattern_start..i];
+                    const raw_pattern = input[pattern_start..i];
                     if (i < input.len and input[i] == '}') i += 1;
+
+                    // The pattern may reference variables (${f%$EXT}).
+                    const pat_expanded = if (std.mem.indexOfScalar(u8, raw_pattern, '$') != null)
+                        self.expandVariablesAllocOpt(raw_pattern, false) catch null
+                    else
+                        null;
+                    defer if (pat_expanded) |p| self.allocator.free(p);
+                    const pattern = pat_expanded orelse raw_pattern;
 
                     if (var_value) |v| {
                         const stripped = stripSuffix(v, pattern, greedy);
