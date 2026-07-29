@@ -143,5 +143,24 @@ t 'cfor continue'    'for ((i=0;i<5;i++)); do [ $i -eq 2 ] && continue; echo $i;
 t 'cfor nested'      'for ((i=0;i<2;i++)); do for ((j=0;j<2;j++)); do echo "$i$j"; done; done'
 t 'cfor infinite'    'for ((;;)); do echo once; break; done'
 
+# --- array literals ---
+t 'arr literal'      'a=(1 2 3); echo "${#a[@]}":"${a[@]}"'
+t 'arr quoted space' 'a=("a b" c); echo "${#a[@]}":"${a[0]}"'
+t 'arr sq space'     "a=('a b' c); echo \"\${#a[@]}\":\"\${a[0]}\""
+t 'arr quoted var'   'a=("$HOME"); echo "${#a[@]}":"${a[@]}"'
+t 'arr unq var split' 'x="foo bar"; a=($x); echo "${#a[@]}":"${a[@]}"'
+t 'arr cmdsubst'     'a=($(echo one two)); echo "${#a[@]}":"${a[@]}"'
+t 'arr quoted cmdsub' 'a=("$(echo p q)"); echo "${#a[@]}":"${a[0]}"'
+t 'arr mixed elems'  'a=("x y" "$(echo p q)" z); echo "${#a[@]}":"${a[@]}"'
+t 'arr append unq'   'a=(a b c); x=z; a+=($x); echo "${#a[@]}"'
+t 'arr append lit'   'a=(a b); a+=(c d); echo "${#a[@]}":"${a[@]}"'
+t 'arr arith elems'  'a=($((1+2)) $((3*3))); echo "${a[@]}"'
+t 'arr nested paren' 'a=("nested (paren) ok" x); echo "${#a[@]}":"${a[0]}"'
+t 'arr sq literal $' "a=('lit \$x' b); echo \"\${#a[@]}\":\"\${a[0]}\""
+t 'arr adjacent q'   'a=("a"b c); echo "${#a[@]}":"${a[0]}"'
+t 'arr backtick'     'a=(`echo hi there`); echo "${#a[@]}":"${a[@]}"'
+t 'arr empty'        'a=(); echo "${#a[@]}"'
+t 'arr prepost sub'  'a=(pre$(echo m n)post); echo "${#a[@]}":"${a[@]}"'
+
 echo "-------------------------------------------"
 echo "PASS=$pass FAIL=$fail"

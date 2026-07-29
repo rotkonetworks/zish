@@ -1818,6 +1818,194 @@ pub fn evaluateList(shell: *Shell, node: *const ast.AstNode) !u8 {
     return last_status;
 }
 
+fn isArraySpace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
+}
+
+// Find the end of one raw array element starting at `start`. Element boundaries
+// are unquoted whitespace; single/double quotes, backtick and $(...) groups, and
+// backslash escapes are skipped so a space inside them does not split the element.
+fn scanArrayElementEnd(content: []const u8, start: usize) usize {
+    var i = start;
+    var paren: u32 = 0;
+    while (i < content.len) {
+        const c = content[i];
+        switch (c) {
+            ' ', '\t', '\n', '\r' => {
+                if (paren == 0) break;
+                i += 1;
+            },
+            '\'' => {
+                i += 1;
+                while (i < content.len and content[i] != '\'') i += 1;
+                if (i < content.len) i += 1; // closing '
+            },
+            '"' => {
+                i += 1;
+                while (i < content.len) {
+                    if (content[i] == '"') {
+                        i += 1;
+                        break;
+                    }
+                    if (content[i] == '\\' and i + 1 < content.len) {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                }
+            },
+            '`' => {
+                i += 1;
+                while (i < content.len) {
+                    if (content[i] == '`') {
+                        i += 1;
+                        break;
+                    }
+                    if (content[i] == '\\' and i + 1 < content.len) {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                }
+            },
+            '\\' => {
+                i += if (i + 1 < content.len) @as(usize, 2) else 1;
+            },
+            '(' => {
+                paren += 1;
+                i += 1;
+            },
+            ')' => {
+                if (paren > 0) paren -= 1;
+                i += 1;
+            },
+            else => i += 1,
+        }
+    }
+    return i;
+}
+
+// Split a raw array-literal body into fields the way bash does:
+//   a=("a b" c)       -> "a b", "c"    (quoted whitespace stays one field)
+//   a=($x) x="p q"    -> "p", "q"      (unquoted expansion is IFS-split)
+//   a=($(echo o t))   -> "o", "t"      (unquoted cmdsubst is IFS-split)
+//   a=("$(echo o t)") -> "o t"         (quoted cmdsubst is one field)
+//   a=("$HOME")       -> "$HOME"       (quoted var is one field)
+fn expandArrayContent(
+    shell: *Shell,
+    content: []const u8,
+    out: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    var i: usize = 0;
+    while (i < content.len) {
+        while (i < content.len and isArraySpace(content[i])) i += 1;
+        if (i >= content.len) break;
+        const elem_start = i;
+        i = scanArrayElementEnd(content, i);
+        if (i > elem_start) {
+            try appendArrayFields(shell, content[elem_start..i], out);
+        }
+    }
+}
+
+// Expand a single raw array element (quotes still attached) into one or more
+// fields. Quotes are removed; the content of single quotes is protected from
+// expansion; an unquoted $-expansion or command substitution makes the whole
+// element subject to IFS word splitting.
+fn appendArrayFields(
+    shell: *Shell,
+    raw: []const u8,
+    out: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(shell.allocator);
+
+    var has_unquoted_exp = false;
+    var i: usize = 0;
+    while (i < raw.len) {
+        const c = raw[i];
+        switch (c) {
+            '\'' => {
+                // single quotes: literal, protect $ and ` from later expansion
+                i += 1;
+                while (i < raw.len and raw[i] != '\'') {
+                    const q = raw[i];
+                    if (q == '$') {
+                        try buf.append(shell.allocator, Shell.LIT_DOLLAR);
+                    } else if (q == '`') {
+                        try buf.append(shell.allocator, Shell.LIT_BACKTICK);
+                    } else {
+                        try buf.append(shell.allocator, q);
+                    }
+                    i += 1;
+                }
+                if (i < raw.len) i += 1; // closing '
+            },
+            '"' => {
+                // double quotes: keep $ / ` active for expansion, drop the quotes
+                i += 1;
+                while (i < raw.len and raw[i] != '"') {
+                    if (raw[i] == '\\' and i + 1 < raw.len) {
+                        const e = raw[i + 1];
+                        switch (e) {
+                            '$' => try buf.append(shell.allocator, Shell.LIT_DOLLAR),
+                            '`' => try buf.append(shell.allocator, Shell.LIT_BACKTICK),
+                            '"', '\\' => try buf.append(shell.allocator, e),
+                            else => {
+                                try buf.append(shell.allocator, '\\');
+                                try buf.append(shell.allocator, e);
+                            },
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    try buf.append(shell.allocator, raw[i]);
+                    i += 1;
+                }
+                if (i < raw.len) i += 1; // closing "
+            },
+            '\\' => {
+                if (i + 1 < raw.len) {
+                    const e = raw[i + 1];
+                    if (e == '$') {
+                        try buf.append(shell.allocator, Shell.LIT_DOLLAR);
+                    } else if (e == '`') {
+                        try buf.append(shell.allocator, Shell.LIT_BACKTICK);
+                    } else {
+                        try buf.append(shell.allocator, e);
+                    }
+                    i += 2;
+                } else {
+                    try buf.append(shell.allocator, '\\');
+                    i += 1;
+                }
+            },
+            '$', '`' => {
+                has_unquoted_exp = true;
+                try buf.append(shell.allocator, c);
+                i += 1;
+            },
+            else => {
+                try buf.append(shell.allocator, c);
+                i += 1;
+            },
+        }
+    }
+
+    const expanded = try shell.expandVariables(buf.items);
+    defer shell.allocator.free(expanded);
+
+    if (has_unquoted_exp) {
+        // Unquoted expansion result undergoes IFS word splitting.
+        var it = std.mem.tokenizeAny(u8, expanded, ifsDelimiters(shell));
+        while (it.next()) |word| {
+            try out.append(shell.allocator, try shell.allocator.dupe(u8, word));
+        }
+    } else {
+        try out.append(shell.allocator, try shell.allocator.dupe(u8, expanded));
+    }
+}
+
 pub fn evaluateAssignment(shell: *Shell, node: *const ast.AstNode) !u8 {
     if (node.children.len != 2) return 1;
 
@@ -1854,50 +2042,15 @@ pub fn evaluateAssignment(shell: *Shell, node: *const ast.AstNode) !u8 {
     if (value.len >= 2 and value[0] == '(' and value[value.len - 1] == ')') {
         const array_content = value[1 .. value.len - 1];
 
-        // parse array elements (space-separated, respecting quotes)
+        // Split the raw body into fields, honouring quotes / substitutions and
+        // applying IFS word-splitting for unquoted expansions.
         var elements: std.ArrayListUnmanaged([]const u8) = .empty;
         defer {
             for (elements.items) |elem| shell.allocator.free(elem);
             elements.deinit(shell.allocator);
         }
 
-        var i: usize = 0;
-        while (i < array_content.len) {
-            // skip whitespace
-            while (i < array_content.len and (array_content[i] == ' ' or array_content[i] == '\t')) {
-                i += 1;
-            }
-            if (i >= array_content.len) break;
-
-            const elem_start = i;
-            var in_quote: u8 = 0;
-
-            // parse element (handle quotes)
-            while (i < array_content.len) {
-                const c = array_content[i];
-                if (in_quote != 0) {
-                    if (c == in_quote) in_quote = 0;
-                } else if (c == '"' or c == '\'') {
-                    in_quote = c;
-                } else if (c == ' ' or c == '\t') {
-                    break;
-                }
-                i += 1;
-            }
-
-            if (i > elem_start) {
-                var elem = array_content[elem_start..i];
-                // strip quotes if present
-                if (elem.len >= 2 and ((elem[0] == '"' and elem[elem.len - 1] == '"') or
-                    (elem[0] == '\'' and elem[elem.len - 1] == '\'')))
-                {
-                    elem = elem[1 .. elem.len - 1];
-                }
-                // expand variables in element
-                const expanded = try shell.expandVariables(elem);
-                try elements.append(shell.allocator, expanded);
-            }
-        }
+        try expandArrayContent(shell, array_content, &elements);
 
         if (is_append) {
             try shell.appendArray(name, elements.items);

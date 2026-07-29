@@ -278,6 +278,107 @@ pub const Lexer = struct {
         };
     }
 
+    // Collect an array assignment literal `name=(...)` verbatim, from the opening
+    // '(' through the matching ')'. Unlike the general word states, this copies the
+    // raw bytes (quotes, $(...), `...`, ${...}, escapes) WITHOUT transforming them,
+    // so the assignment evaluator can split elements on unquoted whitespace and apply
+    // per-element quoting/expansion/word-splitting exactly like bash. Uses a private
+    // depth counter so it never touches self.paren_depth (which the $()/quote
+    // sub-states use for their own nesting).
+    //
+    // Precondition: current token buffer already holds `name=` and the current input
+    // char is the opening '('.
+    fn collectArrayLiteral(self: *Self) Token {
+        self.switchToBuf();
+        self.bufAppend('(');
+        _ = self.advance(); // consume '('
+        var depth: u32 = 1;
+        while (true) {
+            const ch = self.peek() orelse {
+                // Unterminated array literal: emit what we have.
+                self.state = .normal;
+                return self.makeToken(.Word);
+            };
+            switch (ch) {
+                '(' => {
+                    depth += 1;
+                    self.bufAppend(ch);
+                    _ = self.advance();
+                },
+                ')' => {
+                    depth -= 1;
+                    self.bufAppend(ch);
+                    _ = self.advance();
+                    if (depth == 0) {
+                        self.state = .normal;
+                        return self.makeToken(.Word);
+                    }
+                },
+                '\'' => {
+                    // single quotes: copy verbatim, no escapes, until closing '
+                    self.bufAppend(ch);
+                    _ = self.advance();
+                    while (self.peek()) |q| {
+                        self.bufAppend(q);
+                        _ = self.advance();
+                        if (q == '\'') break;
+                    }
+                },
+                '"' => {
+                    // double quotes: copy verbatim, honour backslash escapes so an
+                    // escaped \" does not end the string early.
+                    self.bufAppend(ch);
+                    _ = self.advance();
+                    while (self.peek()) |q| {
+                        if (q == '\\') {
+                            self.bufAppend(q);
+                            _ = self.advance();
+                            if (self.peek()) |e| {
+                                self.bufAppend(e);
+                                _ = self.advance();
+                            }
+                            continue;
+                        }
+                        self.bufAppend(q);
+                        _ = self.advance();
+                        if (q == '"') break;
+                    }
+                },
+                '`' => {
+                    // backtick command substitution: copy verbatim to closing `
+                    self.bufAppend(ch);
+                    _ = self.advance();
+                    while (self.peek()) |q| {
+                        if (q == '\\') {
+                            self.bufAppend(q);
+                            _ = self.advance();
+                            if (self.peek()) |e| {
+                                self.bufAppend(e);
+                                _ = self.advance();
+                            }
+                            continue;
+                        }
+                        self.bufAppend(q);
+                        _ = self.advance();
+                        if (q == '`') break;
+                    }
+                },
+                '\\' => {
+                    self.bufAppend(ch);
+                    _ = self.advance();
+                    if (self.peek()) |e| {
+                        self.bufAppend(e);
+                        _ = self.advance();
+                    }
+                },
+                else => {
+                    self.bufAppend(ch);
+                    _ = self.advance();
+                },
+            }
+        }
+    }
+
     pub fn nextToken(self: *Self) !Token {
         while (true) {
             const c = self.peek();
@@ -619,11 +720,9 @@ pub const Lexer = struct {
                         if (ch == '(') {
                             const word_so_far = self.currentTokenValue();
                             if (word_so_far.len > 0 and word_so_far[word_so_far.len - 1] == '=') {
-                                self.switchToBuf();
-                                self.bufAppend('(');
-                                _ = self.advance();
-                                self.paren_depth = 1;
-                                continue;
+                                // Collect the whole `name=(...)` literal verbatim so the
+                                // assignment evaluator sees raw quotes / substitutions.
+                                return self.collectArrayLiteral();
                             }
                         }
                         self.state = .normal;
