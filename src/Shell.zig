@@ -4343,10 +4343,15 @@ fn preprocessHeredoc(self: *Shell, command: []const u8, delimiter: []const u8) !
 
     const suffix = std.mem.trim(u8, command[suffix_start..], " \t\r\n");
 
-    // Write content to a temp file (use timestamp for uniqueness)
+    // Write content to a temp file. Salt the name with a monotonic counter so
+    // chained heredocs processed within the same millisecond don't collide.
     const ts = compat.milliTimestamp();
-    var path_buf: [64]u8 = undefined;
-    const tmp_path = std.fmt.bufPrint(&path_buf, "/tmp/zish_heredoc_{d}", .{ts}) catch return error.OutOfMemory;
+    const S = struct {
+        var seq: u32 = 0;
+    };
+    S.seq +%= 1;
+    var path_buf: [80]u8 = undefined;
+    const tmp_path = std.fmt.bufPrint(&path_buf, "/tmp/zish_heredoc_{d}_{d}", .{ ts, S.seq }) catch return error.OutOfMemory;
 
     const file = std.Io.Dir.createFileAbsolute(compat.io(), tmp_path, .{ .truncate = true }) catch return error.FileError;
     defer file.close(compat.io());
@@ -4368,6 +4373,15 @@ fn preprocessHeredoc(self: *Shell, command: []const u8, delimiter: []const u8) !
         result[pos] = '\n';
         pos += 1;
         @memcpy(result[pos..][0..suffix.len], suffix);
+    }
+
+    // The suffix may contain further heredocs (cat <<A ...; cat <<B ...).
+    // Process them too by recursing on the rewritten command.
+    if (need_suffix) {
+        if (findHeredocDelimiter(result)) |next_delim| {
+            defer allocator.free(result);
+            return try self.preprocessHeredoc(result, next_delim);
+        }
     }
 
     return result;
