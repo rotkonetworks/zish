@@ -1347,7 +1347,15 @@ fn handleAction(self: *Shell, action: Action) !void {
                 .set_mode => |mode| {
                     self.vim_mode = mode;
                     self.vi.mode = if (mode == .normal) .normal else .insert;
-                    if (mode == .normal) self.paste_mode = false;
+                    if (mode == .normal) {
+                        self.paste_mode = false;
+                        // abandon any half-typed vi operator sequence so the
+                        // next key starts fresh (e.g. Esc during a pending 'd')
+                        self.vi.pending_op = .none;
+                        self.vi.awaiting_text_obj = false;
+                        self.vi.pending_g = false;
+                        self.vi.count = 0;
+                    }
                 },
                 .enter_visual => |vtype| {
                     self.vi.mode = if (vtype == .line) .visual_line else .visual;
@@ -2265,9 +2273,52 @@ fn readNextAction(self: *Shell) !Action {
 
     // dispatch based on vim mode
     return switch (self.vim_mode) {
-        .normal => normalModeAction(char),
+        .normal => self.normalModeDispatch(char),
         .insert => self.resolveInsertAction(char),
     };
+}
+
+// Normal-mode key dispatch. Most keys map to a single self-contained Action
+// via normalModeAction. Multi-key vi sequences (operators like dw/d$/cc/dd,
+// numeric counts, r<char>, the g-prefix) can't be expressed as one Action, so
+// those are driven through the vim.zig state machine, which mutates the edit
+// buffer directly and tracks pending state across keystrokes.
+fn normalModeDispatch(self: *Shell, char: u8) !Action {
+    const v = &self.vi;
+    // A sequence is already in progress, or this key starts one.
+    const in_sequence = v.pending_op != .none or v.awaiting_text_obj or
+        v.pending_g or v.mode == .replace or v.count != 0;
+    const starts_sequence = switch (char) {
+        'd', 'c', 'r', 'g' => true,
+        '1'...'9' => true,
+        else => false,
+    };
+    if (in_sequence or starts_sequence) {
+        return self.viStateMachineKey(char);
+    }
+    return normalModeAction(char);
+}
+
+// Feed one key to the vim.zig state machine and translate the result back into
+// an Action for the render/mode plumbing.
+fn viStateMachineKey(self: *Shell, char: u8) !Action {
+    const was_insert = self.vim_mode == .insert;
+    const result = self.vi.handleKey(&self.edit_buf, char);
+    // keep history-search prefix in sync if the buffer changed
+    if (self.history_index != -1) {
+        self.history_search_prefix_len = self.edit_buf.len;
+    }
+    // Reconcile the shell's mode with the state machine's. vim.zig is not
+    // reliable about returning .mode_changed (e.g. cc/dd clear pending_op
+    // before checking it), so sync straight off self.vi.mode instead. replace
+    // and visual sub-modes leave vim_mode == .normal (block cursor).
+    const now_insert = self.vi.mode == .insert;
+    if (now_insert != was_insert or result == .mode_changed) {
+        self.vim_mode = if (now_insert) .insert else .normal;
+        return .{ .vim_mode = .{ .set_mode = self.vim_mode } };
+    }
+    if (result == .unhandled) return .none;
+    return .redraw_line;
 }
 
 fn resolveInsertAction(self: *Shell, char: u8) Action {
