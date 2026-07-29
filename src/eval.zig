@@ -2173,22 +2173,19 @@ pub fn evaluateAssignment(shell: *Shell, node: *const ast.AstNode) !u8 {
         var result_buf: [32]u8 = undefined;
         const result_str = std.fmt.bufPrint(&result_buf, "{d}", .{arith_result}) catch return 1;
 
+        // Store safely: free the old value and dupe a fresh buffer. The former
+        // in-place @memcpy mutated the variable's existing storage and shrank the
+        // slice below its allocation — which corrupts a later wrong-length free,
+        // and rewrites any command text still aliasing that storage (a
+        // self-referential PROMPT_COMMAND='n=$((n+1))' clobbered itself).
         if (shell.variables.getPtr(name)) |value_ptr| {
-            const old_value = value_ptr.*;
-            if (result_str.len <= old_value.len) {
-                const writable: [*]u8 = @ptrCast(@constCast(old_value.ptr));
-                @memcpy(writable[0..result_str.len], result_str);
-                value_ptr.* = writable[0..result_str.len];
-            } else {
-                shell.allocator.free(old_value);
-                value_ptr.* = try shell.allocator.dupe(u8, result_str);
-            }
-            return 0;
+            shell.allocator.free(value_ptr.*);
+            value_ptr.* = try shell.allocator.dupe(u8, result_str);
+        } else {
+            const name_copy = try shell.allocator.dupe(u8, name);
+            const value_copy = try shell.allocator.dupe(u8, result_str);
+            try shell.variables.put(name_copy, value_copy);
         }
-
-        const name_copy = try shell.allocator.dupe(u8, name);
-        const value_copy = try shell.allocator.dupe(u8, result_str);
-        try shell.variables.put(name_copy, value_copy);
         return 0;
     }
 
