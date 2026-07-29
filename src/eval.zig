@@ -511,6 +511,21 @@ fn expandVariableFast(shell: *Shell, input: []const u8, dest: *[256]u8) !usize {
                 continue;
             }
 
+            // Handle $# (positional parameter count)
+            if (input[i] == '#') {
+                const c = shell.variables.get("#") orelse "0";
+                if (out_pos + c.len > 256) return error.BufferTooSmall;
+                @memcpy(dest[out_pos..][0..c.len], c);
+                out_pos += c.len;
+                i += 1;
+                continue;
+            }
+
+            // $@ / $* join all positionals — needs the full (allocating) expander
+            if (input[i] == '@' or input[i] == '*') {
+                return error.BufferTooSmall;
+            }
+
             // Handle $((expr))
             if (i + 1 < input.len and input[i] == '(' and input[i + 1] == '(') {
                 i += 2;
@@ -2811,35 +2826,70 @@ fn serializeTestInner(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged
     }
 }
 
+// Remove positional parameters $1..$99 (freeing their storage).
+fn clearPositionals(shell: *Shell) void {
+    var i: usize = 1;
+    while (i <= 99) : (i += 1) {
+        var nb: [16]u8 = undefined;
+        const ns = std.fmt.bufPrint(&nb, "{d}", .{i}) catch break;
+        if (shell.variables.fetchRemove(ns)) |kv| {
+            shell.allocator.free(kv.key);
+            shell.allocator.free(kv.value);
+        } else break;
+    }
+}
+
+// Set $1..$n and $# from a slice of arguments.
+fn setPositionals(shell: *Shell, args: []const []const u8) !void {
+    for (args, 1..) |arg, i| {
+        var nb: [16]u8 = undefined;
+        const ns = std.fmt.bufPrint(&nb, "{d}", .{i}) catch continue;
+        try setShellVar(shell, ns, arg);
+    }
+    var cb: [16]u8 = undefined;
+    const cs = std.fmt.bufPrint(&cb, "{d}", .{args.len}) catch "0";
+    try setShellVar(shell, "#", cs);
+}
+
 pub fn callFunction(shell: *Shell, name: []const u8, args: []const []const u8) !u8 {
     const body = shell.functions.get(name) orelse return error.FunctionNotFound;
 
-    // set positional parameters $1, $2, etc.
-    for (args, 1..) |arg, i| {
-        var num_buf: [16]u8 = undefined;
-        const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{i}) catch continue;
-        try setShellVar(shell, num_str, arg);
+    // Save the caller's positional parameters — a function gets its own $1..$#,
+    // restored on return (POSIX). The old code set $1.. but never $#/$@ (so those
+    // were empty inside functions) and wiped the caller's positionals on return.
+    const saved_count: usize = blk: {
+        const c = shell.variables.get("#") orelse break :blk 0;
+        break :blk std.fmt.parseInt(usize, c, 10) catch 0;
+    };
+    var saved: std.ArrayList([]u8) = .empty;
+    defer {
+        for (saved.items) |s| shell.allocator.free(s);
+        saved.deinit(shell.allocator);
+    }
+    {
+        var i: usize = 1;
+        while (i <= saved_count) : (i += 1) {
+            var nb: [16]u8 = undefined;
+            const ns = std.fmt.bufPrint(&nb, "{d}", .{i}) catch break;
+            const v = shell.variables.get(ns) orelse "";
+            try saved.append(shell.allocator, try shell.allocator.dupe(u8, v));
+        }
     }
 
-    // execute function body directly from stored AST (no re-parsing!)
-    const result = evaluateAst(shell, body) catch |err| {
-        // clear positional parameters
-        for (args, 1..) |_, i| {
-            var num_buf: [16]u8 = undefined;
-            const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{i}) catch continue;
-            _ = shell.variables.fetchRemove(num_str);
-        }
-        return err;
-    };
+    // Install the function's arguments as $1..$n and $#.
+    clearPositionals(shell);
+    try setPositionals(shell, args);
 
-    // clear positional parameters
-    for (args, 1..) |_, i| {
-        var num_buf: [16]u8 = undefined;
-        const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{i}) catch continue;
-        if (shell.variables.fetchRemove(num_str)) |kv| {
-            shell.allocator.free(kv.key);
-            shell.allocator.free(kv.value);
-        }
+    const result = evaluateAst(shell, body);
+
+    // Restore the caller's positional parameters.
+    clearPositionals(shell);
+    if (saved.items.len > 0) {
+        setPositionals(shell, saved.items) catch {};
+    } else {
+        var cb: [16]u8 = undefined;
+        const cs = std.fmt.bufPrint(&cb, "{d}", .{saved_count}) catch "0";
+        setShellVar(shell, "#", cs) catch {};
     }
 
     return result;
