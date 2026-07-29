@@ -424,6 +424,14 @@ fn evaluateTestPrimaryFlat(shell: *Shell, args: []const []const u8) bool {
     return if (negate) !result else result;
 }
 
+// Field-splitting delimiters ($IFS). An unset $IFS means the default
+// whitespace set; an explicitly empty $IFS yields "", and tokenizeAny with an
+// empty delimiter set returns the input as a single field (no splitting) —
+// which is exactly the POSIX behavior for IFS="".
+fn ifsDelimiters(shell: *Shell) []const u8 {
+    return shell.variables.get("IFS") orelse " \t\n";
+}
+
 // Check if string contains command substitution $(cmd) but not $((arith))
 fn hasCommandSubstitution(input: []const u8) bool {
     var i: usize = 0;
@@ -679,6 +687,14 @@ fn evaluateEchoBuiltinFast(shell: *Shell, node: *const ast.AstNode) !u8 {
             arg_slices[arg_count] = dest[0..len];
         } else {
             const expanded_len = try expandVariableFast(shell, arg, dest);
+            // An unquoted $var that expands to nothing produces no field at all
+            // (POSIX), so `echo before $empty after` prints one space, not two.
+            // A quoted "" or a literal empty word still counts as a field.
+            if (expanded_len == 0 and arg_node.node_type != .double_quoted and
+                std.mem.indexOfScalar(u8, arg, '$') != null)
+            {
+                continue;
+            }
             arg_slices[arg_count] = dest[0..expanded_len];
         }
         arg_count += 1;
@@ -845,8 +861,18 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     // Falls back to normal path if args too large for stack buffers
     if (n_prefix == 0 and std.mem.eql(u8, raw_cmd, "echo")) {
         var needs_full_expansion = false;
+        // A custom $IFS changes how unquoted $var expansions split into fields;
+        // the fast path only handles the default whitespace set, so defer any
+        // arg containing an expansion to the full path when IFS is set.
+        const ifs_custom = shell.variables.get("IFS") != null;
         for (cmd_children[1..]) |arg_node| {
             const arg = arg_node.value;
+            if (ifs_custom and arg_node.node_type != .string and
+                std.mem.indexOfScalar(u8, arg, '$') != null)
+            {
+                needs_full_expansion = true;
+                break;
+            }
             // Check for features that need full expansion path:
             // - Command substitution $(...)
             // - Brace expansion {a,b}
@@ -1036,7 +1062,7 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
             // Step 2.5: Word splitting for unquoted command substitution results
             // POSIX: unquoted $() results are split on IFS (default: space/tab/newline)
             if (needs_word_split) {
-                var split_iter = std.mem.tokenizeAny(u8, var_expanded, " \t\n");
+                var split_iter = std.mem.tokenizeAny(u8, var_expanded, ifsDelimiters(shell));
                 var has_any = false;
                 while (split_iter.next()) |word| {
                     has_any = true;
@@ -2175,7 +2201,7 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
 
             // Step 2.5: Word splitting for unquoted command substitution
             if (needs_word_split) {
-                var split_iter = std.mem.tokenizeAny(u8, var_expanded, " \t\n");
+                var split_iter = std.mem.tokenizeAny(u8, var_expanded, ifsDelimiters(shell));
                 while (split_iter.next()) |word| {
                     // Step 3: Glob expansion on each split word
                     if (glob.hasGlobChars(word)) {
