@@ -962,8 +962,13 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
             continue;
         }
 
-        // Check if original arg has command substitution (for word splitting)
-        const needs_word_split = hasCommandSubstitution(arg);
+        // Unquoted expansions ($var, ${var}, $(cmd), `cmd`, $((...))) undergo
+        // word splitting on IFS (default: space/tab/newline). POSIX: only the
+        // result of an unquoted expansion is split — a literal word never is,
+        // and a .word node here has no unquoted literal spaces (the lexer split
+        // those into separate nodes), so splitting the whole expansion is safe.
+        const needs_word_split = hasCommandSubstitution(arg) or
+            std.mem.indexOfScalar(u8, arg, '$') != null;
 
         // Step 1: Brace expansion {a,b,c} or {1..5}
         const brace_results = if (Shell.hasBracePattern(arg))
@@ -2039,7 +2044,9 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
         const has_tilde = raw_value.len > 0 and raw_value[0] == '~';
         const needs_var_expansion = has_tilde or std.mem.indexOfScalar(u8, raw_value, '$') != null;
         const has_glob = glob.hasGlobChars(raw_value);
-        const needs_word_split = hasCommandSubstitution(raw_value);
+        // Unquoted expansions undergo IFS word splitting (see evaluateCommand).
+        const needs_word_split = hasCommandSubstitution(raw_value) or
+            std.mem.indexOfScalar(u8, raw_value, '$') != null;
 
         // Fast path: no special expansion needed
         if (!has_brace and !needs_var_expansion and !has_glob) {
