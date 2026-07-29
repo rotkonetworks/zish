@@ -1540,7 +1540,11 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
     var last_status: u8 = 0;
     var pipefail_status: u8 = 0; // first non-zero status for pipefail
 
-    for (pids) |pid| {
+    // Per-stage statuses for $PIPESTATUS (capped; longer pipelines are rare).
+    var pstat_bufs: [16][4]u8 = undefined;
+    var pstat_vals: [16][]const u8 = undefined;
+
+    for (pids, 0..) |pid, idx| {
         const result = compat.posix.waitpid(pid, 0);
         var status: u8 = 0;
         if (compat.posix.W.IFEXITED(result.status)) {
@@ -1551,11 +1555,17 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
             status = 127;
         }
         last_status = status;
+        if (idx < pstat_vals.len) {
+            pstat_vals[idx] = std.fmt.bufPrint(&pstat_bufs[idx], "{d}", .{status}) catch "0";
+        }
         // pipefail: remember first non-zero status
         if (shell.opt_pipefail and status != 0 and pipefail_status == 0) {
             pipefail_status = status;
         }
     }
+
+    // Expose the per-stage exit statuses as $PIPESTATUS.
+    shell.setArray("PIPESTATUS", pstat_vals[0..@min(pids.len, pstat_vals.len)]) catch {};
 
     // pipefail: return first non-zero status if any command failed
     return if (shell.opt_pipefail and pipefail_status != 0) pipefail_status else last_status;
