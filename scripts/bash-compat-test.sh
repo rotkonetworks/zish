@@ -131,5 +131,17 @@ t 'pipe script true' 'true | printf "%s\n" ran'
 t 'pipe cd ls grep'  'cd /etc && ls | grep -c hostname'
 t 'pipe group'       '{ echo x; } | cat'
 
+# --- arithmetic command & C-style for ---
+t 'arith cmd true'   '(( 1 + 1 )); echo $?'
+t 'arith cmd false'  '(( 0 )); echo $?'
+t 'arith cmd cond'   '(( 5 > 3 )) && echo yes'
+t 'arith cmd incr'   'x=5; (( x++ )); echo $x'
+t 'cfor basic'       'for ((i=0;i<3;i++)); do echo $i; done'
+t 'cfor sum'         'sum=0; for ((i=1;i<=10;i++)); do sum=$((sum+i)); done; echo $sum'
+t 'cfor break'       'for ((i=0;i<9;i++)); do [ $i -eq 3 ] && break; echo $i; done'
+t 'cfor continue'    'for ((i=0;i<5;i++)); do [ $i -eq 2 ] && continue; echo $i; done'
+t 'cfor nested'      'for ((i=0;i<2;i++)); do for ((j=0;j<2;j++)); do echo "$i$j"; done; done'
+t 'cfor infinite'    'for ((;;)); do echo once; break; done'
+
 echo "-------------------------------------------"
 echo "PASS=$pass FAIL=$fail"

@@ -50,6 +50,7 @@ pub const TokenType = enum {
     RightBrace,     // }
     TestOpen,       // [[
     TestClose,      // ]]
+    ArithCommand,   // (( ... )) — value holds the inner expression text
 
     // keywords
     If, Then, Else, Elif, Fi,
@@ -366,6 +367,39 @@ pub const Lexer = struct {
                             return self.makeTokenValue(.NewLine, "\n");
                         },
                         '(' => {
+                            // "((" (glued) opens an arithmetic command or the
+                            // header of a C-style `for ((;;))`. Capture the inner
+                            // text up to the matching "))" as one ArithCommand
+                            // token; the parser decides how to use it. "( (" (with
+                            // a space) stays two LeftParen — a nested subshell.
+                            if (self.peekN(1) == @as(u8, '(')) {
+                                _ = self.advance(); // first (
+                                _ = self.advance(); // second (
+                                self.use_buf = true;
+                                self.buf_len = 0;
+                                var depth: i32 = 0;
+                                while (true) {
+                                    const cc = self.peek() orelse return error.UnterminatedExpansion;
+                                    if (cc == '(') {
+                                        depth += 1;
+                                        self.bufAppend('(');
+                                        _ = self.advance();
+                                    } else if (cc == ')') {
+                                        if (depth == 0 and self.peekN(1) == @as(u8, ')')) {
+                                            _ = self.advance(); // first )
+                                            _ = self.advance(); // second )
+                                            break;
+                                        }
+                                        depth -= 1;
+                                        self.bufAppend(')');
+                                        _ = self.advance();
+                                    } else {
+                                        self.bufAppend(cc);
+                                        _ = self.advance();
+                                    }
+                                }
+                                return self.makeToken(.ArithCommand);
+                            }
                             _ = self.advance();
                             return self.makeTokenValue(.LeftParen, "(");
                         },

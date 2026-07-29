@@ -269,6 +269,8 @@ pub fn evaluateAst(shell: *Shell, node: *const ast.AstNode) anyerror!u8 {
         .while_loop => evaluateWhile(shell, node),
         .until_loop => evaluateUntil(shell, node),
         .for_loop => evaluateFor(shell, node),
+        .c_for_loop => evaluateCForLoop(shell, node),
+        .arith_command => evaluateArithCommand(shell, node),
         .subshell => evaluateSubshell(shell, node),
         .test_expression => evaluateTest(shell, node),
         .function_def => evaluateFunctionDef(shell, node),
@@ -1995,6 +1997,59 @@ fn loopControl(shell: *Shell, status: u8) LoopAction {
         return .continue_loop;
     }
     return .normal;
+}
+
+// (( expr )) — evaluate the arithmetic expression(s). Exit status is 0 when the
+// (last) result is non-zero, 1 otherwise (bash semantics). `;`-separated parts
+// are each evaluated for their side effects.
+pub fn evaluateArithCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
+    var result: i64 = 0;
+    var any = false;
+    var it = std.mem.splitScalar(u8, node.value, ';');
+    while (it.next()) |part| {
+        const e = std.mem.trim(u8, part, " \t");
+        if (e.len == 0) continue;
+        any = true;
+        result = shell.evaluateArithmetic(e) catch return 1;
+    }
+    if (!any) return 1;
+    return if (result != 0) 0 else 1;
+}
+
+// for ((init; cond; update)); do body; done — C-style arithmetic for loop.
+pub fn evaluateCForLoop(shell: *Shell, node: *const ast.AstNode) !u8 {
+    if (node.children.len != 1) return 1;
+    const body = node.children[0];
+
+    // Split the header into init/cond/update on ';' (each optional).
+    var parts: [3][]const u8 = .{ "", "", "" };
+    var idx: usize = 0;
+    var it = std.mem.splitScalar(u8, node.value, ';');
+    while (it.next()) |part| : (idx += 1) {
+        if (idx < 3) parts[idx] = std.mem.trim(u8, part, " \t");
+    }
+    const init_expr = parts[0];
+    const cond_expr = parts[1];
+    const update_expr = parts[2];
+
+    if (init_expr.len > 0) _ = shell.evaluateArithmetic(init_expr) catch {};
+
+    var last_status: u8 = 0;
+    while (true) {
+        // An empty condition is always true (for ((;;)) loops forever).
+        if (cond_expr.len > 0) {
+            const c = shell.evaluateArithmetic(cond_expr) catch 0;
+            if (c == 0) break;
+        }
+        const body_status = try evaluateAst(shell, body);
+        switch (loopControl(shell, body_status)) {
+            .break_loop => return if (shell.loop_break > 0 or shell.loop_continue > 0) body_status else 0,
+            .continue_loop => last_status = 0, // fall through to the update step
+            .normal => last_status = body_status,
+        }
+        if (update_expr.len > 0) _ = shell.evaluateArithmetic(update_expr) catch {};
+    }
+    return last_status;
 }
 
 pub fn evaluateWhile(shell: *Shell, node: *const ast.AstNode) !u8 {

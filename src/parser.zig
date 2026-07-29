@@ -254,6 +254,7 @@ pub const Parser = struct {
             .LeftParen => self.parsesubshell(),
             .Function => self.parsefunction(),
             .TestOpen => self.parsetest(),
+            .ArithCommand => self.parsearithcommand(),
             else => self.parsesimplecommand(),
         };
     }
@@ -637,9 +638,35 @@ pub const Parser = struct {
         );
     }
 
+    // (( expr )) as a standalone command — evaluate the arithmetic expression;
+    // exit status is 0 if the result is non-zero, 1 otherwise (bash semantics).
+    fn parsearithcommand(self: *Self) parsererror!*const ast.AstNode {
+        const tok = self.current_token;
+        // The token value points at the lexer's transient buffer; dupe now.
+        const expr = try self.builder.arena.allocator().dupe(u8, tok.value);
+        try self.nextToken(); // consume the (( )) token
+        return self.builder.createarithcommand(expr, tok.line, tok.column);
+    }
+
     fn parsefor(self: *Self) parsererror!*const ast.AstNode {
         const for_token = self.current_token;
         try self.nextToken(); // consume 'for'
+
+        // C-style: for ((init; cond; update)); do ... done
+        if (self.current_token.ty == .ArithCommand) {
+            // Dupe the header now — the lexer buffer is reused by later tokens.
+            const header = try self.builder.arena.allocator().dupe(u8, self.current_token.value);
+            try self.nextToken(); // consume the (( )) header
+            if (self.current_token.ty == .Semicolon or self.current_token.ty == .NewLine) {
+                try self.nextToken();
+            }
+            if (self.current_token.ty != .Do) return error.UnexpectedToken;
+            try self.nextToken(); // consume 'do'
+            const body = try self.parsecommandlist();
+            if (self.current_token.ty != .Done) return error.UnexpectedToken;
+            try self.nextToken(); // consume 'done'
+            return self.builder.createcfor(header, body, for_token.line, for_token.column);
+        }
 
         // parse variable name
         const variable = try self.parseword();

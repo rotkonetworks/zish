@@ -16,6 +16,8 @@ pub const NodeType = enum {
     while_loop,
     until_loop,
     for_loop,
+    c_for_loop, // C-style: for ((init; cond; update)) — value = header, child[0] = body
+    arith_command, // (( expr )) — value = expression text
     case_statement,
     case_item,  // pattern) body;;
     function_def,
@@ -245,6 +247,17 @@ pub const AstBuilder = struct {
         children[children.len - 1] = body;
 
         return self.createnode(.for_loop, "", children, line, column);
+    }
+
+    // (( expr )) — value holds the arithmetic expression text.
+    pub fn createarithcommand(self: *Self, expr: []const u8, line: u32, column: u32) !*const AstNode {
+        return self.createnode(.arith_command, expr, &[_]*const AstNode{}, line, column);
+    }
+
+    // for ((init; cond; update)) — value holds the raw header, child[0] the body.
+    pub fn createcfor(self: *Self, header: []const u8, body: *const AstNode, line: u32, column: u32) !*const AstNode {
+        const children = [_]*const AstNode{body};
+        return self.createnode(.c_for_loop, header, &children, line, column);
     }
 
     pub fn createpipeline(self: *Self, commands: []const *const AstNode, line: u32, column: u32) !*const AstNode {
