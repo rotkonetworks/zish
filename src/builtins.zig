@@ -527,9 +527,35 @@ fn printfFormatArg(writer: anytype, spec: PrintfSpec, arg: []const u8) !void {
             };
         },
         'b' => {
-            // string with backslash escapes interpreted
+            // string with backslash escapes interpreted (\t, \n, \xNN, \0nnn…)
+            var k: usize = 0;
+            while (k < arg.len) {
+                if (arg[k] == '\\' and k + 1 < arg.len) {
+                    const esc = printfParseEscape(arg[k + 1 ..]);
+                    if (esc.len > 0) {
+                        try writer.writeByte(esc.char);
+                        k += 1 + esc.len;
+                        continue;
+                    }
+                }
+                try writer.writeByte(arg[k]);
+                k += 1;
+            }
+            return;
+        },
+        'q' => {
+            // quote the argument so it can be reused as shell input.
+            if (arg.len == 0) {
+                try writer.writeAll("''");
+                return;
+            }
             for (arg) |c| {
-                if (c == '\\') continue; // simplified - just print
+                const needs_escape = switch (c) {
+                    ' ', '\t', '\n', '|', '&', ';', '<', '>', '(', ')', '$', '`',
+                    '"', '\'', '\\', '*', '?', '[', ']', '{', '}', '~', '#', '!' => true,
+                    else => false,
+                };
+                if (needs_escape) try writer.writeByte('\\');
                 try writer.writeByte(c);
             }
             return;
