@@ -18,6 +18,21 @@ t(){
   fi
 }
 
+# stdin-feeding variant: ti <desc> <printf-input> <script>
+ti(){
+  local desc="$1" input="$2" script="$3"
+  local zo bo
+  zo="$(printf "$input" | "$Z" -c "$script" 2>&1)"
+  bo="$(printf "$input" | bash -c "$script" 2>&1)"
+  if [ "$zo" = "$bo" ]; then
+    pass=$((pass+1))
+  else
+    fail=$((fail+1))
+    printf 'FAIL: %s\n   script: %s\n   zish:[%s]\n   bash:[%s]\n' \
+      "$desc" "$script" "$(printf '%s' "$zo"|tr '\n' '^')" "$(printf '%s' "$bo"|tr '\n' '^')"
+  fi
+}
+
 # --- positional / special params ---
 t 'func $#'          'f(){ echo $#; }; f a b c'
 t 'func "$@" iter'   'f(){ for a in "$@"; do printf "<%s>" "$a"; done; echo; }; f "a b" c'
@@ -183,6 +198,13 @@ ti 'mapfile default' 'p\nq\n'       'mapfile -t; echo "${MAPFILE[*]}"'
 ti 'readarray'       'a\nb\n'       'readarray -t arr; echo "${#arr[@]}"'
 ti 'mapfile empty'   ''            'mapfile -t arr; echo "${#arr[@]}"'
 ti 'mapfile -O0'     'x\ny\n'       'mapfile -t -O 0 arr; echo "${arr[*]}"'
+
+# --- select loop ---
+ti 'select pick'     '2\n'         'select x in a b c; do echo "picked $x"; break; done'
+ti 'select reply'    'x\n'         'select v in one two; do echo "R=$REPLY v=$v"; break; done'
+ti 'select invalid'  '9\n'         'select x in a b; do echo "got [$x]"; break; done'
+ti 'select default'  '1\n'         'set -- p q; select x; do echo "picked $x"; break; done'
+ti 'select break'    '1\n'         'select x in a b c; do echo "$x"; break; done'
 
 echo "-------------------------------------------"
 echo "PASS=$pass FAIL=$fail"
