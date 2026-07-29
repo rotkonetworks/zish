@@ -1672,6 +1672,65 @@ pub fn evaluateRedirect(shell: *Shell, node: *const ast.AstNode) !u8 {
     return evaluateAst(shell, command);
 }
 
+// Classify an input-redirect target that is one of our internal heredoc temp
+// files. Returns null for ordinary files, true if the body needs expansion
+// (unquoted delimiter), false if it must be fed literally (quoted delimiter).
+fn heredocTempMode(path: []const u8) ?bool {
+    const prefix = "/tmp/zish_heredoc_";
+    if (!std.mem.startsWith(u8, path, prefix)) return null;
+    if (path.len <= prefix.len) return null;
+    return switch (path[prefix.len]) {
+        'e' => true,
+        'q' => false,
+        else => null,
+    };
+}
+
+// Feed a heredoc temp file to stdin. For an unquoted delimiter the body is
+// expanded now (execution time) and written to a short-lived sibling temp file,
+// which is then dup2'd onto stdin. The original raw file is left in place so a
+// heredoc inside a loop re-expands with each iteration's values.
+fn applyHeredocInput(shell: *Shell, path: []const u8, expand: bool) !void {
+    if (!expand) {
+        const file = try std.Io.Dir.cwd().openFile(compat.io(), path, .{ .mode = .read_only });
+        defer file.close(compat.io());
+        try compat.posix.dup2(file.handle, compat.posix.STDIN_FILENO);
+        return;
+    }
+
+    const raw = std.Io.Dir.cwd().readFileAlloc(compat.io(), path, shell.allocator, .limited(16 * 1024 * 1024)) catch {
+        // On read failure, fall back to feeding the file unexpanded.
+        const file = try std.Io.Dir.cwd().openFile(compat.io(), path, .{ .mode = .read_only });
+        defer file.close(compat.io());
+        try compat.posix.dup2(file.handle, compat.posix.STDIN_FILENO);
+        return;
+    };
+    defer shell.allocator.free(raw);
+
+    const exp = try shell.expandVariables(raw);
+    defer shell.allocator.free(exp);
+
+    // Materialise the expanded body into a sibling temp file (avoids pipe-buffer
+    // deadlock for large bodies, since redirects are applied in the parent before
+    // the reader process is forked).
+    const S = struct {
+        var seq: u32 = 0;
+    };
+    S.seq +%= 1;
+    var name_buf: [128]u8 = undefined;
+    const exp_path = std.fmt.bufPrint(&name_buf, "{s}_x{d}", .{ path, S.seq }) catch return error.OutOfMemory;
+
+    {
+        const wf = try std.Io.Dir.cwd().createFile(compat.io(), exp_path, .{ .truncate = true });
+        defer wf.close(compat.io());
+        compat.writeAll(wf, exp) catch {};
+    }
+    const file = try std.Io.Dir.cwd().openFile(compat.io(), exp_path, .{ .mode = .read_only });
+    try compat.posix.dup2(file.handle, compat.posix.STDIN_FILENO);
+    file.close(compat.io());
+    std.Io.Dir.deleteFileAbsolute(compat.io(), exp_path) catch {};
+}
+
 fn applyRedirect(shell: *Shell, node: *const ast.AstNode) !void {
     const target = node.children[1];
     const redirect_type = node.value;
@@ -1693,9 +1752,17 @@ fn applyRedirect(shell: *Shell, node: *const ast.AstNode) !void {
         if (std.c.lseek(file.handle, 0, std.c.SEEK.END) < 0) return error.Unseekable;
         try compat.posix.dup2(file.handle, compat.posix.STDOUT_FILENO);
     } else if (std.mem.eql(u8, redirect_type, "<")) {
-        const file = try std.Io.Dir.cwd().openFile(compat.io(), expanded_target, .{ .mode = .read_only });
-        defer file.close(compat.io());
-        try compat.posix.dup2(file.handle, compat.posix.STDIN_FILENO);
+        // Heredoc bodies are materialised (by preprocessHeredoc) into temp files
+        // tagged "_e_" (expand) or "_q_" (literal). Unquoted-delimiter bodies are
+        // expanded HERE, at execution time, so they see assignments made earlier on
+        // the same line and the current loop iteration's values.
+        if (heredocTempMode(expanded_target)) |expand| {
+            try applyHeredocInput(shell, expanded_target, expand);
+        } else {
+            const file = try std.Io.Dir.cwd().openFile(compat.io(), expanded_target, .{ .mode = .read_only });
+            defer file.close(compat.io());
+            try compat.posix.dup2(file.handle, compat.posix.STDIN_FILENO);
+        }
     } else if (std.mem.eql(u8, redirect_type, "2>")) {
         const file = try std.Io.Dir.cwd().createFile(compat.io(), expanded_target, .{ .truncate = true });
         defer file.close(compat.io());

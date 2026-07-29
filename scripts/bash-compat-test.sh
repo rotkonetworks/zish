@@ -162,5 +162,16 @@ t 'arr backtick'     'a=(`echo hi there`); echo "${#a[@]}":"${a[@]}"'
 t 'arr empty'        'a=(); echo "${#a[@]}"'
 t 'arr prepost sub'  'a=(pre$(echo m n)post); echo "${#a[@]}":"${a[@]}"'
 
+# --- heredoc body expansion timing ---
+t 'hd assign then'   $'x=EXP; cat <<C\nhas $x\nC'
+t 'hd existing var'  $'cat <<C\nhome=$HOME done\nC'
+t 'hd quoted delim'  $'cat <<\'C\'\nno $HOME here\nC'
+t 'hd dash strip'    $'x=1; cat <<-C\n\tval $x\n\tC'
+t 'hd chained'       $'a=A; cat <<X\n$a\nX\nb=B; cat <<Y\n$b\nY'
+t 'hd arith'         $'x=5; cat <<C\n$((x+1))\nC'
+t 'hd cmdsubst'      $'cat <<C\n$(echo sub)\nC'
+t 'hd loop reexpand' $'for x in a b c; do cat <<E\nitem $x\nE\ndone'
+t 'hd prior cmd'     $'printf "%s\\n" pre; cat <<C\nmid tag\nC'
+
 echo "-------------------------------------------"
 echo "PASS=$pass FAIL=$fail"

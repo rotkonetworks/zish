@@ -4413,13 +4413,12 @@ fn preprocessHeredoc(self: *Shell, command: []const u8, delimiter: []const u8) !
         content = stripped_owned.?;
     }
 
-    // Unquoted delimiter: expand variables and command substitutions in body.
-    var expanded_owned: ?[]const u8 = null;
-    defer if (expanded_owned) |e| allocator.free(e);
-    if (!flags.quoted and content.len > 0) {
-        expanded_owned = try self.expandVariables(content);
-        content = expanded_owned.?;
-    }
+    // NOTE: the body is written to the temp file VERBATIM here. For an unquoted
+    // delimiter, variable/command expansion is deferred to when the `<` redirect
+    // is applied (execution time) so it sees assignments made earlier on the same
+    // line, e.g. `x=EXP; cat <<C ... has $x ... C` must print `has EXP`. The
+    // expand-vs-literal choice is encoded in the temp file name ("_e_" vs "_q_")
+    // and consumed by applyRedirect in eval.zig.
 
     const suffix = std.mem.trim(u8, command[suffix_start..], " \t\r\n");
 
@@ -4431,7 +4430,8 @@ fn preprocessHeredoc(self: *Shell, command: []const u8, delimiter: []const u8) !
     };
     S.seq +%= 1;
     var path_buf: [80]u8 = undefined;
-    const tmp_path = std.fmt.bufPrint(&path_buf, "/tmp/zish_heredoc_{d}_{d}", .{ ts, S.seq }) catch return error.OutOfMemory;
+    const mode_tag: u8 = if (flags.quoted) 'q' else 'e';
+    const tmp_path = std.fmt.bufPrint(&path_buf, "/tmp/zish_heredoc_{c}_{d}_{d}", .{ mode_tag, ts, S.seq }) catch return error.OutOfMemory;
 
     const file = std.Io.Dir.createFileAbsolute(compat.io(), tmp_path, .{ .truncate = true }) catch return error.FileError;
     defer file.close(compat.io());
