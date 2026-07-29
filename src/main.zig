@@ -77,7 +77,8 @@ pub fn main(init: std.process.Init) void {
             std.process.exit(1);
         };
 
-        // Flush stdout buffer before exit
+        // Run any EXIT trap, then flush before exit.
+        shell_instance.runExitTrap();
         shell_instance.stdout().flush() catch {};
         std.process.exit(exit_code);
     } else if (res.positionals.len > 0 and res.positionals[0].len > 0) {
@@ -105,6 +106,7 @@ pub fn main(init: std.process.Init) void {
             std.debug.print("zish: error executing script: {}\n", .{err});
             std.process.exit(1);
         };
+        shell_instance.runExitTrap();
         shell_instance.stdout().flush() catch {};
         std.process.exit(exit_code);
     } else {
