@@ -27,7 +27,9 @@ pub fn main(init: std.process.Init) void {
     }
 
     if (res.args.version != 0) {
-        std.debug.print("zish {s}\n", .{build.version});
+        var vbuf: [64]u8 = undefined;
+        const line = std.fmt.bufPrint(&vbuf, "zish {s}\n", .{build.version}) catch "zish\n";
+        compat.writeAll(.stdout(), line) catch {};
         return;
     }
 

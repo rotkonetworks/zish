@@ -339,8 +339,44 @@ fn evaluateTestBuiltinFast(shell: *Shell, node: *const ast.AstNode) !u8 {
 }
 
 // Flat positional evaluator for the `test` / `[` builtin (POSIX test).
-// Unlike [[ ]], `=` here is a literal string comparison (no globbing).
+// Handles the binary -o (OR) / -a (AND) connectives with POSIX precedence
+// (-a binds tighter than -o), delegating each primary to the evaluator below.
 fn evaluateTestExprFlat(shell: *Shell, args: []const []const u8) bool {
+    if (args.len == 0) return false;
+
+    // Split on -o first (lowest precedence); the whole expression is true if any
+    // -o-separated AND-group is true.
+    var start: usize = 0;
+    var idx: usize = 0;
+    var any = false;
+    while (idx <= args.len) : (idx += 1) {
+        if (idx == args.len or std.mem.eql(u8, args[idx], "-o")) {
+            if (evaluateTestAndGroup(shell, args[start..idx])) any = true;
+            start = idx + 1;
+        }
+    }
+    return any;
+}
+
+// One -o group: split on -a; every -a-separated primary must be true.
+fn evaluateTestAndGroup(shell: *Shell, args: []const []const u8) bool {
+    if (args.len == 0) return false;
+    var start: usize = 0;
+    var idx: usize = 0;
+    var all = true;
+    while (idx <= args.len) : (idx += 1) {
+        if (idx == args.len or std.mem.eql(u8, args[idx], "-a")) {
+            if (!evaluateTestPrimaryFlat(shell, args[start..idx])) all = false;
+            start = idx + 1;
+        }
+    }
+    return all;
+}
+
+// A single test primary (no -a/-o): `!`-negation, a 3-arg binary comparison, a
+// 2-arg unary operator, or a bare string. `=` is a literal string compare here
+// (unlike [[ ]], which globs).
+fn evaluateTestPrimaryFlat(shell: *Shell, args: []const []const u8) bool {
     if (args.len == 0) return false;
 
     var i: usize = 0;
