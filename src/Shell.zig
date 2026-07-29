@@ -1177,6 +1177,7 @@ fn handleAction(self: *Shell, action: Action) !void {
                         if (self.history_index != -1) {
                             self.history_search_prefix_len = self.edit_buf.len;
                         }
+                        self.clampCursorNormal();
                         try self.renderLine();
                     }
                 },
@@ -1197,6 +1198,7 @@ fn handleAction(self: *Shell, action: Action) !void {
                         if (self.history_index != -1) {
                             self.history_search_prefix_len = self.edit_buf.len;
                         }
+                        self.clampCursorNormal();
                         try self.renderLine();
                     }
                 },
@@ -1345,6 +1347,7 @@ fn handleAction(self: *Shell, action: Action) !void {
         .vim_mode => |mode_action| {
             switch (mode_action) {
                 .set_mode => |mode| {
+                    const was_insert = self.vim_mode == .insert;
                     self.vim_mode = mode;
                     self.vi.mode = if (mode == .normal) .normal else .insert;
                     if (mode == .normal) {
@@ -1355,6 +1358,14 @@ fn handleAction(self: *Shell, action: Action) !void {
                         self.vi.awaiting_text_obj = false;
                         self.vi.pending_g = false;
                         self.vi.count = 0;
+                        // vim: leaving insert mode pulls the cursor back off the
+                        // end-of-line position onto the last typed character, so
+                        // x/D/r operate on it instead of no-op'ing past the end.
+                        if (was_insert and self.edit_buf.cursor > 0 and
+                            self.edit_buf.text[self.edit_buf.cursor - 1] != '\n')
+                        {
+                            _ = self.edit_buf.moveLeft();
+                        }
                     }
                 },
                 .enter_visual => |vtype| {
@@ -2283,6 +2294,18 @@ fn readNextAction(self: *Shell) !Action {
 // numeric counts, r<char>, the g-prefix) can't be expressed as one Action, so
 // those are driven through the vim.zig state machine, which mutates the edit
 // buffer directly and tracks pending state across keystrokes.
+// In vim normal mode the cursor rests ON a character, never past the end of
+// its line. After a delete at end-of-line it can land on the newline/end, so
+// pull it back onto the last character (no-op in insert mode or at line start).
+fn clampCursorNormal(self: *Shell) void {
+    if (self.vim_mode != .normal) return;
+    const b = &self.edit_buf;
+    const at_line_end = b.cursor >= b.len or b.text[b.cursor] == '\n';
+    if (at_line_end and b.cursor > 0 and b.text[b.cursor - 1] != '\n') {
+        _ = b.moveLeft();
+    }
+}
+
 fn normalModeDispatch(self: *Shell, char: u8) !Action {
     const v = &self.vi;
     // A sequence is already in progress, or this key starts one.
