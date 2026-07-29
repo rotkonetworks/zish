@@ -190,30 +190,31 @@ pub const LogWriter = struct {
         );
         defer self.allocator.free(log_path);
 
-        // open or create file in append mode (atomic)
-        const file = fs.openFileAbsolute(compat.io(), log_path, .{
-            .mode = .write_only,
-        }) catch |err| blk: {
-            if (err == error.FileNotFound) {
-                // create the file
-                break :blk try fs.createFileAbsolute(compat.io(), log_path, .{
-                    .permissions = .fromMode(0o600),
-                });
-            }
-            return err;
-        };
-        defer file.close(compat.io());
-
-        // seek to end
-        const end_pos = try file.length(compat.io());
-
-        // write header + encrypted data atomically
+        // Build the whole record (header + ciphertext) contiguously and append
+        // it with a SINGLE O_APPEND write. The old code read file.length() then
+        // writePositionalAll at that offset — a TOCTOU race: two shells sharing
+        // the history read the same end offset and overwrote each other's
+        // entries (concurrent-write data loss). With O_APPEND the kernel does
+        // seek-to-end + write as one atomic step, and a single write of a small
+        // (<PIPE_BUF) record is not interleaved with other appenders.
         const header_bytes = std.mem.asBytes(&header);
-        try file.writePositionalAll(compat.io(), header_bytes, end_pos);
-        try file.writePositionalAll(compat.io(), encrypted, end_pos + header_bytes.len);
+        const record = try self.allocator.alloc(u8, header_bytes.len + encrypted.len);
+        defer self.allocator.free(record);
+        @memcpy(record[0..header_bytes.len], header_bytes);
+        @memcpy(record[header_bytes.len..], encrypted);
 
-        // fsync for durability
-        try file.sync(compat.io());
+        const fd = try compat.posix.open(log_path, .{
+            .ACCMODE = .WRONLY,
+            .APPEND = true,
+            .CREAT = true,
+        }, 0o600);
+        defer compat.posix.close(fd);
+
+        var written: usize = 0;
+        while (written < record.len) {
+            written += try compat.posix.write(fd, record[written..]);
+        }
+        _ = std.c.fsync(fd); // durability
 
         // increment sequence
         self.sequence += 1;
