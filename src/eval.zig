@@ -1027,6 +1027,11 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
                 }
                 continue;
             }
+            // "${a[@]}" is likewise one field per array element.
+            if (quotedArrayAll(arg)) |arr_name| {
+                try appendQuotedArrayFields(shell, arr_name, &expanded_args);
+                continue;
+            }
             const var_expanded_result = try shell.expandVariablesNoTildeZ(arg);
             defer var_expanded_result.deinit(shell.allocator);
             try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, var_expanded_result.slice));
@@ -2451,6 +2456,22 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
                 }
                 continue;
             }
+            // "${a[@]}" iterates once per array element.
+            if (quotedArrayAll(raw_value)) |arr_name| {
+                const alen = shell.getArrayLen(arr_name) orelse 0;
+                var ai: usize = 0;
+                while (ai < alen) : (ai += 1) {
+                    const elem = shell.getArrayElement(arr_name, ai) orelse "";
+                    setForVariableFast(cached_value_ptr.?, elem, &loop_buf, &heap_buf, shell.allocator);
+                    last_status = try evaluateAst(shell, body);
+                    if (last_status == 254) { should_break = true; break :outer; }
+                    if (last_status == 253) {
+                        if (shell.loop_continue > 1) { should_break = true; break :outer; }
+                        last_status = 0;
+                    }
+                }
+                continue;
+            }
             const var_expanded_res = try shell.expandVariablesNoTildeZ(raw_value);
             defer var_expanded_res.deinit(shell.allocator);
             const var_expanded = var_expanded_res.slice;
@@ -3587,6 +3608,29 @@ fn positionalCount(shell: *Shell) usize {
 // positional parameter, unlike "$*" which joins them into a single field).
 fn isQuotedAtParam(v: []const u8) bool {
     return std.mem.eql(u8, v, "$@") or std.mem.eql(u8, v, "${@}");
+}
+
+// If v is exactly "${NAME[@]}" — a quoted array-all expansion, which expands to
+// one field per element — return NAME; else null. "${NAME[*]}" joins into a
+// single field, so it is intentionally excluded here.
+fn quotedArrayAll(v: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, v, "${") or !std.mem.endsWith(u8, v, "[@]}")) return null;
+    const name = v[2 .. v.len - 4];
+    if (name.len == 0) return null;
+    for (name) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_') return null;
+    }
+    return name;
+}
+
+// Append every element of array `name` as its own field (for "${a[@]}").
+fn appendQuotedArrayFields(shell: *Shell, name: []const u8, out: *std.ArrayList([:0]const u8)) !void {
+    const len = shell.getArrayLen(name) orelse 0;
+    var i: usize = 0;
+    while (i < len) : (i += 1) {
+        const elem = shell.getArrayElement(name, i) orelse "";
+        try out.append(shell.allocator, try shell.allocator.dupeZ(u8, elem));
+    }
 }
 
 // Remove positional parameters $1..$99 (freeing their storage).

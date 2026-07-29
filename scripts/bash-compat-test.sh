@@ -188,6 +188,14 @@ t 'hd cmdsubst'      $'cat <<C\n$(echo sub)\nC'
 t 'hd loop reexpand' $'for x in a b c; do cat <<E\nitem $x\nE\ndone'
 t 'hd prior cmd'     $'printf "%s\\n" pre; cat <<C\nmid tag\nC'
 
+# --- quoted array-all expansion "${a[@]}" ---
+t 'qarr for'         'a=("x y" z); for e in "${a[@]}"; do echo "<$e>"; done'
+t 'qarr printf'      'a=(1 2 3); printf "[%s]" "${a[@]}"; echo'
+t 'qarr set'         'a=("a b" c); set -- "${a[@]}"; echo "$#"'
+t 'qarr star join'   'a=(one two); echo "${a[*]}"'
+t 'qarr empty'       'a=(); for e in "${a[@]}"; do echo x; done; echo "done ${#a[@]}"'
+t 'qarr funcargs'    'arr=(a b); f(){ echo "got $#"; }; f "${arr[@]}"'
+
 # --- mapfile / readarray ---
 ti 'mapfile basic'   'a\nb\nc\n'    'mapfile -t arr; echo "${#arr[@]} [${arr[1]}]"'
 ti 'mapfile no-nl'   'a\nb\nc'      'mapfile -t arr; echo "${#arr[@]}:${arr[*]}"'
