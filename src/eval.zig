@@ -310,6 +310,21 @@ fn evaluateTestBuiltinFast(shell: *Shell, node: *const ast.AstNode) !u8 {
         if (arg_count >= 8) break; // max args
 
         const arg = arg_node.value;
+
+        // expandVariableFast only handles bare `$name`. Anything needing the
+        // real expander — `${...}` (braced params; note the parser normalizes a
+        // double-quoted "$x" to ${x}, so EVERY quoted variable lands here),
+        // command substitution `$(...)`, or a single-quoted literal — must fall
+        // through to the full path, or the operand keeps stray bytes and the
+        // comparison is wrong (`[ "$x" = ok ]` was reporting not-equal).
+        if (arg_node.node_type == .string or
+            std.mem.indexOf(u8, arg, "${") != null or
+            std.mem.indexOf(u8, arg, "$(") != null or
+            std.mem.indexOf(u8, arg, "`") != null)
+        {
+            return error.BufferTooSmall; // fall through to the full expansion path
+        }
+
         const dest = &arg_buffers[arg_count];
 
         // Fast variable expansion into stack buffer
