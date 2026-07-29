@@ -113,6 +113,7 @@ pub const Action = union(enum) {
     history_nav: HistoryDirection,
     enter_search_mode: SearchDirection,
     exit_search_mode: bool,
+    search_next_match, // Ctrl+R again: step to the next (older) match
     yank: YankAction,
     paste: PasteAction,
     insert_at_position: InsertAtPosition,

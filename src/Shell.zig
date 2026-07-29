@@ -45,6 +45,7 @@ const CTRL_G = input_mod.CTRL_G;
 const CTRL_L = input_mod.CTRL_L;
 const CTRL_D = input_mod.CTRL_D;
 const CTRL_Z = input_mod.CTRL_Z;
+const CTRL_R = input_mod.CTRL_R;
 
 // global shell instance for signal handler - must use atomic access
 // to avoid data races between main thread and signal handlers
@@ -242,6 +243,8 @@ clipboard_len: usize = 0,
 search_mode: bool = false,
 search_buffer: []u8,
 search_len: usize = 0,
+// which match to show (0 = most recent); Ctrl+R steps to older matches
+search_index: usize = 0,
 // paste mode (bracketed paste)
 paste_mode: bool = false,
 // completion state (grouped sub-struct — see completion_mod for logic)
@@ -462,7 +465,9 @@ fn showSearchMatch(self: *Shell) !void {
         defer self.allocator.free(matches);
 
         if (matches.len > 0) {
-            const entry_idx = matches[0].entry_index;
+            // clamp the cycle index to the available matches (stops at oldest)
+            if (self.search_index >= matches.len) self.search_index = matches.len - 1;
+            const entry_idx = matches[self.search_index].entry_index;
             const entry = self.history.?.entries.items[entry_idx];
             const cmd = self.history.?.getCommand(entry);
 
@@ -1007,6 +1012,7 @@ fn handleAction(self: *Shell, action: Action) !void {
                 if (self.search_len < self.search_buffer.len) {
                     self.search_buffer[self.search_len] = char;
                     self.search_len += 1;
+                    self.search_index = 0; // new term → jump to most recent match
                     try self.showSearchMatch();
                 }
             } else {
@@ -1036,6 +1042,7 @@ fn handleAction(self: *Shell, action: Action) !void {
             if (self.search_mode) {
                 if (self.search_len > 0) {
                     self.search_len -= 1;
+                    self.search_index = 0; // term changed → most recent match
                     try self.showSearchMatch();
                 }
             } else {
@@ -1418,6 +1425,7 @@ fn handleAction(self: *Shell, action: Action) !void {
         .enter_search_mode => |direction| {
             self.search_mode = true;
             self.search_len = 0;
+            self.search_index = 0;
             // clear all wrapped rows of the command line first
             if (self.term_view.term.row > 0) {
                 try self.stdout().print("\x1b[{d}A", .{self.term_view.term.row});
@@ -1429,6 +1437,12 @@ fn handleAction(self: *Shell, action: Action) !void {
                 try self.stdout().writeAll("(forward-i-search): ");
             }
             try self.stdout().flush(); // flush erase before any stderr redraw
+        },
+
+        .search_next_match => {
+            // Ctrl+R pressed again — search_index was already advanced; redraw
+            // the search UI with the next (older) match.
+            try self.showSearchMatch();
         },
 
         .exit_search_mode => |execute| {
@@ -2596,6 +2610,11 @@ fn getSearchModeAction(self: *Shell, char: u8) Action {
     return switch (char) {
         '\n' => .{ .exit_search_mode = true },
         '\x1b' => .{ .exit_search_mode = false },
+        CTRL_R => blk: {
+            // Ctrl+R again: advance to the next (older) match
+            self.search_index += 1;
+            break :blk .search_next_match;
+        },
         8, 127 => blk: {
             if (self.search_len > 0) {
                 break :blk .backspace;
