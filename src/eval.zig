@@ -950,6 +950,18 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
         // Double-quoted strings: expand vars/cmds but no word splitting, glob,
         // or tilde (bash leaves '~' literal inside double quotes).
         if (arg_node.node_type == .double_quoted) {
+            // "$@" is special: one field per positional parameter (not joined).
+            if (isQuotedAtParam(arg)) {
+                const count = positionalCount(shell);
+                var i: usize = 1;
+                while (i <= count) : (i += 1) {
+                    var nb: [16]u8 = undefined;
+                    const ns = std.fmt.bufPrint(&nb, "{d}", .{i}) catch break;
+                    const v = shell.variables.get(ns) orelse "";
+                    try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, v));
+                }
+                continue;
+            }
             const var_expanded_result = try shell.expandVariablesNoTildeZ(arg);
             defer var_expanded_result.deinit(shell.allocator);
             try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, var_expanded_result.slice));
@@ -2024,6 +2036,24 @@ pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
 
         // Double-quoted: expand vars/cmds but no word splitting or tilde
         if (value_node.node_type == .double_quoted) {
+            // "$@" is special: iterate once per positional parameter.
+            if (isQuotedAtParam(raw_value)) {
+                const count = positionalCount(shell);
+                var i: usize = 1;
+                while (i <= count) : (i += 1) {
+                    var nb: [16]u8 = undefined;
+                    const ns = std.fmt.bufPrint(&nb, "{d}", .{i}) catch break;
+                    const v = shell.variables.get(ns) orelse "";
+                    setForVariableFast(cached_value_ptr.?, v, &loop_buf, &heap_buf, shell.allocator);
+                    last_status = try evaluateAst(shell, body);
+                    if (last_status == 254) { should_break = true; break :outer; }
+                    if (last_status == 253) {
+                        if (shell.loop_continue > 1) { should_break = true; break :outer; }
+                        last_status = 0;
+                    }
+                }
+                continue;
+            }
             const var_expanded_res = try shell.expandVariablesNoTildeZ(raw_value);
             defer var_expanded_res.deinit(shell.allocator);
             const var_expanded = var_expanded_res.slice;
@@ -2831,6 +2861,18 @@ fn serializeTestInner(allocator: std.mem.Allocator, buf: *std.ArrayListUnmanaged
         },
         else => {},
     }
+}
+
+// Number of positional parameters ($#), 0 if unset.
+fn positionalCount(shell: *Shell) usize {
+    const c = shell.variables.get("#") orelse return 0;
+    return std.fmt.parseInt(usize, c, 10) catch 0;
+}
+
+// True if a double-quoted node is exactly "$@" (which expands to one field per
+// positional parameter, unlike "$*" which joins them into a single field).
+fn isQuotedAtParam(v: []const u8) bool {
+    return std.mem.eql(u8, v, "$@") or std.mem.eql(u8, v, "${@}");
 }
 
 // Remove positional parameters $1..$99 (freeing their storage).
