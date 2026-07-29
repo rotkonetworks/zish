@@ -25,11 +25,6 @@ pub const math = @import("math.zig");
 pub const model = @import("model.zig");
 pub const tokenizer = @import("tokenizer.zig");
 pub const ctm = @import("ctm.zig");
-pub const autonomic = @import("autonomic.zig");
-pub const mel = @import("mel.zig");
-pub const pipe = @import("pipe.zig");
-pub const encoder = @import("encoder.zig");
-pub const whisper = @import("whisper.zig");
 
 const Allocator = std.mem.Allocator;
 const Token = tokenizer.Token;
@@ -273,8 +268,6 @@ fn childMain(req_fd: posix.fd_t, resp_fd: posix.fd_t, model_path: []const u8) vo
     logMsg(dbg, "Tokenizer OK\n");
     logMsg(dbg, "CTM init...\n");
 
-    var ctm_layer_idx: usize = 0;
-
     // Initialize CTM state if model has CTM blocks
     for (0..transformer.config.n_layers) |i| {
         if (transformer.layers[i].ctm_block) |blk| {
@@ -292,29 +285,22 @@ fn childMain(req_fd: posix.fd_t, resp_fd: posix.fd_t, model_path: []const u8) vo
                 sendError(resp_fd);
                 return;
             };
-            ctm_layer_idx = i;
-
             // Make weights plastic (mutable copies for learning)
             @constCast(blk).makePlastic(alloc) catch {};
             break;
         }
     }
 
-    // ── Initialize autonomic controller ──
-    // "Your Server as a Function": the breathing loop IS the server.
-    // inhale = perceive >> dopamine >> replay
-    // exhale = consolidate >> dream >> persist
-    // controller = route(has_input?, inhale, exhale)
-    var controller = autonomic.Controller.init(
-        &transformer,
-        &state,
-        &tok,
-        model_path,
-        ctm_layer_idx,
-    );
-    controller.restore(); // load persisted state from previous sessions
+    // ── Per-request generation state ──
+    // Ghost-text inference is stateless per request (handleRequestWithDopamine
+    // resets pos on each call), so plain locals suffice — no autonomic loop.
+    var pos: usize = 0;
+    var recent_ring: [64]tokenizer.Token = [_]tokenizer.Token{-1} ** 64;
+    var recent_count: usize = 0;
+    var replay_buf: ctm.ReplayBuffer = .{};
+    const surprise_threshold: f32 = 1.5;
 
-    logMsg(dbg, "Controller OK\n");
+    logMsg(dbg, "State ready\n");
 
     // ── Initialize GPU compute (graceful fallback to CPU) ──
     logMsg(dbg, "GPU init...\n");
@@ -348,57 +334,36 @@ fn childMain(req_fd: posix.fd_t, resp_fd: posix.fd_t, model_path: []const u8) vo
         }
     }
 
-    // Set request pipe to non-blocking for continuous inference polling
-    const F_GETFL = 3;
-    const F_SETFL = 4;
-    const O_NONBLOCK = 2048;
-    const cur_flags = posix.fcntl(req_fd, F_GETFL, 0) catch 0;
-    _ = posix.fcntl(req_fd, F_SETFL, cur_flags | O_NONBLOCK) catch {};
-
-    // ── Continuous breathing loop ──
-    // The autonomic controller routes between inhale (input) and exhale (idle).
-    // Each tick is one breath. The model thinks, learns, persists — autonomously.
+    // ── Request/response loop ──
+    // The pipe stays blocking: pollRequest blocks on the next request and
+    // exits the child cleanly when the parent closes the pipe (EOF).
     while (true) {
-        // ════════════════════════════════════
-        // INHALE: check for incoming request
-        // ════════════════════════════════════
-        if (pollRequest(req_fd)) |req| {
-            // Process query through inhale pipeline with warm state
-            const response = handleRequestWithDopamine(
-                &transformer,
-                &state,
-                &tok,
-                req.prompt,
-                req.max_tokens,
-                req.temperature,
-                &controller.ctx.pos,
-                &controller.ctx.recent_ring,
-                &controller.ctx.recent_count,
-                &controller.ctx.replay_buf,
-                controller.ctx.config.surprise_threshold,
-                alloc,
-            ) catch {
-                sendError(resp_fd);
-                alloc.free(req.prompt);
-                continue;
-            };
+        const req = pollRequest(req_fd) orelse continue;
+
+        const response = handleRequestWithDopamine(
+            &transformer,
+            &state,
+            &tok,
+            req.prompt,
+            req.max_tokens,
+            req.temperature,
+            &pos,
+            &recent_ring,
+            &recent_count,
+            &replay_buf,
+            surprise_threshold,
+            alloc,
+        ) catch {
+            sendError(resp_fd);
             alloc.free(req.prompt);
-            defer alloc.free(response);
-
-            // Send response
-            const resp_len: u32 = @intCast(response.len);
-            writeAll(resp_fd, std.mem.asBytes(&resp_len)) catch return;
-            writeAll(resp_fd, response) catch return;
-
-            controller.ctx.total_inhales += 1;
-            controller.ctx.exhale_counter = 0;
             continue;
-        }
+        };
+        alloc.free(req.prompt);
+        defer alloc.free(response);
 
-        // ════════════════════════════════════
-        // EXHALE: idle — think and consolidate
-        // ════════════════════════════════════
-        _ = controller.tick();
+        const resp_len: u32 = @intCast(response.len);
+        writeAll(resp_fd, std.mem.asBytes(&resp_len)) catch return;
+        writeAll(resp_fd, response) catch return;
     }
 }
 

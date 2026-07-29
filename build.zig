@@ -71,26 +71,6 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
-    // Standalone GGUF inference runner: `zig build infer -- <model.gguf> "<prompt>"`.
-    const infer_exe = b.addExecutable(.{
-        .name = "zish-infer",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/infer_cli.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-        .use_llvm = true,
-    });
-    infer_exe.root_module.addImport("clap", clap.module("clap"));
-    infer_exe.root_module.addOptions("build_options", build_options);
-    b.installArtifact(infer_exe);
-    const infer_run = b.addRunArtifact(infer_exe);
-    infer_run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| infer_run.addArgs(args);
-    const infer_step = b.step("infer", "Run GGUF inference (model + prompt)");
-    infer_step.dependOn(&infer_run.step);
-
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });

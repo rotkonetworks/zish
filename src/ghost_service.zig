@@ -1,6 +1,6 @@
 // Ghost text inference pipeline — composable SaaF stages.
 //
-// Same pattern as autonomic.zig: chain(f, g) composes signal-processing functions.
+// chain(f, g) composes signal-processing functions.
 // Each stage is fn(*GhostCtx, GhostSignal) GhostSignal — pure transformation.
 //
 // Pipeline: stalenessGuard >> promptBuilder >> inference >> sanitizer
