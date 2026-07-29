@@ -1360,13 +1360,24 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     compat.posix.sigaction(compat.posix.SIG.INT, &ignore_action, &old_sigint);
     defer compat.posix.sigaction(compat.posix.SIG.INT, &old_sigint, null);
 
-    // wait for child
-    const result = compat.posix.waitpid(pid, 0);
+    // wait for child. UNTRACED makes waitpid return when the child is *stopped*
+    // (e.g. by Ctrl+Z / SIGTSTP), not just when it exits. Without this flag a
+    // Ctrl+Z left the shell blocked here forever while the child sat stopped —
+    // the shell appeared to hang.
+    const result = compat.posix.waitpid(pid, compat.posix.W.UNTRACED);
 
     // take back terminal control
     if (is_tty) {
         const shell_pgid: compat.posix.pid_t = @intCast(std.os.linux.syscall1(.getpgid, 0));
         jobs.tcsetpgrp(compat.posix.STDIN_FILENO, shell_pgid) catch {};
+    }
+
+    // Child was stopped (Ctrl+Z): register it as a stopped background job so it
+    // can be resumed with `fg`, tell the user, and return to the prompt instead
+    // of hanging. bash returns 128 + SIGTSTP for this.
+    if (compat.posix.W.IFSTOPPED(result.status)) {
+        registerStoppedForeground(shell, pid, expanded_args.items);
+        return 148; // 128 + SIGTSTP(20)
     }
 
     if (compat.posix.W.IFEXITED(result.status)) {
@@ -1380,6 +1391,27 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
         return @truncate(128 + @as(u32, @intCast(@intFromEnum(compat.posix.W.TERMSIG(result.status)))));
     }
     return 127;
+}
+
+// Register a foreground command that was just stopped by Ctrl+Z as a stopped
+// background job, and print the standard "[n]+ Stopped  cmd" notice.
+fn registerStoppedForeground(shell: *Shell, pid: compat.posix.pid_t, args: []const [:0]const u8) void {
+    var buf: [512]u8 = undefined;
+    var len: usize = 0;
+    for (args, 0..) |a, i| {
+        if (i > 0 and len < buf.len) {
+            buf[len] = ' ';
+            len += 1;
+        }
+        const n = @min(a.len, buf.len - len);
+        @memcpy(buf[len .. len + n], a[0..n]);
+        len += n;
+        if (len >= buf.len) break;
+    }
+    const cmd = buf[0..len];
+    const job_id = shell.job_table.addStoppedForeground(pid, cmd);
+    shell.stdout().print("\n[{d}]+  Stopped\t\t{s}\n", .{ job_id, cmd }) catch {};
+    shell.stdout().flush() catch {};
 }
 
 // Check if command name is a builtin - delegate to builtins module

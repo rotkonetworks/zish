@@ -189,6 +189,24 @@ pub const JobTable = struct {
         return job_id;
     }
 
+    /// Register a foreground process that was just stopped by SIGTSTP (Ctrl+Z).
+    /// Adds it as a background job in the stopped state so it can be resumed
+    /// with `fg`/`bg`. Saves the terminal modes the child was using so `fg`
+    /// can restore them. Returns the new job id (0 on allocation failure).
+    pub fn addStoppedForeground(self: *JobTable, pid: posix.pid_t, command: []const u8) u32 {
+        const job_id = self.addJob(pid, command, false) catch return 0;
+        if (self.getJob(job_id)) |job| {
+            job.state = .stopped;
+            job.notified = true; // caller prints its own "Stopped" message
+            if (job.processes.items.len > 0) {
+                job.processes.items[0].stopped = true;
+                job.processes.items[0].completed = false;
+            }
+            job.tmodes = posix.tcgetattr(self.shell_terminal) catch null;
+        }
+        return job_id;
+    }
+
     /// Add a pipeline job with multiple processes
     pub fn addPipelineJob(self: *JobTable, pids: []const posix.pid_t, pgid: posix.pid_t, command: []const u8, foreground: bool) !u32 {
         const job_id = self.next_id;
