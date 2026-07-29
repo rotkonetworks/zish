@@ -249,6 +249,7 @@ pub const Parser = struct {
             .While => self.parsewhile(),
             .Until => self.parseuntil(),
             .For => self.parsefor(),
+            .Select => self.parseselect(),
             .Case => self.parsecase(),
             .LeftBrace => self.parsegroup(),
             .LeftParen => self.parsesubshell(),
@@ -363,7 +364,7 @@ pub const Parser = struct {
                     try self.nextToken();
                 },
                 // keywords can be used as arguments (e.g., "echo done")
-                .Done, .Fi, .Else, .Elif, .Then, .Do, .In, .For, .While, .Until, .If, .Case, .Esac, .Function => {
+                .Done, .Fi, .Else, .Elif, .Then, .Do, .In, .For, .Select, .While, .Until, .If, .Case, .Esac, .Function => {
                     if (words.items.len > 0) {
                         // treat keyword as word when it's an argument
                         const token = self.current_token;
@@ -735,6 +736,63 @@ pub const Parser = struct {
             for_token.line,
             for_token.column,
         );
+    }
+
+    fn parseselect(self: *Self) parsererror!*const ast.AstNode {
+        const select_token = self.current_token;
+        try self.nextToken(); // consume 'select'
+
+        // parse variable name
+        const variable = try self.parseword();
+
+        var values = try std.ArrayList(*const ast.AstNode).initCapacity(self.builder.arena.allocator(), 32);
+
+        // `select x; do ...` / `select x do ...` (no `in`) iterates over "$@"
+        if (self.current_token.ty != .In) {
+            if (self.current_token.ty == .Semicolon or self.current_token.ty == .NewLine or self.current_token.ty == .Do) {
+                const at = try self.builder.createdoublequoted("$@", select_token.line, select_token.column);
+                try values.append(self.builder.arena.allocator(), at);
+                if (self.current_token.ty == .Semicolon or self.current_token.ty == .NewLine) {
+                    try self.nextToken();
+                }
+                if (self.current_token.ty != .Do) return error.UnexpectedToken;
+                try self.nextToken(); // consume 'do'
+                const body = try self.parsecommandlist();
+                if (self.current_token.ty != .Done) return error.UnexpectedToken;
+                try self.nextToken(); // consume 'done'
+                return self.builder.createselect(variable, values.items, body, select_token.line, select_token.column);
+            }
+            return error.UnexpectedToken;
+        }
+        try self.nextToken(); // consume 'in'
+
+        // parse value list
+        while (self.current_token.ty != .Semicolon and
+            self.current_token.ty != .NewLine and
+            self.current_token.ty != .Do and
+            self.current_token.ty != .Eof)
+        {
+            if (values.items.len >= types.MAX_ARGS_COUNT) {
+                return error.TooManyArguments;
+            }
+            const value = try self.parseword();
+            try values.append(self.builder.arena.allocator(), value);
+        }
+
+        // skip optional separator
+        if (self.current_token.ty == .Semicolon or self.current_token.ty == .NewLine) {
+            try self.nextToken();
+        }
+
+        if (self.current_token.ty != .Do) return error.UnexpectedToken;
+        try self.nextToken(); // consume 'do'
+
+        const body = try self.parsecommandlist();
+
+        if (self.current_token.ty != .Done) return error.UnexpectedToken;
+        try self.nextToken(); // consume 'done'
+
+        return self.builder.createselect(variable, values.items, body, select_token.line, select_token.column);
     }
 
     fn parsecase(self: *Self) parsererror!*const ast.AstNode {

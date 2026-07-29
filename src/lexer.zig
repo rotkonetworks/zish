@@ -55,6 +55,7 @@ pub const TokenType = enum {
     // keywords
     If, Then, Else, Elif, Fi,
     For, While, Until, Do, Done, In,
+    Select,
     Case, Esac, Function,
 
     // special
@@ -1390,6 +1391,13 @@ fn classifyWord(word: []const u8) TokenType {
             const w4 = @as(*const u32, @ptrCast(&buf)).*;
             if (w4 == @as(u32, @bitCast([4]u8{ 'w', 'h', 'i', 'l' })) and word[4] == 'e') return .While;
             if (w4 == @as(u32, @bitCast([4]u8{ 'u', 'n', 't', 'i' })) and word[4] == 'l') return .Until;
+            return .Word;
+        },
+        6 => {
+            var buf: [4]u8 align(4) = undefined;
+            @memcpy(&buf, word[0..4]);
+            const w4 = @as(*const u32, @ptrCast(&buf)).*;
+            if (w4 == @as(u32, @bitCast([4]u8{ 's', 'e', 'l', 'e' })) and word[4] == 'c' and word[5] == 't') return .Select;
             return .Word;
         },
         8 => {

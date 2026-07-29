@@ -17,6 +17,7 @@ pub const NodeType = enum {
     until_loop,
     for_loop,
     c_for_loop, // C-style: for ((init; cond; update)) — value = header, child[0] = body
+    select_loop, // select name in words; do body; done — [variable, word1..wordN, body]
     arith_command, // (( expr )) — value = expression text
     case_statement,
     case_item,  // pattern) body;;
@@ -247,6 +248,22 @@ pub const AstBuilder = struct {
         children[children.len - 1] = body;
 
         return self.createnode(.for_loop, "", children, line, column);
+    }
+
+    // select name in words; do body; done — same child layout as for_loop:
+    // [variable, word1, ..., wordN, body]
+    pub fn createselect(self: *Self, variable: *const AstNode, values: []const *const AstNode, body: *const AstNode, line: u32, column: u32) !*const AstNode {
+        self.depth += 1;
+        defer self.depth -= 1;
+
+        const allocator = self.arena.allocator();
+
+        var children = try allocator.alloc(*const AstNode, values.len + 2);
+        children[0] = variable;
+        @memcpy(children[1 .. values.len + 1], values);
+        children[children.len - 1] = body;
+
+        return self.createnode(.select_loop, "", children, line, column);
     }
 
     // (( expr )) — value holds the arithmetic expression text.

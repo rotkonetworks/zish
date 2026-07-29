@@ -270,6 +270,7 @@ pub fn evaluateAst(shell: *Shell, node: *const ast.AstNode) anyerror!u8 {
         .until_loop => evaluateUntil(shell, node),
         .for_loop => evaluateFor(shell, node),
         .c_for_loop => evaluateCForLoop(shell, node),
+        .select_loop => evaluateSelect(shell, node),
         .arith_command => evaluateArithCommand(shell, node),
         .subshell => evaluateSubshell(shell, node),
         .test_expression => evaluateTest(shell, node),
@@ -2632,6 +2633,278 @@ fn setForVariable(shell: *Shell, name: []const u8, value: []const u8) !void {
     const name_copy = try shell.allocator.dupe(u8, name);
     const value_copy = try shell.allocator.dupe(u8, value);
     try shell.variables.put(name_copy, value_copy);
+}
+
+// Set a shell variable to an owned copy of `value`, freeing any prior value.
+fn setPlainVar(shell: *Shell, name: []const u8, value: []const u8) !void {
+    const value_copy = try shell.allocator.dupe(u8, value);
+    if (shell.variables.getEntry(name)) |e| {
+        shell.allocator.free(e.value_ptr.*);
+        e.value_ptr.* = value_copy;
+        return;
+    }
+    const name_copy = try shell.allocator.dupe(u8, name);
+    errdefer shell.allocator.free(name_copy);
+    try shell.variables.put(name_copy, value_copy);
+}
+
+// Expand for/select word nodes into a flat, owned list of strings. Mirrors the
+// expansion done per-item in evaluateFor (single-quote literal, double-quote var
+// expansion with "$@" special-casing, and unquoted brace/var/split/glob).
+fn collectWords(shell: *Shell, values: []const *const ast.AstNode, out: *std.ArrayList([]const u8)) !void {
+    for (values) |value_node| {
+        const raw = value_node.value;
+
+        if (value_node.node_type == .string) {
+            try out.append(shell.allocator, try shell.allocator.dupe(u8, raw));
+            continue;
+        }
+
+        if (value_node.node_type == .double_quoted) {
+            if (isQuotedAtParam(raw)) {
+                const count = positionalCount(shell);
+                var i: usize = 1;
+                while (i <= count) : (i += 1) {
+                    var nb: [16]u8 = undefined;
+                    const ns = std.fmt.bufPrint(&nb, "{d}", .{i}) catch break;
+                    const v = shell.variables.get(ns) orelse "";
+                    try out.append(shell.allocator, try shell.allocator.dupe(u8, v));
+                }
+                continue;
+            }
+            const res = try shell.expandVariablesNoTildeZ(raw);
+            defer res.deinit(shell.allocator);
+            try out.append(shell.allocator, try shell.allocator.dupe(u8, res.slice));
+            continue;
+        }
+
+        const has_brace = Shell.hasBracePattern(raw);
+        const needs_var = (raw.len > 0 and raw[0] == '~') or std.mem.indexOfScalar(u8, raw, '$') != null;
+        const has_glob = glob.hasGlobChars(raw);
+        const needs_split = hasCommandSubstitution(raw) or std.mem.indexOfScalar(u8, raw, '$') != null;
+
+        if (!has_brace and !needs_var and !has_glob) {
+            try out.append(shell.allocator, try shell.allocator.dupe(u8, raw));
+            continue;
+        }
+
+        const brace_results = if (has_brace) try Shell.expandBraces(shell.allocator, raw) else null;
+        defer if (brace_results) |br| Shell.freeBraceResults(shell.allocator, br);
+        const brace_items = if (brace_results) |br| br else &[_][]const u8{raw};
+
+        for (brace_items) |brace_item| {
+            const var_expanded = if (needs_var or brace_results != null)
+                try shell.expandVariables(brace_item)
+            else
+                try shell.allocator.dupe(u8, brace_item);
+            defer shell.allocator.free(var_expanded);
+
+            if (needs_split) {
+                var it = std.mem.tokenizeAny(u8, var_expanded, ifsDelimiters(shell));
+                while (it.next()) |word| {
+                    if (glob.hasGlobChars(word)) {
+                        const gr = try glob.expandGlob(shell.allocator, word);
+                        defer glob.freeGlobResults(shell.allocator, gr);
+                        if (gr.len == 0) {
+                            try out.append(shell.allocator, try shell.allocator.dupe(u8, word));
+                        } else for (gr) |m| try out.append(shell.allocator, try shell.allocator.dupe(u8, m));
+                    } else {
+                        try out.append(shell.allocator, try shell.allocator.dupe(u8, word));
+                    }
+                }
+            } else if (glob.hasGlobChars(var_expanded)) {
+                const gr = try glob.expandGlob(shell.allocator, var_expanded);
+                defer glob.freeGlobResults(shell.allocator, gr);
+                if (gr.len == 0) {
+                    try out.append(shell.allocator, try shell.allocator.dupe(u8, var_expanded));
+                } else for (gr) |m| try out.append(shell.allocator, try shell.allocator.dupe(u8, m));
+            } else {
+                try out.append(shell.allocator, try shell.allocator.dupe(u8, var_expanded));
+            }
+        }
+    }
+}
+
+fn digitCount(n: usize) usize {
+    var d: usize = 1;
+    var v = n;
+    while (v >= 10) : (v /= 10) d += 1;
+    return d;
+}
+
+// bash-style indent: advance the cursor from column `from` to `to` using tabs
+// (to 8-column tab stops) and spaces, writing into `buf`.
+fn selectIndent(buf: *std.ArrayList(u8), alloc: std.mem.Allocator, from_in: usize, to: usize) !void {
+    var from = from_in;
+    while (from < to) {
+        if (to / 8 > from / 8) {
+            try buf.append(alloc, '\t');
+            from += 8 - (from % 8);
+        } else {
+            try buf.append(alloc, ' ');
+            from += 1;
+        }
+    }
+}
+
+// Render the numbered select menu to stderr, matching bash's column packing.
+fn printSelectMenu(shell: *Shell, words: []const []const u8) !void {
+    const n = words.len;
+    if (n == 0) {
+        _ = compat.posix.write(compat.posix.STDERR_FILENO, "\n") catch {};
+        return;
+    }
+
+    const cols_env = shell.variables.get("COLUMNS") orelse (compat.posix.getenv("COLUMNS") orelse "");
+    const term_cols: usize = std.fmt.parseInt(usize, std.mem.trim(u8, cols_env, " \t"), 10) catch 80;
+
+    const indices_len = digitCount(n);
+    var max_word: usize = 0;
+    for (words) |w| {
+        if (w.len > max_word) max_word = w.len;
+    }
+    // element width = index field + ") " + word, plus a 2-column inter-column gap
+    const max_elem_len = max_word + indices_len + 2 + 2;
+
+    var cols = if (max_elem_len > 0) term_cols / max_elem_len else 1;
+    if (cols < 1) cols = 1;
+    var rows = (n + cols - 1) / cols;
+    cols = (n + rows - 1) / rows;
+    if (rows == 1) {
+        rows = cols;
+        cols = 1;
+    }
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(shell.allocator);
+
+    var row: usize = 0;
+    while (row < rows) : (row += 1) {
+        var pos: usize = 0;
+        var ind = row;
+        var first_in_row = true;
+        while (true) {
+            const w = words[ind];
+            // "%*d) %s" with index field right-justified to indices_len. bash
+            // leaves the first column of a multi-column row unpadded (its
+            // inter-column indent handles alignment); a single column is padded.
+            var numbuf: [24]u8 = undefined;
+            const ns = std.fmt.bufPrint(&numbuf, "{d}", .{ind + 1}) catch "";
+            const idx_width = if (!first_in_row or cols == 1) indices_len else ns.len;
+            var pad = idx_width;
+            while (pad > ns.len) : (pad -= 1) try buf.append(shell.allocator, ' ');
+            first_in_row = false;
+            try buf.appendSlice(shell.allocator, ns);
+            try buf.appendSlice(shell.allocator, ") ");
+            try buf.appendSlice(shell.allocator, w);
+
+            // Bookkeeping width uses the actual index chars written, matching
+            // bash's indent() accounting so tab/space gaps come out identical.
+            const elem_len = w.len + idx_width + 2;
+            ind += rows;
+            if (ind >= n) break;
+            try selectIndent(&buf, shell.allocator, pos + elem_len, pos + max_elem_len);
+            pos += max_elem_len;
+        }
+        try buf.append(shell.allocator, '\n');
+    }
+
+    _ = compat.posix.write(compat.posix.STDERR_FILENO, buf.items) catch {};
+}
+
+// Read one line from stdin (fd 0). Returns null on immediate EOF with no data.
+// The returned slice (into `buf`) excludes the trailing newline.
+fn readSelectLine(buf: []u8) ?[]const u8 {
+    var pos: usize = 0;
+    var got_any = false;
+    while (pos < buf.len) {
+        var c: [1]u8 = undefined;
+        const nread = compat.posix.read(compat.posix.STDIN_FILENO, &c) catch return if (got_any) buf[0..pos] else null;
+        if (nread == 0) return if (got_any) buf[0..pos] else null;
+        got_any = true;
+        if (c[0] == '\n') return buf[0..pos];
+        buf[pos] = c[0];
+        pos += 1;
+    }
+    return buf[0..pos];
+}
+
+pub fn evaluateSelect(shell: *Shell, node: *const ast.AstNode) !u8 {
+    if (node.children.len < 3) return 1;
+
+    const variable = node.children[0];
+    const body = node.children[node.children.len - 1];
+    const value_nodes = node.children[1 .. node.children.len - 1];
+
+    // Expand the word list once, up front — the menu is fixed for the loop.
+    var words: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (words.items) |w| shell.allocator.free(w);
+        words.deinit(shell.allocator);
+    }
+    try collectWords(shell, value_nodes, &words);
+
+    // PS3 prompt (default "#? ")
+    const ps3 = shell.variables.get("PS3") orelse (compat.posix.getenv("PS3") orelse "#? ");
+
+    var last_status: u8 = 0;
+    var need_menu = true;
+    var line_buf: [4096]u8 = undefined;
+
+    while (true) {
+        // Flush any pending buffered stdout so the menu/prompt (written straight
+        // to fd 2) interleave with prior body output in the right order.
+        shell.stdout().flush() catch {};
+        if (need_menu) {
+            try printSelectMenu(shell, words.items);
+            need_menu = false;
+        }
+        _ = compat.posix.write(compat.posix.STDERR_FILENO, ps3) catch {};
+
+        const line = readSelectLine(&line_buf) orelse {
+            // EOF: bash prints a newline to stderr and exits the loop.
+            _ = compat.posix.write(compat.posix.STDERR_FILENO, "\n") catch {};
+            break;
+        };
+
+        // REPLY holds the raw input line, unmodified (bash does not trim it).
+        try setPlainVar(shell, "REPLY", line);
+
+        // A completely empty line reprints the menu and prompts again (no body).
+        // A blank-but-nonempty line (spaces) is an invalid selection instead.
+        if (line.len == 0) {
+            need_menu = true;
+            continue;
+        }
+
+        // Valid selection is a positive integer within range; else name="".
+        const trimmed = std.mem.trim(u8, line, " \t");
+        const choice: []const u8 = blk: {
+            const num = std.fmt.parseInt(usize, trimmed, 10) catch break :blk "";
+            if (num >= 1 and num <= words.items.len) break :blk words.items[num - 1];
+            break :blk "";
+        };
+        try setPlainVar(shell, variable.value, choice);
+
+        last_status = try evaluateAst(shell, body);
+        if (last_status == 254) { // break
+            switch (loopControl(shell, last_status)) {
+                .break_loop => return if (shell.loop_break > 0 or shell.loop_continue > 0) last_status else 0,
+                else => return 0,
+            }
+        }
+        if (last_status == 253) { // continue
+            if (shell.loop_continue > 1) {
+                switch (loopControl(shell, last_status)) {
+                    .break_loop => return if (shell.loop_break > 0 or shell.loop_continue > 0) last_status else 0,
+                    else => return 0,
+                }
+            }
+            last_status = 0;
+        }
+    }
+
+    return last_status;
 }
 
 pub fn evaluateSubshell(shell: *Shell, node: *const ast.AstNode) !u8 {
