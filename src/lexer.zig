@@ -380,6 +380,15 @@ pub const Lexer = struct {
                                 self.brace_depth = 1;
                                 self.state = .word;
                                 _ = self.advance();
+                            } else if (self.peekN(1)) |nxt| {
+                                // "{ " (brace + blank) opens a command group.
+                                // "{" glued to other characters is a literal word
+                                // — e.g. find's {} placeholder, or a bare {}.
+                                if (nxt == ' ' or nxt == '\t' or nxt == '\n') {
+                                    _ = self.advance();
+                                    return self.makeTokenValue(.LeftBrace, "{");
+                                }
+                                self.state = .word; // lex the whole word (re-reads '{')
                             } else {
                                 _ = self.advance();
                                 return self.makeTokenValue(.LeftBrace, "{");
