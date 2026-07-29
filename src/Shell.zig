@@ -21,7 +21,6 @@ const git = @import("git.zig");
 const jobs = @import("jobs.zig");
 const editor = @import("editor.zig");
 const vim = @import("vim.zig");
-const agent_mod = @import("agent.zig");
 const agent_log = @import("agent_log.zig");
 const audio = @import("audio.zig");
 
@@ -262,9 +261,6 @@ cache: completion_mod.CacheState = .{},
 // ghost text autosuggestion state (grouped sub-struct)
 ghost: GhostState = .{},
 
-// agent continue: loaded conversation context to send as first message
-continue_context: ?[]const u8 = null,
-
 // git info display (set via .zishrc: set git_prompt on)
 show_git_info: bool = false,
 
@@ -285,12 +281,6 @@ log_file: ?std.Io.File = null,
 
 // PATH lookup cache - maps command name -> full path
 path_cache: std.StringHashMap([]const u8),
-
-// embedded LLM agent
-agent: agent_mod.AgentContext,
-agent_output_active: bool = false,
-agent_md: agent_mod.MarkdownRenderer = .{},
-bulletin_cursor: usize = 0,
 
 // Voice mode state
 voice_active: bool = false,
@@ -344,7 +334,6 @@ fn initWithOptions(allocator: std.mem.Allocator, load_config: bool) !*Shell {
         .stdout_writer = std.Io.File.stdout().writer(compat.io(), writer_buffer),
         .path_cache = std.StringHashMap([]const u8).init(allocator),
         .job_table = jobs.JobTable.init(allocator),
-        .agent = agent_mod.AgentContext.init(allocator),
     };
 
     // don't enable raw mode here - will be enabled by run() for interactive mode
@@ -427,10 +416,6 @@ pub fn deinit(self: *Shell) void {
     // stop ghost inference thread
     completion_mod.stopGhostInference(self);
 
-    // stop agent thread so it can clean up
-    self.agent.stop();
-
-    if (self.continue_context) |ctx| self.allocator.free(ctx);
     self.allocator.free(self.clipboard);
     self.allocator.free(self.search_buffer);
     self.allocator.free(self.stdout().buffer);
@@ -858,17 +843,9 @@ pub fn run(self: *Shell) !void {
             try self.handleResize();
         }
 
-        // drain any pending agent output (terminal-aware)
-        try self.drainAgentOutput();
-
         try self.log(last_action);
 
-        // when agent is busy, use poll so we can keep draining output
-        if (self.agent.isBusy()) {
-            last_action = self.pollNextAction() catch .none;
-        } else {
-            last_action = try self.readNextAction();
-        }
+        last_action = try self.readNextAction();
         try self.handleAction(last_action);
         try self.stdout().flush();
     }
@@ -1106,17 +1083,7 @@ fn handleAction(self: *Shell, action: Action) !void {
         },
 
         .cancel_agent => {
-            if (self.agent.isBusy()) {
-                self.agent.cancel();
-                // move below prompt content before printing
-                self.term_view.moveTo(self.term_view.term.rows_owned -| 1, 0);
-                self.term_view.clearToEOL();
-                try self.term_view.flush();
-                try self.stdout().writeAll("\r\n^G agent cancelled\n");
-                try self.stdout().flush();
-                self.term_view.finishLine();
-                try self.renderLine();
-            }
+            // The embedded agent was removed; Ctrl+G is now a no-op.
         },
 
         .suspend_shell => {
@@ -1403,23 +1370,6 @@ fn handleAction(self: *Shell, action: Action) !void {
                 try self.stdout().flush();
 
                 if (command.len > 0) {
-                    // ? translate mode: natural language -> shell command
-                    if (command[0] == '?' and command.len > 1) {
-                        const nl_query = std.mem.trimStart(u8, command[1..], " \t");
-                        if (nl_query.len > 0) {
-                            try self.handleTranslateQuery(nl_query);
-                            self.clearCommand();
-                            self.history_index = -1;
-                            self.history_search_prefix_len = 0;
-                            self.vi.mode = .insert;
-                            self.vim_mode = .insert;
-                            self.term_view.finishLine();
-                            self.displayed_cmd_lines = 1;
-                            try self.renderLine();
-                            return;
-                        }
-                    }
-
                     // Preprocess heredoc: convert << DELIM ... DELIM to <<< "content"
                     const processed_cmd = if (findHeredocDelimiter(command)) |delim|
                         self.preprocessHeredoc(command, delim) catch command
@@ -2013,131 +1963,6 @@ fn isWhitespace(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\n';
 }
 
-/// Handle ? translate mode: send NL query to agent, collect response, populate edit buffer.
-fn handleTranslateQuery(self: *Shell, nl_query: []const u8) !void {
-    const agent_queue = @import("agent_queue.zig");
-
-    // Build translate prompt
-    var prompt_buf: [2048]u8 = undefined;
-    const prompt = std.fmt.bufPrint(&prompt_buf, "Translate this to a shell command. Reply with ONLY the command, nothing else — no explanation, no markdown, no backticks:\n{s}", .{nl_query}) catch return;
-
-    // Send to agent
-    if (!self.agent.query(prompt)) {
-        try self.stdout().writeAll("\x1b[31m? agent queue full\x1b[0m\n");
-        return;
-    }
-
-    // Show thinking indicator
-    const writer = self.stdout();
-    try writer.writeAll("\x1b[90m? translating...\x1b[0m");
-    try writer.flush();
-
-    // Collect response (blocking wait with timeout)
-    var result_buf: [2048]u8 = undefined;
-    var result_len: usize = 0;
-    var done = false;
-    var ticks: u32 = 0;
-    const max_ticks: u32 = 1500; // 30s timeout at 20ms poll
-
-    while (!done and ticks < max_ticks) : (ticks += 1) {
-        var msg: agent_queue.Msg = undefined;
-        while (self.agent.queues.output.pop(&msg)) {
-            switch (msg.kind) {
-                .text_delta => {
-                    const text = msg.slice();
-                    const remaining = result_buf.len - result_len;
-                    const n = @min(text.len, remaining);
-                    @memcpy(result_buf[result_len..][0..n], text[0..n]);
-                    result_len += n;
-                },
-                .done => {
-                    done = true;
-                },
-                .error_msg => {
-                    try writer.writeAll("\r\x1b[2K\x1b[31m? ");
-                    try writer.writeAll(msg.slice());
-                    try writer.writeAll("\x1b[0m\n");
-                    return;
-                },
-                else => {},
-            }
-        }
-        if (!done) compat.sleep(20 * std.time.ns_per_ms);
-    }
-
-    // Clear thinking indicator
-    try writer.writeAll("\r\x1b[2K");
-
-    if (result_len == 0) {
-        try writer.writeAll("\x1b[31m? no response\x1b[0m\n");
-        return;
-    }
-
-    // Strip any leading/trailing whitespace and backticks from response
-    var result = std.mem.trim(u8, result_buf[0..result_len], " \t\n\r");
-    // Strip ```sh ... ``` or ``` ... ``` wrapping
-    if (std.mem.startsWith(u8, result, "```")) {
-        if (std.mem.indexOfScalar(u8, result[3..], '\n')) |nl| {
-            result = result[3 + nl + 1 ..];
-        } else {
-            result = result[3..];
-        }
-        if (std.mem.endsWith(u8, result, "```")) {
-            result = result[0 .. result.len - 3];
-        }
-        result = std.mem.trim(u8, result, " \t\n\r");
-    }
-    // Strip single backtick wrapping
-    if (result.len > 2 and result[0] == '`' and result[result.len - 1] == '`') {
-        result = result[1 .. result.len - 1];
-    }
-
-    if (result.len == 0) {
-        try writer.writeAll("\x1b[31m? empty response\x1b[0m\n");
-        return;
-    }
-
-    // Log translation for training data
-    logTranslation(nl_query, result);
-
-    // Show suggested command and populate edit buffer
-    try writer.writeAll("\x1b[90m? \x1b[0m\x1b[1m");
-    try writer.writeAll(result);
-    try writer.writeAll("\x1b[0m\n");
-    try writer.flush();
-
-    // Put command in edit buffer so user can review and press Enter to run
-    self.edit_buf.clear();
-    _ = self.edit_buf.insertSlice(result);
-}
-
-/// Log a ? translate query and result for training data.
-fn logTranslation(query: []const u8, result: []const u8) void {
-    var path_buf: [512]u8 = undefined;
-    const home = compat.getEnvVarOwned(std.heap.page_allocator, "HOME") catch return;
-    defer std.heap.page_allocator.free(home);
-    const path = std.fmt.bufPrint(&path_buf, "{s}/.zish/translate_log.jsonl", .{home}) catch return;
-
-    const file = std.Io.Dir.cwd().openFile(compat.io(), path, .{ .mode = .write_only }) catch |e| switch (e) {
-        error.FileNotFound => std.Io.Dir.cwd().createFile(compat.io(), path, .{}) catch return,
-        else => return,
-    };
-    defer file.close(compat.io());
-    const end_pos = file.length(compat.io()) catch return;
-
-    const ts: u64 = @bitCast(compat.timestamp());
-    var buf: [4096]u8 = undefined;
-    var pos: usize = 0;
-    pos += logCopy(&buf, pos, "{\"query\":\"");
-    pos = logEscape(&buf, pos, query);
-    pos += logCopy(&buf, pos, "\",\"cmd\":\"");
-    pos = logEscape(&buf, pos, result);
-    pos += logCopy(&buf, pos, "\",\"ts\":");
-    pos += (std.fmt.bufPrint(buf[pos..], "{d}", .{ts}) catch return).len;
-    pos += logCopy(&buf, pos, "}\n");
-    file.writePositionalAll(compat.io(), buf[0..pos], end_pos) catch {};
-}
-
 /// Log every executed command with exit code and duration for training data.
 fn logCommandExecution(command: []const u8, exit_code: u8, elapsed: i64) void {
     if (command.len == 0 or command.len > 2048) return;
@@ -2213,195 +2038,6 @@ fn logEscape(buf: *[4096]u8, start: usize, s: []const u8) usize {
         }
     }
     return pos;
-}
-
-/// Drain agent output with proper terminal coordination.
-/// Clears the current prompt on first output, then streams directly.
-/// Re-renders prompt only when agent is done.
-/// Handler for agent output in inline shell mode (not interactive TUI).
-/// Used by agent_drain.drain() — each message kind dispatches to an onXxx method.
-const ShellDrainHandler = struct {
-    shell: *Shell,
-    writer: *std.Io.Writer,
-    last_was_text: bool = false,
-    wrote: bool = false,
-
-    fn ensureActive(self: *ShellDrainHandler) !void {
-        if (!self.shell.agent_output_active) {
-            self.shell.term_view.moveTo(self.shell.term_view.term.rows_owned -| 1, 0);
-            self.shell.term_view.clearToEOL();
-            try self.shell.term_view.flush();
-            try self.writer.writeAll("\r\n");
-            self.shell.agent_output_active = true;
-        }
-        self.wrote = true;
-    }
-
-    fn resetText(self: *ShellDrainHandler) !void {
-        if (self.last_was_text) try self.writer.writeAll("\x1b[0m");
-        self.last_was_text = false;
-    }
-
-    pub fn onTextDelta(self: *ShellDrainHandler, data: []const u8) !void {
-        try self.ensureActive();
-        try self.shell.agent_md.render(self.writer, data);
-        self.last_was_text = true;
-    }
-
-    pub fn onToolCall(self: *ShellDrainHandler, data: []const u8) !void {
-        try self.ensureActive();
-        try self.resetText();
-        try self.writer.writeAll("\x1b[90m\xe2\x9a\xa1 "); // ⚡
-        try self.writer.writeAll(data);
-        try self.writer.writeAll("\x1b[0m\n");
-    }
-
-    pub fn onToolDone(self: *ShellDrainHandler, data: []const u8) !void {
-        try self.ensureActive();
-        self.last_was_text = false;
-        if (data.len > 0) {
-            const has_ansi = std.mem.indexOf(u8, data, "\x1b[3") != null;
-            if (has_ansi) {
-                try self.writer.writeAll("  ");
-                try self.writer.writeAll(data);
-            } else {
-                try self.writer.writeAll("  \x1b[90m");
-                try self.writer.writeAll(data);
-            }
-            try self.writer.writeAll("\x1b[0m\n");
-        } else {
-            try self.writer.writeAll("  \x1b[32m\xe2\x9c\x93\x1b[0m\n"); // ✓
-        }
-    }
-
-    pub fn onError(self: *ShellDrainHandler, data: []const u8) !void {
-        try self.ensureActive();
-        if (self.last_was_text) try self.writer.writeAll("\x1b[0m\n");
-        self.last_was_text = false;
-        try self.writer.writeAll("\x1b[31m\xe2\x9c\x97 "); // ✗
-        try self.writer.writeAll(data);
-        try self.writer.writeAll("\x1b[0m\n");
-    }
-
-    pub fn onDone(self: *ShellDrainHandler) !void {
-        try self.ensureActive();
-        try self.resetText();
-        try self.writer.writeByte('\n');
-        self.shell.agent_md.reset();
-        self.shell.agent_output_active = false;
-        try self.writer.flush();
-        self.shell.term_view.finishLine();
-        try self.shell.renderLine();
-    }
-
-    pub fn onConfirmRequest(self: *ShellDrainHandler, data: []const u8) !void {
-        try self.ensureActive();
-        if (self.last_was_text) try self.writer.writeAll("\x1b[0m\n");
-        self.last_was_text = false;
-        self.shell.agent_md.reset();
-        try self.writer.writeAll("\x1b[33m\xe2\x9a\xa0 "); // ⚠
-        try self.writer.writeAll(data);
-        try self.writer.writeAll(" \x1b[90m[\x1b[32my\x1b[90m/\x1b[31mn\x1b[90m/\x1b[33ma\x1b[90mlways]\x1b[0m ");
-        try self.writer.flush();
-        var resp: [1]u8 = undefined;
-        const n = posix.read(posix.STDIN_FILENO, &resp) catch 0;
-        if (n > 0 and (resp[0] == 'y' or resp[0] == 'Y')) {
-            _ = self.shell.agent.queues.request.push(.confirm_response, "y");
-            try self.writer.writeAll("y\n");
-        } else if (n > 0 and (resp[0] == 'a' or resp[0] == 'A' or resp[0] == '!')) {
-            _ = self.shell.agent.queues.request.push(.confirm_response, "a");
-            try self.writer.writeAll("a (always)\n");
-        } else {
-            _ = self.shell.agent.queues.request.push(.confirm_response, "n");
-            try self.writer.writeAll("n\n");
-        }
-        try self.writer.flush();
-    }
-
-    pub fn onUsage(self: *ShellDrainHandler, data: []const u8) !void {
-        try self.ensureActive();
-        self.last_was_text = false;
-        try self.writer.writeAll("\x1b[90m");
-        try self.writer.writeAll(data);
-        try self.writer.writeAll("\x1b[0m\n");
-    }
-
-    pub fn onAgentStatus(self: *ShellDrainHandler, data: []const u8) !void {
-        try self.ensureActive();
-        self.last_was_text = false;
-        if (data.len > 0) {
-            try self.writer.writeAll(data);
-            try self.writer.writeByte('\n');
-        }
-    }
-
-    pub fn onCancel(self: *ShellDrainHandler) !void {
-        self.last_was_text = false;
-        self.shell.agent_output_active = false;
-    }
-};
-
-fn drainAgentOutput(self: *Shell) !void {
-    const agent_drain = @import("agent_drain.zig");
-    var handler = ShellDrainHandler{
-        .shell = self,
-        .writer = self.stdout(),
-    };
-    _ = try agent_drain.drain(ShellDrainHandler, &handler, &self.agent.queues);
-
-    if (handler.wrote) {
-        try handler.writer.flush();
-    }
-
-    self.drainBulletin(handler.writer) catch {};
-}
-
-fn drainBulletin(self: *Shell, writer: anytype) !void {
-    const aq = @import("agent_queue.zig");
-    var posts: [8]aq.Post = undefined;
-    const br = self.agent.queues.bulletin.read(self.bulletin_cursor, &posts);
-    self.bulletin_cursor = br.new_cursor;
-    if (br.count == 0) return;
-
-    for (posts[0..br.count]) |*p| {
-        // Only surface escalations and discoveries to the user
-        switch (p.kind) {
-            .escalate => {
-                try writer.writeAll("\x1b[33m⚠ [");
-                try writer.writeAll(p.authorSlice());
-                try writer.writeAll("] ");
-                try writer.writeAll(p.slice());
-                try writer.writeAll("\x1b[0m\n");
-            },
-            .discovery => {
-                try writer.writeAll("\x1b[36m● [");
-                try writer.writeAll(p.authorSlice());
-                try writer.writeAll("] ");
-                try writer.writeAll(p.slice());
-                try writer.writeAll("\x1b[0m\n");
-            },
-            else => {},
-        }
-    }
-    try writer.flush();
-}
-
-/// Non-blocking input read using poll. Returns .none if no input available within timeout.
-/// Used when agent is busy so we can interleave output draining with input reading.
-fn pollNextAction(self: *Shell) !Action {
-    const stdin_fd = posix.STDIN_FILENO;
-    var fds = [_]posix.pollfd{.{
-        .fd = stdin_fd,
-        .events = posix.POLL.IN,
-        .revents = 0,
-    }};
-
-    // 50ms timeout — responsive enough for streaming, not too CPU-hot
-    const poll_result = posix.poll(&fds, 50) catch return .none;
-    if (poll_result == 0) return .none; // timeout, no input
-
-    // input available, read normally
-    return self.readNextAction();
 }
 
 fn readNextAction(self: *Shell) !Action {
