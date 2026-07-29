@@ -2942,6 +2942,26 @@ fn appendPositionalParams(self: *Shell, result: *std.ArrayList(u8)) !void {
     }
 }
 
+// ${@:offset} / ${@:offset:len} — positional params starting at `offset`
+// (1-based, like bash: offset 1 is $1), space-joined. `length` limits count.
+fn appendPositionalSlice(self: *Shell, result: *std.ArrayList(u8), offset: usize, length: ?usize) !void {
+    const count_str = self.variables.get("#") orelse return;
+    const count = std.fmt.parseInt(usize, count_str, 10) catch return;
+    const start = if (offset == 0) 1 else offset;
+    const end = if (length) |l| @min(start + l, count + 1) else count + 1;
+    var idx: usize = start;
+    var emitted: usize = 0;
+    while (idx < end and idx <= count) : (idx += 1) {
+        var num_buf: [16]u8 = undefined;
+        const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{idx}) catch continue;
+        if (self.variables.get(num_str)) |val| {
+            if (emitted > 0) try result.append(self.allocator, ' ');
+            try result.appendSlice(self.allocator, val);
+            emitted += 1;
+        }
+    }
+}
+
 /// Resolve a tilde-prefix name (the text between '~' and the first '/') to a
 /// home/directory path. Returns an owned allocation, or null when the prefix
 /// is not a recognised tilde form (caller then leaves the '~' literal).
@@ -3116,6 +3136,32 @@ fn expandVariablesAllocOpt(self: *Shell, input: []const u8, expand_tilde: bool) 
             if (i < input.len and input[i] == '{') {
                 i += 1; // skip {
 
+                // ${!name} - indirect expansion: the value of `name` names the
+                // variable to expand (e.g. ref=v; ${!ref} yields $v).
+                if (i < input.len and input[i] == '!') {
+                    const after = if (i + 1 < input.len) input[i + 1] else 0;
+                    // Only plain ${!name} here; leave ${!} ($!) and the
+                    // ${!prefix*}/${!arr[@]} forms to fall through unchanged.
+                    if (after != '}' and after != 0) {
+                        i += 1; // skip !
+                        const ref_start = i;
+                        while (i < input.len and input[i] != '}') i += 1;
+                        const ref_name = input[ref_start..i];
+                        if (i < input.len and input[i] == '}') i += 1;
+
+                        const indirect = self.variables.get(ref_name) orelse "";
+                        if (indirect.len > 0) {
+                            if (self.variables.get(indirect)) |v| {
+                                try result.appendSlice(self.allocator, v);
+                            } else if (compat.getEnvVarOwned(self.allocator, indirect)) |val| {
+                                try result.appendSlice(self.allocator, val);
+                                self.allocator.free(val);
+                            } else |_| {}
+                        }
+                        continue;
+                    }
+                }
+
                 // Check for ${#VAR} or ${#arr[@]} length expansion
                 if (i < input.len and input[i] == '#') {
                     i += 1; // skip #
@@ -3173,6 +3219,24 @@ fn expandVariablesAllocOpt(self: *Shell, input: []const u8, expand_tilde: bool) 
                     if (i < input.len and input[i] == '}') {
                         i += 1;
                         try self.appendPositionalParams(&result);
+                        continue;
+                    }
+                    // ${@:offset} / ${@:offset:len} - positional-parameter slice.
+                    if (i < input.len and input[i] == ':') {
+                        i += 1;
+                        const off_start = i;
+                        while (i < input.len and input[i] != '}' and input[i] != ':') i += 1;
+                        const off_str = std.mem.trim(u8, input[off_start..i], " ");
+                        var length: ?usize = null;
+                        if (i < input.len and input[i] == ':') {
+                            i += 1;
+                            const len_start = i;
+                            while (i < input.len and input[i] != '}') i += 1;
+                            length = std.fmt.parseInt(usize, std.mem.trim(u8, input[len_start..i], " "), 10) catch null;
+                        }
+                        if (i < input.len and input[i] == '}') i += 1;
+                        const offset = std.fmt.parseInt(usize, off_str, 10) catch 0;
+                        try self.appendPositionalSlice(&result, offset, length);
                         continue;
                     }
                     // Not a plain ${@}/${*}; rewind and fall through.
