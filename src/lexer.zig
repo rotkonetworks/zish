@@ -874,9 +874,12 @@ pub const Lexer = struct {
                                     _ = self.advance();
                                 } else break;
                             }
-                            // check if word continues
+                            // check if word continues. Inside an array assignment
+                            // (paren_depth > 0) keep collecting so the closing ')'
+                            // reaches the word state — else `a=($x)` ended early as
+                            // the literal word "a=($x".
                             if (self.peek()) |next| {
-                                if (!isOperator(next)) {
+                                if (!isOperator(next) or self.paren_depth > 0) {
                                     self.state = .word;
                                     continue;
                                 }
@@ -888,7 +891,7 @@ pub const Lexer = struct {
                             self.bufAppend(ch);
                             _ = self.advance();
                             if (self.peek()) |next| {
-                                if (!isOperator(next)) {
+                                if (!isOperator(next) or self.paren_depth > 0) {
                                     self.state = .word;
                                     continue;
                                 }
@@ -917,8 +920,10 @@ pub const Lexer = struct {
                         self.brace_depth -= 1;
                         if (self.brace_depth == 0) {
                             _ = self.advance();
+                            // Inside an array assignment keep collecting so ')'
+                            // reaches the word state (a=(${HOME}) must not end early).
                             if (self.peek()) |next| {
-                                if (!isOperator(next)) {
+                                if (!isOperator(next) or self.paren_depth > 0) {
                                     self.state = .word;
                                     continue;
                                 }
