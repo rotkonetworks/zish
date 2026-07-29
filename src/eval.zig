@@ -493,6 +493,24 @@ fn expandVariableFast(shell: *Shell, input: []const u8, dest: *[256]u8) !usize {
                 continue;
             }
 
+            // Handle $$ (shell PID — /tmp/foo.$$ temp files)
+            if (input[i] == '$') {
+                const s = std.fmt.bufPrint(dest[out_pos..], "{d}", .{compat.posix.getpid()}) catch break;
+                out_pos += s.len;
+                i += 1;
+                continue;
+            }
+
+            // Handle $! (PID of the most recent background command)
+            if (input[i] == '!') {
+                if (shell.last_bg_pid != 0) {
+                    const s = std.fmt.bufPrint(dest[out_pos..], "{d}", .{shell.last_bg_pid}) catch break;
+                    out_pos += s.len;
+                }
+                i += 1;
+                continue;
+            }
+
             // Handle $((expr))
             if (i + 1 < input.len and input[i] == '(' and input[i + 1] == '(') {
                 i += 2;
@@ -2267,6 +2285,9 @@ pub fn evaluateBackground(shell: *Shell, node: *const ast.AstNode) !u8 {
             std.debug.print("zish: setpgid({d}): {}\n", .{ pid, err });
         }
     };
+
+    // record for $! (PID of the most recent background command)
+    shell.last_bg_pid = pid;
 
     // add job to table
     const job_id = shell.job_table.addJob(pid, cmd_str, false) catch {

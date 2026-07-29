@@ -196,6 +196,7 @@ arrays: std.StringHashMap(std.ArrayListUnmanaged([]const u8)), // array variable
 functions: std.StringHashMap(*const ast.AstNode), // name -> body AST
 traps: TrapTable = .{}, // signal handlers
 last_exit_code: u8 = 0,
+last_bg_pid: compat.posix.pid_t = 0, // PID of the most recent background command ($!)
 
 // shell options (set -e, -u, -x, -o pipefail)
 opt_errexit: bool = false, // -e: exit on error
@@ -3014,6 +3015,26 @@ fn expandVariablesAllocOpt(self: *Shell, input: []const u8, expand_tilde: bool) 
             // $@ and $* - all positional parameters joined with a space
             if (i < input.len and (input[i] == '@' or input[i] == '*')) {
                 try self.appendPositionalParams(&result);
+                i += 1;
+                continue;
+            }
+
+            // $$ - shell process ID (temp-file idiom: /tmp/foo.$$)
+            if (i < input.len and input[i] == '$') {
+                var buf: [16]u8 = undefined;
+                const s = std.fmt.bufPrint(&buf, "{d}", .{compat.posix.getpid()}) catch "0";
+                try result.appendSlice(self.allocator, s);
+                i += 1;
+                continue;
+            }
+
+            // $! - PID of the most recent background command
+            if (i < input.len and input[i] == '!') {
+                if (self.last_bg_pid != 0) {
+                    var buf: [16]u8 = undefined;
+                    const s = std.fmt.bufPrint(&buf, "{d}", .{self.last_bg_pid}) catch "";
+                    try result.appendSlice(self.allocator, s);
+                }
                 i += 1;
                 continue;
             }
