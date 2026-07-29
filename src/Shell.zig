@@ -208,6 +208,10 @@ last_bg_pid: compat.posix.pid_t = 0, // PID of the most recent background comman
 // popLocalScope / declareLocal.
 local_scopes: std.ArrayList(std.ArrayList(SavedLocal)) = .empty,
 
+// Heredoc temp files (/tmp/zish_heredoc_*) created while processing a command,
+// deleted when that top-level executeCommand call returns so they don't leak.
+heredoc_temps: std.ArrayList([]const u8) = .empty,
+
 // shell options (set -e, -u, -x, -o pipefail)
 opt_errexit: bool = false, // -e: exit on error
 opt_nounset: bool = false, // -u: error on undefined variable
@@ -2940,6 +2944,12 @@ pub fn executeCommand(self: *Shell, command: []const u8) !u8 {
     const trimmed = std.mem.trim(u8, command, " \t\r\n");
     if (trimmed.len == 0) return 0;
 
+    // Delete any heredoc temp files this call materialises once it returns. The
+    // mark makes nested executeCommand calls (command substitution,
+    // PROMPT_COMMAND) clean up only their own files, not an outer call's.
+    const hd_mark = self.heredoc_temps.items.len;
+    defer self.cleanupHeredocTemps(hd_mark);
+
     // Preprocess heredoc: convert << DELIM ... DELIM to file redirect
     const processed = if (findHeredocDelimiter(trimmed)) |delim|
         (if (heredocComplete(trimmed, delim))
@@ -2953,6 +2963,15 @@ pub fn executeCommand(self: *Shell, command: []const u8) !u8 {
     const exit_code = try self.executeCommandInternal(processed);
     self.last_exit_code = exit_code;
     return exit_code;
+}
+
+// Delete and forget heredoc temp files recorded at or after `mark`.
+fn cleanupHeredocTemps(self: *Shell, mark: usize) void {
+    while (self.heredoc_temps.items.len > mark) {
+        const p = self.heredoc_temps.pop() orelse break;
+        std.Io.Dir.deleteFileAbsolute(compat.io(), p) catch {};
+        self.allocator.free(p);
+    }
 }
 
 /// Run $PROMPT_COMMAND (if set) just before displaying an interactive prompt,
@@ -4693,6 +4712,11 @@ fn preprocessHeredoc(self: *Shell, command: []const u8, delimiter: []const u8) !
     defer file.close(compat.io());
     compat.writeAll(file, content) catch return error.WriteError;
     compat.writeAll(file, "\n") catch return error.WriteError;
+
+    // Record for cleanup when the enclosing executeCommand call returns.
+    if (self.allocator.dupe(u8, tmp_path)) |owned| {
+        self.heredoc_temps.append(self.allocator, owned) catch self.allocator.free(owned);
+    } else |_| {}
 
     // Build new command: prefix < /tmp/zish_heredoc_TS; suffix
     const need_suffix = suffix.len > 0;
