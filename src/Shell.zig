@@ -2327,7 +2327,9 @@ fn normalModeAction(char: u8) Action {
         'v' => .{ .vim_mode = .{ .enter_visual = .char } },
         'V' => .{ .vim_mode = .{ .enter_visual = .line } },
 
-        '\n' => .execute_command,
+        // Enter accepts the line (readline vi-command-mode). In raw mode the
+        // terminal delivers CR (\r) for Return, so both must submit.
+        '\n', '\r' => .execute_command,
 
         CTRL_C => .cancel,
         CTRL_G => .cancel_agent,
