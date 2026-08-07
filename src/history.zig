@@ -416,7 +416,11 @@ pub const History = struct {
 
     /// sort entries by timestamp and rebuild hash_map indices
     fn sortByTimestamp(self: *Self) void {
-        std.sort.insertion(HistoryEntry, self.entries.items, {}, struct {
+        // O(n log n) heap sort. The previous insertion sort was O(n²) and made
+        // interactive startup crawl on large history files (Boot: ~0.37s on a
+        // 686 KB log). Heap sort is equivalent for our purpose (equal timestamps
+        // have no required order) and keeps the same O(1) memory profile.
+        std.sort.heap(HistoryEntry, self.entries.items, {}, struct {
             fn lessThan(_: void, a: HistoryEntry, b: HistoryEntry) bool {
                 return a.timestamp < b.timestamp;
             }

@@ -826,7 +826,43 @@ pub const TermView = struct {
             buf.cursor,
         );
 
+        // Optional render trace for debugging the small-window blank bug.
+        // Gated on $ZISH_RENDER_LOG (path). Zero cost when unset.
+        debugLogRender(self, w, render_row, render_col, cursor_row, cursor_col, buf.len, buf.cursor);
+
         try self.flush();
+    }
+
+    fn debugLogRender(self: *Self, w: u16, render_row: u16, render_col: u16, cursor_row: u16, cursor_col: u16, blen: u16, cur: u16) void {
+        const path = compat.posix.getenv("ZISH_RENDER_LOG") orelse return;
+        const f = std.Io.Dir.cwd().createFile(compat.io(), path, .{ .truncate = false }) catch return;
+        defer f.close(compat.io());
+        const end = f.length(compat.io()) catch 0;
+        var buf: [2048]u8 = undefined;
+        // header line: geometry + computed cursor model
+        var w1: std.Io.Writer = .fixed(&buf);
+        w1.print("RENDER w={d} h={d} | term.row={d} col={d} rows_owned={d} | render_row={d} col={d} cursor_row={d} col={d} | blen={d} cur={d} | bytes=", .{
+            w, self.term.height, self.term.row, self.term.col, self.term.rows_owned,
+            render_row, render_col, cursor_row, cursor_col, blen, cur,
+        }) catch {};
+        _ = f.writePositionalAll(compat.io(), w1.buffered(), end) catch return;
+        // escaped emitted bytes
+        var pos = end + w1.end;
+        var eb: [16]u8 = undefined;
+        for (self.out[0..self.out_len]) |c| {
+            const s = switch (c) {
+                0x1b => "<ESC>",
+                '\r' => "<CR>",
+                '\n' => "<LF>",
+                else => blk: {
+                    eb[0] = c;
+                    break :blk eb[0..1];
+                },
+            };
+            _ = f.writePositionalAll(compat.io(), s, pos) catch break;
+            pos += s.len;
+        }
+        _ = f.writePositionalAll(compat.io(), "\n", pos) catch {};
     }
 
     /// call when done with line (enter, ctrl-c)

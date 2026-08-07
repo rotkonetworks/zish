@@ -1516,6 +1516,32 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
         pid.* = 0;
     }
 
+    // Job control for pipelines: in the interactive shell, a foreground
+    // pipeline must run in its OWN process group with control of the terminal
+    // (like the single-command path already does). Without this, the piped
+    // program shares the shell's process group and the interactive line
+    // editor keeps the tty — so a script run via `curl ... | bash` can't read
+    // the controlling tty (/dev/tty) for prompts like "[Y/n]".
+    //
+    // A background job / command substitution runs this function inside a
+    // forked subshell with shell.in_pipeline already true — skip the handoff
+    // there so it doesn't steal the terminal from the parent shell.
+    const is_tty = compat.posix.isatty(compat.posix.STDIN_FILENO);
+    const is_foreground = is_tty and !shell.in_pipeline;
+    if (is_foreground) {
+        // Give the pipeline a cooked terminal (canonical input, ISIG) instead
+        // of the line editor's raw mode, so read()/tty prompts work.
+        shell.disableRawMode();
+    }
+    const shell_pgid: compat.posix.pid_t = @intCast(std.os.linux.getpgid(0));
+    defer {
+        if (is_foreground) {
+            // take terminal back and restore the editor's raw mode
+            jobs.tcsetpgrp(compat.posix.STDIN_FILENO, shell_pgid) catch {};
+            shell.enableRawMode() catch {};
+        }
+    }
+
     // cleanup pipes and kill already-forked children on error
     // NOTE: if a child is in D-state (uninterruptible sleep, e.g. blocked on
     // NFS or stuck disk I/O), signals cannot interrupt it and the final
@@ -1556,6 +1582,19 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
     for (node.children, 0..) |child, i| {
         const pid = try compat.posix.fork();
         if (pid == 0) {
+            // Child: join the pipeline's process group. The first process is
+            // the group leader (pgid == its pid); later processes join it.
+            if (is_tty) {
+                if (i == 0) {
+                    _ = compat.posix.setpgid(0, 0) catch {};
+                    if (is_foreground) {
+                        const mypid: compat.posix.pid_t = @intCast(std.os.linux.getpid());
+                        jobs.tcsetpgrp(compat.posix.STDIN_FILENO, mypid) catch {};
+                    }
+                } else {
+                    _ = compat.posix.setpgid(0, pids[0]) catch {};
+                }
+            }
             // Setup pipes first
             if (i > 0) {
                 try compat.posix.dup2(pipes[i - 1][0], compat.posix.STDIN_FILENO);
@@ -1585,6 +1624,16 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
             std.process.exit(status);
         } else {
             pids[i] = pid;
+            // Parent: assign the child to the pipeline's group (both sides
+            // call setpgid for race avoidance, as in the single-command path).
+            if (is_tty) {
+                const pgid = if (i == 0) pid else pids[0];
+                _ = compat.posix.setpgid(pid, pgid) catch {};
+                if (i == 0 and is_foreground) {
+                    // put the pipeline's group in the foreground
+                    jobs.tcsetpgrp(compat.posix.STDIN_FILENO, pid) catch {};
+                }
+            }
         }
     }
 
