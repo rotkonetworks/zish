@@ -73,6 +73,11 @@ pub const MetadataType = enum(u32) {
 /// Nothing stored in a file can be longer than the file, so the remaining byte
 /// count is a sound upper bound and costs one comparison. `elem_size` is the
 /// minimum on-disk footprint of one element.
+/// Nesting limit for metadata values. GGUF arrays may nominally contain
+/// arrays; nothing real does, and unbounded nesting is a stack-overflow
+/// primitive for a downloaded file.
+const max_value_depth: u8 = 8;
+
 fn boundedCount(reader: Reader, count: u64, elem_size: u64) Error!usize {
     const remaining: u64 = reader.buffer.len -| reader.seek;
     if (elem_size != 0 and count > remaining / elem_size) return Error.Format;
@@ -98,7 +103,13 @@ pub const Array = struct {
     len: u64,
     array: []Value,
 
-    fn read(reader: Reader, alloc: std.mem.Allocator) Error!Array {
+    fn read(reader: Reader, alloc: std.mem.Allocator, depth: u8) Error!Array {
+        // An array whose element type is itself `array` recurses through
+        // Value.read. Each level only costs 12 bytes on disk, so a small file
+        // can nest tens of thousands deep and exhaust the stack — a crash from
+        // a downloaded model. Real GGUF files never nest arrays at all.
+        if (depth >= max_value_depth) return Error.Format;
+
         const element_type = reader.takeEnum(MetadataType, .little) catch return Error.EOF;
         const raw_len = reader.takeInt(u64, .little) catch return Error.EOF;
         // Every element occupies at least one byte on disk, so an array longer
@@ -108,7 +119,7 @@ pub const Array = struct {
 
         var list: std.ArrayList(Value) = .empty;
         for (0..len) |_| {
-            const val = try Value.read(element_type, reader, alloc);
+            const val = try Value.read(element_type, reader, alloc, depth + 1);
             list.append(alloc, val) catch return Error.Alloc;
         }
 
@@ -135,7 +146,7 @@ pub const Value = union(MetadataType) {
     int64: i64,
     float64: f64,
 
-    fn read(value_type: MetadataType, reader: Reader, alloc: std.mem.Allocator) Error!Value {
+    fn read(value_type: MetadataType, reader: Reader, alloc: std.mem.Allocator, depth: u8) Error!Value {
         // zig fmt: off
         return switch (value_type) {
             .uint8   => .{ .uint8   = reader.takeInt(u8, .little)  catch return Error.EOF },
@@ -150,7 +161,7 @@ pub const Value = union(MetadataType) {
             .float32 => .{ .float32 = @bitCast(reader.takeInt(u32, .little) catch return Error.EOF) },
             .float64 => .{ .float64 = @bitCast(reader.takeInt(u64, .little) catch return Error.EOF) },
             .string  => .{ .string  = try String.read(reader, alloc) },
-            .array   => .{ .array   = try Array.read(reader, alloc) },
+            .array   => .{ .array   = try Array.read(reader, alloc, depth) },
         };
         // zig fmt: on
     }
@@ -163,7 +174,7 @@ pub const MetadataKV = struct {
     fn read(reader: Reader, alloc: std.mem.Allocator) Error!MetadataKV {
         const key = try String.read(reader, alloc);
         const value_type = reader.takeEnum(MetadataType, .little) catch return Error.EOF;
-        const value = try Value.read(value_type, reader, alloc);
+        const value = try Value.read(value_type, reader, alloc, 0);
         return .{ .key = key, .value = value };
     }
 };
@@ -301,7 +312,17 @@ pub const GGUFFile = struct {
         // Get alignment
         const alignment: usize = blk: {
             if (getMetadataValue("general.alignment", metadata)) |val| {
-                if (val == .uint32) break :blk val.uint32;
+                if (val == .uint32) {
+                    // This value comes from the file. Zero makes alignOffset
+                    // evaluate `offset % 0` — a divide-by-zero crash — and
+                    // std.mem.alignForward below requires a power of two.
+                    // Neither is a valid GGUF alignment, so reject the file
+                    // rather than silently substituting a default.
+                    if (val.uint32 == 0 or !std.math.isPowerOfTwo(val.uint32)) {
+                        return Error.Format;
+                    }
+                    break :blk val.uint32;
+                }
             }
             break :blk 32;
         };

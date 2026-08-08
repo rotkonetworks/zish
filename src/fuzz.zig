@@ -410,3 +410,109 @@ test "gguf: real models still load" {
 
     if (checked == 0) return error.SkipZigTest;
 }
+
+// ---------------------------------------------------------------------------
+// GGUF: hand-built malicious files
+// ---------------------------------------------------------------------------
+//
+// The random generator above will not reliably produce these two shapes, and
+// both are one-line crashes from a downloaded model, so they get deterministic
+// tests. Each must be *rejected* — an error return is a pass, a crash is not.
+
+const GgufWriter = struct {
+    buf: []u8,
+    n: usize = 0,
+
+    fn u32le(w: *GgufWriter, v: u32) void {
+        std.mem.writeInt(u32, w.buf[w.n..][0..4], v, .little);
+        w.n += 4;
+    }
+    fn u64le(w: *GgufWriter, v: u64) void {
+        std.mem.writeInt(u64, w.buf[w.n..][0..8], v, .little);
+        w.n += 8;
+    }
+    fn str(w: *GgufWriter, s: []const u8) void {
+        w.u64le(s.len);
+        @memcpy(w.buf[w.n..][0..s.len], s);
+        w.n += s.len;
+    }
+    /// magic + version 3 + tensor_count + metadata_kv_count
+    fn header(w: *GgufWriter, tensors: u64, kvs: u64) void {
+        w.u32le(0x46554747);
+        w.u32le(3);
+        w.u64le(tensors);
+        w.u64le(kvs);
+    }
+};
+
+fn expectGgufRejected(bytes: []const u8, path: [:0]const u8) !void {
+    {
+        const file = try std.Io.Dir.createFileAbsolute(compat.io(), path, .{});
+        defer file.close(compat.io());
+        try compat.writeAll(file, bytes);
+    }
+    defer std.Io.Dir.deleteFileAbsolute(compat.io(), path) catch {};
+
+    if (gguf.GGUFFile.open(path, std.heap.page_allocator)) |*f| {
+        var m = f.*;
+        m.deinit();
+        return error.MaliciousFileAccepted;
+    } else |_| {
+        // Any error is fine. Not crashing is the point.
+    }
+}
+
+test "gguf: zero alignment is rejected, not a divide by zero" {
+    // general.alignment reaches `offset % alignment` in alignOffset and
+    // std.mem.alignForward, both of which require a non-zero power of two.
+    var buf: [256]u8 = undefined;
+    var w = GgufWriter{ .buf = &buf };
+    w.header(0, 1);
+    w.str("general.alignment");
+    w.u32le(4); // MetadataType.uint32
+    w.u32le(0); // the payload
+
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/zish_gguf_align0_{d}", .{std.testing.random_seed});
+    try expectGgufRejected(buf[0..w.n], path);
+}
+
+test "gguf: non-power-of-two alignment is rejected" {
+    var buf: [256]u8 = undefined;
+    var w = GgufWriter{ .buf = &buf };
+    w.header(0, 1);
+    w.str("general.alignment");
+    w.u32le(4);
+    w.u32le(33); // not a power of two
+
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/zish_gguf_align33_{d}", .{std.testing.random_seed});
+    try expectGgufRejected(buf[0..w.n], path);
+}
+
+test "gguf: deeply nested arrays do not exhaust the stack" {
+    // An array whose element type is `array` recurses Value.read -> Array.read.
+    // Each level costs 12 bytes on disk.
+    //
+    // The buffer is 1 MiB, and heap-allocated, for a reason: at 12 bytes per
+    // level that is ~87k frames, which genuinely overflows the default 8 MiB
+    // stack when the depth guard is removed. An earlier 64 KiB version of this
+    // test passed with the guard disabled — 5k frames is simply not deep
+    // enough — which would have made it decoration rather than a regression
+    // test. If you shrink this buffer, confirm the test still fails without
+    // the guard in Array.read.
+    const buf = try std.testing.allocator.alloc(u8, 1 << 20);
+    defer std.testing.allocator.free(buf);
+    var w = GgufWriter{ .buf = buf };
+    w.header(0, 1);
+    w.str("x");
+    w.u32le(9); // MetadataType.array — the value is an array...
+    while (w.n + 32 < buf.len) {
+        w.u32le(9); // ...whose element type is also an array
+        w.u64le(1); // ...containing exactly one element
+    }
+
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/zish_gguf_nested_{d}", .{std.testing.random_seed});
+    try expectGgufRejected(buf[0..w.n], path);
+}
