@@ -51,6 +51,7 @@ pub fn isBuiltin(name: []const u8) bool {
         // benchmarking
         "time",
         // zish specific (handled in eval.zig)
+        "feat",
         "chpw",
     };
     for (implemented_builtins) |b| {
@@ -129,6 +130,7 @@ pub fn dispatch(shell: *Shell, cmd_name: []const u8, args: []const []const u8) !
     if (std.mem.eql(u8, cmd_name, "time")) return try timeCmd(shell, args);
 
     // zish specific
+    if (std.mem.eql(u8, cmd_name, "feat")) return null; // handled in eval.zig
     if (std.mem.eql(u8, cmd_name, "chpw")) return null; // handled in eval.zig for now (complex)
 
     return null; // not a builtin

@@ -128,7 +128,9 @@ fn walkRecursive(
         defer allocator.free(full_path);
 
         // skip hidden files unless explicitly in pattern
-        if (entry.name[0] == '.' and file_pattern.len > 0 and file_pattern[0] != '.') {
+        // (length-guarded like the same check in expandGlob — indexing [0] on an
+        // empty name is an out-of-bounds read)
+        if (entry.name.len > 0 and entry.name[0] == '.' and file_pattern.len > 0 and file_pattern[0] != '.') {
             continue;
         }
 

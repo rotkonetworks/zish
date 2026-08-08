@@ -1,0 +1,6 @@
+name = "jls"
+tier = "standard"
+version = "1.0.0"
+help = "JSONL: count records or extract a top-level key per line"
+bin = "jls"
+usage = "jls [-k KEY] [FILE]  # count records, or extract KEY value per line"

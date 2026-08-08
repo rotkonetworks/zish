@@ -216,8 +216,22 @@ opt_errexit: bool = false, // -e: exit on error
 opt_nounset: bool = false, // -u: error on undefined variable
 opt_xtrace: bool = false, // -x: print commands before execution
 opt_pipefail: bool = false, // pipefail: pipeline fails if any command fails
-// when true, external commands exec directly instead of fork+exec (for pipeline children)
-in_pipeline: bool = false,
+// True in a process that is already a forked child of the interactive shell
+// (pipeline stage, subshell, background job). Drives two decisions: a subshell
+// need not fork again, and a forked child must not take the terminal.
+forked_child: bool = false,
+// The one AST node this forked child exists to run in its entirety.
+//
+// When evaluateCommand is about to run an external command and the node it was
+// handed IS this node, nothing follows it in this process, so it may exec in
+// place and skip a redundant fork. Any other node must fork, because there is
+// still more of the body left to run afterwards.
+//
+// This is deliberately a node identity and not a bool: a sticky "exec directly"
+// flag is wrong by construction once the body is a compound, and silently
+// dropped every command after the first in `( a; b )`, `x | { a; b; }` and
+// `( a; b ) &`.
+exec_in_place_node: ?*const ast.AstNode = null,
 // loop control: number of enclosing loops to break/continue out of. 0 = none.
 // set by the break/continue builtins, consumed by loop evaluators.
 loop_break: u32 = 0,
@@ -879,7 +893,13 @@ const CursorStyle = enum {
 };
 
 fn setCursorStyle(_: *Shell, style: CursorStyle) !void {
-    // Write to stderr so it doesn't interfere with pipelines
+    // Write to stderr so it doesn't interfere with pipelines.
+    //
+    // Only when stderr is a terminal: cursor-shape control is meaningless to a
+    // file or a pipe, and emitting it there corrupts whatever is reading. The
+    // fuzz test binary hit exactly that — Shell.deinit reset the cursor into
+    // the build runner's protocol stream and failed the step.
+    if (!posix.isatty(posix.STDERR_FILENO)) return;
     _ = posix.write(posix.STDERR_FILENO, style.escapeCode()) catch {};
 }
 
@@ -1498,6 +1518,17 @@ fn handleAction(self: *Shell, action: Action) !void {
             if (completion_mod.cycleGhostCandidate(self, dir)) {
                 try self.renderLine();
             }
+        },
+
+        .accept_ghost => {
+            // Alt+E: accept one character of ghost text
+            if (completion_mod.acceptGhostChar(self)) try self.renderLine();
+        },
+
+        .toggle_ghost => {
+            // Ctrl+O: toggle ghost autosuggestion on/off
+            completion_mod.toggleGhost(self);
+            try self.renderLine();
         },
 
         .cycle_complete => |direction| {
@@ -2436,13 +2467,21 @@ pub fn enableRawMode(self: *Shell) !void {
     // apply the changes
     posix.tcsetattr(stdin_fd, .NOW, termios) catch return;
 
-    // enable bracketed paste mode (write to stderr to avoid capture by redirects)
-    _ = posix.write(posix.STDERR_FILENO, "\x1b[?2004h") catch {};
+    // enable bracketed paste mode (write to stderr to avoid capture by redirects,
+    // and only when stderr is a terminal — see disableRawMode)
+    if (posix.isatty(posix.STDERR_FILENO)) {
+        _ = posix.write(posix.STDERR_FILENO, "\x1b[?2004h") catch {};
+    }
 }
 
 pub fn disableRawMode(self: *Shell) void {
-    // disable bracketed paste mode (write to stderr to avoid capture by redirects)
-    _ = posix.write(posix.STDERR_FILENO, "\x1b[?2004l") catch {};
+    // Disable bracketed paste mode. Written to stderr to avoid capture by
+    // redirects, and only when stderr is a terminal: sending mode-switch
+    // escapes to a pipe or file is noise at best and corrupts a structured
+    // consumer at worst (this fired into the test runner's protocol stream).
+    if (posix.isatty(posix.STDERR_FILENO)) {
+        _ = posix.write(posix.STDERR_FILENO, "\x1b[?2004l") catch {};
+    }
 
     if (self.original_termios) |original| {
         const stdin_fd = posix.STDIN_FILENO;
@@ -3770,12 +3809,17 @@ const ArithParser = struct {
                 self.pos += 1;
                 const r = try self.parsePower();
                 if (r == 0) return error.DivideByZero;
-                v = @divTrunc(v, r);
+                // minInt / -1 has no representable quotient. @divTrunc is
+                // illegal behaviour there — a panic under safety checks and
+                // silent corruption in ReleaseFast — so wrap like bash does.
+                // Every other operator here already wraps (+%, -%, *%).
+                v = if (v == std.math.minInt(i64) and r == -1) v else @divTrunc(v, r);
             } else if (c == '%') {
                 self.pos += 1;
                 const r = try self.parsePower();
                 if (r == 0) return error.DivideByZero;
-                v = @rem(v, r);
+                // Same overflow case; the mathematical remainder is 0.
+                v = if (v == std.math.minInt(i64) and r == -1) 0 else @rem(v, r);
             } else break;
         }
         return v;

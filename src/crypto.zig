@@ -32,7 +32,13 @@ pub const CryptoContext = struct {
             while (attempts < 3) : (attempts += 1) {
                 // prompt for password
                 const password = try promptPassword(allocator, "Enter history password: ");
-                defer allocator.free(password);
+                // Wipe before returning to the allocator: freed heap is reused,
+                // not cleared, so the plaintext would otherwise sit in whatever
+                // allocation happens to land on those bytes next.
+                defer {
+                    std.crypto.secureZero(u8, password);
+                    allocator.free(password);
+                }
 
                 if (password.len == 0) {
                     return error.EmptyPassword;
@@ -250,6 +256,11 @@ pub fn promptPassword(allocator: std.mem.Allocator, prompt_text: []const u8) ![]
 
     // read password
     var password_buf: [256]u8 = undefined;
+    // Wipe the plaintext before returning by any path. Without this the
+    // password stayed on the stack after the function returned, where it can
+    // surface in a core dump or be handed to a later frame that reuses the
+    // same bytes. The caller gets its own heap copy.
+    defer std.crypto.secureZero(u8, &password_buf);
     const bytes_read = compat.posix.read(stdin_fd, &password_buf) catch return error.ReadFailed;
     const password_line = password_buf[0..bytes_read];
 

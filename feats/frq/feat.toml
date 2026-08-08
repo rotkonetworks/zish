@@ -1,0 +1,6 @@
+name = "frq"
+tier = "standard"
+version = "1.0.0"
+help = "field/token frequency table — count<TAB>value, top-K"
+bin = "frq"
+usage = "frq [-n TOP] [-w FIELD#] [FILE]  # token freq: count<TAB>value (top-K)"

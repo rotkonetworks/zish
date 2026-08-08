@@ -61,12 +61,32 @@ pub const MetadataType = enum(u32) {
     // zig fmt: on
 };
 
+/// Reject a count that cannot fit in what is left of the file.
+///
+/// Every length and count in a GGUF file is attacker-controlled — the file is
+/// downloaded, not typed. Using one to size an allocation without a bound let
+/// a 2^63 string length reach the allocator, which panicked computing its
+/// growth size (a crash on a malicious model) and, with safety checks off,
+/// wrapped to an allocation smaller than the slice length handed straight to
+/// readSliceAll.
+///
+/// Nothing stored in a file can be longer than the file, so the remaining byte
+/// count is a sound upper bound and costs one comparison. `elem_size` is the
+/// minimum on-disk footprint of one element.
+fn boundedCount(reader: Reader, count: u64, elem_size: u64) Error!usize {
+    const remaining: u64 = reader.buffer.len -| reader.seek;
+    if (elem_size != 0 and count > remaining / elem_size) return Error.Format;
+    if (count > remaining) return Error.Format;
+    return std.math.cast(usize, count) orelse return Error.Format;
+}
+
 pub const String = struct {
     len: u64,
     str: []u8,
 
     fn read(reader: Reader, alloc: std.mem.Allocator) Error!String {
-        const len = reader.takeInt(u64, .little) catch return Error.EOF;
+        const raw_len = reader.takeInt(u64, .little) catch return Error.EOF;
+        const len = try boundedCount(reader, raw_len, 1);
         const buf = alloc.alloc(u8, len) catch return Error.Alloc;
         reader.readSliceAll(buf) catch return Error.FileError;
         return .{ .len = len, .str = buf };
@@ -80,7 +100,11 @@ pub const Array = struct {
 
     fn read(reader: Reader, alloc: std.mem.Allocator) Error!Array {
         const element_type = reader.takeEnum(MetadataType, .little) catch return Error.EOF;
-        const len = reader.takeInt(u64, .little) catch return Error.EOF;
+        const raw_len = reader.takeInt(u64, .little) catch return Error.EOF;
+        // Every element occupies at least one byte on disk, so an array longer
+        // than the rest of the file cannot be valid. Without this the loop
+        // allocates its way toward OOM before the reader finally reports EOF.
+        const len = try boundedCount(reader, raw_len, 1);
 
         var list: std.ArrayList(Value) = .empty;
         for (0..len) |_| {
@@ -175,9 +199,15 @@ pub const TensorInfo = struct {
     fn read(reader: Reader, alignment: usize, alloc: std.mem.Allocator) Error!TensorInfo {
         const name = String.read(reader, alloc) catch return Error.EOF;
         const dim = reader.takeInt(u32, .little) catch return Error.EOF;
-        std.debug.assert(dim > 0);
-        const dimensions = alloc.alloc(u64, dim) catch return Error.Alloc;
-        for (0..dim) |i| {
+        // A malformed dimension count is a corrupt file, not a broken
+        // invariant: assert() aborted the process on an attacker-supplied
+        // model in a safety build, and vanished entirely in ReleaseFast.
+        if (dim == 0) return Error.Format;
+        // Each dimension is a u64 on disk, so dim is bounded by the remaining
+        // file. Unbounded, a u32 count asked the allocator for up to 32 GiB.
+        const dim_count = try boundedCount(reader, dim, @sizeOf(u64));
+        const dimensions = alloc.alloc(u64, dim_count) catch return Error.Alloc;
+        for (0..dim_count) |i| {
             dimensions[i] = reader.takeInt(u64, .little) catch return Error.EOF;
         }
         const ggml_type = reader.takeEnum(Type, .little) catch return Error.EOF;
@@ -199,9 +229,18 @@ pub const TensorInfo = struct {
     }
 
     /// Total number of elements in this tensor.
+    ///
+    /// Saturates instead of wrapping. The dimensions come from the file, so
+    /// the product is attacker-controlled: an unchecked `*=` overflowed to a
+    /// *small* number, and callers size buffers off this. Saturating keeps the
+    /// result implausibly large, so a bounds check downstream still rejects it
+    /// rather than being handed a value that looks reasonable.
     pub fn numElements(self: TensorInfo) usize {
         var len: usize = 1;
-        for (self.dimensions) |d| len *= @intCast(d);
+        for (self.dimensions) |d| {
+            const dv = std.math.cast(usize, d) orelse return std.math.maxInt(usize);
+            len = std.math.mul(usize, len, dv) catch return std.math.maxInt(usize);
+        }
         return len;
     }
 
@@ -278,6 +317,17 @@ pub const GGUFFile = struct {
         // Calculate tensor data offset (aligned)
         const file_offset: usize = @intCast(stream.seek);
         const tensor_data_offset = std.mem.alignForward(usize, file_offset, alignment);
+
+        // Every tensor offset must land inside the mapping. getData() does
+        // `tensor_data + offset` with no check of its own, so an offset read
+        // from a malicious file produced a pointer past the end of the mmap —
+        // a segfault at best, a read of unrelated memory at worst. This is the
+        // first point where both the offsets and the file size are known.
+        if (tensor_data_offset > fsize) return Error.Format;
+        for (tensor_info) |ti| {
+            const abs = std.math.add(usize, tensor_data_offset, ti.offset) catch return Error.Format;
+            if (abs > fsize) return Error.Format;
+        }
 
         return .{
             .header = header,

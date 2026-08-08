@@ -1,0 +1,6 @@
+name = "pk"
+tier = "standard"
+version = "1.2.0"
+help = "peek lines: first N, last N (-t), or a Rust-style line range"
+bin = "pk"
+usage = "pk [-n N] | -t N | [RANGE] FILE [FILE...]  # -n first N (10), -t last N; RANGE=4..10 excl | 4..=10 incl | ..10 | 4.."

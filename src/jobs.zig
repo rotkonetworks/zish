@@ -9,8 +9,13 @@ pub fn tcsetpgrp(fd: posix.fd_t, pgrp: posix.pid_t) posix.TermioSetPgrpError!voi
     const rc = std.os.linux.ioctl(fd, TIOCSPGRP, @intFromPtr(&pgrp));
     switch (std.posix.errno(rc)) {
         .SUCCESS => return,
-        .BADF => unreachable,
-        .INVAL => unreachable,
+        // Not unreachable: `fd` is whatever the shell recorded as its terminal
+        // and `pgrp` can name a group that has already exited, so both of these
+        // are reachable from ordinary races (terminal closed under us, job
+        // reaped between lookup and call). Asserting turned a recoverable job
+        // control error into a shell crash.
+        .BADF => return error.NotATerminal,
+        .INVAL => return error.NotAPgrpMember,
         .NOTTY => return error.NotATerminal,
         .PERM => return error.NotAPgrpMember,
         else => |err| return std.posix.unexpectedErrno(err),

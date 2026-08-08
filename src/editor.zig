@@ -17,6 +17,7 @@ pub const Color = struct {
     pub const blue: []const u8 = "\x1b[34m"; // builtins
     pub const gray: []const u8 = "\x1b[90m"; // comments
     pub const yellow: []const u8 = "\x1b[33m"; // escapes
+    pub const flag: []const u8 = "\x1b[94m"; // flags (committed, distinct from ghost gray)
 };
 
 pub const LINE_BUF_SIZE = 4096;
@@ -534,8 +535,8 @@ pub const SyntaxHighlighter = struct {
                 _ = out.emit(Color.blue);
             }
         } else if (word.len > 1 and word[0] == '-') {
-            // flags: --verbose, -f (dim white)
-            _ = out.emit(Color.gray);
+            // flags: --verbose, -f (committed, NOT ghost-gray)
+            _ = out.emit(Color.flag);
         } else if (word.len > 0 and word[0] >= '0' and word[0] <= '9') {
             // numbers
             _ = out.emit(Color.yellow);
@@ -793,12 +794,22 @@ pub const TermView = struct {
         hl.flushWord(self);
         _ = self.emit(Color.reset);
 
-        // render ghost text suggestion (dim, after content, only when cursor at end)
+        // render ghost text suggestion (two-tone: completes-current-token | future)
         if (self.ghost_text.len > 0 and buf.cursor == buf.len) {
-            _ = self.emit("\x1b[90m"); // dim gray
-            for (self.ghost_text) |c| {
+            var ghost_match_len: usize = 0;
+            while (ghost_match_len < self.ghost_text.len and
+                self.ghost_text[ghost_match_len] != ' ' and
+                self.ghost_text[ghost_match_len] != '\t' and
+                self.ghost_text[ghost_match_len] != '\n')
+            {
+                ghost_match_len += 1;
+            }
+
+            // left: completes the token you're typing
+            _ = self.emit(Color.cyan);
+            for (self.ghost_text[0..ghost_match_len]) |c| {
                 if (self.out_len > RENDER_BUF_SIZE - 64) break;
-                if (c == '\n') break; // only show first line of ghost
+                if (c == '\n') break;
                 _ = self.emitByte(c);
                 render_col += 1;
                 if (w > 0 and render_col >= w) {
@@ -806,7 +817,19 @@ pub const TermView = struct {
                     render_col = 0;
                 }
             }
-            _ = self.emit("\x1b[0m");
+            // right: future (italic = placeholder, never reads as committed)
+            _ = self.emit("\x1b[3;90m");
+            for (self.ghost_text[ghost_match_len..]) |c| {
+                if (self.out_len > RENDER_BUF_SIZE - 64) break;
+                if (c == '\n') break;
+                _ = self.emitByte(c);
+                render_col += 1;
+                if (w > 0 and render_col >= w) {
+                    render_row += 1;
+                    render_col = 0;
+                }
+            }
+            _ = self.emit(Color.reset);
         }
 
         // clear any leftover content after our text

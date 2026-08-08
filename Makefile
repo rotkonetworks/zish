@@ -10,7 +10,7 @@ all: build
 build:
 	zig build --release=safe
 
-install: build
+install: build feats
 	install -d $(DESTDIR)$(BINDIR)
 	install -d $(DESTDIR)$(MANDIR)
 	install -m 755 zig-out/bin/zish $(DESTDIR)$(SHELL_PATH)
@@ -50,3 +50,18 @@ test: build
 test-verbose: build
 	@command -v shellspec >/dev/null 2>&1 || { echo "shellspec not found. install from: https://shellspec.info"; exit 1; }
 	shellspec --format documentation
+
+# ---- standard feats (python-replacement tier) ----
+# Compiles feats/<name>/main.zig and stages bin + feat.toml into the registry.
+ZISH_FEAT_DIR ?= $(HOME)/.zish/feats/standard
+FEAT_NAMES := cnt pk frq snf jls
+
+.PHONY: feats
+feats:
+	@mkdir -p $(ZISH_FEAT_DIR)
+	@for f in $(FEAT_NAMES); do \
+		mkdir -p $(ZISH_FEAT_DIR)/$$f/bin; \
+		zig build-exe -O ReleaseFast -fstrip feats/$$f/main.zig -femit-bin=$(ZISH_FEAT_DIR)/$$f/bin/$$f >/dev/null 2>&1; \
+		cp -f feats/$$f/feat.toml $(ZISH_FEAT_DIR)/$$f/feat.toml; \
+		echo "staged feat: $$f"; \
+	done

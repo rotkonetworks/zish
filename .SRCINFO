@@ -1,0 +1,13 @@
+pkgbase = zish
+	pkgdesc = fast shell interpreter written in zig with built-in AI agent and GGUF inference
+	pkgver = 0.15.2
+	pkgrel = 1
+	url = https://github.com/rotkonetworks/zish
+	arch = x86_64
+	license = MIT
+	makedepends = zig>=0.16.0
+	depends = glibc
+	source = zish-0.15.2.tar.gz::https://github.com/rotkonetworks/zish/archive/v0.15.2.tar.gz
+	sha256sums = e0095106bb44e1097c561eea0b1d15f58683f27881cb80bdce5fd506dbe8a91c
+
+pkgname = zish

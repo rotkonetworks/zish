@@ -1270,10 +1270,22 @@ pub const Lexer = struct {
 
     fn switchToBuf(self: *Self) void {
         if (!self.use_buf) {
-            // copy current token content to buffer
+            // Copy the token accumulated so far into the fixed buffer.
+            //
+            // The length must be clamped: a token can already be longer than
+            // MAX_TOKEN_LENGTH when this runs (nothing bounds input scanning
+            // before the first escape forces buffering), and the unclamped
+            // @memcpy wrote past the end of a 1024-byte array — a panic under
+            // safety checks, an out-of-bounds write without them. Reachable
+            // from a >1024-character word followed by any backslash escape.
+            //
+            // Truncating rather than erroring matches bufAppend, which already
+            // caps silently at MAX_TOKEN_LENGTH, so an over-long token behaves
+            // the same whichever path built it.
             const current = self.input[self.token_start..self.pos];
-            @memcpy(self.buf[self.buf_idx][0..current.len], current);
-            self.buf_len = current.len;
+            const n = @min(current.len, types.MAX_TOKEN_LENGTH);
+            @memcpy(self.buf[self.buf_idx][0..n], current[0..n]);
+            self.buf_len = n;
             self.use_buf = true;
         }
     }

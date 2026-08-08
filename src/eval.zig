@@ -109,10 +109,35 @@ inline fn fastParseI64(s: []const u8) ?i64 {
     while (i < s.len) : (i += 1) {
         const c = s[i];
         if (c < '0' or c > '9') return null;
-        result = result * 10 + (c - '0');
+        // A 19-digit literal can exceed i64. Report "not a fast integer" and
+        // let the caller fall back rather than wrapping: unchecked `* 10` here
+        // panicked under safety checks and silently produced a wrong number in
+        // ReleaseFast (`$(( 9999999999999999999 ))` evaluated to 0).
+        result = std.math.mul(i64, result, 10) catch return null;
+        result = std.math.add(i64, result, @as(i64, c - '0')) catch return null;
     }
 
     return if (negative) -result else result;
+}
+
+/// Allocator for a freshly forked child that keeps running shell code.
+///
+/// A forked child must not keep using the parent's GeneralPurposeAllocator: if
+/// another thread (ghost inference) held its lock at fork time, the child would
+/// deadlock on the first allocation. But it also cannot simply switch to
+/// page_allocator, which was the previous approach — the child inherits a heap
+/// full of GPA-owned pointers (PWD, variables, aliases), and the first builtin
+/// that frees one, e.g. `( cd / )` reaching setVar, hands a GPA pointer to
+/// PageAllocator.free. That panics on "incorrect alignment" in a safety build
+/// and corrupts memory in ReleaseFast.
+///
+/// An arena over page_allocator satisfies both: fresh allocations come straight
+/// from mmap and are fork-safe, while free() of an inherited pointer is a
+/// harmless no-op (an arena only rewinds its own most recent allocation and
+/// ignores foreign ones). Nothing is leaked in practice because every caller
+/// exits the process shortly after.
+fn forkChildArena() std.heap.ArenaAllocator {
+    return std.heap.ArenaAllocator.init(std.heap.page_allocator);
 }
 
 // Clean up process substitution children - close fds and reap zombies
@@ -153,7 +178,8 @@ fn expandProcessSubst(shell: *Shell, arg: []const u8) !?[:0]const u8 {
 
     if (pid == 0) {
         // child process - run command
-        shell.allocator = std.heap.page_allocator;
+        var child_arena = forkChildArena();
+        shell.allocator = child_arena.allocator();
 
         if (is_input) {
             // <(cmd): redirect stdout to pipe write end
@@ -1127,6 +1153,9 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
         return result;
     }
 
+    if (std.mem.eql(u8, cmd_name, "feat"))
+        return try featCmd(shell, expanded_args.items);
+
     if (std.mem.eql(u8, cmd_name, "chpw")) {
         const crypto_mod = @import("crypto.zig");
 
@@ -1318,8 +1347,10 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     argv_buf[expanded_args.items.len] = null;
     const argv = argv_buf[0..expanded_args.items.len :null];
 
-    // In pipeline context, exec directly (we're already forked)
-    if (shell.in_pipeline) {
+    // This forked child was created to run exactly this node and nothing else,
+    // so exec in place instead of forking again. Any other node still has body
+    // left to run after it and must take the fork path below.
+    if (shell.exec_in_place_node == node) {
         // Build environment in child process (after fork, safe from parent interference)
         const envp = buildEnvironment(shell) catch @as([*:null]const ?[*:0]const u8, @ptrCast(std.c.environ));
         compat.posix.execvpeZ(argv[0].?, argv, envp) catch {
@@ -1524,10 +1555,10 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
     // the controlling tty (/dev/tty) for prompts like "[Y/n]".
     //
     // A background job / command substitution runs this function inside a
-    // forked subshell with shell.in_pipeline already true — skip the handoff
+    // forked subshell with shell.forked_child already true — skip the handoff
     // there so it doesn't steal the terminal from the parent shell.
     const is_tty = compat.posix.isatty(compat.posix.STDIN_FILENO);
-    const is_foreground = is_tty and !shell.in_pipeline;
+    const is_foreground = is_tty and !shell.forked_child;
     if (is_foreground) {
         // Give the pipeline a cooked terminal (canonical input, ISIG) instead
         // of the line editor's raw mode, so read()/tty prompts work.
@@ -1617,8 +1648,11 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
                 }
             }
 
-            // Full path for builtins, complex commands, etc.
-            shell.in_pipeline = true;
+            // Full path for builtins, complex commands, etc. This stage exists
+            // to run `child` and nothing else, so `child` — and only `child` —
+            // may exec in place.
+            shell.forked_child = true;
+            shell.exec_in_place_node = child;
             const status = evaluateAst(shell, child) catch 127;
             shell.stdout().flush() catch {};
             std.process.exit(status);
@@ -1813,9 +1847,11 @@ fn applyHeredocInput(shell: *Shell, path: []const u8, expand: bool) !void {
         compat.writeAll(wf, exp) catch {};
     }
     const file = try std.Io.Dir.cwd().openFile(compat.io(), exp_path, .{ .mode = .read_only });
+    // Both cleanups must be defers: a failing dup2 previously skipped them,
+    // leaking the descriptor and leaving the temp file behind on every error.
+    defer std.Io.Dir.deleteFileAbsolute(compat.io(), exp_path) catch {};
+    defer file.close(compat.io());
     try compat.posix.dup2(file.handle, compat.posix.STDIN_FILENO);
-    file.close(compat.io());
-    std.Io.Dir.deleteFileAbsolute(compat.io(), exp_path) catch {};
 }
 
 fn applyRedirect(shell: *Shell, node: *const ast.AstNode) !void {
@@ -1875,18 +1911,41 @@ fn applyRedirect(shell: *Shell, node: *const ast.AstNode) !void {
         try compat.posix.dup2(file.handle, compat.posix.STDOUT_FILENO);
         try compat.posix.dup2(file.handle, compat.posix.STDERR_FILENO);
     } else if (std.mem.eql(u8, redirect_type, "<<<")) {
-        // here string: create pipe, write string, connect to stdin
-        const pipe_fds = try compat.posix.pipe();
-        defer compat.posix.close(pipe_fds[0]);
-
-        // write string to write end of pipe
+        // Here string, materialised into a temp file rather than a pipe.
+        //
+        // The pipe version deadlocked: redirects are applied in the parent
+        // before the reading process is forked, so nothing drains the pipe
+        // while we write. Any here-string larger than the pipe buffer (~64 KiB)
+        // blocked the shell forever — `cmd <<< "$(...200k...)"` simply hung.
+        // It also leaked the write end whenever that write failed. The heredoc
+        // path above already uses a temp file for exactly this reason.
+        //
+        // The file is unlinked immediately after opening, so the open fd keeps
+        // it alive and there is nothing left to clean up on any exit path.
         const content_with_newline = try std.fmt.allocPrint(shell.allocator, "{s}\n", .{expanded_target});
         defer shell.allocator.free(content_with_newline);
-        _ = try compat.posix.write(pipe_fds[1], content_with_newline);
-        compat.posix.close(pipe_fds[1]);
 
-        // connect read end to stdin
-        try compat.posix.dup2(pipe_fds[0], compat.posix.STDIN_FILENO);
+        const S = struct {
+            var seq: u32 = 0;
+        };
+        S.seq +%= 1;
+        var name_buf: [64]u8 = undefined;
+        const tmp_path = std.fmt.bufPrint(
+            &name_buf,
+            "/tmp/zish_herestr_{d}_{d}",
+            .{ compat.posix.getpid(), S.seq },
+        ) catch return error.OutOfMemory;
+
+        {
+            const wf = try std.Io.Dir.cwd().createFile(compat.io(), tmp_path, .{ .truncate = true });
+            defer wf.close(compat.io());
+            try compat.writeAll(wf, content_with_newline);
+        }
+
+        const rf = try std.Io.Dir.cwd().openFile(compat.io(), tmp_path, .{ .mode = .read_only });
+        defer rf.close(compat.io());
+        std.Io.Dir.deleteFileAbsolute(compat.io(), tmp_path) catch {};
+        try compat.posix.dup2(rf.handle, compat.posix.STDIN_FILENO);
     } else {
         try applyFdRedirect(redirect_type, expanded_target);
     }
@@ -2981,7 +3040,7 @@ pub fn evaluateSubshell(shell: *Shell, node: *const ast.AstNode) !u8 {
     // isolated from the parent shell (POSIX ( ... ) semantics).
     // Inside an existing pipeline stage we are already a forked child, so run
     // in-process to avoid an extra fork (isolation is already provided).
-    if (shell.in_pipeline) {
+    if (shell.forked_child) {
         return evaluateAst(shell, node.children[0]);
     }
 
@@ -2995,9 +3054,13 @@ pub fn evaluateSubshell(shell: *Shell, node: *const ast.AstNode) !u8 {
 
     if (pid == 0) {
         // === CHILD ===
-        // page_allocator is stateless and safe post-fork
-        shell.allocator = std.heap.page_allocator;
-        shell.in_pipeline = true; // external commands exec directly
+        var child_arena = forkChildArena();
+        shell.allocator = child_arena.allocator();
+        shell.forked_child = true;
+        // Only the body itself may exec in place. When the body is a compound
+        // ( a; b ) evaluateAst descends into nodes that are not this one, and
+        // those correctly fork instead of replacing this process mid-body.
+        shell.exec_in_place_node = node.children[0];
         const status = evaluateAst(shell, node.children[0]) catch 127;
         shell.stdout().flush() catch {};
         compat.posix.exit(status);
@@ -3045,17 +3108,20 @@ pub fn evaluateBackground(shell: *Shell, node: *const ast.AstNode) !u8 {
 
     if (pid == 0) {
         // === CHILD PROCESS ===
-        // SAFETY: After fork, parent's GPA state may be inconsistent if fork
-        // occurred during an allocation. Switch to page_allocator immediately.
-        // This allocator is stateless and safe to use post-fork.
-        shell.allocator = std.heap.page_allocator;
+        // SAFETY: after fork the parent's GPA may be mid-allocation on another
+        // thread. See forkChildArena for why this is an arena and not
+        // page_allocator directly.
+        var child_arena = forkChildArena();
+        shell.allocator = child_arena.allocator();
 
         // set up process group for job control
         jobs.launchProcess(0, 0, false, compat.posix.STDIN_FILENO);
 
-        // Mark as in_pipeline so external commands exec directly
-        // instead of forking again (avoids double-fork for bg jobs)
-        shell.in_pipeline = true;
+        // This child exists to run `command`; when that is a single external
+        // command it may exec in place and avoid a double fork. A compound body
+        // ( a; b ) & descends into other nodes, which fork normally.
+        shell.forked_child = true;
+        shell.exec_in_place_node = command;
 
         // evaluate command and exit with its status
         const status = evaluateAst(shell, command) catch 127;
@@ -3079,11 +3145,22 @@ pub fn evaluateBackground(shell: *Shell, node: *const ast.AstNode) !u8 {
 
     // add job to table
     const job_id = shell.job_table.addJob(pid, cmd_str, false) catch {
-        try shell.stdout().print("[?] {d}\n", .{pid});
+        if (compat.posix.isatty(compat.posix.STDIN_FILENO)) {
+            var buf: [64]u8 = undefined;
+            const line = std.fmt.bufPrint(&buf, "[?] {d}\n", .{pid}) catch return 0;
+            compat.writeAll(.stderr(), line) catch {};
+        }
         return 0;
     };
 
-    try shell.stdout().print("[{d}] {d}\n", .{ job_id, pid });
+    // Job notifications are interactive UI, not command output: bash prints
+    // them only when interactive, and to stderr. Printing to stdout made
+    // `zish -c '( ... ) & wait'` emit "[1] 12345" into the script's output.
+    if (compat.posix.isatty(compat.posix.STDIN_FILENO)) {
+        var buf: [64]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "[{d}] {d}\n", .{ job_id, pid }) catch return 0;
+        compat.writeAll(.stderr(), line) catch {};
+    }
     return 0;
 }
 
@@ -3902,4 +3979,257 @@ fn writeEscapedToBuf(input: []const u8, buf: []u8) usize {
     }
 
     return out_pos;
+}
+
+// ============================================================================
+// feat — python-replacement feats.
+// A feat is a standalone static binary zish execs (no plugin ABI). The tier is
+// the trust model: standard (shipped, exec'd) vs extra (untrusted, exec'd with
+// a stripped env and never as root).
+// ============================================================================
+
+const FeatTier = enum { standard, extra };
+const FEAT_TIER_NAMES = [_][]const u8{ "standard", "extra" };
+
+fn featRoot(alloc: std.mem.Allocator, buf: []u8) ?[]const u8 {
+    if (compat.getEnvVarOwned(alloc, "ZISH_FEAT_PATH")) |p| {
+        defer alloc.free(p);
+        if (p.len < buf.len) {
+            @memcpy(buf[0..p.len], p);
+            return buf[0..p.len];
+        }
+        return null;
+    } else |_| {}
+    const home = compat.getEnvVarOwned(alloc, "HOME") catch return null;
+    defer alloc.free(home);
+    return std.fmt.bufPrint(buf, "{s}/.zish/feats", .{home}) catch null;
+}
+
+/// Terse, hostile-input manifest field: returns the value of `key = "value"`
+/// on its own line, or null. Unknown fields are ignored (never parsed).
+fn featManifestField(content: []const u8, key: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (!std.mem.startsWith(u8, line, key)) continue;
+        const after_key = line[key.len..];
+        const eq_rel = std.mem.indexOfScalar(u8, after_key, '=') orelse continue;
+        // allow whitespace around '=' (TOML: key = "value")
+        if (std.mem.trim(u8, after_key[0..eq_rel], " \t").len != 0) continue;
+        const rest = std.mem.trim(u8, after_key[eq_rel + 1 ..], " \t");
+        if (rest.len < 2 or rest[0] != '"') continue;
+        const end = std.mem.indexOfScalar(u8, rest[1..], '"') orelse continue;
+        return rest[1 .. end + 1];
+    }
+    return null;
+}
+
+/// Parse a feat reference (name, or tier/name). Rejects traversal and any
+/// extra path segments. tier is null when not specified (resolve standard then
+/// extra).
+fn featParseRef(raw: []const u8) ?struct { tier: ?FeatTier, name: []const u8 } {
+    if (raw.len == 0 or std.mem.indexOf(u8, raw, "..") != null) return null;
+    if (std.mem.indexOfScalar(u8, raw, '/')) |slash| {
+        const tier_s = raw[0..slash];
+        const name = raw[slash + 1 ..];
+        if (name.len == 0) return null;
+        if (std.mem.indexOfScalar(u8, name, '/') != null) return null;
+        const tier: FeatTier = if (std.mem.eql(u8, tier_s, "standard"))
+            .standard
+        else if (std.mem.eql(u8, tier_s, "extra"))
+            .extra
+        else
+            return null;
+        return .{ .tier = tier, .name = name };
+    }
+    return .{ .tier = null, .name = raw };
+}
+
+/// Resolve a feat reference to an absolute executable path + tier, or null.
+fn featResolve(alloc: std.mem.Allocator, raw: []const u8) ?struct { tier: FeatTier, bin: []u8 } {
+    const parsed = featParseRef(raw) orelse return null;
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = featRoot(alloc, &root_buf) orelse return null;
+
+    var candidates: [2]FeatTier = undefined;
+    var ncand: usize = 0;
+    if (parsed.tier) |t| {
+        candidates[ncand] = t;
+        ncand += 1;
+    } else {
+        candidates[0] = .standard;
+        candidates[1] = .extra;
+        ncand = 2;
+    }
+
+    var k: usize = 0;
+    while (k < ncand) : (k += 1) {
+        const tier = candidates[k];
+        const tier_name = if (tier == .standard) "standard" else "extra";
+
+        var tier_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const tier_dir = std.fmt.bufPrint(&tier_buf, "{s}/{s}", .{ root, tier_name }) catch continue;
+
+        var bin_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const bin_path = std.fmt.bufPrint(&bin_buf, "{s}/{s}/bin/{s}", .{ tier_dir, parsed.name, parsed.name }) catch continue;
+        // default bin name == feat name; honor an opt-in `bin` manifest field.
+        var mf_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const mf_path = std.fmt.bufPrint(&mf_path_buf, "{s}/{s}/feat.toml", .{ tier_dir, parsed.name }) catch continue;
+        if (std.Io.Dir.cwd().readFileAlloc(compat.io(), mf_path, alloc, .limited(16 * 1024))) |content| {
+            defer alloc.free(content);
+            if (featManifestField(content, "bin")) |b| {
+                if (b.len > 0 and std.mem.indexOfScalar(u8, b, '/') == null and std.mem.indexOf(u8, b, "..") == null) {
+                    const w = std.fmt.bufPrint(&bin_buf, "{s}/{s}/bin/{s}", .{ tier_dir, parsed.name, b }) catch bin_path;
+                    _ = w;
+                }
+            }
+        } else |_| {}
+
+        // must exist and be a regular file
+        const f = std.Io.Dir.cwd().openFile(compat.io(), bin_path, .{}) catch continue;
+        f.close(compat.io());
+        return .{ .tier = tier, .bin = alloc.dupe(u8, bin_path) catch return null };
+    }
+    return null;
+}
+
+/// Minimal stripped envp for untrusted `extra` feats: HOME + a shrunk PATH.
+/// No other variables leak across the trust boundary.
+// NOTE: returned envp strings live for the process lifetime (like
+// buildEnvironment): they survive fork and stay valid until exec in the child.
+// envp strings + pointer array are process-lifetime (like buildEnvironment): they
+// survive fork and stay valid until exec in the child.
+fn featStrippedEnv(alloc: std.mem.Allocator, tier_dir: []const u8) ?[*:null]const ?[*:0]const u8 {
+    const home = compat.getEnvVarOwned(alloc, "HOME") catch return null;
+    const home_s = std.fmt.allocPrint(alloc, "HOME={s}", .{home}) catch return null;
+    const home_env = alloc.dupeZ(u8, home_s) catch return null;
+    const path_s = std.fmt.allocPrint(alloc, "PATH={s}/bin:/usr/local/bin:/usr/bin:/bin", .{tier_dir}) catch return null;
+    const path_env = alloc.dupeZ(u8, path_s) catch return null;
+
+    const envp = alloc.alloc(?[*:0]const u8, 3) catch return null;
+    envp[0] = home_env.ptr;
+    envp[1] = path_env.ptr;
+    envp[2] = null;
+    return @ptrCast(envp.ptr);
+}
+
+fn featExec(shell: *Shell, tier: FeatTier, bin_path: []const u8, sub_args: []const []const u8) !u8 {
+    // null-terminated argv
+    if (1 + sub_args.len >= 250) return 1;
+    var argv: [250]?[*:0]const u8 = undefined;
+    var held: std.ArrayList([:0]u8) = .empty;
+    defer held.deinit(shell.allocator);
+
+    const argv0 = try shell.allocator.dupeZ(u8, bin_path);
+    try held.append(shell.allocator, argv0);
+    argv[0] = argv0.ptr;
+    var n: usize = 1;
+    for (sub_args) |a| {
+        const dz = try shell.allocator.dupeZ(u8, a);
+        try held.append(shell.allocator, dz);
+        argv[n] = dz.ptr;
+        n += 1;
+    }
+    argv[n] = null;
+
+    const envp = if (tier == .extra)
+        featStrippedEnv(shell.allocator, "") orelse @as([*:null]const ?[*:0]const u8, @ptrCast(std.c.environ))
+    else
+        buildEnvironment(shell) catch @as([*:null]const ?[*:0]const u8, @ptrCast(std.c.environ));
+
+    const argv_ptr: [*:null]const ?[*:0]const u8 = argv[0..n :null];
+
+    const pid = compat.posix.fork() catch {
+        try shell.stdout().print("zish: fork failed\n", .{});
+        return 1;
+    };
+    if (pid == 0) {
+        compat.posix.execveZ(argv0.ptr, argv_ptr, envp) catch {
+            compat.posix.exit(127);
+        };
+    }
+    const result = compat.posix.waitpid(pid, 0);
+    if (compat.posix.W.IFEXITED(result.status)) return compat.posix.W.EXITSTATUS(result.status);
+    if (compat.posix.W.IFSIGNALED(result.status))
+        return @truncate(128 + @as(u32, @intCast(@intFromEnum(compat.posix.W.TERMSIG(result.status)))));
+    return 127;
+}
+
+fn featList(shell: *Shell, alloc: std.mem.Allocator) !u8 {
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = featRoot(alloc, &root_buf) orelse return 1;
+
+    for (FEAT_TIER_NAMES) |tier_name| {
+        var tier_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const tier_dir = std.fmt.bufPrint(&tier_buf, "{s}/{s}", .{ root, tier_name }) catch continue;
+        var dir = std.Io.Dir.cwd().openDir(compat.io(), tier_dir, .{ .iterate = true }) catch continue;
+        defer dir.close(compat.io());
+
+        var iter = dir.iterate();
+        while (try iter.next(compat.io())) |entry| {
+            if (entry.kind != .directory) continue;
+            if (entry.name.len == 0 or entry.name[0] == '.') continue;
+
+            var mf_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const mf_path = std.fmt.bufPrint(&mf_path_buf, "{s}/{s}/feat.toml", .{ tier_dir, entry.name }) catch continue;
+            const content = std.Io.Dir.cwd().readFileAlloc(compat.io(), mf_path, alloc, .limited(16 * 1024)) catch continue;
+            defer alloc.free(content);
+            const help = featManifestField(content, "help") orelse "";
+            try shell.stdout().print("{s}\t{s}\t{s}\n", .{ tier_name, entry.name, help });
+        }
+    }
+    return 0;
+}
+
+fn featHelp(shell: *Shell, alloc: std.mem.Allocator, raw: []const u8) !u8 {
+    const resolved = featResolve(alloc, raw) orelse {
+        try shell.stdout().writeAll("feat: not found\n");
+        return 1;
+    };
+    defer alloc.free(resolved.bin);
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = featRoot(alloc, &root_buf) orelse return 1;
+    const parsed = featParseRef(raw) orelse return 1;
+    const tier_name = if (resolved.tier == .standard) "standard" else "extra";
+    var mf_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const mf_path = std.fmt.bufPrint(&mf_path_buf, "{s}/{s}/{s}/feat.toml", .{ root, tier_name, parsed.name }) catch return 1;
+    const content = std.Io.Dir.cwd().readFileAlloc(compat.io(), mf_path, alloc, .limited(16 * 1024)) catch return 1;
+    defer alloc.free(content);
+    const help = featManifestField(content, "help") orelse "";
+    const usage_str = featManifestField(content, "usage") orelse "";
+    try shell.stdout().print("{s}  {s}\n", .{ parsed.name, help });
+    if (usage_str.len > 0) try shell.stdout().print("usage: {s}\n", .{usage_str});
+    return 0;
+}
+
+fn featCmd(shell: *Shell, args: []const []const u8) !u8 {
+    const alloc = shell.allocator;
+    if (args.len < 2) {
+        try shell.stdout().writeAll("feat: usage: feat list | help <name> | run <name> [args...]\n");
+        return 2;
+    }
+    const sub = args[1];
+    if (std.mem.eql(u8, sub, "list")) return try featList(shell, alloc);
+    if (std.mem.eql(u8, sub, "help")) {
+        if (args.len < 3) return 2;
+        return try featHelp(shell, alloc, args[2]);
+    }
+    if (std.mem.eql(u8, sub, "run")) {
+        if (args.len < 3) return 2;
+        const resolved = featResolve(alloc, args[2]) orelse {
+            try shell.stdout().writeAll("feat: not found\n");
+            return 127;
+        };
+        defer alloc.free(resolved.bin);
+        // redshiftzero rule: untrusted extra feats never run as root.
+        if (resolved.tier == .extra and std.c.geteuid() == 0) {
+            try shell.stdout().writeAll("feat: refusing to run extra feat as root\n");
+            return 126;
+        }
+        return try featExec(shell, resolved.tier, resolved.bin, args[3..]);
+    }
+    try shell.stdout().writeAll("feat: unknown subcommand\n");
+    return 2;
 }

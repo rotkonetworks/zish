@@ -109,6 +109,8 @@ pub const Action = union(enum) {
     tap_complete,
     cycle_complete: CycleDirection,
     cycle_ghost: CycleDirection,
+    accept_ghost,           // accept one character of ghost text
+    toggle_ghost,           // enable/disable ghost autosuggestion
     move_cursor: MoveCursorAction,
     history_nav: HistoryDirection,
     enter_search_mode: SearchDirection,
@@ -309,6 +311,8 @@ pub const BindableAction = enum(u8) {
     suspend_shell,
     execute_command,
     tab_complete,
+    accept_ghost_char,
+    toggle_ghost,
     // vi
     enter_normal_mode,
 
@@ -344,6 +348,8 @@ pub const BindableAction = enum(u8) {
             .suspend_shell => .suspend_shell,
             .execute_command => .execute_command,
             .tab_complete => .tap_complete,
+            .accept_ghost_char => .accept_ghost,
+            .toggle_ghost => .toggle_ghost,
             .enter_normal_mode => .{ .vim_mode = .{ .set_mode = .normal } },
         };
     }
@@ -394,6 +400,7 @@ pub const KeyBindings = struct {
         t[11] = .clear_screen;         // ctrl+l (0x0C)
         // t[12] = enter (ctrl+m=0x0D) — handled structurally
         t[13] = .history_down;          // ctrl+n (0x0E)
+        t[14] = .toggle_ghost;          // ctrl+o: toggle ghost autosuggest
         t[15] = .history_up;            // ctrl+p (0x10)
         t[17] = .search_backward;       // ctrl+r (0x12)
         t[18] = .search_forward;        // ctrl+s (0x13)
@@ -410,6 +417,7 @@ pub const KeyBindings = struct {
         var t = [_]BindableAction{.none} ** 128;
         t['b'] = .move_word_backward;
         t['f'] = .move_word_forward;
+        t['e'] = .accept_ghost_char;   // Alt+E: accept one char of ghost text
         t['.'] = .insert_last_arg;
         break :blk t;
     };

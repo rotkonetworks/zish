@@ -83,7 +83,24 @@ pub fn build(b: *std.Build) void {
 
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    // Fuzz targets over the pure parsing/eval surfaces. Rooted at its own file
+    // rather than main.zig so it needs neither clap nor build_options.
+    // `zig build fuzz` runs each target once (a smoke test); `zig build fuzz
+    // --fuzz` searches continuously.
+    const fuzz_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/fuzz.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const run_fuzz_tests = b.addRunArtifact(fuzz_tests);
+    const fuzz_step = b.step("fuzz", "Fuzz lexer/parser/arithmetic/glob (add --fuzz to search)");
+    fuzz_step.dependOn(&run_fuzz_tests.step);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_fuzz_tests.step);
 }

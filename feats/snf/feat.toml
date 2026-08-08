@@ -1,0 +1,6 @@
+name = "snf"
+tier = "standard"
+version = "1.0.0"
+help = "file sniff: size<TAB>lines<TAB>ext<TAB>magic per file"
+bin = "snf"
+usage = "snf FILE [FILE...]  # path<TAB>size<TAB>lines<TAB>ext<TAB>magic"

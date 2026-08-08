@@ -60,10 +60,20 @@ jobs:
           zig build --release=fast -Dtarget=${{ matrix.target }} -Dlto=false
           mv zig-out/bin/zish zig-out/bin/zish-${{ matrix.target }}
 
+      # install.sh refuses to install a binary it cannot verify, so the
+      # checksum has to ship alongside it. One file per target; GitHub merges
+      # same-named assets across matrix jobs, so each job publishes its own.
+      - name: checksum ${{ matrix.target }}
+        run: |
+          cd zig-out/bin
+          sha256sum zish-${{ matrix.target }} > SHA256SUMS-${{ matrix.target }}
+
       - name: attach to release
         uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
         with:
-          files: zig-out/bin/zish-${{ matrix.target }}
+          files: |
+            zig-out/bin/zish-${{ matrix.target }}
+            zig-out/bin/SHA256SUMS-${{ matrix.target }}
           fail_on_unmatched_files: true
 
   # ── Publish to the AUR from the canonical in-repo PKGBUILD ─────────────────

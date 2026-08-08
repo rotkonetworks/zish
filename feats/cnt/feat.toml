@@ -1,0 +1,6 @@
+name = "cnt"
+tier = "standard"
+version = "1.0.0"
+help = "count lines/bytes/words — single integer out"
+bin = "cnt"
+usage = "cnt [-b|-w] [FILE]  # lines by default; -b bytes, -w words"

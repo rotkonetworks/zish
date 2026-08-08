@@ -3,9 +3,14 @@ zig-out/
 zishrc
 test_infer
 test_gguf_open
+test_buffered
 root
+result
+result-*
 
 # Claude Code artifacts
 .claude/scheduled_tasks.lock
+.claude/settings.local.json
+.claude/worktrees/
 scripts/__pycache__/
 scripts/shell_training_data.jsonl

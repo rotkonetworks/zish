@@ -164,6 +164,9 @@ pub fn handleTabCompletion(self: *Shell) !void {
     const word = word_result.word;
     const word_end = word_result.end;
 
+    // feat builtin completion (subcommands + feat names)
+    if (try tryFeatCompletion(self, cmd, word_result)) return;
+
     // check for git-aware completion
     if (try tryGitCompletion(self, cmd, word_result)) return;
 
@@ -1767,30 +1770,81 @@ fn trySubcommandCompletion(self: *Shell, cmd: []const u8, word_result: WordResul
     }
 }
 
+/// Strict allowlist for names completion is willing to execute.
+///
+/// Completion probes run on TAB — before the user has committed to running
+/// anything — so the bar here is "obviously inert", not "probably fine". A
+/// name must be a bare PATH lookup: no '/' (blocks ./relative and absolute
+/// paths), no leading '-' (the callee would parse it as a flag), no leading
+/// '.', and nothing outside a conservative character set. Every shell
+/// metacharacter is rejected as a side effect.
+///
+/// This is defense in depth. Callers below no longer invoke a shell at all,
+/// so metacharacters are already inert; this keeps them inert even if some
+/// future caller reintroduces one.
+fn isSafeProbeName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 32) return false;
+    if (name[0] == '-' or name[0] == '.') return false;
+    for (name) |c| {
+        if (std.ascii.isAlphanumeric(c)) continue;
+        if (c == '_' or c == '-' or c == '.' or c == '+') continue;
+        return false;
+    }
+    return true;
+}
+
+/// Spawn `argv` with stdout and stderr merged into a single pipe and read up
+/// to `buf.len` bytes of it. Returns the byte count (0 on any failure).
+///
+/// The merge reproduces the `2>&1` that the old `/bin/sh -c "..."` string
+/// provided — many tools print --help to stderr — but without a shell in the
+/// loop, so argv elements reach execve verbatim and are never parsed as shell
+/// syntax.
+///
+/// If the child outputs more than `buf.len` we stop reading and close the read
+/// end; the child then takes EPIPE/SIGPIPE and exits, rather than blocking
+/// forever on write while we block in wait().
+fn captureMerged(argv: []const []const u8, buf: []u8) usize {
+    const fds = compat.posix.pipe() catch return 0;
+    // compat.posix.pipe() returns blocking fds; say so explicitly.
+    const write_end: std.Io.File = .{ .handle = fds[1], .flags = .{ .nonblocking = false } };
+
+    var child = std.process.spawn(compat.io(), .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .{ .file = write_end },
+        .stderr = .{ .file = write_end },
+    }) catch {
+        compat.posix.close(fds[0]);
+        compat.posix.close(fds[1]);
+        return 0;
+    };
+
+    // Parent must drop its copy of the write end or the read below never
+    // observes EOF once the child exits.
+    compat.posix.close(fds[1]);
+
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = compat.posix.read(fds[0], buf[total..]) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+
+    compat.posix.close(fds[0]);
+    _ = child.wait(compat.io()) catch {};
+    return total;
+}
+
 fn parseSubcmdsFromHelp(self: *Shell, base_cmd: []const u8) !void {
     self.cache.subcmd_count = 0;
     if (base_cmd.len > self.cache.subcmd_cmd.len) return;
+    if (!isSafeProbeName(base_cmd)) return;
     @memcpy(self.cache.subcmd_cmd[0..base_cmd.len], base_cmd);
     self.cache.subcmd_cmd_len = base_cmd.len;
 
-    var argv_buf: [128]u8 = undefined;
-    var child = try std.process.spawn(compat.io(), .{
-        .argv = &.{ "/bin/sh", "-c", std.fmt.bufPrint(&argv_buf, "{s} --help 2>&1", .{base_cmd}) catch return },
-        .stdin = .ignore,
-        .stdout = .pipe,
-        .stderr = .ignore,
-    });
-
-    const stdout = child.stdout.?;
     var read_buf: [16384]u8 = undefined;
-    var total_read: usize = 0;
-    while (total_read < read_buf.len) {
-        const n = compat.posix.read(stdout.handle, read_buf[total_read..]) catch break;
-        if (n == 0) break;
-        total_read += n;
-    }
-    if (child.stdout) |*s| { s.close(compat.io()); child.stdout = null; }
-    _ = child.wait(compat.io()) catch {};
+    const total_read = captureMerged(&.{ base_cmd, "--help" }, &read_buf);
 
     // parse subcommands: lines starting with 2+ spaces followed by a word (no dash prefix)
     const text = read_buf[0..total_read];
@@ -1849,22 +1903,32 @@ fn tryFlagCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bo
         if (std.mem.eql(u8, base_cmd, tool)) break true;
     } else false;
 
+    var sub_opt: ?[]const u8 = null;
+    if (has_subcmds) {
+        const rest = std.mem.trimStart(u8, trimmed[cmd_end..], " \t");
+        if (rest.len > 0) {
+            const sub_end = std.mem.indexOfAny(u8, rest, " \t") orelse rest.len;
+            const sub = rest[0..sub_end];
+            // only include if subcommand doesn't start with - (it's a flag not a subcmd)
+            if (sub.len > 0 and sub[0] != '-') sub_opt = sub;
+        }
+    }
+
+    // `command` is a cache key only — it is compared and copied, never executed.
+    // base_cmd and sub_opt reach execve as separate argv elements.
     var full_cmd_buf: [64]u8 = undefined;
     const command = blk: {
-        if (has_subcmds) {
-            const rest = std.mem.trimStart(u8, trimmed[cmd_end..], " \t");
-            if (rest.len > 0) {
-                const sub_end = std.mem.indexOfAny(u8, rest, " \t") orelse rest.len;
-                const sub = rest[0..sub_end];
-                // only include if subcommand doesn't start with - (it's a flag not a subcmd)
-                if (sub.len > 0 and sub[0] != '-') {
-                    break :blk std.fmt.bufPrint(&full_cmd_buf, "{s} {s}", .{ base_cmd, sub }) catch base_cmd;
-                }
-            }
+        if (sub_opt) |s| {
+            break :blk std.fmt.bufPrint(&full_cmd_buf, "{s} {s}", .{ base_cmd, s }) catch {
+                // Joined key doesn't fit: probe the base command alone so the
+                // cache key and the probe stay in agreement.
+                sub_opt = null;
+                break :blk base_cmd;
+            };
         }
         break :blk base_cmd;
     };
-    if (command.len > 64) return false;
+    if (command.len > full_cmd_buf.len) return false;
 
     const pattern = word_result.word;
 
@@ -1878,7 +1942,7 @@ fn tryFlagCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bo
 
     if (!cached) {
         // run command --help and parse flags
-        parseFlagsFromHelp(self, command) catch {
+        parseFlagsFromHelp(self, command, base_cmd, sub_opt) catch {
             self.cache.flag_count = 0;
         };
         self.cache.flag_ts = now;
@@ -1929,41 +1993,29 @@ fn tryFlagCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bo
     }
 }
 
-fn parseFlagsFromHelp(self: *Shell, command: []const u8) !void {
+/// Probe `base [sub] --help` and parse flags out of the output.
+///
+/// `base` and `sub` are passed as separate argv elements rather than joined
+/// into one string, so a space (or any other character) inside `sub` can never
+/// split into extra arguments. `cache_key` is only ever compared and copied,
+/// never executed.
+fn parseFlagsFromHelp(self: *Shell, cache_key: []const u8, base: []const u8, sub: ?[]const u8) !void {
     self.cache.flag_count = 0;
-    @memcpy(self.cache.flag_cmd[0..command.len], command);
-    self.cache.flag_cmd_len = command.len;
+    if (cache_key.len > self.cache.flag_cmd.len) return;
+    if (!isSafeProbeName(base)) return;
+    @memcpy(self.cache.flag_cmd[0..cache_key.len], cache_key);
+    self.cache.flag_cmd_len = cache_key.len;
 
-    var argv_buf: [128]u8 = undefined;
-    var child = try std.process.spawn(compat.io(), .{
-        .argv = &.{ "/bin/sh", "-c", std.fmt.bufPrint(&argv_buf, "{s} --help 2>&1", .{command}) catch return },
-        .stdin = .ignore,
-        .stdout = .pipe,
-        .stderr = .ignore,
-    });
-
-    const stdout = child.stdout.?;
     var buf_pos: usize = 0;
     var desc_pos: usize = 0;
     var count: usize = 0;
 
     // read help output and parse flags (cap at 16K to avoid OOM)
     var read_buf: [16384]u8 = undefined;
-    var total_read: usize = 0;
-    while (total_read < read_buf.len) {
-        const n = compat.posix.read(stdout.handle, read_buf[total_read..]) catch break;
-        if (n == 0) break;
-        total_read += n;
-    }
-
-    // Close stdout pipe before wait — prevents deadlock if child produced
-    // more output than our buffer (child blocks on write, wait blocks on child).
-    if (child.stdout) |*s| {
-        s.close(compat.io());
-        child.stdout = null;
-    }
-    if (child.stdout) |*s| { s.close(compat.io()); child.stdout = null; }
-    _ = child.wait(compat.io()) catch {};
+    const total_read = if (sub) |s|
+        captureMerged(&.{ base, s, "--help" }, &read_buf)
+    else
+        captureMerged(&.{ base, "--help" }, &read_buf);
 
     // parse flags from help text — extract flag + description
     const text = read_buf[0..total_read];
@@ -2029,40 +2081,48 @@ fn parseFlagsFromHelp(self: *Shell, command: []const u8) !void {
         }
         // Only try man page if less than 30% have descriptions
         if (desc_count * 100 / count < 30) {
-            augmentFlagsFromMan(self, command, count, &desc_pos);
+            augmentFlagsFromMan(self, base, count, &desc_pos);
         }
     }
 }
 
+/// In-process replacement for `col -bx` over roff output.
+///
+/// man emits overstrike sequences for styling: "X\bX" for bold, "_\bX" for
+/// underline. A backspace means "the next character overwrites the previous
+/// one", so the plain-text rendering keeps the last character written to each
+/// column — what `col -b` does. Tabs become spaces (`col -x`). Rewrites in
+/// place and returns the shortened prefix.
+fn stripOverstrike(buf: []u8) []u8 {
+    var out: usize = 0;
+    var i: usize = 0;
+    while (i < buf.len) : (i += 1) {
+        const c = buf[i];
+        if (c == '\x08') {
+            // Backspace discards the character it overwrites. The overwriting
+            // character is emitted normally on the next iteration.
+            if (out > 0) out -= 1;
+            continue;
+        }
+        buf[out] = if (c == '\t') ' ' else c;
+        out += 1;
+    }
+    return buf[0..out];
+}
+
 /// Parse man page output to fill in missing flag descriptions.
 /// Only augments flags that already exist in the cache but lack descriptions.
-fn augmentFlagsFromMan(self: *Shell, command: []const u8, count: usize, desc_pos: *usize) void {
-    // Extract base command (strip subcommands for man page lookup)
-    const base_cmd = if (std.mem.indexOfScalar(u8, command, ' ')) |sp| command[0..sp] else command;
+fn augmentFlagsFromMan(self: *Shell, base_cmd: []const u8, count: usize, desc_pos: *usize) void {
+    if (!isSafeProbeName(base_cmd)) return;
 
-    var argv_buf: [128]u8 = undefined;
-    const man_cmd = std.fmt.bufPrint(&argv_buf, "COLUMNS=200 man {s} 2>/dev/null | col -bx", .{base_cmd}) catch return;
-
-    var child = std.process.spawn(compat.io(), .{
-        .argv = &.{ "/bin/sh", "-c", man_cmd },
-        .stdin = .ignore,
-        .stdout = .pipe,
-        .stderr = .ignore,
-    }) catch return;
-
-    const stdout = child.stdout.?;
+    // `man` is spawned directly instead of through `sh -c "... | col -bx"`.
+    // The pipeline's only job was stripping roff overstrike sequences, which
+    // stripOverstrike does in-process below — one less process and no shell.
     var read_buf: [32768]u8 = undefined;
-    var total_read: usize = 0;
-    while (total_read < read_buf.len) {
-        const n = compat.posix.read(stdout.handle, read_buf[total_read..]) catch break;
-        if (n == 0) break;
-        total_read += n;
-    }
-    if (child.stdout) |*s| { s.close(compat.io()); child.stdout = null; }
-    _ = child.wait(compat.io()) catch {};
-
-    if (total_read == 0) return;
-    const text = read_buf[0..total_read];
+    const raw_len = captureMerged(&.{ "man", base_cmd }, &read_buf);
+    if (raw_len == 0) return;
+    const text = stripOverstrike(read_buf[0..raw_len]);
+    if (text.len == 0) return;
 
     // For each cached flag without a description, search man page text
     for (0..count) |j| {
@@ -3320,6 +3380,27 @@ pub fn acceptGhostText(self: *Shell) bool {
     return true;
 }
 
+
+
+/// Accept one character of ghost text (Alt+E).
+/// Returns true if a char was accepted.
+pub fn acceptGhostChar(self: *Shell) bool {
+    if (self.ghost.len == 0) return false;
+    if (self.edit_buf.cursor != self.edit_buf.len) return false;
+
+    const ghost = self.ghost.buf[0..self.ghost.len];
+    _ = self.edit_buf.insertSlice(ghost[0..1]);
+    // shift ghost left by one char
+    std.mem.copyForwards(u8, self.ghost.buf[0 .. self.ghost.len - 1], self.ghost.buf[1..self.ghost.len]);
+    self.ghost.len -= 1;
+    return true;
+}
+
+/// Toggle ghost autosuggestion on/off (Ctrl+O).
+pub fn toggleGhost(self: *Shell) void {
+    self.ghost.enabled = !self.ghost.enabled;
+    if (!self.ghost.enabled) self.ghost.len = 0;
+}
 /// Accept one word from ghost text (Ctrl+Right).
 /// Returns true if a word was accepted.
 pub fn acceptGhostWord(self: *Shell) bool {
@@ -3346,4 +3427,103 @@ pub fn acceptGhostWord(self: *Shell) bool {
     self.ghost.len = remaining;
 
     return true;
+}
+
+// -------- feat builtin completion (subcommands + feat names) --------
+fn featRegRoot(self: *Shell, buf: []u8) ?[]const u8 {
+    if (compat.getEnvVarOwned(self.allocator, "ZISH_FEAT_PATH")) |p| {
+        defer self.allocator.free(p);
+        if (p.len < buf.len) {
+            @memcpy(buf[0..p.len], p);
+            return buf[0..p.len];
+        }
+        return null;
+    } else |_| {}
+    const home = compat.getEnvVarOwned(self.allocator, "HOME") catch return null;
+    defer self.allocator.free(home);
+    return std.fmt.bufPrint(buf, "{s}/.zish/feats", .{home}) catch null;
+}
+
+fn featCollectNames(self: *Shell, matches: *std.ArrayList([]const u8), pattern: []const u8) !void {
+    var seen = std.StringHashMap(void).init(self.allocator);
+    defer seen.deinit();
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = featRegRoot(self, &root_buf) orelse return;
+
+    const tiers = [_][]const u8{ "standard", "extra" };
+    for (tiers) |tier| {
+        var tb: [std.fs.max_path_bytes]u8 = undefined;
+        const td = std.fmt.bufPrint(&tb, "{s}/{s}", .{ root, tier }) catch continue;
+        var dir = std.Io.Dir.cwd().openDir(compat.io(), td, .{ .iterate = true }) catch continue;
+        defer dir.close(compat.io());
+        var iter = dir.iterate();
+        while (iter.next(compat.io()) catch null) |entry| {
+            if (entry.kind != .directory) continue;
+            const name = entry.name;
+            if (name.len == 0 or name[0] == '.') continue;
+            if (!std.mem.startsWith(u8, name, pattern)) continue;
+            if (seen.contains(name)) continue;
+            const dup = self.allocator.dupe(u8, name) catch continue;
+            seen.put(dup, {}) catch {
+                self.allocator.free(dup);
+                continue;
+            };
+            matches.append(self.allocator, dup) catch {
+                self.allocator.free(dup);
+                continue;
+            };
+        }
+    }
+}
+
+fn tryFeatCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bool {
+    const trimmed = std.mem.trimStart(u8, cmd, " \t");
+    if (!std.mem.startsWith(u8, trimmed, "feat")) return false;
+    if (trimmed.len > 4 and trimmed[4] != ' ' and trimmed[4] != '\t') return false;
+
+    // tokenize what's completed before the cursor to find position + previous token
+    var prev_token: ?[]const u8 = null;
+    var tokens: usize = 0;
+    var it = std.mem.tokenizeAny(u8, cmd[0..word_result.start], " \t");
+    while (it.next()) |t| {
+        prev_token = t;
+        tokens += 1;
+    }
+    const pattern = word_result.word;
+
+    if (tokens == 1) {
+        // second word: complete subcommands
+        const subcmds = [_][]const u8{ "list", "help", "run" };
+        var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 4);
+        defer {
+            for (matches.items) |m| self.allocator.free(m);
+            matches.deinit(self.allocator);
+        }
+        for (subcmds) |s| {
+            if (std.mem.startsWith(u8, s, pattern))
+                matches.append(self.allocator, self.allocator.dupe(u8, s) catch continue) catch continue;
+        }
+        if (matches.items.len == 0) return false;
+        if (matches.items.len == 1) return try applySingleCompletion(self, matches.items[0], word_result);
+        return try showCompletionMatches(self, &matches, word_result, pattern);
+    }
+
+    if (tokens == 2 and prev_token != null and
+        (std.mem.eql(u8, prev_token.?, "run") or std.mem.eql(u8, prev_token.?, "help")))
+    {
+        // third word after run/help: complete feat names from the registry
+        var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 16);
+        defer {
+            for (matches.items) |m| self.allocator.free(m);
+            matches.deinit(self.allocator);
+        }
+        try featCollectNames(self, &matches, pattern);
+        if (matches.items.len == 0) return false;
+        std.mem.sort([]const u8, matches.items, {}, StringOrder.lessThan);
+        if (matches.items.len == 1) return try applySingleCompletion(self, matches.items[0], word_result);
+        return try showCompletionMatches(self, &matches, word_result, pattern);
+    }
+
+    return false;
 }
