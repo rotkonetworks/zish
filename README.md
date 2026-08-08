@@ -76,17 +76,18 @@ They're opt-in and never in the hot path. A feat is just a binary zish
 
 See [docs/feat-spec.md](docs/feat-spec.md) for the boundary contract.
 
-## Optional: LLM agent
+## Ghost text
 
-zish can host an embedded agent with tool use and local GGUF inference. It's
-off to the side and not what the shell is about:
+If you point zish at a local GGUF model, it suggests the rest of the command
+as you type — shown ahead of the cursor in a dimmer color, so a suggestion
+never reads as something you typed. `ctrl+o` toggles it, `alt+e` accepts one
+character.
 
-```sh
-agent            # interactive
-agent <query>    # one-shot
-```
+Inference is pure Zig with no external dependencies, runs in a forked child so
+a slow model can't stall the prompt, and is entirely optional — zish works
+normally with no model configured.
 
-Config lives in `~/.zish/agent.json`.
+Config lives in `~/.zish/agent.json` (`completion_model` points at the `.gguf`).
 
 ## Tests
 

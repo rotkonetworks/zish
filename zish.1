@@ -1,6 +1,6 @@
 .TH ZISH 1 "March 2026" "zish 1.0.0" "User Commands"
 .SH NAME
-zish \- a modern shell with vim editing, job control, and an embedded LLM agent
+zish \- a fast zsh-compatible shell with vim editing and job control
 .SH SYNOPSIS
 .B zish
 [\fB\-c\fR \fIcommand\fR]
@@ -12,8 +12,8 @@ zish \- a modern shell with vim editing, job control, and an embedded LLM agent
 is a Unix shell written in Zig, featuring vim-style modal editing,
 job control, arrays, process substitution, statistical benchmarking,
 intelligent tab completion with ghost text prediction,
-syntax highlighting, and an embedded LLM agent with recursive
-subagent spawning, autonomous task execution, and local GGUF inference.
+syntax highlighting, and optional ghost text completion backed by
+a local GGUF inference engine.
 .PP
 When invoked without arguments, zish starts an interactive session.
 When given \fB\-c\fR, it executes the command string.
@@ -436,9 +436,6 @@ Move to end of line
 .BR Ctrl\-F
 Move cursor right
 .TP
-.BR Ctrl\-G
-Cancel agent operation
-.TP
 .BR Ctrl\-H ", " Backspace
 Delete character before cursor
 .TP
@@ -618,13 +615,21 @@ History-based prefix matching
 When a local GGUF model is configured (see \fBcompletion_model\fR in
 .IR CONFIGURATION ),
 zish displays predictive ghost text in dim color ahead of the cursor.
-Press
-.B Right
-or
-.B End
-to accept the full prediction, or
+The part completing the token you are typing is shown in cyan;
+the rest is italic, so a suggestion never reads as committed input.
+.TP
+.BR Right ", " End
+Accept the full prediction
+.TP
 .B Ctrl\-Right
-to accept one word at a time.
+Accept one word
+.TP
+.B Alt\-E
+Accept one character
+.TP
+.B Ctrl\-O
+Toggle ghost text on or off
+.PP
 Ghost text is generated asynchronously on a background thread
 using pure-Zig inference with no external dependencies.
 .SH SYNTAX HIGHLIGHTING
@@ -696,278 +701,6 @@ Command number n
 .TP
 .B !string
 Most recent command starting with string
-.SH AGENT
-The
-.B agent
-builtin provides an embedded LLM agent with tool use,
-recursive subagent spawning, and autonomous task execution.
-The agent runs on a dedicated background thread and communicates
-with the shell via a lock-free SPSC ring buffer.
-.SS Subcommands
-.TP
-.B agent
-Enter interactive agent mode. Displays model name in header.
-.TP
-.B agent c\fR, \fBagent continue
-Re-enter interactive mode, continuing the current session.
-.TP
-.B agent attach \fR[\fIid\fR]
-Attach to a running session via FIFO pipe (like screen/tmux).
-Input is sent through \fB~/.zish/sessions/\fIid\fB/ctl\fR.
-.TP
-.B agent \fIquery\fR
-Send a one-shot query and print the response.
-.TP
-.B agent \-m \fImodel\fR \fR[\fIquery\fR]
-Switch model before query. Accepts aliases:
-.BR opus ", " sonnet ", " haiku ,
-or a full model ID string.
-.TP
-.B agent stop
-Cancel the current agent operation.
-.TP
-.B agent status
-Show whether the agent is busy or idle.
-.TP
-.B agent sessions
-List recent sessions (last 10).
-.TP
-.B agent log \fR[\fIid\fR]
-View conversation log with markdown rendering.
-Shows latest session if no id given.
-.TP
-.B agent tasks
-List subagent tasks from the current session.
-.TP
-.B agent config
-Show current agent configuration.
-.TP
-.B agent clear
-Reset conversation history and start fresh.
-.TP
-.B agent help
-Show agent usage information.
-.SS Interactive Mode
-In interactive mode, the agent presents a bottom-anchored TUI
-using ANSI scroll regions. Output stays in terminal scrollback
-(no alternate screen). The layout consists of:
-.IP \(bu 2
-Output scroll region (top rows)
-.IP \(bu 2
-Separator line with scroll indicator
-.IP \(bu 2
-Multiline input area (grows up to 5 lines)
-.IP \(bu 2
-Status bar: model name, session cost, elapsed time, keybinding hints
-.PP
-The input area uses
-.B \(rA
-as the prompt character.
-Press
-.B Enter
-to submit,
-.B Ctrl\-J
-or
-.B Alt\-Enter
-to insert a newline.
-.B PageUp / PageDown
-scrolls through message history (512KB ring buffer).
-.SS Interactive Commands
-.TP
-.B /compact
-Summarize conversation to save context window space.
-.TP
-.B /cost
-Show session cost breakdown.
-.TP
-.B /model \fR[\fIname\fR]
-Show or switch model (opus, sonnet, haiku, or full model ID).
-.TP
-.B /diff
-Show uncommitted git changes.
-.TP
-.B /commit \fR[\fImsg\fR]
-Commit changes. If no message given, the agent generates one.
-.TP
-.B /review
-AI code review of all changes made this session.
-.TP
-.B /undo
-Undo the last file change made by the agent.
-.TP
-.B /plan \fItask\fR
-Plan a task without executing (read-only analysis).
-.TP
-.B /spawn \fItask\fR
-Spawn a full-tools worker subagent for parallel work.
-.TP
-.B /queue \fItask\fR
-Queue an autonomous task for execution when agent is idle.
-.TP
-.B /agents\fR, \fB/tasks
-Show subagent workers and task queue status.
-.TP
-.B /sessions
-List recent sessions.
-.TP
-.B /config
-Show current configuration.
-.TP
-.B /search \fIpattern\fR\fR, \fB/s \fIpattern\fR
-Search message history backwards (case-insensitive, strips ANSI).
-.TP
-.B /help
-Show available interactive commands.
-.TP
-.B clear
-Reset conversation history.
-.TP
-.B exit\fR, \fBquit\fR, \fBCtrl\-D
-Leave agent mode.
-.PP
-Additional prefixes:
-.TP
-.B !\fIcommand\fR
-Run a shell command directly via the zish engine.
-.TP
-.B !
-Drop to a full zish shell prompt.
-.TP
-.B ?\fIintent\fR
-Translate natural language to a shell command.
-.SS Agent Tools
-The agent has access to the following built-in tools:
-.TP
-.B Bash
-Execute shell commands. Supports git, builds, package managers.
-.TP
-.B Read
-Read file contents with line numbers. Supports
-.I offset
-and
-.I limit
-parameters for reading sections of large files.
-.TP
-.B Edit
-Make exact string replacements in files (find and replace).
-Shows a diff preview of changes. Requires reading the file first.
-.TP
-.B Write
-Create a new file or overwrite an existing file.
-.TP
-.B Glob
-Find files matching a glob pattern (e.g., "**/*.zig").
-.TP
-.B Grep
-Search file contents using regular expressions.
-.TP
-.B Agent
-Spawn a recursive subagent for autonomous parallel tasks.
-Subagents can themselves spawn further subagents (see
-.IR "RECURSIVE SUBAGENTS" ).
-.TP
-.B WebFetch
-Fetch a URL and convert HTML to plain text.
-.TP
-.B WebSearch
-Search the web using DuckDuckGo.
-.PP
-Tool calls are displayed as
-.B "\(bu ToolName(args)"
-during execution, with results shown after completion.
-.SS Plugin Tools
-Custom tools can be defined in \fB~/.zish/agent-tools.json\fR (max 16).
-Format:
-.PP
-.RS
-.nf
-[{
-  "name": "deploy",
-  "description": "Deploy the application",
-  "command": "deploy.sh {environment}",
-  "parameters": { "environment": "target env" },
-  "confirm": true
-}]
-.fi
-.RE
-.PP
-Parameters use \fB{param}\fR substitution. All parameter values are
-shell-escaped with single-quote wrapping.
-Tools with \fB"confirm": true\fR require user approval before execution.
-.SS Recursive Subagents
-The agent can spawn subagents up to 3 levels deep,
-with a maximum of 8 concurrent subagents per level.
-Worker subagents inherit the full tool set from their parent,
-including the ability to spawn their own subagents.
-Read-only subagents receive only Bash, Read, Glob, and Grep.
-Each subagent makes its own API calls and has atomic status tracking.
-The parent agent blocks on each subagent result with a 120-second timeout.
-.SS Autonomous Tasks
-The task queue holds up to 16 autonomous tasks.
-Tasks are submitted via \fB/queue\fR and execute during the agent's
-idle exhale phase. Use \fB/tasks\fR to inspect queue status.
-.SS Auto-Compact
-When total input tokens exceed 120K and history contains more than
-6 messages, the agent automatically summarizes the conversation
-to free context window space. Old messages are dropped and replaced
-with a summary, preserving the last 4 messages. The token counter
-resets after compaction. Manual compaction is available via \fB/compact\fR.
-The visible TUI history (ring buffer) is not affected.
-.SS Token Tracking
-The agent parses SSE events (message_start, message_delta) to track
-input and output tokens. Cumulative session cost is displayed in the
-status bar and available via \fB/cost\fR.
-.SS CLAUDE.md
-The agent automatically loads CLAUDE.md files from the current
-working directory, walking up parent directories and checking
-\fB.claude/CLAUDE.md\fR as well. Contents are prepended to the
-system prompt (up to 3KB, within an 8KB system prompt buffer).
-.SS Confirmation Flow
-When a tool call requires confirmation, the agent pushes a
-.B confirm_request
-message. The main thread displays the request, reads a keystroke
-from the user, and pushes a
-.B confirm_response
-back to the agent thread.
-.SH QUERY ROUTER
-When enabled, the query router classifies user input before
-dispatching to the agent, reducing cost by routing simple
-queries to cheaper models or bypassing the LLM entirely.
-.SS Classification Pipeline
-.IP 1. 4
-Local pattern matching classifies approximately 70% of queries
-at zero cost, detecting shell commands and keyword patterns.
-.IP 2. 4
-Local GGUF inference (if configured) provides model-based
-classification using pure-Zig inference with no external dependencies.
-.IP 3. 4
-API call to Haiku (~300ms, ~300 tokens) for ambiguous queries.
-.IP 4. 4
-Default to Sonnet if all classifiers are unavailable.
-.SS Route Decisions
-Each classification produces a structured RouteDecision:
-.TP
-.B action
-.BR shell " (bypass LLM entirely),"
-.BR agent " (send to LLM),"
-.BR fan_out " (parallel subagent dispatch)"
-.TP
-.B model tier
-.BR haiku " (fast/cheap),"
-.BR sonnet " (balanced),"
-.BR opus " (reasoning-heavy)"
-.TP
-.B tool mask
-Subset of tools the agent may use for this query.
-.PP
-The router never talks to the user directly; routing decisions
-are displayed as dim
-.B [route info]
-annotations.
-.SS Shell Action
-When the router detects a direct shell command (e.g., \fBls\fR,
-\fBgit status\fR), it runs the command via \fB/bin/sh \-c\fR
-and bypasses the LLM entirely.
 .SH LOCAL INFERENCE
 .B zish
 includes a pure-Zig GGUF inference engine with no external
@@ -1025,94 +758,29 @@ State files are stored as siblings of the GGUF model file:
 \fB.ctmstate\fR (sync accumulators),
 \fB.plastic\fR (weight overlay),
 \fB.replay\fR (replay buffer).
-.SH SESSION MANAGEMENT
-Agent sessions are logged in JSONL format under
-\fB~/.zish/sessions/\fIid\fB/conversation.jsonl\fR.
-.PP
-Sessions can be listed with \fBagent sessions\fR, viewed with
-\fBagent log\fR, and attached to (like screen/tmux) with
-\fBagent attach\fR via a FIFO at
-\fB~/.zish/sessions/\fIid\fB/ctl\fR.
 .SH CONFIGURATION
-.SS Agent Configuration
+.SS Ghost Text
 .B ~/.zish/agent.json
 .PP
 .RS
 .nf
 {
-  "provider": "anthropic",
-  "model": "claude-sonnet-4-6",
-  "base_url": "https://api.anthropic.com",
-  "api_key": "sk-...",
-  "api_key_cmd": "pass show anthropic",
-  "max_tokens": 8192,
-  "max_tool_iterations": 10,
-  "max_agents": 8,
-  "auto_allow": false,
-  "router_enabled": false,
-  "router_provider": "anthropic",
-  "router_model": "claude-haiku-4-5-20251001",
-  "router_base_url": "https://api.anthropic.com",
-  "router_local_only": false,
-  "router_local_model": "/path/to/router.gguf",
   "completion_model": "/path/to/completion.gguf",
-  "haiku_model": "claude-haiku-4-5-20251001",
-  "sonnet_model": "claude-sonnet-4-6",
-  "opus_model": "claude-opus-4-6"
+  "router_local_model": "/path/to/router.gguf"
 }
 .fi
 .RE
 .TP
-.B provider
-API provider: "anthropic", "ollama", or "openai".
-.TP
-.B model
-Default model ID.
-.TP
-.B base_url
-API endpoint URL.
-.TP
-.B api_key
-API key. Overridden by ZISH_AGENT_KEY or ANTHROPIC_API_KEY environment variables.
-.TP
-.B api_key_cmd
-Shell command to retrieve API key dynamically.
-.TP
-.B max_tokens
-Maximum tokens per API response (default: 8192).
-.TP
-.B max_tool_iterations
-Maximum tool calls per query (default: 10).
-.TP
-.B max_agents
-Maximum concurrent subagents (default: 8).
-.TP
-.B auto_allow
-Auto-approve all tool calls without confirmation (default: false).
-.TP
-.B router_enabled
-Enable the query router (default: false).
-.TP
-.B router_local_only
-Never call router API; use local pattern matching only.
+.B completion_model
+Path to a local GGUF model used for ghost text prediction.
+Ghost text is disabled when unset.
 .TP
 .B router_local_model
-Path to a local GGUF model for router inference.
-.TP
-.B completion_model
-Path to a local GGUF model for ghost text prediction.
-.TP
-.B haiku_model\fR, \fBsonnet_model\fR, \fBopus_model
-Model IDs for each tier, used by the router.
-.SS Authentication
-If no API key is configured, zish auto-loads Claude Code
-OAuth credentials from \fB~/.claude/.credentials.json\fR
-and sends appropriate identification headers.
-.SS Plugin Tools
-.B ~/.zish/agent-tools.json
+Path to a local GGUF model used for local query classification.
 .PP
-JSON array of custom tool definitions. See
-.IR "AGENT TOOLS" .
+The file is also parsed for a number of keys left over from a
+removed API agent (\fBprovider\fR, \fBapi_key\fR, \fBmax_agents\fR
+and similar). They are accepted but ignored.
 .SS Keybindings
 .B ~/.zish/keybindings.json
 .PP
@@ -1133,12 +801,6 @@ Previous working directory (for cd \-).
 .TP
 .B PWD
 Current working directory.
-.TP
-.B ZISH_AGENT_KEY
-API key for the agent (takes precedence over config file).
-.TP
-.B ANTHROPIC_API_KEY
-Anthropic API key (fallback if ZISH_AGENT_KEY is not set).
 .TP
 .B ?
 Exit status of last command.
@@ -1207,28 +869,13 @@ Startup file for interactive shells.
 Command history file.
 .TP
 .B ~/.zish/agent.json
-Agent configuration file.
-.TP
-.B ~/.zish/agent-tools.json
-Custom agent tool definitions.
+Ghost text / local inference configuration.
 .TP
 .B ~/.zish/keybindings.json
 Custom keybinding overrides.
 .TP
-.B ~/.zish/sessions/
-Agent session logs in JSONL format.
-.TP
-.B ~/.zish/sessions/\fIid\fB/ctl
-FIFO pipe for session attachment.
-.TP
 .B ~/.zish/models/
 Local GGUF models for inference.
-.TP
-.B ~/.claude/.credentials.json
-Claude Code OAuth credentials (auto-loaded).
-.TP
-.B CLAUDE.md, .claude/CLAUDE.md
-Agent system prompt context (loaded from cwd and parents).
 .SH EXIT STATUS
 The exit status is that of the last command executed,
 or 0 if no command was executed.
@@ -1247,29 +894,6 @@ Benchmark a command with histogram:
 time \-n 100 \-w 5 \-H ./myprogram
 .fi
 .RE
-.PP
-One-shot agent query:
-.RS
-.nf
-agent "explain this error" 2>&1 | head
-.fi
-.RE
-.PP
-Agent with model override:
-.RS
-.nf
-agent \-m opus "review this function for security issues"
-.fi
-.RE
-.PP
-Interactive agent session:
-.RS
-.nf
-agent
-> /spawn refactor the auth module
-> /spawn write tests for the API
-> /tasks
-.fi
 .RE
 .PP
 Process substitution:

@@ -7,7 +7,7 @@
 pkgname=zish
 pkgver=0.15.2
 pkgrel=1
-pkgdesc="fast shell interpreter written in zig with built-in AI agent and GGUF inference"
+pkgdesc="fast zsh-compatible shell written in zig, with local GGUF ghost-text completion"
 arch=('x86_64')
 url="https://github.com/rotkonetworks/zish"
 license=('MIT')

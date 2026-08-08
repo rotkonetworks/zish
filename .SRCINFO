@@ -1,5 +1,5 @@
 pkgbase = zish
-	pkgdesc = fast shell interpreter written in zig with built-in AI agent and GGUF inference
+	pkgdesc = fast zsh-compatible shell written in zig, with local GGUF ghost-text completion
 	pkgver = 0.15.2
 	pkgrel = 1
 	url = https://github.com/rotkonetworks/zish
