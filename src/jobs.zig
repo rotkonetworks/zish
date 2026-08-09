@@ -1,12 +1,37 @@
 // jobs.zig - Job control for zish
 const std = @import("std");
+const builtin = @import("builtin");
 const compat = @import("compat.zig");
 const posix = compat.posix;
 
-/// tcsetpgrp via ioctl (workaround: Zig 0.15 std.c missing tcsetpgrp binding)
+/// The TIOCSPGRP ioctl request number for this target.
+///
+/// Taken from the platform's own table when it has one. macOS exposes a `T`
+/// struct but omits IOCSPGRP, so the BSD encoding is computed instead:
+/// _IOW(g, n, t) = IOC_IN | (sizeof(t) << 16) | (g << 8) | n, which for
+/// ('t', 118, c_int) is 0x80047476.
+const tiocspgrp: u32 = blk: {
+    const T = std.posix.system.T;
+    if (@hasDecl(T, "IOCSPGRP")) break :blk @intCast(T.IOCSPGRP);
+    break :blk switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => 0x80000000 |
+            (@as(u32, @sizeOf(c_int)) << 16) | (@as(u32, 't') << 8) | 118,
+        else => @compileError("TIOCSPGRP is unknown for this target; add it here"),
+    };
+};
+
+/// tcsetpgrp via ioctl — std.posix.tcsetpgrp does not compile on 0.16 (it
+/// calls a std.c.tcsetpgrp that does not exist), so the ioctl stays.
+///
+/// The request number is taken from the target's own T table rather than
+/// hardcoded. It was `0x5410`, the Linux value: on any other platform that
+/// number names a *different* ioctl, so the call would compile and then do
+/// something unrelated at runtime — the worst kind of portability bug, because
+/// the build stays green. Same pattern as TIOCGWINSZ in Shell.zig.
 pub fn tcsetpgrp(fd: posix.fd_t, pgrp: posix.pid_t) posix.TermioSetPgrpError!void {
-    const TIOCSPGRP = 0x5410;
-    const rc = std.os.linux.ioctl(fd, TIOCSPGRP, @intFromPtr(&pgrp));
+    // The request is bit-cast because macOS types the ioctl request as a
+    // signed c_int, and 0x80047476 does not fit in one as a positive value.
+    const rc = std.posix.system.ioctl(fd, @bitCast(tiocspgrp), @intFromPtr(&pgrp));
     switch (std.posix.errno(rc)) {
         .SUCCESS => return,
         // Not unreachable: `fd` is whatever the shell recorded as its terminal
@@ -131,11 +156,11 @@ pub const JobTable = struct {
 
         // get actual process group - tcgetpgrp returns the foreground pgrp,
         // but we want our own pgrp which we can get via getpgid(0)
-        const shell_pgid = std.os.linux.syscall1(.getpgid, 0);
-        const pgid: posix.pid_t = if (@as(isize, @bitCast(shell_pgid)) < 0)
-            std.os.linux.getpid() // fallback if syscall fails
+        const shell_pgid = posix.getProcessGroup(0);
+        const pgid: posix.pid_t = if (shell_pgid < 0)
+            posix.getpid() // fallback if getpgid fails
         else
-            @intCast(shell_pgid);
+            shell_pgid;
 
         return JobTable{
             .jobs = .empty,
@@ -499,7 +524,7 @@ pub const JobTable = struct {
 pub fn launchProcess(pid: posix.pid_t, pgid: posix.pid_t, foreground: bool, terminal: posix.fd_t) void {
     // in child, pid=0 means use our own pid
     const our_pid: posix.pid_t = if (pid == 0)
-        @intCast(std.os.linux.getpid())
+        @intCast(posix.getpid())
     else
         pid;
 

@@ -1395,7 +1395,7 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     if (pid == 0) {
         // child: create own process group and take terminal control
         // this allows TUI apps (like claude) to work properly
-        const child_pid = std.os.linux.getpid();
+        const child_pid = compat.posix.getpid();
         compat.posix.setpgid(0, 0) catch {};
         if (is_tty) {
             jobs.tcsetpgrp(compat.posix.STDIN_FILENO, child_pid) catch {};
@@ -1429,7 +1429,7 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
 
     // take back terminal control
     if (is_tty) {
-        const shell_pgid: compat.posix.pid_t = @intCast(std.os.linux.syscall1(.getpgid, 0));
+        const shell_pgid: compat.posix.pid_t = compat.posix.getProcessGroup(0);
         jobs.tcsetpgrp(compat.posix.STDIN_FILENO, shell_pgid) catch {};
     }
 
@@ -1588,7 +1588,7 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
         // of the line editor's raw mode, so read()/tty prompts work.
         shell.disableRawMode();
     }
-    const shell_pgid: compat.posix.pid_t = @intCast(std.os.linux.getpgid(0));
+    const shell_pgid: compat.posix.pid_t = @intCast(compat.posix.getProcessGroup(0));
     defer {
         if (is_foreground) {
             // take terminal back and restore the editor's raw mode
@@ -1643,7 +1643,7 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
                 if (i == 0) {
                     _ = compat.posix.setpgid(0, 0) catch {};
                     if (is_foreground) {
-                        const mypid: compat.posix.pid_t = @intCast(std.os.linux.getpid());
+                        const mypid: compat.posix.pid_t = @intCast(compat.posix.getpid());
                         jobs.tcsetpgrp(compat.posix.STDIN_FILENO, mypid) catch {};
                     }
                 } else {
@@ -3409,11 +3409,11 @@ fn evaluateUnaryTest(shell: *Shell, opc: u8, operand: []const u8) bool {
         'k' => statModeBit(cwd, operand, 0o1000),
         'O' => blk: {
             const st = statPosix(operand) orelse break :blk false;
-            break :blk st.uid == std.os.linux.geteuid();
+            break :blk st.uid == compat.posix.geteuid();
         },
         'G' => blk: {
             const st = statPosix(operand) orelse break :blk false;
-            break :blk st.gid == std.os.linux.getegid();
+            break :blk st.gid == compat.posix.getegid();
         },
         'v' => shell.variables.contains(operand),
         'o' => isShellOption(shell, operand),

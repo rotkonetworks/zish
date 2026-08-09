@@ -376,7 +376,7 @@ pub fn readAllWithKey(allocator: std.mem.Allocator, key: [32]u8) ![]EntryData {
 }
 
 fn generateInstanceId() u8 {
-    const pid = std.os.linux.getpid();
+    const pid = compat.posix.getpid();
     var hasher = std.hash.Wyhash.init(0);
     hasher.update(std.mem.asBytes(&pid));
     var hostname_buf: [posix.HOST_NAME_MAX]u8 = undefined;

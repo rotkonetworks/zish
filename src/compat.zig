@@ -424,6 +424,35 @@ pub const posix = struct {
         return system.getpid();
     }
 
+    // libc-backed and therefore portable, unlike the raw std.os.linux syscall
+    // wrappers these replaced. A raw `syscall1(.getpgid, 0)` compiles for any
+    // target but emits a Linux syscall, so it is wrong at runtime everywhere
+    // else rather than failing to build.
+
+    // Zig 0.16 has no std.c binding for these two, so declare them. Going
+    // through libc rather than a raw syscall is what makes them portable: a
+    // std.os.linux.syscall1 compiles for any target but emits a Linux syscall,
+    // so it is silently wrong elsewhere instead of failing to build.
+    extern "c" fn getpgid(pid: pid_t) pid_t;
+    extern "c" fn wait4(pid: pid_t, status: ?*c_int, options: c_int, usage: ?*anyopaque) pid_t;
+
+    pub fn getProcessGroup(pid: pid_t) pid_t {
+        return getpgid(pid);
+    }
+
+    pub fn geteuid() std.posix.uid_t {
+        return system.geteuid();
+    }
+
+    pub fn getegid() std.posix.gid_t {
+        return system.getegid();
+    }
+
+    /// waitpid plus resource usage. Used by the `time` builtin.
+    pub fn waitRusage(pid: pid_t, status: *u32, options: u32, usage: ?*anyopaque) pid_t {
+        return wait4(pid, @ptrCast(status), @intCast(options), usage);
+    }
+
     pub fn exit(status: u8) noreturn {
         std.c.exit(status);
     }

@@ -588,7 +588,7 @@ fn expandPS1(self: *Shell, ps1: []const u8, buf: *[256]u8) PromptInfo {
                     }
                 }
             },
-            '$' => put(buf, &len, &visible, nonprint, if (std.os.linux.geteuid() == 0) "#" else "$"),
+            '$' => put(buf, &len, &visible, nonprint, if (compat.posix.geteuid() == 0) "#" else "$"),
             'e' => put(buf, &len, &visible, nonprint, "\x1b"),
             'a' => put(buf, &len, &visible, nonprint, "\x07"),
             's' => put(buf, &len, &visible, nonprint, "zish"),
@@ -1119,7 +1119,7 @@ fn handleAction(self: *Shell, action: Action) !void {
             self.disableRawMode();
 
             // send SIGTSTP to ourselves - we'll be stopped here
-            const pid = std.os.linux.getpid();
+            const pid = compat.posix.getpid();
             _ = posix.kill(pid, posix.SIG.TSTP) catch {};
 
             // === EXECUTION RESUMES HERE AFTER SIGCONT ===

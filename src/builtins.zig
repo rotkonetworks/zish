@@ -1763,7 +1763,7 @@ fn kill(shell: *Shell, args: []const []const u8) !u8 {
             try shell.stdout().print("kill: invalid pid: {s}\n", .{pid_str});
             return 1;
         };
-        const result = std.os.linux.kill(pid, @enumFromInt(sig));
+        const result = std.c.kill(pid, @enumFromInt(sig));
         if (result != 0) {
             try shell.stdout().print("kill: {d}: operation not permitted\n", .{pid});
             return 1;
@@ -2012,14 +2012,7 @@ const Rusage = extern struct {
 
 // wait4 syscall - like waitpid but returns rusage
 fn wait4(pid: compat.posix.pid_t, status: *u32, options: u32, rusage: ?*Rusage) compat.posix.pid_t {
-    const ret = std.os.linux.syscall4(
-        .wait4,
-        @bitCast(@as(isize, pid)),
-        @intFromPtr(status),
-        options,
-        @intFromPtr(rusage),
-    );
-    return @truncate(@as(isize, @bitCast(ret)));
+    return compat.posix.waitRusage(pid, status, options, @ptrCast(rusage));
 }
 
 const BenchSample = struct {

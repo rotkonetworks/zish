@@ -2825,7 +2825,7 @@ fn logCompletionImpl(cmd: []const u8, word_start: usize, prefix: []const u8, com
         else => return,
     };
     defer file.close(compat.io());
-    if (std.posix.errno(std.os.linux.lseek(file.handle, 0, std.os.linux.SEEK.END)) != .SUCCESS) return;
+    if (std.posix.errno(std.c.lseek(file.handle, 0, std.c.SEEK.END)) != .SUCCESS) return;
 
     const ctx = cmd[0..@min(word_start, cmd.len)];
     const ts: u64 = @bitCast(compat.timestamp());
@@ -3349,7 +3349,7 @@ fn logRejection(cmd: []const u8, predicted: []const u8) void {
         else => return,
     };
     defer file.close(compat.io());
-    if (std.posix.errno(std.os.linux.lseek(file.handle, 0, std.os.linux.SEEK.END)) != .SUCCESS) return;
+    if (std.posix.errno(std.c.lseek(file.handle, 0, std.c.SEEK.END)) != .SUCCESS) return;
 
     const ts: u64 = @bitCast(compat.timestamp());
 

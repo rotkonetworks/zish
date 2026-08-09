@@ -71,7 +71,7 @@ pub const ForkServer = struct {
 
             // Auto-terminate when parent dies (prevents zombie/orphan VRAM leaks)
             const PR_SET_PDEATHSIG = 1;
-            _ = std.os.linux.prctl(@intCast(PR_SET_PDEATHSIG), @intFromEnum(std.os.linux.SIG.TERM), 0, 0, 0);
+            _ = std.os.linux.prctl(@intCast(PR_SET_PDEATHSIG), @intFromEnum(std.posix.SIG.TERM), 0, 0, 0);
 
             // Redirect stdout/stderr to /dev/null so inference noise
             // doesn't corrupt the terminal
