@@ -36,3 +36,79 @@ jobs:
 
       - name: test
         run: zig build test
+
+      # The end-to-end suite. Every case is a bug that was once real, including
+      # the tab-completion RCE, so a red case here is a regression rather than a
+      # curiosity. It diffs against bash, which ubuntu-latest already has.
+      - name: regression suite
+        run: ./tests/regress.sh
+
+      # bench.sh validates output against bash before timing anything, so it
+      # doubles as a differential correctness check — it is what caught
+      # $(($1 * 2)) silently evaluating to 0. Timings are not asserted on;
+      # shared CI runners are far too noisy for that to mean anything.
+      - name: benchmark correctness
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq hyperfine zsh
+          ./bench.sh
+
+  # ── Portability ────────────────────────────────────────────────────────────
+  #
+  # zish is Linux-only at runtime, but the tree is being ported. These jobs stop
+  # that work from rotting: without them the next raw std.os.linux call silently
+  # undoes it, because a Linux syscall wrapper compiles fine for every target.
+  #
+  # Build-only, deliberately. A Mach-O binary that links proves nothing about
+  # whether job control or terminal handling behave on macOS — that needs the
+  # remaining statx/waitpid sites ported and a real run. Do not read a green
+  # check here as "macOS is supported".
+  cross-build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-macos
+          - x86_64-macos
+          - aarch64-linux
+    steps:
+      - name: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: setup zig 0.16.0
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      # --prefix keeps the cross output away from zig-out. Overwriting it with a
+      # foreign binary is not hypothetical: it happened during development and
+      # bench.sh failed with "Exec format error" on a Mach-O binary.
+      - name: cross-build ${{ matrix.target }}
+        run: zig build -Dtarget=${{ matrix.target }} -Dlto=false --prefix /tmp/out-${{ matrix.target }}
+
+  # Native macOS build, against the real SDK and linker rather than Zig's
+  # cross-compilation stubs. Catches what cross-building cannot.
+  macos-build:
+    runs-on: macos-latest
+    continue-on-error: true # porting in progress; must not gate merges yet
+    steps:
+      - name: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: setup zig 0.16.0
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      - name: build
+        run: zig build --release=fast -Dlto=false
+
+      # Informational only. It will fail until the statx and waitpid sites are
+      # ported; the output is the porting to-do list, which is the point.
+      - name: smoke (informational)
+        continue-on-error: true
+        run: |
+          ./zig-out/bin/zish --version
+          ./zig-out/bin/zish -c 'echo hello'
+          ./zig-out/bin/zish -c '( echo a; echo b )'
+          ./zig-out/bin/zish -c 'x=6; echo $(($x * 2))'
