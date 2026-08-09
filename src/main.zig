@@ -6,9 +6,11 @@ const clap = @import("clap");
 const Shell = @import("Shell.zig");
 const build_options = @import("build_options");
 const compat = @import("compat.zig");
+const trace = @import("trace.zig");
 
 pub fn main(init: std.process.Init) void {
     compat.setIo(init.io);
+    trace.init();
     const allocator = init.gpa;
 
     var diag = clap.Diagnostic{};

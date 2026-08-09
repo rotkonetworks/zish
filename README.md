@@ -76,6 +76,23 @@ They're opt-in and never in the hot path. A feat is just a binary zish
 
 See [docs/feat-spec.md](docs/feat-spec.md) for the boundary contract.
 
+## Driving zish from a program
+
+Open file descriptor 3 and zish writes one JSON record per command, so a
+harness never has to parse ANSI escapes or prompt redraws to find out what
+happened:
+
+```sh
+$ zish -c 'make test' 3>trace.jsonl
+$ cat trace.jsonl
+{"ts":1786246738163,"cmd":"make test","cwd":"/src","exit":0,"ms":842}
+```
+
+It's off unless fd 3 is open — no flag, no config. stdout stays exactly as the
+command left it, and internals (rc sourcing, command substitution) are not
+recorded, only what you actually submitted. Use `ZISH_TRACE_FD` for a
+different descriptor.
+
 ## Ghost text
 
 If you point zish at a local GGUF model, it suggests the rest of the command

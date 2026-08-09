@@ -386,7 +386,7 @@ pub const posix = struct {
         }
     }
 
-    pub const FStatError = error{ SystemResources, AccessDenied, Unexpected };
+    pub const FStatError = error{ SystemResources, AccessDenied, BadFileDescriptor, Unexpected };
 
     pub fn fstat(fd: fd_t) FStatError!Stat {
         const linux = std.os.linux;
@@ -394,7 +394,11 @@ pub const posix = struct {
         switch (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, linux.STATX.BASIC_STATS, &stat))) {
             .SUCCESS => return stat,
             .INVAL => unreachable,
-            .BADF => unreachable, // always a race condition
+            // Not "always a race condition": fstat on a descriptor that was
+            // never opened is how you *probe* for one, which is exactly what
+            // the session trace does for fd 3. Asserting here turned "no
+            // harness attached" into a panic on every plain `zish -c`.
+            .BADF => return error.BadFileDescriptor,
             .NOMEM => return error.SystemResources,
             .ACCES => return error.AccessDenied,
             else => |err| return unexpectedErrno(err),

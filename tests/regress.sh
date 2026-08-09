@@ -181,6 +181,56 @@ expect "subshell unset"                $''       0 'x=1; ( unset x ; echo $x )'
 expect "background cd"                 $'ok'     0 '( cd / ; /bin/echo ok ) & wait'
 
 # ---------------------------------------------------------------------------
+printf '\n%s\n' "session trace (fd 3)"
+# ---------------------------------------------------------------------------
+# A harness opens fd 3 and gets one JSON record per top-level command. The
+# whole point is that it never has to parse stdout, so the invariants are:
+# stdout is untouched, nothing is emitted when fd 3 is closed, and internals
+# (rc sourcing, command substitution) stay out of the trace.
+
+# trace NAME EXPECTED SCRIPT  — EXPECTED is matched against the record stream
+trace_case() {
+    local name="$1" want="$2" script="$3"
+    selected "$name" || { SKIP=$((SKIP + 1)); return; }
+    local out="$WORK/trace.jsonl"
+    rm -f "$out"
+    (cd "$WORK" && timeout 10 "$OLDPWD/$ZISH" -c "$script" >/dev/null 2>&1 3>"$out")
+    local got
+    got=$(python3 -c "
+import sys, json
+try:
+    print(' '.join(json.loads(l)['cmd'] for l in open('$out') if l.strip()))
+except Exception as e:
+    print('PARSE-ERROR', e)
+" 2>/dev/null)
+    if [ "$got" = "$want" ]; then
+        report_pass "$name"
+    else
+        report_fail "$name" "$want" "$got" "$script"
+    fi
+}
+
+expect "no trace when fd 3 closed"  $'ok' 0 'echo ok'
+trace_case "records the command"    'echo hi'          'echo hi'
+trace_case "hides command subst"    'x=$(echo sub)'    'x=$(echo sub)'
+trace_case "records each statement" 'echo a; echo b'   'echo a; echo b'
+
+expect "trace keeps stdout clean"   $'just-this' 0 'echo just-this'
+
+# exit status and duration must be real, not placeholders
+if selected "trace exit and timing"; then
+    rm -f "$WORK/t.jsonl"
+    (cd "$WORK" && timeout 10 "$OLDPWD/$ZISH" -c 'sleep 0.2; false' >/dev/null 2>&1 3>"$WORK/t.jsonl")
+    res=$(python3 -c "
+import json
+r = json.load(open('$WORK/t.jsonl'))
+print('ok' if r['exit'] == 1 and r['ms'] >= 150 else f\"exit={r['exit']} ms={r['ms']}\")
+" 2>/dev/null)
+    if [ "$res" = "ok" ]; then report_pass "trace exit and timing"
+    else report_fail "trace exit and timing" "exit=1 ms>=150" "$res" "sleep 0.2; false"; fi
+fi
+
+# ---------------------------------------------------------------------------
 printf '\n%s\n' "redirection"
 # ---------------------------------------------------------------------------
 # Here strings were written into a pipe while nothing was reading yet, so

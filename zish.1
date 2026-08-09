@@ -1,4 +1,4 @@
-.TH ZISH 1 "March 2026" "zish 1.0.0" "User Commands"
+.TH ZISH 1 "August 2026" "zish 0.16.0" "User Commands"
 .SH NAME
 zish \- a fast zsh-compatible shell with vim editing and job control
 .SH SYNOPSIS
@@ -701,6 +701,48 @@ Command number n
 .TP
 .B !string
 Most recent command starting with string
+.SH SESSION TRACE
+When file descriptor 3 is open, zish writes one JSON record per top-level
+command to it. This lets a program driving zish read what happened without
+parsing ANSI escapes, prompt redraws or history replay from stdout.
+.PP
+.RS
+.nf
+$ zish \-c 'make test' 3>trace.jsonl
+{"ts":1786246738163,"cmd":"make test","cwd":"/src","exit":0,"ms":842}
+.fi
+.RE
+.TP
+.B ts
+Start time, milliseconds since the Unix epoch.
+.TP
+.B cmd
+The command as submitted. Escaped as a JSON string; bytes that are not valid
+UTF\-8 are replaced with U+FFFD so the stream is always parseable.
+.TP
+.B cwd
+Working directory at the time the command ran.
+.TP
+.B exit
+Exit status.
+.TP
+.B ms
+Wall-clock duration in milliseconds.
+.PP
+The trace is off unless fd 3 is open, so there is nothing to enable or
+disable. Set
+.B ZISH_TRACE_FD
+to use a different descriptor; values of 2 or below are refused, since writing
+records onto stdout or stderr would reintroduce the interleaving this exists
+to avoid.
+.PP
+Only top-level commands are recorded. Sourcing
+.B ~/.zishrc
+at startup, command substitution and
+.B PROMPT_COMMAND
+are internals, not commands anyone submitted, and are left out. Writes are
+best-effort: if the reader goes away, records are dropped rather than blocking
+or killing the shell.
 .SH LOCAL INFERENCE
 .B zish
 includes a pure-Zig GGUF inference engine with no external

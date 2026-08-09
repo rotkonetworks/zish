@@ -23,6 +23,7 @@ const editor = @import("editor.zig");
 const vim = @import("vim.zig");
 const agent_log = @import("agent_log.zig");
 const audio = @import("audio.zig");
+const trace = @import("trace.zig");
 
 // Re-export from input module (for compatibility)
 const VimMode = input_mod.VimMode;
@@ -216,6 +217,9 @@ opt_errexit: bool = false, // -e: exit on error
 opt_nounset: bool = false, // -u: error on undefined variable
 opt_xtrace: bool = false, // -x: print commands before execution
 opt_pipefail: bool = false, // pipefail: pipeline fails if any command fails
+// Nesting depth of executeCommand. Command substitution and PROMPT_COMMAND
+// re-enter it, and the session trace records only depth 0.
+exec_depth: u16 = 0,
 // True in a process that is already a forked child of the interactive shell
 // (pipeline stage, subshell, background job). Drives two decisions: a subshell
 // need not fork again, and a forked child must not take the terminal.
@@ -2612,12 +2616,26 @@ fn loadConfig(self: *Shell) !void {
     const source_cmd = try std.fmt.allocPrint(self.allocator, "source {s}", .{config_path});
     defer self.allocator.free(source_cmd);
 
+    // Sourcing the rc file is startup, not a command anyone ran. Entering it at
+    // depth 1 keeps it out of the session trace, which should contain only what
+    // the user or the driving harness actually submitted.
+    self.exec_depth += 1;
+    defer self.exec_depth -= 1;
+
     _ = self.executeCommand(source_cmd) catch {};
 }
 
 pub fn executeCommand(self: *Shell, command: []const u8) !u8 {
     const trimmed = std.mem.trim(u8, command, " \t\r\n");
     if (trimmed.len == 0) return 0;
+
+    // Session trace. Only the outermost call is recorded: this function
+    // recurses for command substitution and PROMPT_COMMAND, and a harness
+    // wants the command that was run, not its internals.
+    const tracing = trace.enabled() and self.exec_depth == 0;
+    const trace_start: i64 = if (tracing) compat.milliTimestamp() else 0;
+    self.exec_depth += 1;
+    defer self.exec_depth -= 1;
 
     // Delete any heredoc temp files this call materialises once it returns. The
     // mark makes nested executeCommand calls (command substitution,
@@ -2637,6 +2655,13 @@ pub fn executeCommand(self: *Shell, command: []const u8) !u8 {
 
     const exit_code = try self.executeCommandInternal(processed);
     self.last_exit_code = exit_code;
+
+    if (tracing) {
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = compat.posix.getcwd(&cwd_buf) catch "";
+        trace.record(self.allocator, trimmed, cwd, exit_code, trace_start, compat.milliTimestamp());
+    }
+
     return exit_code;
 }
 
