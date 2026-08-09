@@ -1,5 +1,52 @@
 # changelog
 
+## v0.16.1
+
+Correctness fix release. Recommended for anyone on 0.16.0.
+
+### fixed
+- **`$(( ))` silently evaluated `$var` to 0.** The arithmetic parser had no
+  case for `$`, so it raised a syntax error that was converted to 0 without
+  any message. `$((x * 2))` was correct but `$(($x * 2))` was 0, and every
+  positional parameter in arithmetic was 0 — so
+  `double() { echo $(($1 * 2)); }` returned zeros for every argument. It only
+  ever worked because an earlier expansion pass usually substituted the
+  variable first; for a word containing `*` that pass is skipped.
+- feats could not be invoked as ordinary commands: `feat run calc 2+2` worked,
+  `calc 2+2` was "command not found"
+- the pipeline fast path exec'd without checking PATH, so `echo 1+1 | calc`
+  failed with 127 while `calc 1+1` worked
+- `compat.posix.fstat` asserted `unreachable` on EBADF, which made probing a
+  possibly-unopened descriptor a panic
+
+### added
+- **`calc` feat** — float arithmetic, which `$(( ))` cannot do at all
+  (`$((3/2))` is 1, `$((2**0.5))` is a syntax error). f64 throughout, real
+  division, `sqrt`/`ln`/`log(base,x)`/trig, hex and binary literals. Errors
+  exit non-zero with nothing on stdout, so `x=$(calc ...)` is a number or
+  empty, never a wrong number.
+- feats now resolve as plain commands, as a fallback after builtins, functions
+  and PATH — a feat can never shadow a real binary
+- **session trace on fd 3** — one JSON record per top-level command
+  (`zish -c 'make test' 3>trace.jsonl`), so a program driving zish never has to
+  parse ANSI escapes to learn what happened
+- gguf: metadata nesting depth is bounded and `general.alignment` validated;
+  both were crashes reachable from a downloaded model file
+
+### changed
+- README benchmark claim corrected from "3-7x" to the measured **1.5-2x**
+- docs no longer describe the removed LLM agent
+- CI now runs `tests/regress.sh` and `bench.sh`, cross-builds for macOS and
+  aarch64-linux, and builds natively on macOS
+
+### macOS (preview, not supported)
+zish now builds on macOS and passes a 16-case smoke test there — basic
+execution, subshells, arithmetic, pipelines, command substitution, functions,
+loops, `-f`/`-d`/`-x` file tests, globs, background jobs, redirects, heredocs
+and here-strings all work. Not yet ported: `-L`/`-h`, `-nt`/`-ot`/`-ef`/`-O`/
+`-G` (statx-based; they return false instead of erroring), and interactive job
+control has not been exercised at all. Treat it as a preview.
+
 ## v0.16.0
 
 security and correctness release. upgrading is recommended for all users.

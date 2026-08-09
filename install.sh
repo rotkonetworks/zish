@@ -35,24 +35,38 @@ have() { command -v "$1" >/dev/null 2>&1; }
 os=$(uname -s)
 arch=$(uname -m)
 
+macos_preview=0
 case "$os" in
     Linux) ;;
     Darwin)
-        die "macOS is not supported yet.
+        # macOS builds and passes a 16-case smoke test in CI (basic execution,
+        # subshells, arithmetic, pipelines, functions, globs, background jobs,
+        # redirects, heredocs). Interactive job control is NOT exercised there,
+        # and a few file-test operators are still Linux-only. So: buildable,
+        # not supported. There are no prebuilt macOS binaries for that reason —
+        # shipping one would imply a promise we cannot keep yet.
+        macos_preview=1
+        if ! have zig; then
+            die "macOS support is a preview and needs to be built from source.
 
-zish talks to the kernel directly for job control and terminal handling
-(Linux-specific syscalls and ioctls), so it does not build on macOS today.
-This is a porting task, not a packaging one. Follow:
-  https://github.com/$REPO/issues"
+There are no prebuilt macOS binaries yet: zish builds and passes a basic smoke
+test on macOS, but interactive job control is untested there.
+
+Install Zig 0.16 and re-run:
+  brew install zig
+  sh install.sh"
+        fi
         ;;
     *)
-        die "unsupported OS: $os (zish is Linux-only for now)"
+        die "unsupported OS: $os (zish targets Linux; macOS is a preview)"
         ;;
 esac
 
+os_suffix=linux
+[ "$os" = "Darwin" ] && os_suffix=macos
 case "$arch" in
-    x86_64|amd64)  target="x86_64-linux" ;;
-    aarch64|arm64) target="aarch64-linux" ;;
+    x86_64|amd64)  target="x86_64-$os_suffix" ;;
+    aarch64|arm64) target="aarch64-$os_suffix" ;;
     *) die "unsupported architecture: $arch" ;;
 esac
 
@@ -99,11 +113,15 @@ fi
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
-say "Downloading zish-$target ($VERSION)..."
-if ! fetch "$base/zish-$target" "$tmp/zish"; then
-    warn "No release binary for $target."
+if [ "$macos_preview" = "1" ]; then
+    say "macOS preview: no prebuilt binary, building from source..."
+else
+    say "Downloading zish-$target ($VERSION)..."
+fi
+if [ "$macos_preview" = "1" ] || ! fetch "$base/zish-$target" "$tmp/zish"; then
+    [ "$macos_preview" = "1" ] || warn "No release binary for $target."
     if have zig; then
-        say "Zig found — building from source instead."
+        [ "$macos_preview" = "1" ] || say "Zig found — building from source instead."
         src="$tmp/src"
         mkdir -p "$src"
         ref=$([ "$VERSION" = "latest" ] && echo main || echo "$VERSION")

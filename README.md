@@ -41,12 +41,24 @@ zig build --release=fast                           # from source
 
 Your `.zshrc`, your scripts and your muscle memory keep working. It's a single
 static binary with no interpreter startup, so it starts and runs quicker —
-**about 1.5–2x faster than bash and zsh** on variables, functions, arithmetic,
-conditionals, loops and command substitution. Run `./bench.sh` to reproduce it
-on your own machine; it validates output against bash before timing anything,
-so a wrong-but-fast answer fails instead of scoring well.
+**1.3–2x faster than bash and zsh**:
 
-Linux only, for now.
+| | vs bash | vs zsh |
+|---|---|---|
+| command substitution | 1.97x | 1.86x |
+| nested loops | 1.58x | 1.69x |
+| conditionals | 1.53x | 1.67x |
+| arithmetic | 1.57x | 1.66x |
+| functions | 1.57x | 1.63x |
+| variables | 1.53x | 1.64x |
+| pipelines | 1.30x | 1.35x |
+
+Measured with `./bench.sh` (hyperfine, all shells `--norc`/`--no-rcs`). It
+validates every result against bash *before* timing, so a wrong-but-fast
+answer fails rather than scoring well — that check is what caught a real
+arithmetic bug in 0.16.0. Run it yourself; numbers vary by machine.
+
+Linux only. macOS is a preview — see below.
 
 ## Try it
 
@@ -137,6 +149,27 @@ a slow model can't stall the prompt, and is entirely optional — zish works
 normally with no model configured.
 
 Config lives in `~/.zish/agent.json` (`completion_model` points at the `.gguf`).
+
+## macOS (preview)
+
+zish builds on macOS and passes a 16-case smoke test in CI — basic execution,
+subshells, arithmetic, pipelines, command substitution, functions, loops,
+`-f`/`-d`/`-x` file tests, globs, background jobs, redirects, heredocs and
+here-strings.
+
+It is **not supported yet**. Interactive job control has never been exercised
+there, and `-L`/`-h`/`-nt`/`-ot`/`-ef`/`-O`/`-G` still use a Linux-only syscall
+and quietly return false. There are no prebuilt macOS binaries for that reason
+— shipping one would imply a promise that isn't true yet.
+
+To try it:
+
+```sh
+brew install zig
+zig build --release=fast && ./zig-out/bin/zish
+```
+
+Reports of what breaks are more useful than patches right now.
 
 ## Tests
 
