@@ -54,7 +54,7 @@ test-verbose: build
 # ---- standard feats (python-replacement tier) ----
 # Compiles feats/<name>/main.zig and stages bin + feat.toml into the registry.
 ZISH_FEAT_DIR ?= $(HOME)/.zish/feats/standard
-FEAT_NAMES := cnt pk frq snf jls
+FEAT_NAMES := cnt pk frq snf jls calc
 
 .PHONY: feats
 feats:

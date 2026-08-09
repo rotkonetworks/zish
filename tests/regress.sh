@@ -181,6 +181,42 @@ expect "subshell unset"                $''       0 'x=1; ( unset x ; echo $x )'
 expect "background cd"                 $'ok'     0 '( cd / ; /bin/echo ok ) & wait'
 
 # ---------------------------------------------------------------------------
+printf '\n%s\n' "arithmetic variables"
+# ---------------------------------------------------------------------------
+# ArithParser had no case for '$', so it raised SyntaxError, which
+# evaluateArithmetic silently converts to 0. It only appeared to work because
+# the outer expander usually substituted $x first — but not for a word
+# containing '*'. Every positional parameter in arithmetic was 0.
+same_as_bash "arith \$var with +"      'x=6; echo $(($x + 2))'
+same_as_bash "arith \$var with *"      'x=6; echo $(($x * 2))'
+same_as_bash "arith \$var with /"      'x=6; echo $(($x / 2))'
+same_as_bash "arith braced \${x}"      'x=6; echo $((${x} * 2))'
+same_as_bash "arith two \$vars"        'x=6; y=2; echo $(($x * $y))'
+same_as_bash "arith positional"        'set -- 4; echo $(($1 * 2))'
+same_as_bash "arith positional func"   'double() { echo $(($1 * 2)); }; for i in 1 2 3; do double $i; done'
+same_as_bash "arith bare identifier"   'x=6; echo $((x * 2))'
+same_as_bash "arith literal"           'echo $((3 * 2))'
+
+# ---------------------------------------------------------------------------
+printf '\n%s\n' "feats"
+# ---------------------------------------------------------------------------
+# A feat is an exec'd binary, resolved as a plain command so `calc 2+2` works
+# rather than only `feat run calc 2+2`. It must stay a *fallback*: a feat may
+# never shadow a real command, or installing one changes what a script means.
+# These skip when the feats aren't staged (make feats).
+if [ -x "$HOME/.zish/feats/standard/calc/bin/calc" ]; then
+    expect "feat as bare command"      $'1.5'    0 'calc 3/2'
+    expect "feat float math"           $'9'      0 'calc "(1+2)*3"'
+    expect "feat via feat run"         $'0.25'   0 "feat run calc '1/4'"
+    expect "feat reads stdin"          $'2'      0 'echo 1+1 | calc'
+    expect "real command beats feat"   $'ok'     0 'echo ok'
+    expect "calc rejects trailing junk" $'1'     0 'calc "2+2 oops" >/dev/null 2>&1; echo $?'
+    expect "calc divide by zero"       $'1'      0 'calc 1/0 >/dev/null 2>&1; echo $?'
+else
+    SKIP=$((SKIP + 7))
+fi
+
+# ---------------------------------------------------------------------------
 printf '\n%s\n' "session trace (fd 3)"
 # ---------------------------------------------------------------------------
 # A harness opens fd 3 and gets one JSON record per top-level command. The

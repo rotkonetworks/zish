@@ -1,0 +1,6 @@
+name = "calc"
+tier = "standard"
+version = "1.0.0"
+help = "float arithmetic — the math $(( )) can't do"
+bin = "calc"
+usage = "calc 'EXPR'  |  echo EXPR | calc   # f64: 3/2 is 1.5, 2^0.5 works"

@@ -76,22 +76,37 @@ Vim mode is always on — press `Esc`. `man zish` has the full keymap.
 
 ## Feats
 
-Feats are small standalone binaries that answer one question each, so you
-don't reach for Python to inspect a file or count something:
+Feats are small standalone binaries that answer one question each, so you don't
+reach for Python to do arithmetic or count something.
+
+Install them once, then just use them like any other command:
 
 ```sh
-pk <file>       # first N lines
-cnt <file>      # a single number: lines/bytes/words
-frq <file>      # field frequency table
-fq <glob>       # list files recursively
-jls <.jsonl>    # select/tally JSONL fields
-snf <path>      # size, lines, ext, magic — one line per file
+make feats          # builds and stages into ~/.zish/feats/standard
 ```
 
-They're opt-in and never in the hot path. A feat is just a binary zish
-`exec`s — no plugin ABI, no dynamic loading. `zish feat list` to start.
+```sh
+$ calc '2^0.5'                 # bash can't: $(( )) is integer-only
+1.4142135623730951
+$ calc 3/2
+1.5
+$ echo 1+1 | calc
+2
+$ cnt file.txt                 # a single number
+128
+$ frq access.log               # field frequency table
+$ pk -t 5 build.log            # last 5 lines
+$ snf src/                     # size, lines, ext, magic per file
+$ jls events.jsonl             # select/tally JSONL fields
+```
 
-See [docs/feat-spec.md](docs/feat-spec.md) for the boundary contract.
+They resolve as ordinary commands, but only as a **fallback** — a feat can
+never shadow a real binary, so installing one can't change what an existing
+script means. `feat list` shows what you have, `feat help <name>` explains one,
+and `feat run <name>` is the explicit form if you want it.
+
+A feat is just a binary zish `exec`s: no plugin ABI, no dynamic loading, no
+in-process hooks. See [docs/feat-spec.md](docs/feat-spec.md) for the contract.
 
 ## Driving zish from a program
 

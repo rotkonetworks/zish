@@ -1311,6 +1311,30 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
         };
     }
 
+    // Feats resolve as plain commands: `calc 2+2`, not `feat run calc 2+2`.
+    //
+    // This is a *fallback*, deliberately placed after builtins, functions and
+    // (below) PATH: a feat must never shadow something the system already
+    // provides, or installing one silently changes what an existing script
+    // means. It only fires where the alternative was "command not found".
+    //
+    // `feat run <name>` still works and stays the explicit form; this just
+    // removes the ceremony from the common case. A feat nobody can remember
+    // how to invoke is a feat nobody uses.
+    if (shell.lookupCommand(cmd_name) == null) {
+        if (featResolve(shell.allocator, cmd_name)) |f| {
+            defer shell.allocator.free(f.bin);
+            // Same rule as `feat run`: untrusted extra feats never run as root.
+            // Reached by a different path, so the check has to be repeated here
+            // rather than assumed.
+            if (f.tier == .extra and std.c.geteuid() == 0) {
+                try shell.stdout().writeAll("feat: refusing to run extra feat as root\n");
+                return 126;
+            }
+            return try featExec(shell, f.tier, f.bin, expanded_args.items[1..]);
+        }
+    }
+
     // external command
     // restore terminal to normal mode so child can handle signals properly
     // only do this if stdin is a tty
@@ -1641,8 +1665,17 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
             // Fast path: simple external command - exec directly without evaluateAst
             if (child.node_type == .command and child.children.len > 0) {
                 const cmd_name = child.children[0].value;
-                // Check if it's a simple external command (not a builtin, no special chars)
-                if (!isBuiltin(cmd_name) and !needsExpansion(child)) {
+                // Check if it's a simple external command (not a builtin, no
+                // special chars) that actually exists in PATH.
+                //
+                // The PATH check matters: this fast path execs directly and
+                // never returns, so a name that is not a real binary — a feat
+                // like `calc` — would exec-fail with 127 instead of falling
+                // through to the feat resolution in evaluateCommand. That is
+                // why `calc 3/2` worked but `echo 1+1 | calc` did not.
+                if (!isBuiltin(cmd_name) and !needsExpansion(child) and
+                    shell.lookupCommand(cmd_name) != null)
+                {
                     execSimpleCommand(shell, child);
                     // execSimpleCommand doesn't return on success
                 }
