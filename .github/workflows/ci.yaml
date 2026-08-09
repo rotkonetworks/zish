@@ -103,12 +103,43 @@ jobs:
       - name: build
         run: zig build --release=fast -Dlto=false
 
-      # Informational only. It will fail until the statx and waitpid sites are
-      # ported; the output is the porting to-do list, which is the point.
+      # Informational only, and deliberately per-feature: each line prints its
+      # own ok/FAIL so the log is a porting to-do list rather than a single red
+      # cross. The statx-based file tests and raw waitpid are expected to be
+      # among the failures until those sites are ported.
       - name: smoke (informational)
         continue-on-error: true
         run: |
-          ./zig-out/bin/zish --version
-          ./zig-out/bin/zish -c 'echo hello'
-          ./zig-out/bin/zish -c '( echo a; echo b )'
-          ./zig-out/bin/zish -c 'x=6; echo $(($x * 2))'
+          Z=./zig-out/bin/zish
+          fails=0
+          check() { # check NAME EXPECTED SCRIPT
+            got=$("$Z" -c "$3" 2>&1) || true
+            if [ "$got" = "$2" ]; then
+              printf 'ok    %s\n' "$1"
+            else
+              printf 'FAIL  %-22s expected=%q got=%q\n' "$1" "$2" "$got"
+              fails=$((fails+1))
+            fi
+          }
+          "$Z" --version
+          check basic          'hello'   'echo hello'
+          check subshell       'a
+          b'                             '( echo a; echo b )'
+          check arithmetic     '12'      'x=6; echo $(($x * 2))'
+          check positional     '6'       'f() { echo $(($1 * 2)); }; f 3'
+          check pipeline       'HELLO'   '/bin/echo hello | tr a-z A-Z'
+          check cmdsubst       'sub'     'x=$(/bin/echo sub); echo $x'
+          check func           'in'      'f() { echo in; }; f'
+          check loop           '1 2 3'   'for i in 1 2 3; do printf "%s " $i; done | sed "s/ $//"'
+          check file_test_f    'yes'     '[ -f /etc/hosts ] && echo yes || echo no'
+          check file_test_d    'yes'     '[ -d /tmp ] && echo yes || echo no'
+          check file_test_x    'yes'     '[ -x /bin/sh ] && echo yes || echo no'
+          check glob           'ok'      'cd /tmp && mkdir -p zt && touch zt/a.txt && set -- zt/*.txt && [ "$1" = "zt/a.txt" ] && echo ok'
+          check background     'bg'      '/bin/echo bg & wait'
+          check redirect       'w'       'echo w > /tmp/zt.txt; cat /tmp/zt.txt'
+          check heredoc        'hd'      'cat <<EOF
+          hd
+          EOF'
+          check herestring     'hs'      'cat <<< hs'
+          echo "---"
+          echo "macOS smoke failures: $fails"
