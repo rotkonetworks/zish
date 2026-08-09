@@ -1,35 +1,52 @@
 # zish
 
-A fast, zsh-compatible shell written in Zig.
+**A fast, zsh-compatible shell written in Zig.**
 
-Your `.zshrc`, your scripts and your muscle memory keep working. It's a single
-static binary with no interpreter startup, so it runs noticeably quicker —
-roughly 3–7x on loops, conditionals, arithmetic and command substitution
-(`./bench.sh` to check for yourself).
-
-Linux only, for now.
+[![release](https://img.shields.io/github/v/release/rotkonetworks/zish?style=for-the-badge&logo=github&label=GitHub&color=24292e)](https://github.com/rotkonetworks/zish/releases/latest)
+[![AUR](https://img.shields.io/aur/version/zish?style=for-the-badge&logo=archlinux&label=AUR&color=1793d1)](https://aur.archlinux.org/packages/zish)
+[![Nix](https://img.shields.io/badge/Nix-flake-5277C3?style=for-the-badge&logo=nixos&logoColor=white)](https://github.com/rotkonetworks/zish#install)
+[![license](https://img.shields.io/github/license/rotkonetworks/zish?style=for-the-badge&color=green)](LICENSE)
 
 ## Install
 
 ```sh
-# Arch
-paru -S zish
-
-# Nix
-nix profile install github:rotkonetworks/zish
-
-# Anything else (downloads a verified release binary, or builds from source)
-curl -fsSLO https://raw.githubusercontent.com/rotkonetworks/zish/main/install.sh
-less install.sh && sh install.sh
-
-# From source
-zig build --release=fast && ./zig-out/bin/zish
+curl -fsSL https://raw.githubusercontent.com/rotkonetworks/zish/main/install.sh | sh
 ```
 
-Read `install.sh` before running it. Piping a script from the network straight
-into a shell means running code you never saw — the script is short so you
-don't have to take that on faith, and it refuses to install a binary whose
-checksum it can't verify.
+Detects your platform, uses your package manager if zish is packaged for it,
+otherwise installs a release binary — and refuses to install one whose checksum
+it can't verify.
+
+<details>
+<summary>Prefer not to pipe curl into sh? (you're right)</summary>
+
+Piping a script from the network into a shell runs code you never saw. It's the
+convenient option, not the safe one, and this project spends a lot of effort on
+not executing things you didn't ask for — so here's the honest version:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/rotkonetworks/zish/main/install.sh
+less install.sh          # ~170 lines, readable in a minute
+sh install.sh
+```
+
+Or skip the script entirely:
+
+```sh
+paru -S zish                                       # Arch (AUR)
+nix profile install github:rotkonetworks/zish      # Nix / NixOS
+zig build --release=fast                           # from source
+```
+</details>
+
+Your `.zshrc`, your scripts and your muscle memory keep working. It's a single
+static binary with no interpreter startup, so it starts and runs quicker —
+**about 1.5–2x faster than bash and zsh** on variables, functions, arithmetic,
+conditionals, loops and command substitution. Run `./bench.sh` to reproduce it
+on your own machine; it validates output against bash before timing anything,
+so a wrong-but-fast answer fails instead of scoring well.
+
+Linux only, for now.
 
 ## Try it
 

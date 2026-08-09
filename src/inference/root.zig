@@ -160,7 +160,7 @@ pub const ForkServer = struct {
         if (!self.alive) return false;
         if (self.reaped) return false;
         // Non-blocking waitpid to check if child exited
-        const result = posix.waitpid(self.child_pid, std.os.linux.W.NOHANG);
+        const result = posix.waitpid(self.child_pid, std.posix.W.NOHANG);
         if (result.pid != 0) {
             // Child exited (and is now reaped)
             self.alive = false;
@@ -187,10 +187,10 @@ pub const ForkServer = struct {
         // Reap child (non-blocking first, then SIGTERM if needed)
         if (!self.reaped) {
             self.reaped = true;
-            const result = posix.waitpid(self.child_pid, std.os.linux.W.NOHANG);
+            const result = posix.waitpid(self.child_pid, std.posix.W.NOHANG);
             if (result.pid == 0) {
                 // Still running, send SIGTERM
-                posix.kill(self.child_pid, std.os.linux.SIG.TERM) catch {};
+                posix.kill(self.child_pid, std.posix.SIG.TERM) catch {};
                 // Wait with timeout — use blocking waitpid
                 _ = posix.waitpid(self.child_pid, 0);
             }

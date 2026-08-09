@@ -4,6 +4,7 @@
 // Parses GGUF v3 files: header, metadata KV pairs, tensor info, mmap'd tensor data.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const compat = @import("../compat.zig");
 
 const page_size = std.heap.page_size_min;
@@ -280,10 +281,15 @@ pub const GGUFFile = struct {
         const stat = compat.posix.fstat(fd) catch return Error.FileError;
         const fsize: u64 = @intCast(stat.size);
 
-        const mmap_type: compat.posix.MAP = .{
+        // POPULATE and NORESERVE are Linux-only prefault/overcommit hints.
+        // They are an optimisation for a multi-GB weight file, not required
+        // for correctness, so other platforms simply map without them.
+        const mmap_type: compat.posix.MAP = if (builtin.os.tag == .linux) .{
             .TYPE = .SHARED,
             .NORESERVE = true,
             .POPULATE = true,
+        } else .{
+            .TYPE = .SHARED,
         };
         const ptr = compat.posix.mmap(null, fsize, .{ .READ = true }, mmap_type, fd, 0) catch return Error.FileError;
         errdefer compat.posix.munmap(ptr);

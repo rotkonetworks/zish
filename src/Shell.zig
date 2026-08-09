@@ -3910,6 +3910,45 @@ const ArithParser = struct {
         if (std.ascii.isDigit(c)) {
             return self.parseNumber();
         }
+        // $name, ${name} and $1 — a value reference, not a variable to assign to.
+        //
+        // bash accepts both `$((x))` and `$(($x))`. zish only ever worked by
+        // accident: the outer expander usually substituted $x before this
+        // parser saw it. For a word containing `*` or `%` it doesn't, so the
+        // raw `$` reached here, fell through to SyntaxError, and
+        // evaluateArithmetic turned that into 0 — silently. That is why
+        // `$(($x * 2))` was 0 while `$(($x + 2))` was correct, and why
+        // `f() { echo $(($1 * 2)); }` returned 0 for every argument.
+        //
+        // Handling it here makes the result independent of whether an earlier
+        // pass happened to expand the word.
+        if (c == '$') {
+            self.pos += 1;
+            const braced = self.peek() == '{';
+            if (braced) self.pos += 1;
+
+            const start = self.pos;
+            if (std.ascii.isDigit(self.peek())) {
+                // Positional parameter: $1, $12. Digits only, never an ident.
+                while (self.pos < self.src.len and std.ascii.isDigit(self.src[self.pos])) {
+                    self.pos += 1;
+                }
+            } else {
+                while (self.pos < self.src.len and
+                    (std.ascii.isAlphanumeric(self.src[self.pos]) or self.src[self.pos] == '_'))
+                {
+                    self.pos += 1;
+                }
+            }
+            if (self.pos == start) return error.SyntaxError;
+            const name = self.src[start..self.pos];
+
+            if (braced) {
+                if (self.peek() != '}') return error.SyntaxError;
+                self.pos += 1;
+            }
+            return self.readVar(name);
+        }
         if (std.ascii.isAlphabetic(c) or c == '_') {
             const name = self.readIdent() orelse return error.SyntaxError;
             // post-increment / post-decrement

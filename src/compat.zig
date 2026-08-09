@@ -175,7 +175,9 @@ pub const posix = struct {
     pub const E = std.posix.E;
     /// 0.16 made std.posix.Stat void on linux; Statx keeps the same field
     /// names for the common members (size, mode, uid, gid, ino, nlink).
-    pub const Stat = std.os.linux.Statx;
+    // statx is Linux-only. Everywhere else this is the libc stat struct;
+    // both expose `.size`, which is all callers use.
+    pub const Stat = if (builtin.os.tag == .linux) std.os.linux.Statx else std.c.Stat;
     pub const ReadError = std.posix.ReadError;
 
     // --- lifted from zig 0.15.2 std.posix (libc-backed, linux only) ---
@@ -389,8 +391,17 @@ pub const posix = struct {
     pub const FStatError = error{ SystemResources, AccessDenied, BadFileDescriptor, Unexpected };
 
     pub fn fstat(fd: fd_t) FStatError!Stat {
-        const linux = std.os.linux;
         var stat = mem.zeroes(Stat);
+        if (builtin.os.tag != .linux) {
+            switch (std.posix.errno(std.c.fstat(fd, &stat))) {
+                .SUCCESS => return stat,
+                .BADF => return error.BadFileDescriptor,
+                .NOMEM => return error.SystemResources,
+                .ACCES => return error.AccessDenied,
+                else => |err| return unexpectedErrno(err),
+            }
+        }
+        const linux = std.os.linux;
         switch (linux.errno(linux.statx(fd, "", linux.AT.EMPTY_PATH, linux.STATX.BASIC_STATS, &stat))) {
             .SUCCESS => return stat,
             .INVAL => unreachable,
@@ -556,8 +567,16 @@ pub const posix = struct {
             .NOENT => return error.FileNotFound,
             .NOTDIR => return error.NotDir,
             .TXTBSY => return error.FileBusy,
-            .LIBBAD => return error.InvalidExe,
-            else => |err| return unexpectedErrno(err),
+            else => |err| {
+                // ELIBBAD is Linux-only. Looked up by name rather than written
+                // as `.LIBBAD` so this compiles on platforms whose errno enum
+                // does not define it.
+                const ErrT = @TypeOf(err);
+                if (comptime @hasField(ErrT, "LIBBAD")) {
+                    if (err == @field(ErrT, "LIBBAD")) return error.InvalidExe;
+                }
+                return unexpectedErrno(err);
+            },
         }
     }
 
