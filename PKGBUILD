@@ -5,7 +5,7 @@
 # sets pkgver from the tag, and runs `updpkgsums` to fill sha256sums from the
 # actual GitHub tarball. Do not hand-edit pkgver/sha256sums here.
 pkgname=zish
-pkgver=0.15.2
+pkgver=0.16.1
 pkgrel=1
 pkgdesc="fast zsh-compatible shell written in zig, with local GGUF ghost-text completion"
 arch=('x86_64')
@@ -15,7 +15,7 @@ depends=('glibc')
 # zish requires the Zig 0.16 std/build API (std.Io, module link_libc, etc.).
 makedepends=('zig>=0.16.0')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/rotkonetworks/$pkgname/archive/v$pkgver.tar.gz")
-sha256sums=('e0095106bb44e1097c561eea0b1d15f58683f27881cb80bdce5fd506dbe8a91c')
+sha256sums=('30ba61fedf9757afd3518354d8e1a0c4b6711f96a2640c883192d8959309b963')
 
 build() {
     cd "$pkgname-$pkgver"

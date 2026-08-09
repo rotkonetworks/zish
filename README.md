@@ -41,22 +41,29 @@ zig build --release=fast                           # from source
 
 Your `.zshrc`, your scripts and your muscle memory keep working. It's a single
 static binary with no interpreter startup, so it starts and runs quicker —
-**1.3–2x faster than bash and zsh**:
+**roughly 1.3–2x faster than bash and zsh**:
 
-| | vs bash | vs zsh |
+| benchmark | vs bash | vs zsh |
 |---|---|---|
-| command substitution | 1.97x | 1.86x |
-| nested loops | 1.58x | 1.69x |
-| conditionals | 1.53x | 1.67x |
-| arithmetic | 1.57x | 1.66x |
-| functions | 1.57x | 1.63x |
-| variables | 1.53x | 1.64x |
-| pipelines | 1.30x | 1.35x |
+| command substitution | 2.0x ± 0.3 | 1.9x ± 0.3 |
+| nested loops | 1.7x ± 0.2 | 1.8x ± 0.2 |
+| arithmetic | 1.7x ± 0.2 | 1.8x ± 0.2 |
+| functions | 1.7x ± 0.3 | 1.8x ± 0.3 |
+| for + function call | 1.7x ± 0.2 | 1.8x ± 0.3 |
+| conditionals | 1.7x ± 0.2 | 1.7x ± 0.2 |
+| case | 1.6x ± 0.2 | 1.8x ± 0.2 |
+| variables | 1.6x ± 0.3 | 1.7x ± 0.3 |
+| pipelines | 1.3x ± 0.2 | 1.5x ± 0.2 |
 
-Measured with `./bench.sh` (hyperfine, all shells `--norc`/`--no-rcs`). It
-validates every result against bash *before* timing, so a wrong-but-fast
-answer fails rather than scoring well — that check is what caught a real
-arithmetic bug in 0.16.0. Run it yourself; numbers vary by machine.
+Reproduce with `./bench.sh` (hyperfine; all shells run `--norc`/`--no-rcs`
+from `/bin/sh`). The error bars are wide relative to the gaps, and numbers move
+5–10% between runs on the same machine, so treat these as "consistently faster,
+not dramatically faster" rather than precise figures. Pipelines are the weakest
+case, because the cost there is `fork`/`exec` and the kernel, not the shell.
+
+`bench.sh` validates every result against bash *before* timing, so a
+wrong-but-fast answer fails instead of scoring well. That check is what caught
+a real arithmetic bug in 0.16.0, which is the main reason it exists.
 
 Linux only. macOS is a preview — see below.
 
