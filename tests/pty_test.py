@@ -290,8 +290,20 @@ def _(sh):
     sh.sendline("echo $((12 * 12))")
     first = sh.read()
     expect(first, "144")
-    sh.send("\x1b[A")  # up arrow recalls it
-    time.sleep(0.3)
+
+    # Wait for the recalled line to actually be on screen before submitting,
+    # rather than sleeping a fixed 0.3s and hoping. The fixed sleep was flaky:
+    # the redraw races with ghost-text generation, so on a loaded machine the
+    # newline arrived before the recall had landed and an empty line ran.
+    sh.send("\x1b[A")
+    recalled = ""
+    for _ in range(20):
+        recalled += sh.read(quiet_for=0.1, timeout=1.0)
+        if "12 * 12" in recalled or "12*12" in recalled:
+            break
+    assert "12 * 12" in recalled or "12*12" in recalled, \
+        f"up-arrow did not recall the command: {recalled[-300:]!r}"
+
     sh.send("\n")
     # 144 must appear *again*, from the recalled command actually running.
     expect(sh.read(timeout=8), "144")
