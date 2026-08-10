@@ -173,6 +173,27 @@ def expect(haystack, needle, what=""):
     assert needle in haystack, f"expected {needle!r} in output{what}\n        got: {haystack[-400:]!r}"
 
 
+def expect_soon(sh, needle, timeout=10.0):
+    """Read until `needle` appears, rather than until the pty goes quiet.
+
+    A quiet-based read is wrong here: the shell echoes each keystroke
+    immediately, then pauses while the command actually runs, then prints the
+    result. On a slow runner the quiet threshold fires *in that pause*, so the
+    read returns the echoed line without the output — which is what turned CI
+    red while the same test passed locally. Waiting for content makes the suite
+    independent of how fast the machine is.
+    """
+    seen = ""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        seen += sh.read(quiet_for=0.15, timeout=1.0)
+        if needle in seen:
+            return seen
+    assert needle in seen, \
+        f"expected {needle!r} within {timeout}s\n        got: {seen[-400:]!r}"
+    return seen
+
+
 # ---------------------------------------------------------------------------
 print("\n\033[2mzish pty suite — %s\033[0m\n" % ZISH)
 print("basics")
@@ -182,8 +203,7 @@ print("basics")
 @test("prompt appears")
 def _(sh):
     sh.sendline("")
-    out = sh.read()
-    expect(out, "READY>")
+    expect_soon(sh, "READY>")
 
 
 @test("command runs and prints")
@@ -193,7 +213,7 @@ def _(sh):
     # nothing at all — verified: an earlier version of this test passed
     # against a stub that only printed a prompt.
     sh.sendline("echo $((21 + 21))")
-    expect(sh.read(), "42")
+    expect_soon(sh, "42")
 
 
 @test("exit status is tracked")
@@ -201,7 +221,7 @@ def _(sh):
     sh.sendline("false")
     sh.read()
     sh.sendline("echo status=$?")
-    expect(sh.read(), "status=1")
+    expect_soon(sh, "status=1")
 
 
 # ---------------------------------------------------------------------------
@@ -225,8 +245,7 @@ def _(sh):
     sh.send("\x1a")
     sh.read(timeout=8)
     sh.sendline("jobs")
-    out = sh.read(timeout=8)
-    expect(out, "sleep 30")
+    expect_soon(sh, "sleep 30")
 
 
 @test("bg resumes it in the background")
@@ -249,7 +268,7 @@ def _(sh):
     sh.send("\x03")  # ctrl-C
     sh.read(timeout=8)
     sh.sendline("echo $((6 * 7))")   # computed: not present in what we typed
-    expect(sh.read(timeout=8), "42")
+    expect_soon(sh, "42")
 
 
 @test("terminal is usable after a foreground child exits")
@@ -260,7 +279,7 @@ def _(sh):
     sh.sendline("/bin/echo child-ran")
     sh.read()
     sh.sendline("echo $((100 + 23))")   # computed, so pty echo cannot fake it
-    expect(sh.read(), "123")
+    expect_soon(sh, "123")
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +294,7 @@ def _(sh):
     sh.send("ech\t")
     time.sleep(0.5)
     sh.sendline(" $((11 * 5))")
-    expect(sh.read(timeout=8), "55")
+    expect_soon(sh, "55")
 
 
 @test("tab completion does not execute what was typed")
@@ -297,15 +316,13 @@ def _(sh):
     sh.send("\x03")
     sh.read()
     sh.sendline("echo $((9 * 9))")
-    out = sh.read(timeout=8)
-    expect(out, "81")
+    expect_soon(sh, "81")
 
 
 @test("history recalls the previous command")
 def _(sh):
     sh.sendline("echo $((12 * 12))")
-    first = sh.read()
-    expect(first, "144")
+    expect_soon(sh, "144")
 
     # Wait for the recalled line to actually be on screen before submitting,
     # rather than sleeping a fixed 0.3s and hoping. The fixed sleep was flaky:
@@ -322,7 +339,7 @@ def _(sh):
 
     sh.send("\n")
     # 144 must appear *again*, from the recalled command actually running.
-    expect(sh.read(timeout=8), "144")
+    expect_soon(sh, "144")
 
 
 # ---------------------------------------------------------------------------
