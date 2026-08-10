@@ -420,6 +420,65 @@ pub const posix = struct {
         return system.isatty(handle) != 0;
     }
 
+    /// The subset of stat(2) the shell's file-test operators need, in a shape
+    /// that does not depend on the platform's struct layout.
+    ///
+    /// Necessary because the two sides disagree: 0.16 dropped std.c.Stat on
+    /// linux in favour of statx, while statx does not exist anywhere else.
+    /// Callers ([ -O ], [ -G ], [ -ef ], [ -nt ], [ -ot ], [ -L ]) should not
+    /// have to care which one they are compiled against.
+    pub const FileStat = struct {
+        dev: u64,
+        ino: u64,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        mtime_ns: i128,
+    };
+
+    // Wrapped in a namespace rather than renamed: an unprefixed `stat` at this
+    // scope collides with the local of that name in fstat below, but renaming
+    // the extern renames the *symbol* and the link then fails on _c_stat.
+    const libc = struct {
+        extern "c" fn lstat(path: [*:0]const u8, buf: *std.c.Stat) c_int;
+        extern "c" fn stat(path: [*:0]const u8, buf: *std.c.Stat) c_int;
+    };
+
+    /// stat a path. `follow` = false is lstat (do not follow symlinks).
+    /// Returns null when the path cannot be stat'd, for any reason.
+    pub fn statPath(pathz: [*:0]const u8, follow: bool) ?FileStat {
+        if (builtin.os.tag == .linux) {
+            const linux = std.os.linux;
+            var st: linux.Statx = undefined;
+            const mask: linux.STATX = .{ .TYPE = true, .MODE = true, .UID = true, .GID = true, .INO = true, .MTIME = true };
+            const flags: u32 = if (follow) 0 else linux.AT.SYMLINK_NOFOLLOW;
+            if (linux.statx(linux.AT.FDCWD, pathz, flags, mask, &st) != 0) return null;
+            return .{
+                // statx splits the device into major/minor; recombine so the
+                // field means the same thing as st_dev does elsewhere.
+                .dev = (@as(u64, st.dev_major) << 32) | @as(u64, st.dev_minor),
+                .ino = st.ino,
+                .uid = st.uid,
+                .gid = st.gid,
+                .mode = st.mode,
+                .mtime_ns = @as(i128, st.mtime.sec) * std.time.ns_per_s + @as(i128, st.mtime.nsec),
+            };
+        }
+        var cst: std.c.Stat = undefined;
+        const rc = if (follow) libc.stat(pathz, &cst) else libc.lstat(pathz, &cst);
+        if (rc != 0) return null;
+        const st = cst;
+        const ts = st.mtime();
+        return .{
+            .dev = @intCast(@as(i64, st.dev)),
+            .ino = @intCast(st.ino),
+            .uid = st.uid,
+            .gid = st.gid,
+            .mode = st.mode,
+            .mtime_ns = @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec),
+        };
+    }
+
     pub fn getpid() pid_t {
         return system.getpid();
     }

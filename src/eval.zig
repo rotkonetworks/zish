@@ -3427,10 +3427,9 @@ fn isSymlink(path: []const u8) bool {
     @memcpy(buf[0..path.len], path);
     buf[path.len] = 0;
     const pathz: [*:0]const u8 = @ptrCast(&buf);
-    var st: std.os.linux.Statx = undefined;
-    const mask: std.os.linux.STATX = .{ .TYPE = true };
-    const rc = std.os.linux.statx(std.os.linux.AT.FDCWD, pathz, std.os.linux.AT.SYMLINK_NOFOLLOW, mask, &st);
-    if (rc != 0) return false;
+    // Was statx, which is Linux-only: everywhere else this silently returned
+    // false, so `[ -L link ]` was never true rather than erroring.
+    const st = compat.posix.statPath(pathz, false) orelse return false;
     return (st.mode & 0o170000) == 0o120000; // S_IFLNK
 }
 
@@ -3446,17 +3445,17 @@ fn statModeBit(cwd: std.Io.Dir, path: []const u8, bit: u32) bool {
     return (stat.permissions.toMode() & bit) != 0;
 }
 
-fn statPosix(path: []const u8) ?std.os.linux.Statx {
+/// stat(2) via libc. Portable, unlike the statx it replaced — std.c.Stat
+/// exposes dev/ino/uid/gid and a uniform mtime() accessor on every target,
+/// where statx is Linux-only and made -O/-G/-ef/-nt/-ot silently false
+/// everywhere else.
+fn statPosix(path: []const u8) ?compat.posix.FileStat {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     if (path.len >= buf.len) return null;
     @memcpy(buf[0..path.len], path);
     buf[path.len] = 0;
     const pathz: [*:0]const u8 = @ptrCast(&buf);
-    var st: std.os.linux.Statx = undefined;
-    const mask: std.os.linux.STATX = .{ .UID = true, .GID = true, .INO = true, .MTIME = true };
-    const rc = std.os.linux.statx(std.os.linux.AT.FDCWD, pathz, 0, mask, &st);
-    if (rc != 0) return null;
-    return st;
+    return compat.posix.statPath(pathz, true);
 }
 
 fn isShellOption(shell: *Shell, name: []const u8) bool {
@@ -3473,7 +3472,7 @@ fn fileCompare(op: []const u8, a: []const u8, b: []const u8) bool {
     const sb = statPosix(b);
     if (std.mem.eql(u8, op, "-ef")) {
         if (sa == null or sb == null) return false;
-        return sa.?.dev_major == sb.?.dev_major and sa.?.dev_minor == sb.?.dev_minor and sa.?.ino == sb.?.ino;
+        return sa.?.dev == sb.?.dev and sa.?.ino == sb.?.ino;
     }
     const ta: i128 = if (sa) |s| mtimeNs(s) else if (std.mem.eql(u8, op, "-ot")) std.math.maxInt(i128) else std.math.minInt(i128);
     const tb: i128 = if (sb) |s| mtimeNs(s) else if (std.mem.eql(u8, op, "-nt")) std.math.maxInt(i128) else std.math.minInt(i128);
@@ -3481,8 +3480,8 @@ fn fileCompare(op: []const u8, a: []const u8, b: []const u8) bool {
     return ta < tb; // -ot
 }
 
-fn mtimeNs(st: std.os.linux.Statx) i128 {
-    return @as(i128, st.mtime.sec) * std.time.ns_per_s + @as(i128, st.mtime.nsec);
+fn mtimeNs(st: compat.posix.FileStat) i128 {
+    return st.mtime_ns;
 }
 
 // Minimal POSIX ERE matcher for the `=~` operator. Supports: literals, `.`,

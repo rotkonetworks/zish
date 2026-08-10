@@ -141,5 +141,20 @@ jobs:
           hd
           EOF'
           check herestring     'hs'      'cat <<< hs'
+          # stat-backed operators. These were statx-only and silently returned
+          # false on macOS; they are the point of this run.
+          cd /tmp && rm -rf zt2 && mkdir zt2 && cd zt2
+          touch old && sleep 1 && touch new && ln -s old lnk
+          check symlink        'yes'     '[ -L lnk ] && echo yes || echo no'
+          check not_symlink    'no'      '[ -L old ] && echo yes || echo no'
+          check newer_than     'yes'     '[ new -nt old ] && echo yes || echo no'
+          check older_than     'yes'     '[ old -ot new ] && echo yes || echo no'
+          check same_file      'yes'     '[ old -ef old ] && echo yes || echo no'
+          check diff_file      'no'      '[ old -ef new ] && echo yes || echo no'
+          check owned_by_me    'yes'     '[ -O old ] && echo yes || echo no'
+          check group_is_mine  'yes'     '[ -G old ] && echo yes || echo no'
+          # waitpid path
+          check wait_status    '7'       '(exit 7) & wait $!; echo $?'
+          cd - >/dev/null
           echo "---"
           echo "macOS smoke failures: $fails"

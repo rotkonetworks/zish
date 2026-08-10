@@ -51,22 +51,16 @@ pub fn tcsetpgrp(fd: posix.fd_t, pgrp: posix.pid_t) posix.TermioSetPgrpError!voi
 /// returns {.pid = 0, .status = 0} on ECHILD or other errors
 fn waitpidRetry(pid: posix.pid_t, flags: u32) struct { pid: posix.pid_t, status: u32 } {
     while (true) {
-        // use raw syscall for EINTR visibility
-        var status: u32 = 0;
-        const rc = std.os.linux.waitpid(pid, &status, flags);
-        const result: isize = @bitCast(rc);
+        // libc waitpid rather than the raw Linux syscall: the syscall wrapper
+        // compiles for any target but only *works* on Linux. EINTR is still
+        // visible, just through errno instead of a negative return.
+        var status: c_int = 0;
+        const rc = std.c.waitpid(pid, &status, @intCast(flags));
 
-        if (result > 0) {
-            return .{ .pid = @intCast(result), .status = status };
-        } else if (result == 0) {
-            // WNOHANG and no child ready
-            return .{ .pid = 0, .status = 0 };
-        } else {
-            // negative = -errno
-            const err: std.os.linux.E = @enumFromInt(@as(u16, @intCast(-result)));
-            if (err == .INTR) continue; // retry on signal interrupt
-            return .{ .pid = 0, .status = 0 }; // ECHILD or other error
-        }
+        if (rc > 0) return .{ .pid = rc, .status = @bitCast(status) };
+        if (rc == 0) return .{ .pid = 0, .status = 0 }; // WNOHANG, none ready
+        if (std.posix.errno(rc) == .INTR) continue; // retry on signal
+        return .{ .pid = 0, .status = 0 }; // ECHILD or other error
     }
 }
 
