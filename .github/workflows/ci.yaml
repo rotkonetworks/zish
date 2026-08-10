@@ -47,6 +47,7 @@ jobs:
       # regress.sh drives `zish -c`, which never enters any of them — the
       # tab-completion RCE lived in exactly this untested surface.
       - name: pty suite
+        timeout-minutes: 6
         run: python3 tests/pty_test.py
 
       # bench.sh validates output against bash before timing anything, so it
@@ -186,4 +187,5 @@ jobs:
       # green here.
       - name: pty suite (informational)
         continue-on-error: true
+        timeout-minutes: 8
         run: python3 tests/pty_test.py

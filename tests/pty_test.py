@@ -33,6 +33,19 @@ import signal
 import sys
 import time
 
+# Hard ceiling per test. Without it a shell that never responds hangs the whole
+# job rather than failing one case — observed on macOS, where the first
+# interactive test blocked and the CI runner sat for 18 minutes.
+TEST_TIMEOUT_S = int(os.environ.get("PTY_TEST_TIMEOUT", "25"))
+
+
+class Timeout(Exception):
+    pass
+
+
+def _alarm(_sig, _frm):
+    raise Timeout(f"test exceeded {TEST_TIMEOUT_S}s (shell not responding)")
+
 ZISH = os.environ.get("ZISH", "./zig-out/bin/zish")
 
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[=>()][A-Za-z0-9]?|\r")
@@ -127,6 +140,8 @@ def test(name):
             skipped += 1
             return fn
         sh = None
+        signal.signal(signal.SIGALRM, _alarm)
+        signal.alarm(TEST_TIMEOUT_S)
         try:
             sh = Shell()
             sh.read()  # consume banner + first prompt
@@ -146,6 +161,7 @@ def test(name):
             failures.append(name)
             print(f"\033[31m  ERROR\033[0m {name}: {type(e).__name__}: {e}")
         finally:
+            signal.alarm(0)
             if sh:
                 sh.close()
         return fn
