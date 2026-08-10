@@ -121,6 +121,21 @@ jobs:
               fails=$((fails+1))
             fi
           }
+          # Differential: assert zish agrees with bash *on this machine*, rather
+          # than hardcoding an answer. Some of these are genuinely
+          # platform-specific — BSD gives a new file the directory's group, not
+          # the process's, so `[ -G f ]` is legitimately false on macOS where it
+          # is true on Linux. Hardcoding "yes" tested the platform, not zish.
+          checkvs() { # checkvs NAME SCRIPT
+            got=$("$Z" -c "$2" 2>&1) || true
+            want=$(bash -c "$2" 2>&1) || true
+            if [ "$got" = "$want" ]; then
+              printf 'ok    %-22s (= bash: %q)\n' "$1" "$want"
+            else
+              printf 'FAIL  %-22s bash=%q zish=%q\n' "$1" "$want" "$got"
+              fails=$((fails+1))
+            fi
+          }
           "$Z" --version
           check basic          'hello'   'echo hello'
           check subshell       'a
@@ -145,14 +160,14 @@ jobs:
           # false on macOS; they are the point of this run.
           cd /tmp && rm -rf zt2 && mkdir zt2 && cd zt2
           touch old && sleep 1 && touch new && ln -s old lnk
-          check symlink        'yes'     '[ -L lnk ] && echo yes || echo no'
-          check not_symlink    'no'      '[ -L old ] && echo yes || echo no'
-          check newer_than     'yes'     '[ new -nt old ] && echo yes || echo no'
-          check older_than     'yes'     '[ old -ot new ] && echo yes || echo no'
-          check same_file      'yes'     '[ old -ef old ] && echo yes || echo no'
-          check diff_file      'no'      '[ old -ef new ] && echo yes || echo no'
-          check owned_by_me    'yes'     '[ -O old ] && echo yes || echo no'
-          check group_is_mine  'yes'     '[ -G old ] && echo yes || echo no'
+          checkvs symlink        '[ -L lnk ] && echo yes || echo no'
+          checkvs not_symlink    '[ -L old ] && echo yes || echo no'
+          checkvs newer_than     '[ new -nt old ] && echo yes || echo no'
+          checkvs older_than     '[ old -ot new ] && echo yes || echo no'
+          checkvs same_file      '[ old -ef old ] && echo yes || echo no'
+          checkvs diff_file      '[ old -ef new ] && echo yes || echo no'
+          checkvs owned_by_me    '[ -O old ] && echo yes || echo no'
+          checkvs group_is_mine  '[ -G old ] && echo yes || echo no'
           # waitpid path
           check wait_status    '7'       '(exit 7) & wait $!; echo $?'
           cd - >/dev/null
