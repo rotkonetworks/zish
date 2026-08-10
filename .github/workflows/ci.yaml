@@ -110,7 +110,7 @@ jobs:
       - name: smoke (informational)
         continue-on-error: true
         run: |
-          Z=./zig-out/bin/zish
+          Z=$PWD/zig-out/bin/zish   # absolute: the stat tests cd elsewhere
           fails=0
           check() { # check NAME EXPECTED SCRIPT
             got=$("$Z" -c "$3" 2>&1) || true
