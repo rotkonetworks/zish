@@ -43,6 +43,12 @@ jobs:
       - name: regression suite
         run: ./tests/regress.sh
 
+      # Interactive paths: line editor, job control signals, terminal handover.
+      # regress.sh drives `zish -c`, which never enters any of them — the
+      # tab-completion RCE lived in exactly this untested surface.
+      - name: pty suite
+        run: python3 tests/pty_test.py
+
       # bench.sh validates output against bash before timing anything, so it
       # doubles as a differential correctness check — it is what caught
       # $(($1 * 2)) silently evaluating to 0. Timings are not asserted on;
@@ -173,3 +179,11 @@ jobs:
           cd - >/dev/null
           echo "---"
           echo "macOS smoke failures: $fails"
+
+      # The interactive suite is why the macOS port matters: TIOCSPGRP and the
+      # tcsetpgrp handover are computed for BSD but were never exercised, and
+      # CI is the only Mac available. Informational until it is consistently
+      # green here.
+      - name: pty suite (informational)
+        continue-on-error: true
+        run: python3 tests/pty_test.py
