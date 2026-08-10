@@ -48,7 +48,7 @@ jobs:
       # tab-completion RCE lived in exactly this untested surface.
       - name: pty suite
         timeout-minutes: 6
-        run: python3 tests/pty_test.py
+        run: python3 -u tests/pty_test.py
 
       # bench.sh validates output against bash before timing anything, so it
       # doubles as a differential correctness check — it is what caught
@@ -188,4 +188,4 @@ jobs:
       - name: pty suite (informational)
         continue-on-error: true
         timeout-minutes: 8
-        run: python3 tests/pty_test.py
+        run: python3 -u tests/pty_test.py
