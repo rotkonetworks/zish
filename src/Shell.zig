@@ -4290,15 +4290,107 @@ fn executeExternal(self: *Shell, command: []const u8) !u8 {
 }
 
 /// Find heredoc delimiter in command (e.g., << 'EOF' or << EOF or <<EOF)
-fn findHeredocDelimiter(command: []const u8) ?[]const u8 {
+/// Byte offset of the first heredoc operator `<<` (not `<<<`) that is NOT
+/// inside quotes and not in a comment. The old scanners walked raw bytes, so a
+/// literal `<<` in a string (`echo "a << b"`) was mistaken for a heredoc and
+/// the real one later in the script was never found.
+fn findHeredocOp(command: []const u8) ?usize {
     var i: usize = 0;
-    while (i + 1 < command.len) : (i += 1) {
-        // look for << but not <<<
-        if (command[i] == '<' and command[i + 1] == '<') {
-            if (i + 2 < command.len and command[i + 2] == '<') {
-                i += 2; // skip <<<
+    var in_single = false;
+    var in_double = false;
+    var at_word_start = true;
+    while (i < command.len) : (i += 1) {
+        const c = command[i];
+        if (in_single) {
+            if (c == '\'') in_single = false;
+            continue;
+        }
+        if (in_double) {
+            if (c == '\\' and i + 1 < command.len) {
+                i += 1;
+            } else if (c == '"') in_double = false;
+            continue;
+        }
+        switch (c) {
+            '\\' => {
+                if (i + 1 < command.len) i += 1;
+                at_word_start = false;
                 continue;
-            }
+            },
+            '\'' => {
+                in_single = true;
+                at_word_start = false;
+                continue;
+            },
+            '"' => {
+                in_double = true;
+                at_word_start = false;
+                continue;
+            },
+            '#' => {
+                if (at_word_start) {
+                    while (i < command.len and command[i] != '\n') : (i += 1) {}
+                    at_word_start = true;
+                    continue;
+                }
+                at_word_start = false;
+                continue;
+            },
+            '<' => {
+                if (i + 1 < command.len and command[i + 1] == '<') {
+                    if (i + 2 < command.len and command[i + 2] == '<') {
+                        i += 2; // here-string, not a heredoc
+                        at_word_start = false;
+                        continue;
+                    }
+                    return i;
+                }
+                at_word_start = false;
+                continue;
+            },
+            ' ', '\t', '\n', ';', '|', '&', '(' => {
+                at_word_start = true;
+                continue;
+            },
+            else => {
+                at_word_start = false;
+                continue;
+            },
+        }
+    }
+    return null;
+}
+
+/// Characters that terminate an unquoted heredoc delimiter word.
+fn isHeredocDelimEnd(c: u8) bool {
+    return switch (c) {
+        ' ', '\t', '\n', ';', '|', '&', '<', '>', '(', ')' => true,
+        else => false,
+    };
+}
+
+/// Byte offset just past the delimiter word for the heredoc whose `<<` starts
+/// at `pos`. Everything between here and the newline is the REST OF THE LINE
+/// (redirects, pipes, `;`, `&&`, further heredocs) and must be preserved.
+fn heredocDelimEnd(command: []const u8, pos: usize) usize {
+    var j = pos + 2;
+    if (j < command.len and command[j] == '-') j += 1;
+    while (j < command.len and (command[j] == ' ' or command[j] == '\t')) : (j += 1) {}
+    if (j >= command.len) return command.len;
+    const quote = command[j];
+    if (quote == '\'' or quote == '"') {
+        j += 1;
+        while (j < command.len and command[j] != quote) : (j += 1) {}
+        if (j < command.len) j += 1; // consume closing quote
+        return j;
+    }
+    while (j < command.len and !isHeredocDelimEnd(command[j])) : (j += 1) {}
+    return j;
+}
+
+fn findHeredocDelimiter(command: []const u8) ?[]const u8 {
+    if (findHeredocOp(command)) |i| {
+        {
             // found <<, now parse delimiter
             var j = i + 2;
             // skip optional - for <<-
@@ -4315,9 +4407,12 @@ fn findHeredocDelimiter(command: []const u8) ?[]const u8 {
                 while (j < command.len and command[j] != quote) : (j += 1) {}
                 if (j > start) return command[start..j];
             } else {
-                // unquoted delimiter - word until whitespace/newline
+                // unquoted delimiter - word until whitespace/newline OR an
+                // operator. Stopping only at whitespace absorbed `;` and `|`
+                // into the delimiter, so `cat <<A; echo x` looked for a
+                // delimiter line "A;" that never came.
                 const start = j;
-                while (j < command.len and command[j] != ' ' and command[j] != '\t' and command[j] != '\n') : (j += 1) {}
+                while (j < command.len and !isHeredocDelimEnd(command[j])) : (j += 1) {}
                 if (j > start) return command[start..j];
             }
         }
@@ -4344,29 +4439,22 @@ fn heredocFlags(command: []const u8, pos: usize) HeredocFlags {
 /// Preprocess heredoc: convert "cmd << DELIM\ncontent\nDELIM" to "cmd < /tmp/zish_heredoc_XXXX"
 fn preprocessHeredoc(self: *Shell, command: []const u8, delimiter: []const u8) ![]const u8 {
     const allocator = self.allocator;
-    // Find << position
-    var heredoc_pos: usize = 0;
-    var i: usize = 0;
-    while (i + 1 < command.len) : (i += 1) {
-        if (command[i] == '<' and command[i + 1] == '<') {
-            if (i + 2 < command.len and command[i + 2] == '<') {
-                i += 2;
-                continue;
-            }
-            heredoc_pos = i;
-            break;
-        }
-    }
+    // Find << position (quote/comment aware — must agree with findHeredocDelimiter)
+    const heredoc_pos: usize = findHeredocOp(command) orelse 0;
 
     const flags = heredocFlags(command, heredoc_pos);
 
     // Get part before <<
     const prefix = command[0..heredoc_pos];
 
-    // Find where heredoc content starts (after newline following delimiter specification)
-    var content_start: usize = heredoc_pos + 2;
-    // skip past the delimiter specification to the newline
+    // Everything between the end of the delimiter word and the newline belongs
+    // to the COMMAND, not to the heredoc: `cat <<A >out.txt`, `cat <<A | tr`,
+    // `cat <<A && echo`, `cat <<A ; cat <<B`. Previously this span was skipped
+    // and silently dropped, so the redirect/pipe never happened.
+    const delim_end = heredocDelimEnd(command, heredoc_pos);
+    var content_start: usize = delim_end;
     while (content_start < command.len and command[content_start] != '\n') : (content_start += 1) {}
+    const line_rest = command[delim_end..content_start];
     if (content_start < command.len) content_start += 1; // skip the newline
 
     // Find where content ends (at delimiter line)
@@ -4462,9 +4550,9 @@ fn preprocessHeredoc(self: *Shell, command: []const u8, delimiter: []const u8) !
         self.heredoc_temps.append(self.allocator, owned) catch self.allocator.free(owned);
     } else |_| {}
 
-    // Build new command: prefix < /tmp/zish_heredoc_TS; suffix
+    // Build new command: prefix < /tmp/zish_heredoc_TS <line_rest>; suffix
     const need_suffix = suffix.len > 0;
-    const total_len = prefix.len + 2 + tmp_path.len + if (need_suffix) 1 + suffix.len else 0;
+    const total_len = prefix.len + 2 + tmp_path.len + line_rest.len + if (need_suffix) 1 + suffix.len else 0;
     const result = try allocator.alloc(u8, total_len);
     var pos: usize = 0;
     @memcpy(result[pos..][0..prefix.len], prefix);
@@ -4473,6 +4561,8 @@ fn preprocessHeredoc(self: *Shell, command: []const u8, delimiter: []const u8) !
     pos += 2;
     @memcpy(result[pos..][0..tmp_path.len], tmp_path);
     pos += tmp_path.len;
+    @memcpy(result[pos..][0..line_rest.len], line_rest);
+    pos += line_rest.len;
     if (need_suffix) {
         result[pos] = '\n';
         pos += 1;

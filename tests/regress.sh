@@ -281,6 +281,46 @@ line1
 line2
 EOF'
 
+# Heredocs were rewritten by a byte-level pre-pass over the raw command text
+# before the lexer ran, so it had to re-derive quoting and line structure and
+# got both wrong. Four consequences, all fixed 2026-08-19:
+#   1. everything after the delimiter WORD on that line was silently dropped,
+#      so `cat <<A >out` wrote to stdout and never created the file (exit 0),
+#   2. the delimiter scan stopped only at whitespace, so `;`/`|` were absorbed
+#      into the delimiter and it never matched,
+#   3. only the first heredoc on a line was processed, the second leaked as
+#      commands,
+#   4. the `<<` scan was quote-blind, so a literal `<<` in a string hid the
+#      real heredoc later in the script.
+same_as_bash "heredoc then redirect"   'cat <<A >hd_out.txt
+one
+A
+cat hd_out.txt'
+same_as_bash "heredoc then pipe"       'cat <<A | tr a-z A-Z
+one
+A'
+same_as_bash "heredoc then &&"         'cat <<A && echo tail_ran
+one
+A'
+same_as_bash "heredoc then semicolon"  'cat <<A; echo tail
+one
+A'
+same_as_bash "two heredocs one line"   'cat <<A ; cat <<B
+one
+A
+two
+B'
+same_as_bash "literal << then heredoc" 'echo "lit << here"
+cat <<E
+body
+E'
+same_as_bash "<< inside single quotes" "echo 'a << b'"
+same_as_bash "<< in comment"           '# a << b
+echo ok'
+same_as_bash "heredoc quoted delim"    "cat <<'E'
+raw \$novar
+E"
+
 # ---------------------------------------------------------------------------
 printf '\n%s\n' "lexer token buffer"
 # ---------------------------------------------------------------------------
