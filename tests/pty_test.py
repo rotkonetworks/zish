@@ -25,15 +25,21 @@ Design notes:
   nothing to install.
 """
 
+import fcntl
 import os
 import pty
 import re
 import select
 import shutil
 import signal
+import struct
 import sys
 import tempfile
+import termios
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from vt import VT  # noqa: E402
 
 # Hard ceiling per test. Without it a shell that never responds hangs the whole
 # job rather than failing one case — observed on macOS, where the first
@@ -68,7 +74,7 @@ def clean(s: str) -> str:
 class Shell:
     """An interactive zish on the far side of a pty."""
 
-    def __init__(self, env_extra=None):
+    def __init__(self, env_extra=None, cols=None, rows=None):
         env = dict(os.environ)
         # A predictable prompt and no user config: otherwise the assertions
         # depend on whoever's ~/.zishrc is on the machine.
@@ -83,12 +89,22 @@ class Shell:
         if env_extra:
             env.update(env_extra)
 
+        if cols:
+            env["COLUMNS"], env["LINES"] = str(cols), str(rows)
+
         self.pid, self.fd = pty.fork()
         if self.pid == 0:  # child
             try:
                 os.execve(ZISH, [ZISH], env)
             except Exception:
                 os._exit(127)
+        # A real window size, so wrapping and viewport-overflow behave as they
+        # would on screen. Without this the pty defaults to 0x0 and nothing
+        # ever wraps.
+        self.vt = None
+        if cols:
+            fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+            self.vt = VT(rows, cols)
         self.buf = ""
 
     def read(self, quiet_for=0.25, timeout=6.0) -> str:
@@ -105,7 +121,10 @@ class Shell:
                     break
                 if not chunk:
                     break
-                out += chunk.decode("utf-8", "replace")
+                text = chunk.decode("utf-8", "replace")
+                out += text
+                if self.vt is not None:
+                    self.vt.feed(text)
                 last = time.time()
             elif time.time() - last >= quiet_for and out:
                 break
@@ -350,6 +369,56 @@ def _(sh):
     sh.send("\x03")          # abandon whatever is on the line
     sh.sendline("echo $((7 * 8))")
     expect_soon(sh, "56")
+
+
+# ---------------------------------------------------------------------------
+print("\nmultiline rendering")
+# ---------------------------------------------------------------------------
+
+
+@test("pasted multi-line content renders a contiguous window")
+def _(sh):
+    # Regression: pasting a multi-line command into a terminal shorter than the
+    # content dropped lines out of the *middle* of the display.
+    #
+    #   40x4 showed:  AAA, BBB, CCC, EEE     <- DDD gone
+    #   40x3 showed:  AAA, BBB, EEE          <- CCC and DDD gone
+    #
+    # When content is taller than the viewport some lines must scroll off, and
+    # that is fine — but what remains has to be a contiguous *suffix*, the last
+    # N lines. Keeping the first rows and the last one, with a hole in between,
+    # is what made the cursor look like it was in the wrong place. The buffer
+    # was always correct; the command still ran right. This is display only.
+    #
+    # Cause: the redraw moves up to the region start and rewrites everything.
+    # Once the content is taller than the screen the top has scrolled off and
+    # is unreachable — ESC[nA saturates at row 0 — so the rewrite begins from
+    # the wrong origin.
+    sh.close()  # the default shell has no window size; make one that does
+    small = Shell(cols=40, rows=4)
+    try:
+        small.read()
+        body = "echo AAA \\\n  BBB \\\n  CCC \\\n  DDD \\\n  EEE"
+        small.send("\x1b[200~" + body + "\x1b[201~")
+        time.sleep(1.2)
+        small.read()
+        screen = small.vt.visible_text()
+
+        order = ["AAA", "BBB", "CCC", "DDD", "EEE"]
+        seen = [t for t in order if t in screen]
+        assert seen, f"nothing rendered\n        screen: {screen!r}"
+
+        # Must end at the last line and be gap-free back from there.
+        idx = [order.index(t) for t in seen]
+        contiguous = idx == list(range(idx[0], idx[-1] + 1))
+        ends_at_last = idx[-1] == len(order) - 1
+        assert contiguous and ends_at_last, (
+            f"visible lines are not a contiguous suffix: {seen}\n"
+            + "\n".join("        | " + l for l in screen.splitlines())
+        )
+    finally:
+        small.close()
+        sh.vt = None
 
 
 # ---------------------------------------------------------------------------
