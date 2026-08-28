@@ -193,8 +193,16 @@ pub fn apply() Error!void {
         return Error.NoNewPrivsFailed;
     }
 
+    // TSYNC applies the filter to every thread of the process, not just this
+    // one. zish is single-threaded at this point (the filter is installed at
+    // startup, before any worker thread is spawned) — but a plain
+    // SET_MODE_FILTER covers only the calling thread, so relying on that
+    // invariant means a future thread-spawn moved earlier would silently leave
+    // threads unfiltered. With TSYNC the kernel either syncs all threads or
+    // returns the offending thread id (a positive value), which the != 0 check
+    // treats as failure. Fail-closed and correct regardless of thread count.
     const fprog = SockFprog{ .len = @intCast(prog.len), .filter = &prog };
-    const rc = linux.syscall3(.seccomp, SECCOMP.SET_MODE_FILTER, 0, @intFromPtr(&fprog));
+    const rc = linux.syscall3(.seccomp, SECCOMP.SET_MODE_FILTER, SECCOMP.FILTER_FLAG.TSYNC, @intFromPtr(&fprog));
     if (@as(isize, @bitCast(rc)) != 0) return Error.InstallFailed;
 }
 
