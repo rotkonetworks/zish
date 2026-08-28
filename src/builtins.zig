@@ -21,118 +21,148 @@ fn ensureDirStack(allocator: std.mem.Allocator) !void {
     }
 }
 
-/// Check if name is a builtin that dispatch() handles.
-/// NOTE: This list must match what dispatch() below actually implements.
-/// For syntax highlighting of standard bash builtins, see keywords.shell_builtins instead.
-pub fn isBuiltin(name: []const u8) bool {
-    // This list must stay in sync with dispatch() cases below
-    const implemented_builtins = [_][]const u8{
-        // simple returns
-        "true", "false", ":", "continue", "break",
-        // directory
-        "cd", "pwd", "pushd", "popd", "dirs", "..", "...", "-",
-        // io
-        "echo", "printf", "read", "mapfile", "readarray",
-        // test
-        "test", "[",
-        // variables
-        "export", "unset", "local", "declare", "readonly", "set", "shift", "getopts",
-        // aliases
-        "alias", "unalias",
-        // source/eval/exec
-        "source", ".", "eval", "exec",
-        // info
-        "type", "which", "hash", "history", "help",
-        // job control
-        "jobs", "fg", "bg", "wait", "kill", "disown", "trap",
-        // shell control
-        "exit", "return", "builtin", "command",
-        // benchmarking
-        "time",
-        // zish specific (handled in eval.zig)
-        "feat",
-        "chpw",
-    };
-    for (implemented_builtins) |b| {
-        if (std.mem.eql(u8, name, b)) return true;
+/// One builtin: a name and the function that runs it.
+///
+/// A table rather than a chain of `if (std.mem.eql(...))`. The chain carried
+/// a second, hand-maintained list in isBuiltin with the comment "This list
+/// must stay in sync with dispatch() cases below" — a rule a human had to
+/// remember. Deriving both from one table makes drift unrepresentable rather
+/// than merely discouraged.
+///
+/// `run` returns `?u8`: null means "this name IS a builtin, but eval.zig
+/// handles it" (feat, chpw), which the chain expressed the same way.
+pub const Builtin = struct {
+    name: []const u8,
+    run: *const fn (*Shell, []const []const u8) anyerror!?u8,
+};
+
+// Adapters, so every entry has one signature. The alternative is a tagged
+// union and a switch at the call site, which is more machinery for less.
+fn bTrue(_: *Shell, _: []const []const u8) anyerror!?u8 {
+    return 0;
+}
+fn bFalse(_: *Shell, _: []const []const u8) anyerror!?u8 {
+    return 1;
+}
+fn bContinue(_: *Shell, _: []const []const u8) anyerror!?u8 {
+    return 253;
+}
+fn bBreak(_: *Shell, _: []const []const u8) anyerror!?u8 {
+    return 254;
+}
+/// Handled in eval.zig; listed here so isBuiltin agrees with reality.
+fn bElsewhere(_: *Shell, _: []const []const u8) anyerror!?u8 {
+    return null;
+}
+
+/// Wrap `fn(*Shell, args) !u8` into the table signature.
+fn withArgs(comptime f: fn (*Shell, []const []const u8) anyerror!u8) fn (*Shell, []const []const u8) anyerror!?u8 {
+    return struct {
+        fn call(sh: *Shell, args: []const []const u8) anyerror!?u8 {
+            return try f(sh, args);
+        }
+    }.call;
+}
+
+/// Wrap `fn(*Shell) !u8` (the builtins that take no arguments).
+fn noArgs(comptime f: fn (*Shell) anyerror!u8) fn (*Shell, []const []const u8) anyerror!?u8 {
+    return struct {
+        fn call(sh: *Shell, _: []const []const u8) anyerror!?u8 {
+            return try f(sh);
+        }
+    }.call;
+}
+
+/// Every builtin zish implements. Aliases (`:` for true, `[` for test, `.` for
+/// source, `which` for type, `readarray` for mapfile, `declare` for local) are
+/// separate rows pointing at the same function, so the alias set is data you
+/// can read rather than `or` clauses buried in a condition.
+pub const table = [_]Builtin{
+    .{ .name = "true", .run = bTrue },
+    .{ .name = ":", .run = bTrue },
+    .{ .name = "false", .run = bFalse },
+    .{ .name = "continue", .run = bContinue },
+    .{ .name = "break", .run = bBreak },
+
+    .{ .name = "cd", .run = withArgs(cd) },
+    .{ .name = "pwd", .run = withArgs(pwd) },
+    .{ .name = "pushd", .run = withArgs(pushd) },
+    .{ .name = "popd", .run = withArgs(popd) },
+    .{ .name = "dirs", .run = withArgs(dirs) },
+    .{ .name = "..", .run = noArgs(dotdot) },
+    .{ .name = "...", .run = noArgs(dotdotdot) },
+    .{ .name = "-", .run = noArgs(dash) },
+
+    .{ .name = "echo", .run = withArgs(echo) },
+    .{ .name = "printf", .run = withArgs(printf) },
+    .{ .name = "read", .run = withArgs(read) },
+    .{ .name = "mapfile", .run = withArgs(mapfile) },
+    .{ .name = "readarray", .run = withArgs(mapfile) },
+
+    .{ .name = "test", .run = withArgs(testCmd) },
+    .{ .name = "[", .run = withArgs(testCmd) },
+
+    .{ .name = "export", .run = withArgs(exportVar) },
+    .{ .name = "unset", .run = withArgs(unset) },
+    .{ .name = "local", .run = withArgs(local) },
+    .{ .name = "declare", .run = withArgs(local) },
+    .{ .name = "readonly", .run = withArgs(readonly) },
+    .{ .name = "set", .run = withArgs(set) },
+    .{ .name = "shift", .run = withArgs(shift) },
+    .{ .name = "getopts", .run = withArgs(getopts) },
+
+    .{ .name = "alias", .run = withArgs(alias) },
+    .{ .name = "unalias", .run = withArgs(unalias) },
+
+    .{ .name = "source", .run = withArgs(source) },
+    .{ .name = ".", .run = withArgs(source) },
+    .{ .name = "eval", .run = withArgs(eval) },
+    .{ .name = "exec", .run = withArgs(exec) },
+
+    .{ .name = "type", .run = withArgs(typeCmd) },
+    .{ .name = "which", .run = withArgs(typeCmd) },
+    .{ .name = "hash", .run = withArgs(hash) },
+    .{ .name = "history", .run = withArgs(history) },
+    .{ .name = "help", .run = withArgs(help) },
+
+    .{ .name = "jobs", .run = withArgs(jobs) },
+    .{ .name = "fg", .run = withArgs(fg) },
+    .{ .name = "bg", .run = withArgs(bg) },
+    .{ .name = "wait", .run = withArgs(wait) },
+    .{ .name = "kill", .run = withArgs(kill) },
+    .{ .name = "disown", .run = withArgs(disown) },
+    .{ .name = "trap", .run = withArgs(trap) },
+
+    .{ .name = "exit", .run = withArgs(exit) },
+    .{ .name = "return", .run = withArgs(returnCmd) },
+    .{ .name = "builtin", .run = withArgs(builtinCmd) },
+    .{ .name = "command", .run = withArgs(commandCmd) },
+    .{ .name = "time", .run = withArgs(timeCmd) },
+
+    .{ .name = "feat", .run = bElsewhere },
+    .{ .name = "chpw", .run = bElsewhere },
+};
+
+fn lookup(name: []const u8) ?Builtin {
+    for (table) |b| {
+        if (std.mem.eql(u8, b.name, name)) return b;
     }
-    return false;
+    return null;
+}
+
+/// Is `name` a builtin dispatch() knows about?
+///
+/// Derived from the same table dispatch uses, so the two cannot disagree.
+/// (For syntax highlighting of standard bash builtins, see
+/// keywords.shell_builtins instead — that list is deliberately wider.)
+pub fn isBuiltin(name: []const u8) bool {
+    return lookup(name) != null;
 }
 
 // main dispatch function - called from eval.zig
 pub fn dispatch(shell: *Shell, cmd_name: []const u8, args: []const []const u8) !?u8 {
-    // simple no-arg builtins
-    if (std.mem.eql(u8, cmd_name, "true") or std.mem.eql(u8, cmd_name, ":")) return 0;
-    if (std.mem.eql(u8, cmd_name, "false")) return 1;
-    if (std.mem.eql(u8, cmd_name, "continue")) return 253;
-    if (std.mem.eql(u8, cmd_name, "break")) return 254;
-
-    // directory builtins
-    if (std.mem.eql(u8, cmd_name, "cd")) return try cd(shell, args);
-    if (std.mem.eql(u8, cmd_name, "pwd")) return try pwd(shell, args);
-    if (std.mem.eql(u8, cmd_name, "pushd")) return try pushd(shell, args);
-    if (std.mem.eql(u8, cmd_name, "popd")) return try popd(shell, args);
-    if (std.mem.eql(u8, cmd_name, "dirs")) return try dirs(shell, args);
-    if (std.mem.eql(u8, cmd_name, "..")) return try dotdot(shell);
-    if (std.mem.eql(u8, cmd_name, "...")) return try dotdotdot(shell);
-    if (std.mem.eql(u8, cmd_name, "-")) return try dash(shell);
-
-    // io builtins
-    if (std.mem.eql(u8, cmd_name, "echo")) return try echo(shell, args);
-    if (std.mem.eql(u8, cmd_name, "printf")) return try printf(shell, args);
-    if (std.mem.eql(u8, cmd_name, "read")) return try read(shell, args);
-    if (std.mem.eql(u8, cmd_name, "mapfile") or std.mem.eql(u8, cmd_name, "readarray")) return try mapfile(shell, args);
-
-    // test builtin
-    if (std.mem.eql(u8, cmd_name, "test") or std.mem.eql(u8, cmd_name, "[")) return try testCmd(shell, args);
-
-    // variable builtins
-    if (std.mem.eql(u8, cmd_name, "export")) return try exportVar(shell, args);
-    if (std.mem.eql(u8, cmd_name, "unset")) return try unset(shell, args);
-    if (std.mem.eql(u8, cmd_name, "local") or std.mem.eql(u8, cmd_name, "declare")) return try local(shell, args);
-    if (std.mem.eql(u8, cmd_name, "readonly")) return try readonly(shell, args);
-    if (std.mem.eql(u8, cmd_name, "set")) return try set(shell, args);
-    if (std.mem.eql(u8, cmd_name, "shift")) return try shift(shell, args);
-    if (std.mem.eql(u8, cmd_name, "getopts")) return try getopts(shell, args);
-
-    // alias builtins
-    if (std.mem.eql(u8, cmd_name, "alias")) return try alias(shell, args);
-    if (std.mem.eql(u8, cmd_name, "unalias")) return try unalias(shell, args);
-
-    // source/eval/exec
-    if (std.mem.eql(u8, cmd_name, "source") or std.mem.eql(u8, cmd_name, ".")) return try source(shell, args);
-    if (std.mem.eql(u8, cmd_name, "eval")) return try eval(shell, args);
-    if (std.mem.eql(u8, cmd_name, "exec")) return try exec(shell, args);
-
-    // info builtins
-    if (std.mem.eql(u8, cmd_name, "type") or std.mem.eql(u8, cmd_name, "which")) return try typeCmd(shell, args);
-    if (std.mem.eql(u8, cmd_name, "hash")) return try hash(shell, args);
-    if (std.mem.eql(u8, cmd_name, "history")) return try history(shell, args);
-    if (std.mem.eql(u8, cmd_name, "help")) return try help(shell, args);
-
-    // job control
-    if (std.mem.eql(u8, cmd_name, "jobs")) return try jobs(shell, args);
-    if (std.mem.eql(u8, cmd_name, "fg")) return try fg(shell, args);
-    if (std.mem.eql(u8, cmd_name, "bg")) return try bg(shell, args);
-    if (std.mem.eql(u8, cmd_name, "wait")) return try wait(shell, args);
-    if (std.mem.eql(u8, cmd_name, "kill")) return try kill(shell, args);
-    if (std.mem.eql(u8, cmd_name, "disown")) return try disown(shell, args);
-    if (std.mem.eql(u8, cmd_name, "trap")) return try trap(shell, args);
-
-    // shell control
-    if (std.mem.eql(u8, cmd_name, "exit")) return try exit(shell, args);
-    if (std.mem.eql(u8, cmd_name, "return")) return try returnCmd(shell, args);
-    if (std.mem.eql(u8, cmd_name, "builtin")) return try builtinCmd(shell, args);
-    if (std.mem.eql(u8, cmd_name, "command")) return try commandCmd(shell, args);
-
-    // benchmarking
-    if (std.mem.eql(u8, cmd_name, "time")) return try timeCmd(shell, args);
-
-    // zish specific
-    if (std.mem.eql(u8, cmd_name, "feat")) return null; // handled in eval.zig
-    if (std.mem.eql(u8, cmd_name, "chpw")) return null; // handled in eval.zig for now (complex)
-
-    return null; // not a builtin
+    const b = lookup(cmd_name) orelse return null; // not a builtin
+    return b.run(shell, args);
 }
 
 // ============ directory builtins ============
