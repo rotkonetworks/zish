@@ -54,14 +54,17 @@ test-verbose: build
 # ---- standard feats (python-replacement tier) ----
 # Compiles feats/<name>/main.zig and stages bin + feat.toml into the registry.
 ZISH_FEAT_DIR ?= $(HOME)/.zish/feats/standard
-FEAT_NAMES := cnt pk frq snf jls calc
+FEAT_NAMES := cnt pk frq snf jls calc parallel
+# Feats needing libc (parallel uses execvp for PATH+env resolution).
+FEAT_LIBC := parallel
 
 .PHONY: feats
 feats:
 	@mkdir -p $(ZISH_FEAT_DIR)
 	@for f in $(FEAT_NAMES); do \
 		mkdir -p $(ZISH_FEAT_DIR)/$$f/bin; \
-		zig build-exe -O ReleaseFast -fstrip feats/$$f/main.zig -femit-bin=$(ZISH_FEAT_DIR)/$$f/bin/$$f >/dev/null 2>&1; \
+		lc=""; case " $(FEAT_LIBC) " in *" $$f "*) lc="-lc";; esac; \
+		zig build-exe -O ReleaseFast -fstrip $$lc feats/$$f/main.zig -femit-bin=$(ZISH_FEAT_DIR)/$$f/bin/$$f >/dev/null 2>&1; \
 		cp -f feats/$$f/feat.toml $(ZISH_FEAT_DIR)/$$f/feat.toml; \
 		echo "staged feat: $$f"; \
 	done

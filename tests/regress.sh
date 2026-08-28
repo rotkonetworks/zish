@@ -601,6 +601,41 @@ same_as_bash "positional in function"  'f() { echo $1; }; f arg1'
 same_as_bash "nested subshell value"   'echo $( echo $( echo deep ) )'
 
 # ---------------------------------------------------------------------------
+printf '\n%s\n' "parallel feat"
+# ---------------------------------------------------------------------------
+# The parallel runner is a feat (separate binary), so it is only tested when
+# staged (`make feats`). It fans jobs out N-at-a-time with per-job grouped
+# output in input order, execs argv directly (no shell → no injection), and
+# exits with the failure count.
+PAR="$HOME/.zish/feats/standard/parallel/bin/parallel"
+if [ -x "$PAR" ]; then
+    got=$("$PAR" echo {} ::: a b c 2>/dev/null)
+    [ "$got" = $'a\nb\nc' ] && report_pass "parallel: {} substitution + order" \
+        || report_fail "parallel: {} substitution + order" "a|b|c" "$(echo "$got" | tr '\n' '|')" "grouped output"
+    got=$(printf '%s\n' x y | "$PAR" echo got {} 2>/dev/null)
+    [ "$got" = $'got x\ngot y' ] && report_pass "parallel: stdin items" \
+        || report_fail "parallel: stdin items" "got x|got y" "$(echo "$got" | tr '\n' '|')" "stdin"
+    # an item with metacharacters must stay one argument
+    rm -f "$WORK/PWNED"
+    "$PAR" echo ::: "z;touch $WORK/PWNED" >/dev/null 2>&1
+    [ -e "$WORK/PWNED" ] && report_fail "parallel: no shell injection" "no file" "item executed" "injection" \
+        || report_pass "parallel: no shell injection"
+    # exit status = number of failed jobs
+    "$PAR" sh -c 'exit 0' ::: 1 2 3 >/dev/null 2>&1
+    [ $? -eq 0 ] && report_pass "parallel: exit 0 when all succeed" \
+        || report_fail "parallel: exit 0 when all succeed" "0" "$?" "exit status"
+    "$PAR" sh -c 'test {} -eq 0' ::: 0 1 1 >/dev/null 2>&1
+    [ $? -eq 2 ] && report_pass "parallel: exit = failure count" \
+        || report_fail "parallel: exit = failure count" "2" "$?" "exit status"
+    # no leftover temp files
+    ls /tmp/zish_parallel_* >/dev/null 2>&1 \
+        && report_fail "parallel: no leftover temp" "clean" "temp left" "cleanup" \
+        || report_pass "parallel: no leftover temp"
+else
+    SKIP=$((SKIP + 6))
+fi
+
+# ---------------------------------------------------------------------------
 printf '\n'
 # ---------------------------------------------------------------------------
 total=$((PASS + FAIL))
