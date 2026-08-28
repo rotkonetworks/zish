@@ -118,6 +118,55 @@ the allocator unchecked. Fixed, and then made moot: the inference engine has
 since been removed entirely — about 7,700 lines of parsing, mmap and tensor
 math, gone. Deleting an attack surface beats hardening one.
 
+**Forgeable session trace.** With fd 3 open, zish writes a JSON record per
+command — and a harness is meant to trust those records to know what ran. But
+the raw descriptor was inherited by every forked child, so any command (`echo
+… >&3`) could write its own records, letting a hostile agent describe a clean
+session over a dirty one. The descriptor is now relocated to a high number with
+close-on-exec, so only zish's own process can reach it; children see fd 3
+closed. Regression: "trace cannot be forged by a child".
+
+## Attacking the sandbox
+
+The `--profile` restriction was red-teamed directly. What held, and what did
+not:
+
+**Held** (Landlock enforced it, verified by trying):
+
+- `/proc/self/mem` and `/proc/<pid>/mem` writes — denied.
+- `/proc/self/root` and `/proc/self/fd/<n>` re-anchoring — denied; Landlock
+  re-checks the reopened path.
+- Reopening a read-only fd as write via `/proc/self/fd` — denied.
+- A symlink inside a granted root pointing out of it — denied; the target is
+  resolved and checked.
+- Hardlinking a file into a granted root — denied by the `refer` restriction
+  (surfaces as `EXDEV`).
+- A child dropping `no_new_privs` or lifting the ruleset — refused by the
+  kernel; rulesets only ever intersect.
+
+**Did not hold** — and these are the honest limits, not bugs to be fixed in
+zish:
+
+- **Inherited writable descriptors.** Landlock restricts `open()`, not writes
+  to descriptors already open when it was applied. If the process that launches
+  zish leaves a writable fd open — and `stderr` pointed at a real log file is
+  the common case — a sandboxed command can write to it regardless of profile.
+  Verified: a harness whose `stderr` was a file outside every granted root had
+  that file written from inside the sandbox. Mitigation is on the launcher:
+  don't pass writable fds into a sandboxed zish (`O_CLOEXEC`, or redirect
+  through a pipe you own).
+- **In-memory execution.** `memfd_create` + `execve` runs code that never
+  touched disk. This is not a filesystem escape — the code is still bound by
+  the profile — but any monitoring that assumes executables appear on disk will
+  miss it.
+- **Deferred execution through granted roots** and **unrestricted reads /
+  network**, both covered in [agents.md](agents.md): the sandbox bounds writes
+  to a blast radius, it does not prevent reading secrets or sending them.
+
+The takeaway is the same one the docs lead with: this is filesystem-write
+containment for a process tree, enforced by the kernel. It is not a jail, and
+the boundary is only as good as the fds and roots the launcher hands it.
+
 ## Testing
 
 ```sh

@@ -58,7 +58,31 @@ pub fn init() void {
     // fstat fails with EBADF when the descriptor was never opened, which is
     // the common case — no harness, no trace.
     _ = compat.posix.fstat(fd) catch return;
-    trace_fd = fd;
+
+    // Move the trace channel out of reach of the commands we run.
+    //
+    // The trace is zish's private report to whoever launched it. Left on the
+    // inherited descriptor it would be a shared, forgeable channel: every
+    // forked child inherits fd 3, so `echo … >&3` from any command — or from
+    // an agent zish is wrapping — writes a record the operator will parse as
+    // zish's own. A harness that trusts the trace to know what ran could be
+    // fed a clean-looking session over a dirty one.
+    //
+    // Duplicate it to a high descriptor with close-on-exec and drop the low
+    // one. zish writes records from its own process (no exec between fork and
+    // these writes never run in a child), so CLOEXEC does not affect them; a
+    // child, which reaches the channel only across exec, now cannot. The old
+    // number is freed for the child's own use.
+    const F_DUPFD_CLOEXEC = 1030;
+    if (compat.posix.fcntl(fd, F_DUPFD_CLOEXEC, 10)) |high| {
+        _ = compat.posix.close(fd);
+        trace_fd = @intCast(high);
+    } else |_| {
+        // Could not relocate it (out of descriptors, or a platform without
+        // F_DUPFD_CLOEXEC). Fail closed: no trace is safer than a forgeable
+        // one, because the whole value of the channel is that it is trusted.
+        return;
+    }
 }
 
 pub fn enabled() bool {

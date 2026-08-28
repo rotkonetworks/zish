@@ -366,6 +366,28 @@ trace_case "records each statement" 'echo a; echo b'   'echo a; echo b'
 
 expect "trace keeps stdout clean"   $'just-this' 0 'echo just-this'
 
+# A command must not be able to write to the trace channel. It is zish's
+# private report to whoever launched it; if a forked child inherits the raw
+# descriptor, `>&3` forges a record the harness parses as zish's own, so a
+# hostile command could describe a clean session over a dirty one. The
+# descriptor is relocated with close-on-exec so only zish reaches it.
+if selected "trace cannot be forged by a child"; then
+    rm -f "$WORK/t.jsonl"
+    # The forged text would also appear inside zish's own record of the
+    # command (the record echoes the command line back), so match on shape:
+    # a genuine record is a line beginning `{"ts":`. Any other line is a raw
+    # write the child slipped in.
+    (cd "$WORK" && timeout 10 "$OLDPWD/$ZISH" -c '/bin/sh -c "echo INJECTED >&3" 2>/dev/null' >/dev/null 2>&1 3>"$WORK/t.jsonl")
+    # grep -vc prints the count but exits 1 when it is zero, so no `|| echo 0`
+    # (that would append a second line and defeat the check).
+    stray=$(grep -vc '^{"ts":' "$WORK/t.jsonl")
+    if [ "$stray" != "0" ]; then
+        report_fail "trace cannot be forged by a child" "only {\"ts\":…} records" "$stray stray line(s)" "forgeable trace"
+    else
+        report_pass "trace cannot be forged by a child"
+    fi
+fi
+
 # exit status and duration must be real, not placeholders
 if selected "trace exit and timing"; then
     rm -f "$WORK/t.jsonl"
