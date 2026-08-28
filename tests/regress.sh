@@ -627,12 +627,21 @@ if [ -x "$PAR" ]; then
     "$PAR" sh -c 'test {} -eq 0' ::: 0 1 1 >/dev/null 2>&1
     [ $? -eq 2 ] && report_pass "parallel: exit = failure count" \
         || report_fail "parallel: exit = failure count" "2" "$?" "exit status"
+    # -n N batches items per command, matching xargs -n exactly
+    got=$(seq 1 5 | "$PAR" -n 2 echo 2>/dev/null)
+    want=$(seq 1 5 | xargs -n 2 echo 2>/dev/null)
+    [ "$got" = "$want" ] && report_pass "parallel: -n matches xargs -n" \
+        || report_fail "parallel: -n matches xargs -n" "$(echo "$want" | tr '\n' '|')" "$(echo "$got" | tr '\n' '|')" "batching"
+    # {} with -n>1 is rejected, not silently wrong
+    "$PAR" -n 2 echo {} ::: a b c >/dev/null 2>&1
+    [ $? -eq 2 ] && report_pass "parallel: {} with -n>1 rejected" \
+        || report_fail "parallel: {} with -n>1 rejected" "exit 2" "$?" "ambiguous combo"
     # no leftover temp files
     ls /tmp/zish_parallel_* >/dev/null 2>&1 \
         && report_fail "parallel: no leftover temp" "clean" "temp left" "cleanup" \
         || report_pass "parallel: no leftover temp"
 else
-    SKIP=$((SKIP + 6))
+    SKIP=$((SKIP + 8))
 fi
 
 # ---------------------------------------------------------------------------

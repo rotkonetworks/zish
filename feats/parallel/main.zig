@@ -24,6 +24,8 @@
 //     own temp file, copied out atomically when the job finishes, in input
 //     order. Concurrent jobs never scramble each other's lines — the whole
 //     reason to prefer this over a bare `cmd & cmd & wait` loop.
+//   - -n K passes up to K items per command (xargs -n; default 1). {} is a
+//     single-item placeholder, so it is rejected with -n>1.
 //   - Default parallelism is the CPU count; -j0 is unbounded.
 //   - Exit status is the number of failed jobs, clamped to 125 (0 = all ok).
 //
@@ -104,22 +106,27 @@ fn makeTempFile() !i32 {
     }
 }
 
+/// Build argv for one job. `chunk` is the batch of items for this job (a single
+/// item unless -n>1). {} substitution applies only when the chunk is exactly
+/// one item; with a larger batch the whole chunk is appended as arguments, the
+/// way `xargs -n N` does. {#} (job number) is replaced regardless.
 fn buildArgv(
     arena: std.mem.Allocator,
     template: []const []const u8,
-    item: []const u8,
+    chunk: []const []const u8,
     job_no: usize,
 ) ![:null]?[*:0]const u8 {
     var out = std.ArrayList(?[*:0]const u8).empty;
-    var saw_brace = false;
+    var saw_item_brace = false;
     var num_buf: [20]u8 = undefined;
     const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{job_no}) catch "0";
+    const item: []const u8 = if (chunk.len == 1) chunk[0] else "";
 
     for (template) |tok| {
         const has_item = std.mem.indexOf(u8, tok, "{}") != null;
         const has_num = std.mem.indexOf(u8, tok, "{#}") != null;
         if (has_item or has_num) {
-            if (has_item) saw_brace = true;
+            if (has_item) saw_item_brace = true;
             var acc = std.ArrayList(u8).empty;
             var i: usize = 0;
             while (i < tok.len) {
@@ -139,7 +146,11 @@ fn buildArgv(
             try out.append(arena, try arena.dupeZ(u8, tok));
         }
     }
-    if (!saw_brace) try out.append(arena, try arena.dupeZ(u8, item));
+    // No {} placeholder: append the batch (xargs behaviour). With {} and a
+    // single-item chunk it was already substituted above.
+    if (!saw_item_brace) {
+        for (chunk) |it| try out.append(arena, try arena.dupeZ(u8, it));
+    }
     try out.append(arena, null);
     const slice = try out.toOwnedSlice(arena);
     return slice[0 .. slice.len - 1 :null];
@@ -157,6 +168,7 @@ pub fn main(init: std.process.Init) void {
     // options
     var jobs: usize = 0;
     var jobs_set = false;
+    var batch: usize = 1; // items per command; -n N raises it (xargs -n)
     var idx: usize = 1;
     while (idx < args.len) : (idx += 1) {
         const a = args[idx];
@@ -174,8 +186,16 @@ pub fn main(init: std.process.Init) void {
         } else if (std.mem.startsWith(u8, a, "-j")) {
             jobs = std.fmt.parseInt(usize, a[2..], 10) catch die("-j needs a number");
             jobs_set = true;
+        } else if (std.mem.eql(u8, a, "-n")) {
+            idx += 1;
+            if (idx >= args.len) die("-n needs a number");
+            batch = std.fmt.parseInt(usize, args[idx], 10) catch die("-n needs a number");
+            if (batch == 0) die("-n needs a positive number");
+        } else if (std.mem.startsWith(u8, a, "-n")) {
+            batch = std.fmt.parseInt(usize, a[2..], 10) catch die("-n needs a number");
+            if (batch == 0) die("-n needs a positive number");
         } else if (a.len > 1 and a[0] == '-' and a[1] != '-') {
-            die("unknown option (only -j N and -- are supported)");
+            die("unknown option (supported: -j N, -n N, --)");
         } else break;
     }
 
@@ -190,6 +210,15 @@ pub fn main(init: std.process.Init) void {
         (if (in_items) &arg_items else &template).append(alloc, args[idx]) catch die("out of memory");
     }
     if (template.items.len == 0) die("no command given");
+
+    // {} names a single item, so it is incompatible with batching (-n>1) —
+    // which item would it be? xargs draws the same line (-I implies -n1).
+    if (batch > 1) {
+        for (template.items) |tok| {
+            if (std.mem.indexOf(u8, tok, "{}") != null)
+                die("{} cannot be combined with -n greater than 1 (drop {} to append the batch)");
+        }
+    }
 
     if (!jobs_set) jobs = std.Thread.getCpuCount() catch 4;
     if (jobs == 0) jobs = std.math.maxInt(usize);
@@ -210,7 +239,7 @@ pub fn main(init: std.process.Init) void {
         group = false;
     }
 
-    runAll(alloc, template.items, items.items, jobs) catch die("out of memory");
+    runAll(alloc, template.items, items.items, jobs, batch) catch die("out of memory");
 }
 
 fn readStdinItems(alloc: std.mem.Allocator, items: *std.ArrayList([]const u8)) !void {
@@ -231,8 +260,10 @@ fn readStdinItems(alloc: std.mem.Allocator, items: *std.ArrayList([]const u8)) !
     }
 }
 
-fn runAll(alloc: std.mem.Allocator, template: []const []const u8, items: []const []const u8, max_parallel: usize) !void {
-    const jobs = try alloc.alloc(Job, items.len);
+fn runAll(alloc: std.mem.Allocator, template: []const []const u8, items: []const []const u8, max_parallel: usize, batch: usize) !void {
+    // One job per chunk of `batch` items (batch==1 is the common one-per case).
+    const num_jobs = (items.len + batch - 1) / batch;
+    const jobs = try alloc.alloc(Job, num_jobs);
     for (jobs) |*j| j.* = .{};
 
     var launched: usize = 0;
@@ -241,9 +272,11 @@ fn runAll(alloc: std.mem.Allocator, template: []const []const u8, items: []const
     var next_print: usize = 0;
     var failures: usize = 0;
 
-    while (reaped < items.len) {
-        while (active < max_parallel and launched < items.len) {
-            try launchJob(alloc, &jobs[launched], template, items[launched], launched + 1);
+    while (reaped < num_jobs) {
+        while (active < max_parallel and launched < num_jobs) {
+            const start = launched * batch;
+            const end = @min(start + batch, items.len);
+            try launchJob(alloc, &jobs[launched], template, items[start..end], launched + 1);
             launched += 1;
             active += 1;
         }
@@ -261,23 +294,23 @@ fn runAll(alloc: std.mem.Allocator, template: []const []const u8, items: []const
                 break;
             }
         }
-        while (next_print < items.len and jobs[next_print].done and !jobs[next_print].printed) {
+        while (next_print < num_jobs and jobs[next_print].done and !jobs[next_print].printed) {
             flushJob(&jobs[next_print]);
             next_print += 1;
         }
     }
-    while (next_print < items.len) : (next_print += 1) {
+    while (next_print < num_jobs) : (next_print += 1) {
         if (jobs[next_print].done and !jobs[next_print].printed) flushJob(&jobs[next_print]);
     }
     linux.exit(@intCast(@min(failures, 125)));
 }
 
-fn launchJob(alloc: std.mem.Allocator, job: *Job, template: []const []const u8, item: []const u8, job_no: usize) !void {
+fn launchJob(alloc: std.mem.Allocator, job: *Job, template: []const []const u8, chunk: []const []const u8, job_no: usize) !void {
     // In grouped mode each job writes to its own temp file; ungrouped, it
     // inherits our stdout/stderr (out_fd stays -1 and flushJob is a no-op).
     const fd: i32 = if (group) (makeTempFile() catch -1) else -1;
     var arena = std.heap.ArenaAllocator.init(alloc);
-    const argv = try buildArgv(arena.allocator(), template, item, job_no);
+    const argv = try buildArgv(arena.allocator(), template, chunk, job_no);
 
     const frc = linux.fork();
     if (failed(frc)) {
@@ -318,9 +351,10 @@ const help_text =
     \\usage: parallel [-j N] CMD [ARG...] ::: item...
     \\       ... | parallel [-j N] CMD [ARG...]
     \\
-    \\Run CMD once per item, up to N at a time (default: CPU count; -j0 = unbounded).
-    \\{} in CMD is replaced by the item; {#} by the job number. With no {}, the item
-    \\is appended. CMD is exec'd directly (no shell): an item is always one argument.
+    \\Run CMD over the items, up to -j N at a time (default: CPU count; -j0 = unbounded).
+    \\-n K passes up to K items per command (xargs -n; default 1). {} in CMD is
+    \\replaced by the item, {#} by the job number; with no {} the items are appended.
+    \\CMD is exec'd directly (no shell): an item is always one argument.
     \\Output is grouped per job, in input order. Exit status = number of failed jobs.
     \\
     \\  seq 1 100 | parallel -j8 gzip {}
