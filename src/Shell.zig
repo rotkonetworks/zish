@@ -4492,18 +4492,35 @@ fn preprocessHeredoc(self: *Shell, command: []const u8, delimiter: []const u8) !
 
     const suffix = std.mem.trim(u8, command[suffix_start..], " \t\r\n");
 
-    // Write content to a temp file. Salt the name with a monotonic counter so
-    // chained heredocs processed within the same millisecond don't collide.
-    const ts = compat.milliTimestamp();
-    const S = struct {
-        var seq: u32 = 0;
-    };
-    S.seq +%= 1;
-    var path_buf: [80]u8 = undefined;
+    // Write content to a temp file in /tmp, which is world-writable — so the
+    // name must be unguessable and the create must not follow a planted
+    // symlink. A predictable name (timestamp + counter) plus a symlink-following
+    // O_CREAT|O_TRUNC was an arbitrary-file-overwrite: an attacker pre-creates
+    // `/tmp/zish_heredoc_e_<ts>_1` as a symlink to a victim's file and the
+    // heredoc body lands there. Now: 8 random bytes in the name, and
+    // `.exclusive` (O_EXCL) so the create fails closed on any pre-existing path,
+    // symlink included. The mode tag stays right after the prefix so
+    // heredocTempMode() can still classify it.
     const mode_tag: u8 = if (flags.quoted) 'q' else 'e';
-    const tmp_path = std.fmt.bufPrint(&path_buf, "/tmp/zish_heredoc_{c}_{d}_{d}", .{ mode_tag, ts, S.seq }) catch return error.OutOfMemory;
-
-    const file = std.Io.Dir.createFileAbsolute(compat.io(), tmp_path, .{ .truncate = true }) catch return error.FileError;
+    var rnd: [8]u8 = undefined;
+    var path_buf: [80]u8 = undefined;
+    var file: std.Io.File = undefined;
+    var attempt: u8 = 0;
+    const tmp_path = while (true) {
+        compat.posix.randomBytes(&rnd);
+        const p = std.fmt.bufPrint(&path_buf, "/tmp/zish_heredoc_{c}_{s}", .{ mode_tag, std.fmt.bytesToHex(rnd, .lower) }) catch return error.OutOfMemory;
+        if (std.Io.Dir.createFileAbsolute(compat.io(), p, .{ .truncate = true, .exclusive = true })) |f| {
+            file = f;
+            break p;
+        } else |err| {
+            // PathAlreadyExists on a random 64-bit name means either the
+            // 1-in-2^64 collision or an attacker spraying names; retry a few
+            // times, then give up rather than fall back to an unsafe create.
+            attempt += 1;
+            if (err == error.PathAlreadyExists and attempt < 8) continue;
+            return error.FileError;
+        }
+    };
     defer file.close(compat.io());
     compat.writeAll(file, content) catch return error.WriteError;
     compat.writeAll(file, "\n") catch return error.WriteError;

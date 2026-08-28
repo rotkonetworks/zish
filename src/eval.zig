@@ -1872,15 +1872,17 @@ fn applyHeredocInput(shell: *Shell, path: []const u8, expand: bool) !void {
     // Materialise the expanded body into a sibling temp file (avoids pipe-buffer
     // deadlock for large bodies, since redirects are applied in the parent before
     // the reader process is forked).
-    const S = struct {
-        var seq: u32 = 0;
-    };
-    S.seq +%= 1;
-    var name_buf: [128]u8 = undefined;
-    const exp_path = std.fmt.bufPrint(&name_buf, "{s}_x{d}", .{ path, S.seq }) catch return error.OutOfMemory;
+    // Sibling temp file for the expanded body. `path` already carries the
+    // random suffix from preprocessHeredoc, so appending here keeps it
+    // unguessable; `.exclusive` (O_EXCL) makes the create fail closed rather
+    // than follow a planted symlink or clobber a pre-existing file.
+    var rnd: [8]u8 = undefined;
+    compat.posix.randomBytes(&rnd);
+    var name_buf: [160]u8 = undefined;
+    const exp_path = std.fmt.bufPrint(&name_buf, "{s}_x{s}", .{ path, std.fmt.bytesToHex(rnd, .lower) }) catch return error.OutOfMemory;
 
     {
-        const wf = try std.Io.Dir.cwd().createFile(compat.io(), exp_path, .{ .truncate = true });
+        const wf = try std.Io.Dir.cwd().createFile(compat.io(), exp_path, .{ .truncate = true, .exclusive = true });
         defer wf.close(compat.io());
         compat.writeAll(wf, exp) catch {};
     }
@@ -1963,19 +1965,26 @@ fn applyRedirect(shell: *Shell, node: *const ast.AstNode) !void {
         const content_with_newline = try std.fmt.allocPrint(shell.allocator, "{s}\n", .{expanded_target});
         defer shell.allocator.free(content_with_newline);
 
-        const S = struct {
-            var seq: u32 = 0;
-        };
-        S.seq +%= 1;
+        // Unguessable name + O_EXCL, for the same reason as the heredoc path:
+        // a predictable /tmp name opened without O_EXCL is an arbitrary-file
+        // overwrite via a pre-planted symlink.
+        var rnd: [8]u8 = undefined;
         var name_buf: [64]u8 = undefined;
-        const tmp_path = std.fmt.bufPrint(
-            &name_buf,
-            "/tmp/zish_herestr_{d}_{d}",
-            .{ compat.posix.getpid(), S.seq },
-        ) catch return error.OutOfMemory;
-
+        var wf: std.Io.File = undefined;
+        var attempt: u8 = 0;
+        const tmp_path = while (true) {
+            compat.posix.randomBytes(&rnd);
+            const p = std.fmt.bufPrint(&name_buf, "/tmp/zish_herestr_{s}", .{std.fmt.bytesToHex(rnd, .lower)}) catch return error.OutOfMemory;
+            if (std.Io.Dir.cwd().createFile(compat.io(), p, .{ .truncate = true, .exclusive = true })) |f| {
+                wf = f;
+                break p;
+            } else |err| {
+                attempt += 1;
+                if (err == error.PathAlreadyExists and attempt < 8) continue;
+                return err;
+            }
+        };
         {
-            const wf = try std.Io.Dir.cwd().createFile(compat.io(), tmp_path, .{ .truncate = true });
             defer wf.close(compat.io());
             try compat.writeAll(wf, content_with_newline);
         }

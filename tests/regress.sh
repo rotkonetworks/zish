@@ -447,6 +447,24 @@ expect "here string small"             $'hello here' 0 'cat <<< "hello here"'
 expect "here string past pipe buffer"  $'70001'      0 'x=$(head -c 70000 /dev/zero | tr "\0" "x"); cat <<< "$x" | wc -c'
 expect "here string 100k"              $'100001'     0 'x=$(head -c 100000 /dev/zero | tr "\0" "x"); cat <<< "$x" | wc -c'
 expect "here string leaves no temp"    $'clean'      0 'cat <<< hi >/dev/null; ls /tmp/zish_herestr_* >/dev/null 2>&1 && echo dirty || echo clean'
+
+# A heredoc must never write through a symlink planted in world-writable /tmp.
+# The old scheme used a predictable name (/tmp/zish_heredoc_e_<ms>_1) opened
+# with O_CREAT|O_TRUNC and no O_EXCL, so pre-planting a symlink to a victim
+# file made the heredoc body overwrite it — a reliable arbitrary-file-write
+# on a shared host. Spray the millisecond window (which clobbered the old code
+# every run) and require the victim untouched. Fixed by random names + O_EXCL.
+if selected "heredoc resists /tmp symlink attack"; then
+    v=$(mktemp); printf 'SACRED' > "$v"
+    now=$(date +%s%3N 2>/dev/null || echo 0)
+    for d in $(seq 0 400); do ln -sf "$v" "/tmp/zish_heredoc_e_$((now+d))_1" 2>/dev/null; done
+    "$OLDPWD/$ZISH" -c 'cat <<EOF >/dev/null
+PWNED
+EOF' >/dev/null 2>&1
+    if [ "$(cat "$v")" = "SACRED" ]; then report_pass "heredoc resists /tmp symlink attack"
+    else report_fail "heredoc resists /tmp symlink attack" "victim untouched" "victim overwritten" "arbitrary file write"; fi
+    rm -f /tmp/zish_heredoc_e_* "$v"
+fi
 same_as_bash "heredoc still works"     'cat <<EOF
 line1
 line2

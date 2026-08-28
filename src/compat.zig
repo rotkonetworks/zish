@@ -483,6 +483,26 @@ pub const posix = struct {
         return system.getpid();
     }
 
+    /// Fill `buf` with cryptographically-strong random bytes. Used to make
+    /// temp-file names unguessable so an attacker cannot pre-create or
+    /// pre-symlink one (the security against a symlink clobber comes from
+    /// O_EXCL; this closes the pre-creation DoS and any guessing). Best-effort:
+    /// on failure the buffer is left as-is, and the O_EXCL create still fails
+    /// closed on a collision.
+    pub fn randomBytes(buf: []u8) void {
+        if (builtin.os.tag == .linux) {
+            var off: usize = 0;
+            while (off < buf.len) {
+                const rc = std.os.linux.getrandom(buf[off..].ptr, buf.len - off, 0);
+                const n: isize = @bitCast(rc);
+                if (n <= 0) return;
+                off += @intCast(n);
+            }
+        } else {
+            std.crypto.random.bytes(buf);
+        }
+    }
+
     // libc-backed and therefore portable, unlike the raw std.os.linux syscall
     // wrappers these replaced. A raw `syscall1(.getpgid, 0)` compiles for any
     // target but emits a Linux syscall, so it is wrong at runtime everywhere
