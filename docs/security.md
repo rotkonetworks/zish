@@ -84,6 +84,24 @@ Write-only device sinks (`/dev/null`, `/dev/zero`, `/dev/tty`, ...) stay
 writable under every profile. `cat x >/dev/null` is a write, and the first
 version of this broke it; that case is now in the regression suite.
 
+### Syscall restriction (the "pledge" half)
+
+Landlock is Cosmopolitan's `unveil` — it bounds files. Every restrictive
+profile also installs a seccomp-BPF filter, the `pledge` half, bounding
+syscalls. It is a small curated *denylist*, not an allowlist: a shell execs
+arbitrary programs (a compiler, git, python) and the filter is inherited across
+exec, so an allowlist would kill legitimate tools and rot with every kernel
+release. The denylist is `ptrace`, `process_vm_readv`/`writev` and `kexec` —
+things a shell's children have no legitimate need for. Denied calls return
+`EPERM` (fail gracefully), except a non-native syscall ABI, which is killed
+(the arch guard that stops a number-keyed filter being bypassed via x32/compat).
+
+Deliberately *not* in the denylist: `socket` (the agent must reach its model),
+`unshare`/`mount` (rootless containers, `nix build`), `bpf` (observability),
+`memfd`/`execveat` (glibc, CPython, Wayland use them, and anonymous exec is
+still Landlock-write-bounded). Those belong to explicit named profiles, not a
+silent default. See [agents.md](agents.md) for the network design.
+
 ### Structured output instead of screen-scraping
 
 With fd 3 open, zish writes one JSON record per submitted command. A harness
@@ -143,6 +161,10 @@ not:
   (surfaces as `EXDEV`).
 - A child dropping `no_new_privs` or lifting the ruleset — refused by the
   kernel; rulesets only ever intersect.
+- `ptrace`/`process_vm_readv`/`process_vm_writev` — denied by the seccomp
+  filter every restrictive profile installs (see below). This closed the one
+  escape that Landlock alone could not: with yama `ptrace_scope=0` a restricted
+  process could otherwise attach to an unrestricted one and act through it.
 
 **Did not hold** — and these are the honest limits, not bugs to be fixed in
 zish:

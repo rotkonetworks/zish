@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const build = @import("build.zig.zon");
 const cli = @import("cli.zig");
 const sandbox = @import("sandbox.zig");
+const seccomp = @import("seccomp.zig");
 const Shell = @import("Shell.zig");
 const build_options = @import("build_options");
 const compat = @import("compat.zig");
@@ -121,6 +122,22 @@ pub fn main(init: std.process.Init) void {
             compat.writeAll(.stderr(), m) catch {};
             std.process.exit(1);
         };
+
+        // The "pledge" half: a seccomp syscall denylist, applied after Landlock
+        // (so the filter need not permit the landlock syscalls) and while still
+        // single-threaded. It rides along on every restrictive profile with no
+        // flag of its own — it denies only syscalls a shell's children have no
+        // legitimate need for (ptrace and friends), so there is nothing to
+        // opt into. Fail closed, exactly like Landlock.
+        if (profile != .unrestricted) {
+            seccomp.apply() catch |err| {
+                var eb: [160]u8 = undefined;
+                const m = std.fmt.bufPrint(&eb, "zish: cannot enforce syscall restriction for --profile {s}: {s}\n", .{ pname, @errorName(err) }) catch "zish: cannot enforce syscall restriction\n";
+                compat.writeAll(.stderr(), m) catch {};
+                std.process.exit(1);
+            };
+        }
+
         // Stamp the enforced profile into the trace only after apply()
         // returned, so the label attests what the kernel accepted, not what
         // was merely requested. `pname` is a fixed profile name, not input.

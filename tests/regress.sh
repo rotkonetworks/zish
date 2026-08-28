@@ -215,6 +215,33 @@ if "$ZISH" --profile readonly -c 'true' 2>/dev/null; then
     fi
     rm -f /tmp/zish_sbx_probe
 
+    # The "pledge" half: a restrictive profile also installs a seccomp filter
+    # (mode 2 in /proc/self/status), inherited across exec, that denies ptrace
+    # and friends — the tested escape #3. `none` and no-profile leave it off.
+    if [ "$(cat /proc/self/status 2>/dev/null | grep -c '^Seccomp')" != "0" ]; then
+        m=$("$ZISH" --profile readonly -c 'grep ^Seccomp: /proc/self/status' 2>/dev/null | awk '{print $2}')
+        if [ "$m" = "2" ]; then report_pass "profile installs a seccomp filter"
+        else report_fail "profile installs a seccomp filter" "Seccomp=2" "Seccomp=$m" "no syscall filter"; fi
+
+        m0=$("$ZISH" --profile none -c 'grep ^Seccomp: /proc/self/status' 2>/dev/null | awk '{print $2}')
+        if [ "$m0" = "0" ]; then report_pass "no filter without a profile"
+        else report_fail "no filter without a profile" "Seccomp=0" "Seccomp=$m0" "filter leaked to none"; fi
+
+        # ptrace is actually denied (not just the filter present). strace uses
+        # PTRACE_TRACEME; under the profile it must fail rather than trace.
+        if command -v strace >/dev/null 2>&1; then
+            if "$ZISH" --profile readonly -c 'strace /bin/true' >/dev/null 2>&1; then
+                report_fail "profile denies ptrace" "strace fails" "strace traced" "ptrace not blocked"
+            else
+                report_pass "profile denies ptrace"
+            fi
+        else
+            SKIP=$((SKIP + 1))
+        fi
+    else
+        SKIP=$((SKIP + 3))
+    fi
+
     # --allow-write is what makes wrapping an agent harness possible: the
     # harness needs its own state directory writable or it fails in ways that
     # look like harness bugs. The grant must be exactly the named root.

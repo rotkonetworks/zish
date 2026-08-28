@@ -85,9 +85,21 @@ unknown profile name exits with status 2, and a kernel that cannot enforce the
 requested profile exits with status 1. \fBnone\fR needs no kernel support and
 always starts.
 .PP
-Only writes are restricted. Every profile can still read the whole filesystem,
-including credentials, so this bounds damage rather than disclosure. Network
-access, process creation, signals and \fBptrace\fR are not restricted either.
+Every restrictive profile additionally installs a seccomp syscall filter that
+denies
+.BR ptrace ,
+.BR process_vm_readv / process_vm_writev
+and
+.B kexec
+\(em syscalls a shell's children have no legitimate use for. Denied calls
+return
+.B EPERM
+rather than killing the caller. The filter is inherited across exec like the
+Landlock restriction.
+.PP
+Only writes are restricted on the filesystem. Every profile can still read the
+whole filesystem, including credentials, so this bounds damage rather than
+disclosure. Network access, process creation and signals are not restricted.
 It is a blast radius, not a jail.
 .SH TRACING
 When file descriptor 3 is open, zish writes one JSON record per submitted

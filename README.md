@@ -249,6 +249,15 @@ non-zero rather than quietly running unrestricted. Write-only device sinks
 `cat x >/dev/null` is a write and a sandbox that breaks it is just a broken
 shell.
 
+Every restrictive profile also installs a **seccomp syscall filter** — the
+"pledge" half to Landlock's "unveil". It rides along with no flag of its own and
+denies `ptrace` and `process_vm_readv`/`writev` (attaching to or reading another
+process's memory) and `kexec` — syscalls a shell's children have no legitimate
+need for. Denied calls return `EPERM`, so a program that tries one fails
+gracefully rather than being killed. This is deliberately a small list; the
+syscalls with real legitimate uses (`socket`, `unshare`, `mount`, `memfd`) are
+left for named profiles rather than defaulted on.
+
 #### What it does not stop
 
 Worth keeping straight, because the above sounds stronger than it is:
@@ -258,11 +267,7 @@ Worth keeping straight, because the above sounds stronger than it is:
 - **Network is unrestricted.** Combined with the above: a sandboxed process can
   read a secret and POST it somewhere. Landlock can restrict TCP connect/bind;
   zish does not use that yet.
-- Process creation and signals are unrestricted. `ptrace` too — harmless while
-  `/proc/sys/kernel/yama/ptrace_scope` is `1` or higher, since only descendants
-  are attachable and those are all restricted. **At `0`, any unsandboxed process
-  of yours is attachable, and that is a real escape.** Check it before relying
-  on any of this.
+- Process creation and signals are unrestricted.
 - **Anything writable is code you will run later.** This is the one that gets
   people. A granted root usually contains `.git/hooks`, a `Makefile`,
   `package.json` scripts, `.envrc` — all of which execute, unsandboxed, the next

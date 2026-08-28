@@ -110,16 +110,20 @@ sandboxed and read the denials.
 - Bounds the whole process tree to a directory, enforced by the kernel.
 - Needs no root, no container, no image, no `LD_PRELOAD`.
 - Bounds zish itself, so a bug in the shell is contained by the same limit.
-- Costs nothing at runtime — it is a one-time syscall at startup.
+- Denies `ptrace`/`process_vm_*` (and `kexec`) via a seccomp filter, so a
+  sandboxed process can't attach to or read another process's memory — closing
+  the yama-`ptrace_scope=0` escape below regardless of the sysctl.
+- Costs nothing at runtime — a one-time syscall at startup, inherited across
+  exec.
 
 **Does not**
 
 - Restrict the network. A sandboxed agent can still make requests, and
-  exfiltrate anything it is allowed to read. Landlock can restrict TCP
-  connect/bind; zish does not use that yet.
+  exfiltrate anything it is allowed to read. That's a design choice, not an
+  oversight — the agent needs to reach its model. See "Network" below.
 - Restrict reads. Every profile can read the whole filesystem, credentials
   included. This bounds damage, not disclosure.
-- Restrict process creation, signals, or `ptrace`.
+- Restrict process creation or signals.
 - Replace the harness's own permission prompts. It is the layer beneath them,
   for when they are bypassed, misconfigured, or skipped outright.
 
@@ -162,10 +166,12 @@ export CLAUDE_CONFIG_DIR=/tmp/claude-scratch
 zish --profile workdir --allow-write "$CLAUDE_CONFIG_DIR:/tmp" -c 'claude'
 ```
 
-**Check `ptrace_scope`.** With `/proc/sys/kernel/yama/ptrace_scope` at `1` or
-above, only descendants can be attached and every descendant is restricted. At
-`0`, a restricted process can attach to any unrestricted process you own and
-act through it — a genuine escape, and nothing zish does prevents it.
+**`ptrace_scope` — belt and suspenders.** The classic version of this attack:
+with `/proc/sys/kernel/yama/ptrace_scope` at `0`, a process could attach to any
+unrestricted process you own and act through it. A restrictive profile now
+blocks the `ptrace` syscall outright via seccomp, so this is closed regardless
+of the sysctl. Keeping `ptrace_scope >= 1` is still good defence in depth for
+everything *not* running under a zish profile:
 
 ```sh
 cat /proc/sys/kernel/yama/ptrace_scope    # want >= 1
