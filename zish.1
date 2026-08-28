@@ -1,6 +1,6 @@
-.TH ZISH 1 "August 2026" "zish 0.16.0" "User Commands"
+.TH ZISH 1 "August 2026" "zish 0.16.1" "User Commands"
 .SH NAME
-zish \- a fast zsh-compatible shell with vim editing and job control
+zish \- a fast shell with vim editing and job control
 .SH SYNOPSIS
 .B zish
 [\fB\-c\fR \fIcommand\fR]
@@ -11,9 +11,8 @@ zish \- a fast zsh-compatible shell with vim editing and job control
 .B zish
 is a Unix shell written in Zig, featuring vim-style modal editing,
 job control, arrays, process substitution, statistical benchmarking,
-intelligent tab completion with ghost text prediction,
-syntax highlighting, and optional ghost text completion backed by
-a local GGUF inference engine.
+intelligent tab completion, syntax highlighting, and ghost text
+completion drawn from history and completion candidates.
 .PP
 When invoked without arguments, zish starts an interactive session.
 When given \fB\-c\fR, it executes the command string.
@@ -612,11 +611,9 @@ Pipe targets (common commands after |)
 .IP \(bu 2
 History-based prefix matching
 .SS Ghost Text
-When a local GGUF model is configured (see \fBcompletion_model\fR in
-.IR CONFIGURATION ),
-zish displays predictive ghost text in dim color ahead of the cursor.
-The part completing the token you are typing is shown in cyan;
-the rest is italic, so a suggestion never reads as committed input.
+As you type, zish suggests the rest of the command from your history and from
+completion candidates. The part completing the token you are typing is shown
+in cyan; the rest is italic, so a suggestion never reads as committed input.
 .TP
 .BR Right ", " End
 Accept the full prediction
@@ -630,199 +627,9 @@ Accept one character
 .B Ctrl\-O
 Toggle ghost text on or off
 .PP
-Ghost text is generated asynchronously on a background thread
-using pure-Zig inference with no external dependencies.
-.SH SYNTAX HIGHLIGHTING
-.B zish
-highlights input as you type using ANSI 256-color codes:
-.IP \(bu 2
-Builtins and keywords in distinct colors
-.IP \(bu 2
-Valid commands in green, invalid in red
-.IP \(bu 2
-Strings and quoted text highlighted
-.IP \(bu 2
-Variables and expansions highlighted
-.IP \(bu 2
-Operators and redirections highlighted
-.SH PROMPT
-The default prompt format is:
-.PP
-.RS
-.B [M] user@host path (branch) [exit] $
-.RE
-.PP
-.TP
-.B [M]
-Vi mode indicator:
-.B [N]
-(blue) normal,
-.B [I]
-(cyan) insert,
-.B [V]
-(yellow) visual,
-.B [VL]
-(yellow) visual line
-.TP
-.B user@host
-Green. Current username and hostname.
-.TP
-.B path
-Cyan. Working directory with ~ expansion for home.
-.TP
-.B (branch)
-Yellow. Current git branch, shown only inside git repositories.
-.TP
-.B [exit]
-Red. Last exit code, shown only when non-zero.
-.SH COMMAND SUGGESTIONS
-When a command is not found, zish suggests similar commands
-using Levenshtein distance matching against builtins, aliases,
-and executables in PATH.
-.SH JOB CONTROL
-.TP
-.BR Ctrl\-Z
-Suspend foreground job
-.TP
-.BR Ctrl\-C
-Interrupt foreground job
-.PP
-Job specifications: %1 (job 1), %+ (current), %\- (previous), %string (match).
-.SH HISTORY
-Command history is saved to \fB~/.zish_history\fR.
-.PP
-History expansion:
-.TP
-.B !!
-Previous command
-.TP
-.B !n
-Command number n
-.TP
-.B !string
-Most recent command starting with string
-.SH SESSION TRACE
-When file descriptor 3 is open, zish writes one JSON record per top-level
-command to it. This lets a program driving zish read what happened without
-parsing ANSI escapes, prompt redraws or history replay from stdout.
-.PP
-.RS
-.nf
-$ zish \-c 'make test' 3>trace.jsonl
-{"ts":1786246738163,"cmd":"make test","cwd":"/src","exit":0,"ms":842}
-.fi
-.RE
-.TP
-.B ts
-Start time, milliseconds since the Unix epoch.
-.TP
-.B cmd
-The command as submitted. Escaped as a JSON string; bytes that are not valid
-UTF\-8 are replaced with U+FFFD so the stream is always parseable.
-.TP
-.B cwd
-Working directory at the time the command ran.
-.TP
-.B exit
-Exit status.
-.TP
-.B ms
-Wall-clock duration in milliseconds.
-.PP
-The trace is off unless fd 3 is open, so there is nothing to enable or
-disable. Set
-.B ZISH_TRACE_FD
-to use a different descriptor; values of 2 or below are refused, since writing
-records onto stdout or stderr would reintroduce the interleaving this exists
-to avoid.
-.PP
-Only top-level commands are recorded. Sourcing
-.B ~/.zishrc
-at startup, command substitution and
-.B PROMPT_COMMAND
-are internals, not commands anyone submitted, and are left out. Writes are
-best-effort: if the reader goes away, records are dropped rather than blocking
-or killing the shell.
-.SH LOCAL INFERENCE
-.B zish
-includes a pure-Zig GGUF inference engine with no external
-dependencies. It supports Transformer models with RoPE,
-RMSNorm, SwiGLU MLP, grouped-query attention, and KV cache.
-.SS Process Isolation
-The inference engine uses fork-based process isolation.
-The parent process communicates with the child via pipes.
-The child process loads the model via mmap and runs continuous
-inference, self-feeding tokens between requests to keep
-internal state warm.
-.SS Quantization
-Supported formats: F32, F16, Q8_0 (SIMD matmul), Q4_K
-(fused dot product), Q6_K (fused dot product). Fused dot
-products operate directly on quantized weights without
-intermediate f32 buffers.
-.SS Multi-threaded Matmul
-Matrix multiplications are split across available CPU cores
-(up to 8 threads), with the last chunk executed on the
-calling thread.
-.SS Sliding Window Attention
-Models with sliding window metadata (e.g., Mistral) use
-windowed attention, reducing complexity from O(T\(sq) to O(T\(muW).
-.SS CTM (Continuous Thinking Model)
-CTM support adds iterative thinking blocks on top of the
-standard MLP. CTM is additive: the MLP always runs first,
-and CTM adds thinking as a second residual. CTM blocks
-include SuperLinear layers, SynapseUNET, and dual
-synchronization accumulators.
-.PP
-CTM parameters are read from GGUF metadata:
-.BR ctm.enabled ", " ctm.iterations ", "
-.BR ctm.memory_length ", " ctm.n_synch .
-.SS CTM Plasticity
-The inference engine supports online learning through
-a breathing architecture:
-.TP
-.B Dopamine gating
-Surprise-based neuromodulation, clamped [0.5, 1.0],
-prevents positive feedback loops.
-.TP
-.B Hebbian learning
-Gradient-free weight updates from synchronization patterns
-with novelty gating and homeostasis (1% norm cap).
-.TP
-.B Replay buffer
-64-entry ring buffer of token sequences with surprise scores.
-Persisted to a \fB.replay\fR file alongside the model.
-.TP
-.B Breathing loop
-Inhale (dopamine-tracked generation) and exhale (compact
-every 100 steps, save every 1000 steps).
-.PP
-State files are stored as siblings of the GGUF model file:
-\fB.ctmstate\fR (sync accumulators),
-\fB.plastic\fR (weight overlay),
-\fB.replay\fR (replay buffer).
-.SH CONFIGURATION
-.SS Ghost Text
-.B ~/.zish/agent.json
-.PP
-.RS
-.nf
-{
-  "completion_model": "/path/to/completion.gguf",
-  "router_local_model": "/path/to/router.gguf"
-}
-.fi
-.RE
-.TP
-.B completion_model
-Path to a local GGUF model used for ghost text prediction.
-Ghost text is disabled when unset.
-.TP
-.B router_local_model
-Path to a local GGUF model used for local query classification.
-.PP
-The file is also parsed for a number of keys left over from a
-removed API agent (\fBprovider\fR, \fBapi_key\fR, \fBmax_agents\fR
-and similar). They are accepted but ignored.
+There is no model involved. Earlier versions shipped a GGUF inference engine
+for this; it was removed in favour of history matching, which is where the
+useful suggestions came from anyway.
 .SS Keybindings
 .B ~/.zish/keybindings.json
 .PP
@@ -910,14 +717,8 @@ Startup file for interactive shells.
 .B ~/.zish_history
 Command history file.
 .TP
-.B ~/.zish/agent.json
-Ghost text / local inference configuration.
-.TP
 .B ~/.zish/keybindings.json
 Custom keybinding overrides.
-.TP
-.B ~/.zish/models/
-Local GGUF models for inference.
 .SH EXIT STATUS
 The exit status is that of the last command executed,
 or 0 if no command was executed.
