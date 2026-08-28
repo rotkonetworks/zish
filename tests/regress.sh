@@ -181,6 +181,56 @@ expect "subshell unset"                $''       0 'x=1; ( unset x ; echo $x )'
 expect "background cd"                 $'ok'     0 '( cd / ; /bin/echo ok ) & wait'
 
 # ---------------------------------------------------------------------------
+printf '\n%s\n' "capability restriction (--profile)"
+# ---------------------------------------------------------------------------
+# The shell is the fork/exec chokepoint, so it is the only place that can bound
+# what a command touches without trusting the command. Landlock is inherited
+# across exec and cannot be relaxed, so restricting the session restricts every
+# child — that inheritance is the property worth guarding.
+#
+# Skipped where the kernel has no Landlock (it is queried, not assumed).
+if "$ZISH" --profile readonly -c 'true' 2>/dev/null; then
+    # These must run *with* the flag, so they cannot use expect() (which shells
+    # out without it). An earlier version of this block did, and passed by
+    # testing unrestricted behaviour.
+    rm -f /tmp/zish_sbx_probe
+    if "$ZISH" --profile readonly -c 'echo x > /tmp/zish_sbx_probe' >/dev/null 2>&1 && [ -e /tmp/zish_sbx_probe ]; then
+        rm -f /tmp/zish_sbx_probe
+        report_fail "readonly blocks writes" "write refused" "write succeeded" "sandbox not enforced"
+    else
+        report_pass "readonly blocks writes"
+    fi
+    if "$ZISH" --profile readonly -c 'cat /etc/hostname >/dev/null' >/dev/null 2>&1; then
+        report_pass "readonly still allows reads"
+    else
+        report_fail "readonly still allows reads" "read allowed" "read refused" "over-restricted"
+    fi
+    # A child process must not be able to escape the restriction.
+    if "$ZISH" --profile readonly -c '/bin/sh -c "echo x > /tmp/zish_sbx_child" 2>/dev/null' 2>/dev/null; then :; fi
+    if [ -e /tmp/zish_sbx_child ]; then
+        rm -f /tmp/zish_sbx_child
+        report_fail "restriction inherited by children" "child blocked" "child wrote the file" "sandbox escape"
+    else
+        report_pass "restriction inherited by children"
+    fi
+    rm -f /tmp/zish_sbx_probe
+else
+    SKIP=$((SKIP + 4))
+fi
+
+# An unknown profile must be refused, not silently ignored — a caller that
+# asked for a sandbox and did not get one is worse off than one that never did.
+if selected "unknown profile is refused"; then
+    if "$ZISH" --profile bogus -c 'echo ran' >/dev/null 2>&1; then
+        report_fail "unknown profile is refused" "exit != 0" "ran anyway" "fail-closed"
+    else
+        report_pass "unknown profile is refused"
+    fi
+else
+    SKIP=$((SKIP + 1))
+fi
+
+# ---------------------------------------------------------------------------
 printf '\n%s\n' "test builtin"
 # ---------------------------------------------------------------------------
 # `test` had three implementations, and the *fast path* was the more capable

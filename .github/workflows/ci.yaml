@@ -32,7 +32,7 @@ jobs:
 
       # LTO off in CI for speed; -Doptimize path exercised the same as release.
       - name: build (release)
-        run: zig build --release=fast -Dlto=false
+        run: zig build --release=safe -Dlto=false
 
       - name: test
         run: zig build test
@@ -108,7 +108,7 @@ jobs:
           version: 0.16.0
 
       - name: build
-        run: zig build --release=fast -Dlto=false
+        run: zig build --release=safe -Dlto=false
 
       # Informational only, and deliberately per-feature: each line prints its
       # own ok/FAIL so the log is a porting to-do list rather than a single red

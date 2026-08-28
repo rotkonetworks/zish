@@ -19,7 +19,7 @@ sha256sums=('30ba61fedf9757afd3518354d8e1a0c4b6711f96a2640c883192d8959309b963')
 
 build() {
     cd "$pkgname-$pkgver"
-    zig build --release=fast
+    zig build --release=safe
 }
 
 # No check(): `zig build test` builds the test exe in Debug (all modules +

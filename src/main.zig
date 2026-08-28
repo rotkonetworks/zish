@@ -1,8 +1,10 @@
 // main.zig - zish shell implementation
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build = @import("build.zig.zon");
 const cli = @import("cli.zig");
+const sandbox = @import("sandbox.zig");
 const Shell = @import("Shell.zig");
 const build_options = @import("build_options");
 const compat = @import("compat.zig");
@@ -35,9 +37,48 @@ pub fn main(init: std.process.Init) void {
         return;
     }
 
+    // Capability restriction, applied before anything runs.
+    //
+    // Session-scoped rather than per-command, because Landlock is inherited
+    // across exec and cannot be relaxed: restricting the shell restricts
+    // everything it will ever spawn, with no way for a child to opt out. That
+    // is the property an agent actually wants — "this whole session may not
+    // write outside here" — and it is stronger than anything a per-command
+    // flag could offer.
+    //
+    // Fail closed. If restriction was requested and the kernel cannot enforce
+    // it, refuse to run rather than running unrestricted: a caller that asked
+    // for a sandbox and silently did not get one is worse off than one that
+    // never asked.
+    if (res.value("profile")) |pname| {
+        const profile = sandbox.Profile.fromString(pname) orelse {
+            var eb: [128]u8 = undefined;
+            const m = std.fmt.bufPrint(&eb, "zish: unknown profile '{s}' (none|readonly|workdir)\n", .{pname}) catch "zish: unknown profile\n";
+            compat.writeAll(.stderr(), m) catch {};
+            std.process.exit(2);
+        };
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = compat.posix.getcwd(&cwd_buf) catch "";
+        var cwd_z: [std.fs.max_path_bytes]u8 = undefined;
+        @memcpy(cwd_z[0..cwd.len], cwd);
+        cwd_z[cwd.len] = 0;
+        var roots = [_][*:0]const u8{@ptrCast(&cwd_z)};
+        sandbox.apply(profile, &roots) catch |err| {
+            var eb: [160]u8 = undefined;
+            const m = std.fmt.bufPrint(&eb, "zish: cannot enforce --profile {s}: {s}\n", .{ pname, @errorName(err) }) catch "zish: cannot enforce profile\n";
+            compat.writeAll(.stderr(), m) catch {};
+            std.process.exit(1);
+        };
+    }
+
     if (res.isSet("version")) {
-        var vbuf: [64]u8 = undefined;
-        const line = std.fmt.bufPrint(&vbuf, "zish {s}\n", .{build.version}) catch "zish\n";
+        // The build mode is part of the version because it changes the
+        // security properties, not just the speed: ReleaseFast removes the
+        // bounds, overflow and alignment checks that turn a memory bug into a
+        // clean abort. Anyone filing a bug — or deciding whether to let an
+        // agent drive this — needs to know which one they are running.
+        var vbuf: [96]u8 = undefined;
+        const line = std.fmt.bufPrint(&vbuf, "zish {s} ({s})\n", .{ build.version, @tagName(builtin.mode) }) catch "zish\n";
         compat.writeAll(.stdout(), line) catch {};
         return;
     }
@@ -150,6 +191,7 @@ const params = [_]cli.Flag{
     .{ .short = 'l', .long = "login", .help = "Start as a login shell." },
     .{ .short = 'd', .long = "debug-log-file", .help = "File to write debug info to.", .takes_value = true, .value_name = "FILE" },
     .{ .short = 'c', .help = "Command to execute.", .takes_value = true, .value_name = "CMD" },
+    .{ .long = "profile", .help = "Restrict what commands may touch: none|readonly|workdir.", .takes_value = true, .value_name = "NAME" },
 };
 
 /// Best-effort "which argument was bad" for the error message. cli.parse

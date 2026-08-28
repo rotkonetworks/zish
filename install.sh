@@ -128,7 +128,7 @@ if [ "$macos_preview" = "1" ] || ! fetch "$base/zish-$target" "$tmp/zish"; then
         fetch "https://github.com/$REPO/archive/$ref.tar.gz" "$tmp/src.tar.gz" \
             || die "could not download source"
         tar -xzf "$tmp/src.tar.gz" -C "$src" --strip-components=1
-        (cd "$src" && zig build --release=fast) || die "build failed"
+        (cd "$src" && zig build --release=safe) || die "build failed"
         cp "$src/zig-out/bin/zish" "$tmp/zish"
     else
         die "no release binary for $target and no zig to build from source"

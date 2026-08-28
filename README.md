@@ -35,25 +35,30 @@ Or skip the script entirely:
 ```sh
 paru -S zish                                       # Arch (AUR)
 nix profile install github:rotkonetworks/zish      # Nix / NixOS
-zig build --release=fast                           # from source
+zig build --release=safe                           # from source
 ```
 </details>
 
 Your muscle memory and your POSIX/bash scripts keep working. It's a single
 binary with no interpreter startup, so it starts and runs quicker —
-**roughly 1.3–2x faster than bash and zsh**:
+**roughly 1.2–1.8x faster than bash**:
 
-| benchmark | vs bash | vs zsh |
-|---|---|---|
-| command substitution | 2.0x ± 0.3 | 1.9x ± 0.3 |
-| nested loops | 1.7x ± 0.2 | 1.8x ± 0.2 |
-| arithmetic | 1.7x ± 0.2 | 1.8x ± 0.2 |
-| functions | 1.7x ± 0.3 | 1.8x ± 0.3 |
-| for + function call | 1.7x ± 0.2 | 1.8x ± 0.3 |
-| conditionals | 1.7x ± 0.2 | 1.7x ± 0.2 |
-| case | 1.6x ± 0.2 | 1.8x ± 0.2 |
-| variables | 1.6x ± 0.3 | 1.7x ± 0.3 |
-| pipelines | 1.3x ± 0.2 | 1.5x ± 0.2 |
+| benchmark | vs bash |
+|---|---|
+| command substitution | 1.8x ± 0.3 |
+| conditionals | 1.5x ± 0.3 |
+| case | 1.4x ± 0.3 |
+| arithmetic | 1.4x ± 0.3 |
+| nested loops | 1.4x ± 0.3 |
+| for + function call | 1.4x ± 0.3 |
+| variables | 1.4x ± 0.3 |
+| functions | 1.4x ± 0.3 |
+| pipelines | 1.2x ± 0.1 |
+
+Measured on the **`--release=safe`** binary, which is what ships. Unchecked
+(`--release=fast`) is roughly 1.3–2.0x instead — the difference buys bounds,
+overflow and alignment checks, which is a trade worth making in a shell an
+agent drives.
 
 Reproduce with `./bench.sh` (hyperfine; all shells run `--norc`/`--no-rcs`
 from `/bin/sh`). The error bars are wide relative to the gaps, and numbers move
@@ -199,7 +204,7 @@ that hasn't been earned yet. Build from source:
 
 ```sh
 brew install zig
-zig build --release=fast && ./zig-out/bin/zish
+zig build --release=safe && ./zig-out/bin/zish
 ```
 
 Reports of what breaks are more useful than patches right now.
