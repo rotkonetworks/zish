@@ -85,8 +85,10 @@ unknown profile name exits with status 2, and a kernel that cannot enforce the
 requested profile exits with status 1. \fBnone\fR needs no kernel support and
 always starts.
 .PP
-Only filesystem access is restricted. Network access, process creation and
-signals are not.
+Only writes are restricted. Every profile can still read the whole filesystem,
+including credentials, so this bounds damage rather than disclosure. Network
+access, process creation, signals and \fBptrace\fR are not restricted either.
+It is a blast radius, not a jail.
 .SH TRACING
 When file descriptor 3 is open, zish writes one JSON record per submitted
 command to it, so a program driving zish does not have to parse prompts or
