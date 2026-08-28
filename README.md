@@ -193,47 +193,74 @@ zish --profile workdir  -c 'make build'   # may write under $PWD, read elsewhere
 zish --profile none                       # the default
 ```
 
-`--allow-write` adds writable roots, `:`-separated like `PATH`. That is what
-makes it possible to wrap an agent, which needs its own state directory:
+`--allow-write` adds writable roots, `:`-separated like `PATH` — which is what
+makes it possible to wrap an agent, since the agent needs its own state
+directory:
 
 ```sh
 zish --profile workdir --allow-write "$HOME/.claude:/tmp" -c 'claude'
 ```
 
-Backed by [Landlock](https://docs.kernel.org/userspace-api/landlock.html), the
-kernel's unprivileged sandbox — no root, no container, no `LD_PRELOAD` tricks.
-The restriction is applied once at startup and is **inherited and irrevocable**,
-so it holds for every child process too:
+**The shell is not enforcing this.** zish makes one syscall at startup
+([Landlock](https://docs.kernel.org/userspace-api/landlock.html), the kernel's
+unprivileged sandbox — no root, no container, no `LD_PRELOAD`) and then gets out
+of the way. After that the *kernel* refuses the write. There is no parser to
+trick, no quoting to get right, no allowlist to slip past.
 
-```sh
-$ zish --profile readonly -c '/bin/sh -c "echo x > /tmp/f"'
-/bin/sh: line 1: /tmp/f: Permission denied
+Which is why it holds for programs that never involve a shell at all:
+
+```
+$ zish --profile readonly -c 'bash -c "echo x > /tmp/A"'
+/usr/bin/bash: line 1: /tmp/A: Permission denied      # bash's own redirect
+
+$ zish --profile readonly -c 'python3 -c "open(\"/tmp/B\",\"w\")"'
+PermissionError: [Errno 13] Permission denied: '/tmp/B'
 ```
 
-Session-scoped rather than per-command, deliberately. Because the kernel is
-enforcing it against the whole process tree, it also bounds **zish itself** — a
-bug in zish's own parser can't write outside the profile either. That is the
-point. Zig's safety checks (on in the shipped build) turn the bugs they cover
-into a clean abort, but no in-process check covers everything, so zish should
-not be the only thing standing between an agent and your filesystem.
+The restriction lives in the process's credentials: `fork` copies it, `exec`
+preserves it, and nothing can clear it. A child may add another Landlock
+ruleset, but rulesets only intersect — it is a one-way ratchet.
 
-It **fails closed**. An unknown profile name, or a kernel without Landlock,
-exits non-zero rather than quietly running unrestricted — a sandbox that
-silently degrades to no sandbox is worse than none, because you stop watching.
-Write-only device sinks (`/dev/null`, `/dev/tty`, ...) stay writable under every
-profile; `cat x >/dev/null` is a write, and a "sandbox" that breaks it is just a
-broken shell.
+```
+$ zish --profile readonly -c 'grep NoNewPrivs /proc/self/status'
+NoNewPrivs:  1                              # 0 outside the sandbox
 
-Network access is not restricted — Landlock's network rules cover TCP
-connect/bind only, so treat this as filesystem containment, not isolation.
+tried to drop no_new_privs: -1              # the kernel refuses
+```
 
-**You do not have to swap the agent's shell for this to work.** Claude Code
-drives `bash` with no option to change it, and Python's `shell=True` is
-hardcoded to `/bin/sh` — but none of that matters, because the restriction is
-inherited by every descendant whatever shell they use. Wrapping Claude Code
-this way was verified end to end: it runs normally, and with `Bash` allowed it
-cannot write outside the roots you granted. Recipes for that and for other
-harnesses are in [docs/agents.md](docs/agents.md).
+`no_new_privs` also makes the kernel ignore setuid bits and file capabilities on
+exec, so escaping by running something setuid does not work either.
+
+It is session-scoped rather than per-command, deliberately: because the kernel
+enforces it against the whole tree, it also bounds **zish itself**. Zig's safety
+checks (on in the shipped build) turn the bugs they cover into a clean abort,
+but no in-process check covers everything — zish should not be the only thing
+between an agent and your filesystem.
+
+It **fails closed**: an unknown profile, or a kernel without Landlock, exits
+non-zero rather than quietly running unrestricted. Write-only device sinks
+(`/dev/null`, `/dev/tty`, ...) stay writable under every profile, because
+`cat x >/dev/null` is a write and a sandbox that breaks it is just a broken
+shell.
+
+#### What it does not stop
+
+Worth keeping straight, because the above sounds stronger than it is:
+
+- **Reads are unrestricted.** Every profile can read the whole filesystem —
+  SSH keys, `.env` files, tokens. This bounds damage, not disclosure.
+- **Network is unrestricted.** Combined with the above: a sandboxed process can
+  read a secret and POST it somewhere. Landlock can restrict TCP connect/bind;
+  zish does not use that yet.
+- Process creation, signals and `ptrace` are unrestricted.
+
+A blast radius, not a jail — which is why it belongs *underneath* an agent's own
+permission prompts rather than replacing them.
+
+You also do not have to change the agent to get it. Claude Code drives `bash`
+with no option to swap it, and Python's `shell=True` is hardcoded to `/bin/sh`,
+but neither matters when the restriction is inherited by every descendant.
+Recipes are in [docs/agents.md](docs/agents.md).
 
 ## Ghost text
 
