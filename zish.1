@@ -68,6 +68,34 @@ always starts.
 .PP
 Only filesystem access is restricted. Network access, process creation and
 signals are not.
+.SH TRACING
+When file descriptor 3 is open, zish writes one JSON record per submitted
+command to it, so a program driving zish does not have to parse prompts or
+ANSI escapes to learn what happened:
+.PP
+.RS
+.nf
+$ zish \-c 'make test' 3>trace.jsonl
+$ cat trace.jsonl
+{"ts":1786246738163,"cmd":"make test","cwd":"/src","exit":0,"ms":842}
+.fi
+.RE
+.PP
+The fields are the start time in milliseconds since the epoch, the command as
+submitted, the working directory, the exit status, and the elapsed
+milliseconds. Strings are JSON\-escaped; invalid UTF\-8 becomes U+FFFD.
+.PP
+There is no flag and no configuration: the feature is off unless the
+descriptor is open, and standard output is left exactly as the command wrote
+it. Only what was actually submitted is recorded \- sourcing of startup files,
+command substitutions and other internal evaluation are not.
+.PP
+Set
+.B ZISH_TRACE_FD
+to use a different descriptor. A value of 2 or below, or one that is not a
+number, disables tracing entirely rather than falling back to descriptor 3:
+writing records into the command's own output is the failure this exists to
+avoid.
 .SH SHELL GRAMMAR
 .SS Simple Commands
 A simple command is a sequence of words separated by spaces.
@@ -676,6 +704,12 @@ useful suggestions came from anyway.
 .PP
 Custom keybinding overrides loaded at shell startup.
 .SH ENVIRONMENT
+.TP
+.B ZISH_TRACE_FD
+File descriptor to write session trace records to, instead of 3. Must be a
+number greater than 2, or tracing is disabled. See
+.B TRACING
+above.
 .TP
 .B HOME
 Home directory for cd and tilde expansion.
