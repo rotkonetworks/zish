@@ -125,6 +125,70 @@ sandboxed and read the denials.
 
 Treat it as a blast radius, not a jail.
 
+## Nothing has to break Landlock to get out
+
+No userspace bypass of the restriction itself is known, and a child cannot lift
+it. But escaping the *restriction* is not the same as escaping the *sandbox's
+purpose*, and the recipes above hand over three routes to code running
+unrestricted later. All three were verified against the exact command this
+document recommends:
+
+```
+content-WRITABLE  ~/.claude/settings.json   # contains hooks: shell commands
+content-WRITABLE  ./.git/hooks              # runs on your next commit
+content-WRITABLE  ./Makefile                # runs on your next `make`
+```
+
+(Probed with a real append, not `touch` — see the metadata note below for why
+`touch` proves nothing here.)
+
+Write a `SessionStart` hook into `settings.json` and it executes the next time
+the harness starts — outside any sandbox, because *you* launched that one.
+Same for a git hook, a Makefile target, `package.json` scripts, `.envrc`.
+
+So state the guarantee accurately: **the sandbox protects everything outside
+the roots you granted. It cannot protect the roots themselves, and those
+contain executable configuration.** Granting write access to a directory is
+granting deferred code execution in it.
+
+Two things follow.
+
+**Do not grant the harness's config directory if you can avoid it.** Claude
+Code honours `CLAUDE_CONFIG_DIR`, so point it at a throwaway and leave your
+real `~/.claude` — hooks and all — unwritable:
+
+```sh
+export CLAUDE_CONFIG_DIR=/tmp/claude-scratch
+zish --profile workdir --allow-write "$CLAUDE_CONFIG_DIR:/tmp" -c 'claude'
+```
+
+**Check `ptrace_scope`.** With `/proc/sys/kernel/yama/ptrace_scope` at `1` or
+above, only descendants can be attached and every descendant is restricted. At
+`0`, a restricted process can attach to any unrestricted process you own and
+act through it — a genuine escape, and nothing zish does prevents it.
+
+```sh
+cat /proc/sys/kernel/yama/ptrace_scope    # want >= 1
+```
+
+**File metadata is not covered.** Landlock restricts a defined set of access
+rights, and changing timestamps or permissions is not among them. Both of these
+succeed on a file the process cannot write:
+
+```
+$ chmod 777 ~/.claude/keybindings.json   # succeeds
+$ touch    ~/.claude/keybindings.json    # succeeds
+$ printf '' >> ~/.claude/keybindings.json
+zish: error executing command: error.AccessDenied     # content still denied
+```
+
+This is not an escape — Landlock is enforced independently of file
+permissions, so `chmod 777` does not buy the process a write. It is a
+sabotage surface: modes and timestamps can be changed filesystem-wide.
+
+It also makes `touch` useless as a probe. If you are testing what a profile
+allows, append a byte; a successful `touch` says nothing about content.
+
 ## Reading what happened
 
 Restriction bounds the damage. Tracing tells you what ran — but note carefully

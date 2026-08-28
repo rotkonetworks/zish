@@ -252,7 +252,15 @@ Worth keeping straight, because the above sounds stronger than it is:
 - **Network is unrestricted.** Combined with the above: a sandboxed process can
   read a secret and POST it somewhere. Landlock can restrict TCP connect/bind;
   zish does not use that yet.
-- Process creation, signals and `ptrace` are unrestricted.
+- Process creation and signals are unrestricted. `ptrace` too — harmless while
+  `/proc/sys/kernel/yama/ptrace_scope` is `1` or higher, since only descendants
+  are attachable and those are all restricted. **At `0`, any unsandboxed process
+  of yours is attachable, and that is a real escape.** Check it before relying
+  on any of this.
+- **Anything writable is code you will run later.** This is the one that gets
+  people. A granted root usually contains `.git/hooks`, a `Makefile`,
+  `package.json` scripts, `.envrc` — all of which execute, unsandboxed, the next
+  time *you* run git or make. Nothing has to break Landlock for that to happen.
 
 A blast radius, not a jail — which is why it belongs *underneath* an agent's own
 permission prompts rather than replacing them.

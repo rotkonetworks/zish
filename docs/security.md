@@ -24,6 +24,12 @@ and — more usefully — what it does not.
   can still open sockets.
 - A malicious binary you install and run. zish executes what you ask it to;
   a restriction profile bounds what that binary may write, nothing more.
+- Anything that runs *after* the restricted session ends. A profile grants
+  write access to directories that hold executable configuration — `.git/hooks`,
+  `Makefile`, `package.json`, `.envrc`, an agent's own hook settings — and all
+  of those run unrestricted the next time you invoke git, make or the harness.
+  Granting write access is granting deferred code execution. See
+  [agents.md](agents.md).
 
 ## What is enforced
 
