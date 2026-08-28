@@ -121,6 +121,10 @@ pub fn main(init: std.process.Init) void {
             compat.writeAll(.stderr(), m) catch {};
             std.process.exit(1);
         };
+        // Stamp the enforced profile into the trace only after apply()
+        // returned, so the label attests what the kernel accepted, not what
+        // was merely requested. `pname` is a fixed profile name, not input.
+        trace.setSandbox(pname);
     } else if (res.isSet("allow-write")) {
         compat.writeAll(.stderr(), "zish: --allow-write needs a restrictive --profile (readonly|workdir)\n") catch {};
         std.process.exit(2);

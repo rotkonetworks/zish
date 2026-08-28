@@ -388,6 +388,42 @@ if selected "trace cannot be forged by a child"; then
     fi
 fi
 
+# A command must not be able to inject a second record by splitting the JSON.
+# The cmd and cwd fields carry arbitrary bytes — a newline plus a `}` and a
+# fresh `{"ts":...` would forge a record if they were not escaped. Craft both
+# a hostile command and a hostile directory name and require every emitted
+# line to parse as one JSON object.
+if selected "trace resists json injection"; then
+    rm -f "$WORK/inj.jsonl"
+    evil=$'x","exit":0}\n{"ts":0,"cmd":"INJECTED'
+    injdir="$WORK/$(printf 'd\ndir')"
+    mkdir -p "$injdir" 2>/dev/null || injdir="$WORK"
+    (cd "$injdir" && timeout 10 "$OLDPWD/$ZISH" -c "echo '$evil'" >/dev/null 2>&1 3>"$WORK/inj.jsonl")
+    res=$(python3 -c "
+import json,sys
+n=0
+for ln in open('$WORK/inj.jsonl'):
+    ln=ln.rstrip('\n')
+    if not ln: continue
+    try: json.loads(ln); n+=1
+    except Exception: print('UNPARSEABLE'); sys.exit()
+print('ok' if n>=1 else 'empty')
+" 2>&1)
+    if [ "$res" = "ok" ]; then report_pass "trace resists json injection"
+    else report_fail "trace resists json injection" "every line one JSON object" "$res" "log injection"; fi
+fi
+
+# The trace must attest which profile was enforced, so a harness can confirm
+# the session it launched is the one it is reading rather than trust the flag
+# it passed. Read it back with the sandbox off (needs no kernel support).
+if selected "trace records the sandbox profile"; then
+    rm -f "$WORK/sb.jsonl"
+    (cd "$WORK" && timeout 10 "$OLDPWD/$ZISH" --profile none -c 'echo hi' >/dev/null 2>&1 3>"$WORK/sb.jsonl")
+    got=$(python3 -c "import json;print(json.load(open('$WORK/sb.jsonl')).get('sandbox','MISSING'))" 2>/dev/null)
+    if [ "$got" = "none" ]; then report_pass "trace records the sandbox profile"
+    else report_fail "trace records the sandbox profile" "sandbox=none" "sandbox=$got" "no attestation"; fi
+fi
+
 # exit status and duration must be real, not placeholders
 if selected "trace exit and timing"; then
     rm -f "$WORK/t.jsonl"

@@ -177,13 +177,19 @@ happened:
 ```sh
 $ zish -c 'make test' 3>trace.jsonl
 $ cat trace.jsonl
-{"ts":1786246738163,"cmd":"make test","cwd":"/src","exit":0,"ms":842}
+{"ts":1786246738163,"cmd":"make test","cwd":"/src","exit":0,"ms":842,"sandbox":"none"}
 ```
 
 It's off unless fd 3 is open — no flag, no config. stdout stays exactly as the
 command left it, and internals (rc sourcing, command substitution) are not
 recorded, only what you actually submitted. Use `ZISH_TRACE_FD` for a
 different descriptor.
+
+The channel is meant to be trusted, so it is built not to be forgeable: the
+descriptor is moved out of reach of the commands zish runs (they can't write
+their own records), string fields are escaped so a crafted command or directory
+name can't inject a second record, and each line carries the `sandbox` profile
+in force so a harness can confirm the containment it asked for was applied.
 
 ### Restricting what a session may touch
 

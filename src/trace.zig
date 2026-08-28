@@ -5,7 +5,7 @@
 //! descriptor, and zish writes it a machine-readable record per command:
 //!
 //!     zish -c 'make test' 3>trace.jsonl
-//!     {"ts":1785303570123,"cmd":"make test","cwd":"/src","exit":0,"ms":842}
+//!     {"ts":1785303570123,"cmd":"make test","cwd":"/src","exit":0,"ms":842,"sandbox":"none"}
 //!
 //! Design notes
 //!
@@ -40,6 +40,18 @@ const default_fd: i32 = 3;
 
 var trace_fd: ?i32 = null;
 var probed = false;
+
+/// The restriction profile in force, stamped into every record so a harness
+/// can read what containment applied rather than assume it. Set once from
+/// main, after the sandbox is applied, so the value in the trace reflects what
+/// the kernel actually enforced — not merely what was asked for. A short
+/// static string; never attacker-controlled.
+var sandbox_label: []const u8 = "none";
+
+/// Record which profile was enforced. Call after the sandbox is applied.
+pub fn setSandbox(label: []const u8) void {
+    sandbox_label = label;
+}
 
 /// Probe for a trace descriptor. Call once, from main, before anything runs.
 pub fn init() void {
@@ -151,7 +163,12 @@ pub fn record(
     int(&line, alloc, &num, exit_code) catch return;
     line.appendSlice(alloc, ",\"ms\":") catch return;
     int(&line, alloc, &num, end_ms - start_ms) catch return;
-    line.appendSlice(alloc, "}\n") catch return;
+    // A fixed enum of profile names — never attacker input — so it needs no
+    // escaping. A harness diffs this against what it requested to confirm the
+    // session it launched is the one it is reading.
+    line.appendSlice(alloc, ",\"sandbox\":\"") catch return;
+    line.appendSlice(alloc, sandbox_label) catch return;
+    line.appendSlice(alloc, "\"}\n") catch return;
 
     // One write per record keeps lines atomic up to PIPE_BUF, so a harness
     // reading concurrently never sees a torn record. Failures are dropped:

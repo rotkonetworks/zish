@@ -200,7 +200,7 @@ process**. In the wrapper shape, that is one command: the agent itself.
 ```sh
 $ zish --profile workdir --allow-write /tmp -c 'bash -c "echo one; echo two"' 3>trace.jsonl
 $ cat trace.jsonl
-{"ts":1787935251419,"cmd":"bash -c \"echo one; echo two\"","cwd":"/tmp/demo","exit":0,"ms":1}
+{"ts":1787935251419,"cmd":"bash -c \"echo one; echo two\"","cwd":"/tmp/demo","exit":0,"ms":1,"sandbox":"workdir"}
 ```
 
 One record, not three. The commands the agent runs internally go through its

@@ -98,13 +98,18 @@ ANSI escapes to learn what happened:
 .nf
 $ zish \-c 'make test' 3>trace.jsonl
 $ cat trace.jsonl
-{"ts":1786246738163,"cmd":"make test","cwd":"/src","exit":0,"ms":842}
+{"ts":1786246738163,"cmd":"make test","cwd":"/src","exit":0,"ms":842,"sandbox":"none"}
 .fi
 .RE
 .PP
 The fields are the start time in milliseconds since the epoch, the command as
-submitted, the working directory, the exit status, and the elapsed
-milliseconds. Strings are JSON\-escaped; invalid UTF\-8 becomes U+FFFD.
+submitted, the working directory, the exit status, the elapsed milliseconds,
+and the restriction profile in force (see
+.BR SANDBOXING ).
+String fields are JSON\-escaped; invalid UTF\-8 becomes U+FFFD, so a value
+containing quotes or newlines cannot break the record apart. The
+.B sandbox
+field lets a harness confirm the session it launched is the one it is reading.
 .PP
 There is no flag and no configuration: the feature is off unless the
 descriptor is open, and standard output is left exactly as the command wrote
