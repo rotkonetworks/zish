@@ -1635,6 +1635,9 @@ fn tryHistoryCompletion(self: *Shell, current_input: []const u8) !bool {
     while (idx > 0) {
         idx -= 1;
         const entry = items[idx];
+        // Never suggest a line that was "command not found" (127). It failed
+        // every time it ran; replaying it is offering the user their own typo.
+        if (entry.exit_code == 127) continue;
         const cmd_text = h.getCommand(entry);
         if (cmd_text.len <= prefix.len) continue;
         if (!std.mem.startsWith(u8, cmd_text, prefix)) continue;
@@ -2986,6 +2989,7 @@ pub fn updateGhostText(self: *Shell) void {
     for (0..items.len) |i| {
         const idx = items.len - 1 - i;
         const entry = items[idx];
+        if (entry.exit_code == 127) continue; // don't ghost a command-not-found line
         const command = h.getCommand(entry);
         if (command.len > cmd.len and std.mem.startsWith(u8, command, cmd)) {
             const age_secs: f32 = @floatFromInt(if (now_ts > entry.timestamp) now_ts - entry.timestamp else 0);

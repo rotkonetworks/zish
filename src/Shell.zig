@@ -1361,6 +1361,21 @@ fn handleAction(self: *Shell, action: Action) !void {
                     }
                 }
 
+                // Erase the on-screen ghost suggestion before the newline
+                // commits this line to scrollback. Setting ghost.len=0 above
+                // only clears the state; the dimmed glyphs are still drawn to
+                // the right of the cursor, and without this re-render they get
+                // baked into the scrolled-back line and copied along with the
+                // command. Re-render with an empty ghost (render() emits \x1b[J,
+                // which erases them); the cursor is at end-of-line whenever a
+                // ghost is shown, so the following newline stays clean.
+                self.term_view.ghost_text = "";
+                {
+                    var pbuf: [256]u8 = undefined;
+                    const p = self.buildPrompt(&pbuf);
+                    self.term_view.render(&self.edit_buf, p.slice, p.visible_len) catch {};
+                }
+
                 try self.stdout().writeByte('\n');
                 try self.stdout().flush();
 
