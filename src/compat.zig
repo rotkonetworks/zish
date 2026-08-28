@@ -210,6 +210,21 @@ pub const posix = struct {
         }
     }
 
+    /// Reposition the file offset. `whence` is SEEK_SET(0)/CUR(1)/END(2).
+    /// Returns the resulting offset. Used to rewind a capture temp file after
+    /// a command has written to it, before reading it back.
+    pub fn lseek(fd: fd_t, offset: i64, whence: u32) !i64 {
+        if (builtin.os.tag == .linux) {
+            const rc = std.os.linux.lseek(fd, offset, whence);
+            if (@as(isize, @bitCast(rc)) < 0) return error.SeekFailed;
+            return @intCast(rc);
+        } else {
+            const rc = std.c.lseek(fd, @intCast(offset), @enumFromInt(whence));
+            if (rc < 0) return error.SeekFailed;
+            return @intCast(rc);
+        }
+    }
+
     pub fn dup(old_fd: fd_t) !fd_t {
         const rc = system.dup(old_fd);
         return switch (errno(rc)) {

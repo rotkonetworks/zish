@@ -332,7 +332,15 @@ fn initWithOptions(allocator: std.mem.Allocator, load_config: bool) !*Shell {
         .search_buffer = search_buffer,
         .search_len = 0,
         .completion = completion_mod.CompletionState.init(),
-        .stdout_writer = std.Io.File.stdout().writer(compat.io(), writer_buffer),
+        // Streaming, not the default positional, mode. A shell's stdout is a
+        // stream: it must append sequentially, never pwrite at a tracked
+        // offset. Positional mode self-corrects to streaming only on an
+        // unseekable target (terminal, pipe); command substitution redirects
+        // stdout to a *seekable* capture file, where positional writes would
+        // succeed at a stale offset and scatter the output. Streaming is also
+        // correct now that the shell is single-threaded (the one reason to
+        // prefer positional — seek-position thread-safety — no longer applies).
+        .stdout_writer = std.Io.File.Writer.initStreaming(std.Io.File.stdout(), compat.io(), writer_buffer),
         .path_cache = std.StringHashMap([]const u8).init(allocator),
         .job_table = jobs.JobTable.init(allocator),
     };
@@ -4053,61 +4061,67 @@ fn executeCommandAndCapture(self: *Shell, command: []const u8) ![]const u8 {
         self.allocator.dupe(u8, "");
 }
 
-/// Run a command through zish's own evaluator with stdout redirected to a pipe,
-/// returning the captured output. stdout is restored afterwards.
+/// Run a command through zish's own evaluator with stdout captured, returning
+/// the output. stdout is restored afterwards.
+///
+/// The capture sink is an unlinked temp file, not a pipe. This is the whole
+/// point: a regular file never blocks on `write`, so a command emitting more
+/// than a pipe buffer (64 KiB) cannot deadlock — which a pipe would, because
+/// `executeCommandInternal` runs the command and `waitpid`s for it on this same
+/// thread, with nothing draining the pipe until after it returns. The previous
+/// design drained the pipe on a background thread; that made the shell
+/// briefly multi-threaded while it `fork`s to exec, which is a latent deadlock
+/// (a child inheriting a mutex the vanished reader thread held) avoided only by
+/// careful discipline. No thread means the bug class cannot occur at all.
+///
+/// The file is created O_EXCL with a random name and unlinked immediately, so
+/// there is no on-disk artifact and no symlink/TOCTOU window: after the create
+/// only our fd reaches the inode. It costs no more than the pipe+thread it
+/// replaces — an unlinked tmpfs file versus a `clone` per substitution.
 fn captureInternal(self: *Shell, command: []const u8) ![]const u8 {
-    const pipe_fds = try compat.posix.pipe();
-    // pipe_fds[0] = read end, pipe_fds[1] = write end
+    const O = compat.posix.O;
+    var rnd: [8]u8 = undefined;
+    var name_buf: [64]u8 = undefined;
+    var attempt: u8 = 0;
+    const capfd = while (true) {
+        compat.posix.randomBytes(&rnd);
+        const path = std.fmt.bufPrintZ(&name_buf, "/tmp/zish_capture_{s}", .{std.fmt.bytesToHex(rnd, .lower)}) catch return error.NameTooLong;
+        if (compat.posix.openZ(path.ptr, O{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true }, 0o600)) |fd| {
+            // Unlink now: the inode lives as long as this fd, leaves nothing on
+            // disk, and cannot be reached by name (so no symlink swap).
+            std.Io.Dir.deleteFileAbsolute(compat.io(), path) catch {};
+            break fd;
+        } else |err| {
+            attempt += 1;
+            if (err == error.PathAlreadyExists and attempt < 8) continue;
+            return err;
+        }
+    };
+    defer compat.posix.close(capfd);
 
     const stdout_backup = try compat.posix.dup(compat.posix.STDOUT_FILENO);
     defer compat.posix.close(stdout_backup);
 
-    // Flush any pending buffered stdout before swapping the fd so it lands on
-    // the terminal rather than in the captured buffer.
+    // Flush pending buffered stdout before swapping the fd so it lands on the
+    // terminal, not in the capture.
     self.stdout().flush() catch {};
-
-    try compat.posix.dup2(pipe_fds[1], compat.posix.STDOUT_FILENO);
-    compat.posix.close(pipe_fds[1]);
-
-    // Drain the pipe on a background thread so large output can't deadlock by
-    // filling the pipe buffer while the writer is still running.
-    var buffer: std.ArrayListUnmanaged(u8) = .empty;
-    errdefer buffer.deinit(self.allocator);
-
-    const Reader = struct {
-        fn run(alloc: std.mem.Allocator, fd: compat.posix.fd_t, out: *std.ArrayListUnmanaged(u8)) void {
-            var tmp: [4096]u8 = undefined;
-            while (true) {
-                const n = compat.posix.read(fd, &tmp) catch break;
-                if (n == 0) break;
-                out.appendSlice(alloc, tmp[0..n]) catch break;
-            }
-        }
-    };
-    const thread = std.Thread.spawn(.{}, Reader.run, .{ self.allocator, pipe_fds[0], &buffer }) catch {
-        // Fall back to synchronous drain if a thread can't be spawned.
-        _ = self.executeCommandInternal(command) catch {};
-        self.stdout().flush() catch {};
-        compat.posix.dup2(stdout_backup, compat.posix.STDOUT_FILENO) catch {};
-        var tmp: [4096]u8 = undefined;
-        while (true) {
-            const n = compat.posix.read(pipe_fds[0], &tmp) catch break;
-            if (n == 0) break;
-            buffer.appendSlice(self.allocator, tmp[0..n]) catch break;
-        }
-        compat.posix.close(pipe_fds[0]);
-        return buffer.toOwnedSlice(self.allocator);
-    };
+    try compat.posix.dup2(capfd, compat.posix.STDOUT_FILENO);
 
     _ = self.executeCommandInternal(command) catch {};
     self.stdout().flush() catch {};
 
-    // Restore stdout and close the write end so the reader sees EOF.
+    // Restore stdout, then read the capture back from the start.
     compat.posix.dup2(stdout_backup, compat.posix.STDOUT_FILENO) catch {};
+    _ = compat.posix.lseek(capfd, 0, 0) catch return error.SeekFailed; // SEEK_SET
 
-    thread.join();
-    compat.posix.close(pipe_fds[0]);
-
+    var buffer: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buffer.deinit(self.allocator);
+    var tmp: [4096]u8 = undefined;
+    while (true) {
+        const n = compat.posix.read(capfd, &tmp) catch break;
+        if (n == 0) break;
+        try buffer.appendSlice(self.allocator, tmp[0..n]);
+    }
     return buffer.toOwnedSlice(self.allocator);
 }
 

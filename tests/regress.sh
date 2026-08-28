@@ -572,6 +572,16 @@ printf '\n%s\n' "core semantics (differential vs bash)"
 # ---------------------------------------------------------------------------
 same_as_bash "pipeline 3 stages"       '/bin/echo hello | tr a-z A-Z | tr -d O'
 same_as_bash "command substitution"    'x=$( /bin/echo sub ); echo got=$x'
+# Command substitution captures via an unlinked temp file, single-threaded. The
+# cases that broke earlier designs: >64KB output would deadlock a naive pipe
+# (nothing drains while the shell waitpids), and nested substitution corrupted
+# output when the buffered stdout writer pwrote at a stale offset into the
+# seekable capture file. Both must match bash exactly.
+same_as_bash "cmdsubst nested"         'echo "[$(echo $(echo deep))]"'
+same_as_bash "cmdsubst nested x3"      'echo "[$(echo $(echo $(echo x)))]"'
+expect "cmdsubst >64KB external"       $'200000' 0 'x=$(head -c 200000 /dev/zero | tr "\0" x); echo ${#x}'
+expect "cmdsubst >64KB in-process"     $'319999' 0 'x=$(for i in $(seq 1 20000); do echo padding-padding; done); echo ${#x}'
+expect "cmdsubst leaves no temp"       $'clean'  0 'x=$(echo hi); ls /tmp/zish_capture_* >/dev/null 2>&1 && echo dirty || echo clean'
 same_as_bash "exit status propagates"  'false; echo $?'
 same_as_bash "logical and/or"          'true && echo a; false || echo b'
 same_as_bash "for loop"                'for i in 1 2 3; do echo $i; done'
