@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const build = @import("build.zig.zon");
-const clap = @import("clap");
+const cli = @import("cli.zig");
 const Shell = @import("Shell.zig");
 const build_options = @import("build_options");
 const compat = @import("compat.zig");
@@ -13,22 +13,29 @@ pub fn main(init: std.process.Init) void {
     trace.init();
     const allocator = init.gpa;
 
-    var diag = clap.Diagnostic{};
-    var res = clap.parse(clap.Help, &params, clap.parsers.default, init.minimal.args, .{
-        .diagnostic = &diag,
-        .allocator = allocator,
-    }) catch |err| {
-        diag.reportToFile(init.io, .stderr(), err) catch {};
-        return;
+    const argv = init.minimal.args.toSlice(allocator) catch {
+        std.debug.print("zish: cannot read arguments\n", .{});
+        std.process.exit(1);
     };
-    defer res.deinit();
 
-    if (res.args.help != 0) {
-        clap.helpToFile(init.io, .stdout(), clap.Help, &params, .{}) catch {};
+    const res = cli.parse(&params, argv) catch |err| {
+        var eb: [256]u8 = undefined;
+        const msg = switch (err) {
+            error.MissingValue => std.fmt.bufPrint(&eb, "zish: option requires an argument: {s}\n", .{res_bad(argv)}) catch "zish: bad arguments\n",
+            else => std.fmt.bufPrint(&eb, "zish: unrecognized option: {s}\n", .{res_bad(argv)}) catch "zish: bad arguments\n",
+        };
+        compat.writeAll(.stderr(), msg) catch {};
+        std.process.exit(2);
+    };
+
+    if (res.isSet("help")) {
+        var hbuf: [1024]u8 = undefined;
+        const text = cli.renderHelp(&params, "usage: zish [options] [script [args...]]", &hbuf);
+        compat.writeAll(.stdout(), text) catch {};
         return;
     }
 
-    if (res.args.version != 0) {
+    if (res.isSet("version")) {
         var vbuf: [64]u8 = undefined;
         const line = std.fmt.bufPrint(&vbuf, "zish {s}\n", .{build.version}) catch "zish\n";
         compat.writeAll(.stdout(), line) catch {};
@@ -36,8 +43,8 @@ pub fn main(init: std.process.Init) void {
     }
 
     // determine if interactive mode
-    const is_interactive = res.args.c == null and (res.positionals.len == 0 or res.positionals[0].len == 0);
-    const load_config = is_interactive or res.args.login != 0;
+    const is_interactive = res.value("c") == null and res.positionals.len == 0;
+    const load_config = is_interactive or res.isSet("login");
 
     // initialize shell (load config for interactive or login mode)
     const shell_instance = (if (load_config)
@@ -49,7 +56,7 @@ pub fn main(init: std.process.Init) void {
     };
     defer shell_instance.deinit();
 
-    if (res.args.@"debug-log-file") |log_path| {
+    if (res.value("debug-log-file")) |log_path| {
         shell_instance.log_file = if (std.fs.path.isAbsolute(log_path))
             std.Io.Dir.createFileAbsolute(compat.io(), log_path, .{}) catch |err| {
                 std.debug.print("zish: failed to create log file: {}\n", .{err});
@@ -62,20 +69,9 @@ pub fn main(init: std.process.Init) void {
             };
     }
 
-    if (res.args.c) |command| {
-        // set positional parameters if provided
-        inline for (res.positionals, 0..) |positional_slice, idx| {
-            for (positional_slice, 0..) |arg, arg_idx| {
-                var buf: [32]u8 = undefined;
-                const key = std.fmt.bufPrint(&buf, "{d}", .{idx * 100 + arg_idx}) catch continue;
-                const key_copy = allocator.dupe(u8, key) catch continue;
-                const val_copy = allocator.dupe(u8, arg) catch continue;
-                shell_instance.variables.put(key_copy, val_copy) catch {};
-            }
-        }
+    if (res.value("c")) |command| {
+        setPositionals(shell_instance, allocator, res.positionals);
         // $# = count of $1..$n ($0 excluded). Without this $#/$@/$* were empty.
-        setPositionalCount(shell_instance, allocator, res.positionals);
-
         const exit_code = shell_instance.executeCommand(command) catch |err| {
             std.debug.print("zish: error executing command: {}\n", .{err});
             std.process.exit(1);
@@ -85,22 +81,10 @@ pub fn main(init: std.process.Init) void {
         shell_instance.runExitTrap();
         shell_instance.stdout().flush() catch {};
         std.process.exit(exit_code);
-    } else if (res.positionals.len > 0 and res.positionals[0].len > 0) {
+    } else if (res.positionals.len > 0) {
         // script file mode
-        const script_path = res.positionals[0][0];
-
-        // set positional parameters: $0 is script name, $1+ are args
-        inline for (res.positionals, 0..) |positional_slice, idx| {
-            for (positional_slice, 0..) |arg, arg_idx| {
-                var buf: [32]u8 = undefined;
-                const key = std.fmt.bufPrint(&buf, "{d}", .{idx * 100 + arg_idx}) catch continue;
-                const key_copy = allocator.dupe(u8, key) catch continue;
-                const val_copy = allocator.dupe(u8, arg) catch continue;
-                shell_instance.variables.put(key_copy, val_copy) catch {};
-            }
-        }
-        // $# = count of $1..$n ($0/script name excluded).
-        setPositionalCount(shell_instance, allocator, res.positionals);
+        const script_path = res.positionals[0];
+        setPositionals(shell_instance, allocator, res.positionals);
 
         const script_content = std.Io.Dir.cwd().readFileAlloc(compat.io(), script_path, allocator, .limited(1024 * 1024)) catch |err| {
             std.debug.print("zish: cannot read script '{s}': {}\n", .{ script_path, err });
@@ -124,14 +108,29 @@ pub fn main(init: std.process.Init) void {
     }
 }
 
-// Set $# to the number of positional parameters ($1..$n). The loops above key
-// arguments as $0 (command/script name), $1, $2, … so the count is the total
-// number of arguments minus one. Without $#, $@/$*/$# and `for a in "$@"` were
-// all empty in -c and script modes.
-fn setPositionalCount(shell: *Shell, allocator: std.mem.Allocator, positionals: anytype) void {
-    var total: usize = 0;
-    inline for (positionals) |ps| total += ps.len;
-    const n = if (total > 0) total - 1 else 0;
+// Bind positional parameters: $0 is the command or script name, $1.. are its
+// arguments, and $# is the count excluding $0. Without $#, `$@`/`$*`/`$#` and
+// `for a in "$@"` were all empty in -c and script modes.
+//
+// clap returned positionals as a *tuple* of slices, which forced an `inline
+// for` and the `idx * 100 + arg_idx` key arithmetic. A flat slice makes this a
+// plain loop.
+fn setPositionals(shell: *Shell, allocator: std.mem.Allocator, positionals: []const []const u8) void {
+    for (positionals, 0..) |arg, i| {
+        var kbuf: [16]u8 = undefined;
+        const key = std.fmt.bufPrint(&kbuf, "{d}", .{i}) catch continue;
+        const key_copy = allocator.dupe(u8, key) catch continue;
+        const val_copy = allocator.dupe(u8, arg) catch {
+            allocator.free(key_copy);
+            continue;
+        };
+        shell.variables.put(key_copy, val_copy) catch {
+            allocator.free(key_copy);
+            allocator.free(val_copy);
+        };
+    }
+
+    const n = if (positionals.len > 0) positionals.len - 1 else 0;
     var buf: [16]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, "{d}", .{n}) catch return;
     const key = allocator.dupe(u8, "#") catch return;
@@ -145,15 +144,23 @@ fn setPositionalCount(shell: *Shell, allocator: std.mem.Allocator, positionals: 
     };
 }
 
-const params = clap.parseParamsComptime(
-    \\-h, --help                  Display this help and exit.
-    \\-v, --version               print version and exit.
-    \\-l, --login                 Start as login shell.
-    \\-d, --debug-log-file <str>  file to write a debug info to.
-    \\-c  <str>                   command to execute.
-    \\<str>...
-    \\
-);
+const params = [_]cli.Flag{
+    .{ .short = 'h', .long = "help", .help = "Display this help and exit." },
+    .{ .short = 'v', .long = "version", .help = "Print version and exit." },
+    .{ .short = 'l', .long = "login", .help = "Start as a login shell." },
+    .{ .short = 'd', .long = "debug-log-file", .help = "File to write debug info to.", .takes_value = true, .value_name = "FILE" },
+    .{ .short = 'c', .help = "Command to execute.", .takes_value = true, .value_name = "CMD" },
+};
+
+/// Best-effort "which argument was bad" for the error message. cli.parse
+/// reports it in the Result, but the Result is gone on the error path, so
+/// find the first thing that looks like an unknown option.
+fn res_bad(argv: []const []const u8) []const u8 {
+    for (argv[1..]) |a| {
+        if (a.len >= 2 and a[0] == '-' and !std.mem.eql(u8, a, "--")) return a;
+    }
+    return "";
+}
 
 test {
     std.testing.refAllDecls(@This());

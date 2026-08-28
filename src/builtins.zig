@@ -6,7 +6,6 @@ const parser = @import("parser.zig");
 const input_mod = @import("input.zig");
 const BindableAction = input_mod.BindableAction;
 const editor = @import("editor.zig");
-const audio_mod = @import("audio.zig");
 const linkify = @import("linkify.zig");
 const compat = @import("compat.zig");
 

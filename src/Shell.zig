@@ -21,8 +21,6 @@ const git = @import("git.zig");
 const jobs = @import("jobs.zig");
 const editor = @import("editor.zig");
 const vim = @import("vim.zig");
-const agent_log = @import("agent_log.zig");
-const audio = @import("audio.zig");
 const trace = @import("trace.zig");
 
 // Re-export from input module (for compatibility)
@@ -169,22 +167,10 @@ pub const GhostState = struct {
     enabled: bool = true,
     buf: [512]u8 = undefined,
     len: usize = 0,
-    from_ctm: bool = false,
     candidates: [8][512]u8 = undefined,
     candidate_lens: [8]usize = [_]usize{0} ** 8,
     candidate_count: u8 = 0,
     candidate_idx: u8 = 0,
-    infer_input: [512]u8 = undefined,
-    infer_input_len: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    infer_prev_cmd: [512]u8 = undefined,
-    infer_prev_len: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    infer_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    infer_result: [512]u8 = undefined,
-    infer_result_len: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    infer_result_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    last_result_seq: u32 = 0,
-    infer_thread: ?std.Thread = null,
-    infer_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
 allocator: std.mem.Allocator,
@@ -301,9 +287,6 @@ log_file: ?std.Io.File = null,
 path_cache: std.StringHashMap([]const u8),
 
 // Voice mode state
-voice_active: bool = false,
-voice_capture: ?audio.Capture = null,
-voice_playback: ?audio.Playback = null,
 
 pub fn init(allocator: std.mem.Allocator) !*Shell {
     return initWithOptions(allocator, true);
@@ -430,9 +413,6 @@ pub fn deinit(self: *Shell) void {
     // Null out global pointer BEFORE freeing — prevents signal handler
     // from dereferencing freed memory if SIGWINCH arrives during shutdown.
     @atomicStore(?*Shell, &global_shell, null, .release);
-
-    // stop ghost inference thread
-    completion_mod.stopGhostInference(self);
 
     self.allocator.free(self.clipboard);
     self.allocator.free(self.search_buffer);
@@ -831,23 +811,6 @@ pub fn run(self: *Shell) !void {
     // set initial cursor style based on vim mode
     const initial_cursor = if (self.vim_mode == .normal) CursorStyle.block else CursorStyle.bar;
     try self.setCursorStyle(initial_cursor);
-
-    // Agent thread starts lazily on first `agent` command or query — no eager startup.
-    // Ghost text inference also lazy — only if completion_model is configured.
-    {
-        var cfg = agent_log.AgentConfig.load(self.allocator);
-        defer cfg.deinit();
-        if (cfg.completion_model.len > 0) {
-            // expand ~ to home directory
-            var path_buf: [512]u8 = undefined;
-            const model_path = if (std.mem.startsWith(u8, cfg.completion_model, "~/")) blk: {
-                const home = compat.getEnvVarOwned(self.allocator, "HOME") catch break :blk cfg.completion_model;
-                defer self.allocator.free(home);
-                break :blk std.fmt.bufPrint(&path_buf, "{s}{s}", .{ home, cfg.completion_model[1..] }) catch cfg.completion_model;
-            } else cfg.completion_model;
-            completion_mod.startGhostInference(self, model_path);
-        }
-    }
 
     self.runPromptCommand();
     try self.renderLine();

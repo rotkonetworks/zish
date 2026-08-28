@@ -9,8 +9,6 @@ pub fn build(b: *std.Build) void {
     // Default to ReleaseFast for production performance
     const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
 
-    const clap = b.dependency("clap", .{});
-
     // Performance build options
     const enable_simd = b.option(bool, "simd", "Enable SIMD optimizations") orelse true;
     const enable_lto = b.option(bool, "lto", "Enable Link Time Optimization") orelse (optimize != .Debug);
@@ -33,7 +31,6 @@ pub fn build(b: *std.Build) void {
         .use_llvm = true,
     });
 
-    exe.root_module.addImport("clap", clap.module("clap"));
 
     exe.root_module.addAnonymousImport("build.zig.zon", .{
         .root_source_file = b.path("build.zig.zon"),

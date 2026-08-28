@@ -2801,10 +2801,10 @@ pub fn displayCompletions(self: *Shell) !void {
 // Log accepted/rejected completions to ~/.zish/completion_log.jsonl for training.
 // Accepted: user pressed Tab/Right to accept ghost text → positive signal
 // Rejected: user typed a different character while ghost text was visible → negative signal
-// Format: {"ctx":"text","pfx":"prefix","cmp":"completion","src":"ghost_ctm","act":"accept|reject","ts":N}
+// Format: {"ctx":"text","pfx":"prefix","cmp":"completion","src":"ghost_h","act":"accept|reject","ts":N}
 // This data enables Libratus-style counterfactual regret training:
 // the model learns from its mistakes by seeing what the user actually typed.
-const CompletionSource = enum { tab, ghost_history, ghost_ctm, history_menu };
+const CompletionSource = enum { tab, ghost_history, history_menu };
 
 fn logCompletionWith(cmd: []const u8, word_start: usize, prefix: []const u8, completion: []const u8, source: CompletionSource) void {
     logCompletionImpl(cmd, word_start, prefix, completion, source);
@@ -2843,7 +2843,6 @@ fn logCompletionImpl(cmd: []const u8, word_start: usize, prefix: []const u8, com
     pos += copySlice(&buf, pos, switch (source) {
         .tab => "tab",
         .ghost_history => "ghost_h",
-        .ghost_ctm => "ghost_ctm",
         .history_menu => "hist",
     });
     pos += copySlice(&buf, pos, "\",\"ts\":");
@@ -2947,7 +2946,6 @@ fn ghostFileSuggestion(self: *Shell, partial: []const u8) bool {
         const n = @min(best_len, self.ghost.buf.len);
         @memcpy(self.ghost.buf[0..n], best[0..n]);
         self.ghost.len = n;
-        self.ghost.from_ctm = false;
         return true;
     }
     return false;
@@ -2962,50 +2960,6 @@ pub fn updateGhostText(self: *Shell) void {
     const cmd = self.edit_buf.slice();
     if (cmd.len < 2 or self.edit_buf.cursor != self.edit_buf.len) return;
     if (self.completion.mode) return;
-
-    // check for CTM inference result (non-blocking)
-    // Accept any result (even from older seq) as long as it was generated for
-    // a prefix of the current input. This prevents results being discarded
-    // when the user types faster than inference can complete.
-    const res_seq = self.ghost.infer_result_seq.load(.acquire);
-    if (res_seq > 0 and res_seq != self.ghost.last_result_seq) {
-        const rlen = self.ghost.infer_result_len.load(.monotonic);
-        if (rlen > 0) {
-            const n = @min(rlen, self.ghost.buf.len);
-            @memcpy(self.ghost.buf[0..n], self.ghost.infer_result[0..n]);
-            // Seqlock re-validation: if the writer published a newer result
-            // while we copied, the copy may be torn — discard it this round.
-            if (self.ghost.infer_result_seq.load(.acquire) == res_seq) {
-                self.ghost.len = n;
-                self.ghost.from_ctm = true;
-                self.ghost.last_result_seq = res_seq;
-            }
-            // Don't return — still submit new request for updated input
-        }
-    }
-
-    // submit new inference request on every keystroke
-    const cur_seq = self.ghost.infer_seq.load(.monotonic);
-    if (self.ghost.infer_thread != null and cmd.len <= self.ghost.infer_input.len) {
-        const new_seq = cur_seq +% 1;
-        const len: u32 = @intCast(cmd.len);
-        @memcpy(self.ghost.infer_input[0..cmd.len], cmd);
-        self.ghost.infer_input_len.store(len, .monotonic);
-        // Publish the previous history command too — the inference thread
-        // must not touch shell.history (ArrayList realloc on main thread
-        // would be a use-after-free there).
-        var prev_len: u32 = 0;
-        if (self.history) |hh| {
-            if (hh.entries.items.len > 0) {
-                const hcmd = hh.getCommand(hh.entries.items[hh.entries.items.len - 1]);
-                const n = @min(hcmd.len, self.ghost.infer_prev_cmd.len);
-                @memcpy(self.ghost.infer_prev_cmd[0..n], hcmd[0..n]);
-                prev_len = @intCast(n);
-            }
-        }
-        self.ghost.infer_prev_len.store(prev_len, .monotonic);
-        self.ghost.infer_seq.store(new_seq, .release);
-    }
 
     // Strategy 0: CWD-aware file path completion
     // If user is typing a path-like thing (contains / or starts with . or after space)
@@ -3092,7 +3046,6 @@ pub fn updateGhostText(self: *Shell) void {
         const n = self.ghost.candidate_lens[ci];
         @memcpy(self.ghost.buf[0..n], self.ghost.candidates[ci][0..n]);
         self.ghost.len = n;
-        self.ghost.from_ctm = false;
         return;
     }
 
@@ -3132,7 +3085,6 @@ pub fn updateGhostText(self: *Shell) void {
             const n = @min(suffix.len, self.ghost.buf.len);
             @memcpy(self.ghost.buf[0..n], suffix[0..n]);
             self.ghost.len = n;
-            self.ghost.from_ctm = false;
         }
     }
 
@@ -3168,7 +3120,6 @@ pub fn updateGhostText(self: *Shell) void {
                 const n = @min(s.completion.len, self.ghost.buf.len);
                 @memcpy(self.ghost.buf[0..n], s.completion[0..n]);
                 self.ghost.len = n;
-                self.ghost.from_ctm = false;
                 return;
             }
         }
@@ -3191,137 +3142,19 @@ pub fn cycleGhostCandidate(self: *Shell, direction: i8) bool {
 }
 
 /// Start the ghost inference background thread (called when completion_model is configured).
-pub fn startGhostInference(self: *Shell, model_path: []const u8) void {
-    if (self.ghost.infer_thread != null) return;
-    if (model_path.len == 0) return;
+// Model-backed ghost text was removed along with src/inference/.
+//
+// Ghost text itself still works: the suggestion comes from history prefix
+// matching (searchHistoryGhost) and completion candidates, which is where the
+// useful suggestions came from anyway — a local model only helped on the tail,
+// commands you had not run before.
+//
+// What went with it: a GGUF parser handling attacker-supplied model files, a
+// Vulkan backend loaded by dlopen, a fork-server with its own wire protocol,
+// and a CTM implementation. ~7,700 lines whose only job in a shell was to grey
+// out a suggestion. The shell executes commands with the user's full authority;
+// it should not also be a model runtime.
 
-    // Copy model path to a stable location (self is heap-allocated, fields are stable)
-    var path_buf: [256]u8 = undefined;
-    if (model_path.len > path_buf.len) return;
-    @memcpy(path_buf[0..model_path.len], model_path);
-
-    const GhostInferCtx = struct {
-        shell: *Shell,
-        path: [256]u8,
-        path_len: usize,
-    };
-
-    // Allocate context on heap so thread can reference it
-    const ctx = self.allocator.create(GhostInferCtx) catch return;
-    ctx.* = .{ .shell = self, .path = path_buf, .path_len = model_path.len };
-
-    self.ghost.infer_thread = std.Thread.spawn(.{}, ghostInferThread, .{ctx}) catch {
-        self.allocator.destroy(ctx);
-        return;
-    };
-}
-
-fn ghostInferThread(ctx: anytype) void {
-    const ghost_svc = @import("ghost_service.zig");
-
-    const shell = ctx.shell;
-    // Copy the path to a stack buffer local to this thread function: ctx is
-    // destroyed below, but model_path is stored in ghost_ctx and used later
-    // for ForkServer respawn.
-    var path_buf: [256]u8 = undefined;
-    const path_len = ctx.path_len;
-    @memcpy(path_buf[0..path_len], ctx.path[0..path_len]);
-    const model_path = path_buf[0..path_len];
-    const alloc = shell.allocator;
-
-    // Spawn ForkServer for inference
-    const infer = @import("inference/root.zig");
-    var server = infer.ForkServer.spawn(model_path) catch {
-        alloc.destroy(ctx);
-        return;
-    };
-    defer server.shutdown();
-    alloc.destroy(ctx);
-
-    // Initialize pipeline context
-    var ghost_ctx = ghost_svc.GhostCtx{
-        .current_seq = &shell.ghost.infer_seq,
-        .server = &server,
-        .model_path = model_path,
-        .last_cmd = &.{},
-        .prompt_buf = undefined,
-        .result_buf = undefined,
-        .allocator = alloc,
-    };
-
-    var last_seq: u32 = 0;
-
-    // Poll/debounce loop — scheduling only, pipeline handles transformation
-    while (!shell.ghost.infer_stop.load(.monotonic)) {
-        const seq = shell.ghost.infer_seq.load(.acquire);
-        if (seq == last_seq) {
-            compat.sleep(20 * std.time.ns_per_ms);
-            continue;
-        }
-        last_seq = seq;
-
-        // Debounce: wait for input to stabilize
-        compat.sleep(100 * std.time.ns_per_ms);
-        if (shell.ghost.infer_seq.load(.monotonic) != seq) continue;
-
-        // Read input + previous command (published together under infer_seq)
-        const ilen = shell.ghost.infer_input_len.load(.monotonic);
-        if (ilen == 0 or ilen > 512) continue;
-        var input_buf: [512]u8 = undefined;
-        @memcpy(input_buf[0..ilen], shell.ghost.infer_input[0..ilen]);
-
-        const plen = shell.ghost.infer_prev_len.load(.monotonic);
-        var prev_buf: [512]u8 = undefined;
-        if (plen > 0 and plen <= prev_buf.len) {
-            @memcpy(prev_buf[0..plen], shell.ghost.infer_prev_cmd[0..plen]);
-        }
-
-        // Seqlock re-validation: if the main thread published a newer input
-        // while we copied, the copies may be torn — skip this round.
-        if (shell.ghost.infer_seq.load(.acquire) != seq) continue;
-
-        ghost_ctx.last_cmd = if (plen > 0 and plen <= prev_buf.len) prev_buf[0..plen] else &.{};
-
-        // Run the composable pipeline: staleness >> prompt >> infer >> sanitize
-        const signal = ghost_svc.pipeline(&ghost_ctx, .{
-            .input = .{ .text = input_buf[0..ilen], .seq = seq },
-        });
-
-        // Publish result to editor thread via atomics
-        switch (signal) {
-            .completion => |c| {
-                const n = c.len;
-                @memcpy(shell.ghost.infer_result[0..n], c.buf[0..n]);
-                shell.ghost.infer_result_len.store(n, .monotonic);
-                shell.ghost.infer_result_seq.store(c.seq, .release);
-            },
-            else => {}, // stale, idle — nothing to publish
-        }
-    }
-}
-
-/// Stop the ghost inference thread.
-pub fn stopGhostInference(self: *Shell) void {
-    self.ghost.infer_stop.store(true, .monotonic);
-    if (self.ghost.infer_thread) |t| {
-        t.join();
-        self.ghost.infer_thread = null;
-    }
-}
-
-/// Log a ghost text rejection — user typed a character instead of accepting.
-/// This is the counterfactual signal: model predicted X, user did Y.
-pub fn rejectGhostText(self: *Shell) void {
-    if (self.ghost.len == 0) return;
-    if (!self.ghost.from_ctm) return; // only log model predictions, not history matches
-
-    const cmd = self.edit_buf.slice();
-    const ghost = self.ghost.buf[0..self.ghost.len];
-
-    // Log: context = current input, predicted = ghost, actual = what user typed next
-    logRejection(cmd, ghost);
-    self.ghost.len = 0;
-}
 
 fn writeJsonEscapedToFile(file: std.Io.File, s: []const u8) void {
     for (s) |c| {
@@ -3375,7 +3208,7 @@ pub fn acceptGhostText(self: *Shell) bool {
 
     // log accepted ghost suggestion with source tracking
     logCompletionWith(self.edit_buf.slice(), 0, "", self.edit_buf.slice(),
-        if (self.ghost.from_ctm) .ghost_ctm else .ghost_history);
+        .ghost_history);
 
     return true;
 }
