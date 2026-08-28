@@ -370,7 +370,12 @@ fn evaluateTestBuiltinFast(shell: *Shell, node: *const ast.AstNode) !u8 {
 // Flat positional evaluator for the `test` / `[` builtin (POSIX test).
 // Handles the binary -o (OR) / -a (AND) connectives with POSIX precedence
 // (-a binds tighter than -o), delegating each primary to the evaluator below.
-fn evaluateTestExprFlat(shell: *Shell, args: []const []const u8) bool {
+/// Evaluate a flat `test` argument list: unary and binary operators, `!`
+/// negation, and `-a`/`-o` grouping.
+///
+/// Public because builtins.testCmd delegates here. It used to be a second,
+/// less capable implementation of the same thing — see the note there.
+pub fn evaluateTestExprFlat(shell: *Shell, args: []const []const u8) bool {
     if (args.len == 0) return false;
 
     // Split on -o first (lowest precedence); the whole expression is true if any

@@ -947,7 +947,6 @@ fn stripIfs(s: []const u8) []const u8 {
 // ============ test builtin ============
 
 fn testCmd(shell: *Shell, args: []const []const u8) !u8 {
-    _ = shell;
     if (args.len < 2) return 1;
 
     var test_args = args[1..];
@@ -961,72 +960,30 @@ fn testCmd(shell: *Shell, args: []const []const u8) !u8 {
 
     if (test_args.len == 0) return 1;
 
-    // unary operators
-    if (test_args.len == 2) {
-        const op = test_args[0];
-        const arg = test_args[1];
-
-        if (std.mem.eql(u8, op, "-n")) return if (arg.len > 0) 0 else 1;
-        if (std.mem.eql(u8, op, "-z")) return if (arg.len == 0) 0 else 1;
-        if (std.mem.eql(u8, op, "-d")) {
-            var dir = std.Io.Dir.cwd().openDir(compat.io(), arg, .{}) catch return 1;
-            dir.close(compat.io());
-            return 0;
-        }
-        if (std.mem.eql(u8, op, "-f")) {
-            const stat = std.Io.Dir.cwd().statFile(compat.io(), arg, .{}) catch return 1;
-            return if (stat.kind == .file) 0 else 1;
-        }
-        if (std.mem.eql(u8, op, "-e")) {
-            std.Io.Dir.cwd().access(compat.io(), arg, .{}) catch return 1;
-            return 0;
-        }
-        if (std.mem.eql(u8, op, "-r") or std.mem.eql(u8, op, "-w") or std.mem.eql(u8, op, "-x")) {
-            std.Io.Dir.cwd().access(compat.io(), arg, .{}) catch return 1;
-            return 0;
-        }
-        if (std.mem.eql(u8, op, "-s")) {
-            const stat = std.Io.Dir.cwd().statFile(compat.io(), arg, .{}) catch return 1;
-            return if (stat.size > 0) 0 else 1;
-        }
-        if (std.mem.eql(u8, op, "-L") or std.mem.eql(u8, op, "-h")) {
-            const stat = std.Io.Dir.cwd().statFile(compat.io(), arg, .{}) catch return 1;
-            return if (stat.kind == .sym_link) 0 else 1;
-        }
-    }
-
-    // single arg: true if non-empty
-    if (test_args.len == 1) {
-        return if (test_args[0].len > 0) 0 else 1;
-    }
-
-    // binary operators
-    if (test_args.len >= 3) {
-        const left = test_args[0];
-        const op = test_args[1];
-        const right = test_args[2];
-
-        // string comparison
-        if (std.mem.eql(u8, op, "=") or std.mem.eql(u8, op, "==")) {
-            return if (std.mem.eql(u8, left, right)) 0 else 1;
-        }
-        if (std.mem.eql(u8, op, "!=")) {
-            return if (!std.mem.eql(u8, left, right)) 0 else 1;
-        }
-
-        // integer comparison
-        const l = std.fmt.parseInt(i64, left, 10) catch 0;
-        const r = std.fmt.parseInt(i64, right, 10) catch 0;
-
-        if (std.mem.eql(u8, op, "-eq")) return if (l == r) 0 else 1;
-        if (std.mem.eql(u8, op, "-ne")) return if (l != r) 0 else 1;
-        if (std.mem.eql(u8, op, "-lt")) return if (l < r) 0 else 1;
-        if (std.mem.eql(u8, op, "-le")) return if (l <= r) 0 else 1;
-        if (std.mem.eql(u8, op, "-gt")) return if (l > r) 0 else 1;
-        if (std.mem.eql(u8, op, "-ge")) return if (l >= r) 0 else 1;
-    }
-
-    return 1;
+    // Delegate to the one evaluator.
+    //
+    // This was a second implementation of `test`, and the *shortcut* in
+    // eval.zig was the more capable one: it handled `!`, `-a`/`-o` and
+    // -nt/-ot/-ef, none of which existed here. Since the fast path bails to
+    // this function whenever an operand is quoted — and the parser normalises
+    // "$x" to ${x}, so that is *every* quoted variable — adding quotes flipped
+    // the answer:
+    //
+    //     [ ! -f /nonexistent ]   -> fast path -> true   (correct)
+    //     [ ! -f "$missing" ]     -> here      -> false  (wrong)
+    //
+    // `!` was not handled at all, so the three arguments `!`, `-f`, `` fell
+    // into the binary-operator branch with left="!", op="-f" and matched
+    // nothing. Features were added to the shortcut because that is where the
+    // debugging happened, and the general path rotted underneath.
+    //
+    // With one evaluator the fast path is what it should always have been: an
+    // argument-expansion optimisation, not a separate dialect of `test`.
+    // Imported here rather than at module scope, matching the other eval.zig
+    // uses in this file (eval imports builtins, so the cycle is broken at the
+    // call site).
+    const eval_mod = @import("eval.zig");
+    return if (eval_mod.evaluateTestExprFlat(shell, test_args)) 0 else 1;
 }
 
 // ============ variable builtins ============

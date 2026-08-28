@@ -181,6 +181,28 @@ expect "subshell unset"                $''       0 'x=1; ( unset x ; echo $x )'
 expect "background cd"                 $'ok'     0 '( cd / ; /bin/echo ok ) & wait'
 
 # ---------------------------------------------------------------------------
+printf '\n%s\n' "test builtin"
+# ---------------------------------------------------------------------------
+# `test` had three implementations, and the *fast path* was the more capable
+# one — it handled `!`, `-a`/`-o` and -nt/-ot/-ef; builtins.testCmd handled
+# none of them. The fast path bails whenever an operand is quoted, and the
+# parser normalises "$x" to ${x}, so adding quotes flipped the answer:
+#
+#     [ ! -f /nonexistent ]  -> fast path -> true   (correct)
+#     [ ! -f "$missing" ]    -> testCmd   -> false  (wrong, silently)
+same_as_bash "test ! with quoted empty"   '[ ! -f "$missing" ] && echo T || echo F'
+same_as_bash "test ! with literal path"   '[ ! -f /nonexistent ] && echo T || echo F'
+same_as_bash "test ! -z quoted"           '[ ! -z "x" ] && echo T || echo F'
+same_as_bash "test -a grouping"           '[ a = a -a b = b ] && echo T || echo F'
+same_as_bash "test -o grouping"           '[ a = a -o b = c ] && echo T || echo F'
+same_as_bash "test ! with -a"             '[ ! -f /nonexistent -a -d /tmp ] && echo T || echo F'
+same_as_bash "test bare string"           '[ x ] && echo T || echo F'
+same_as_bash "test empty string"          '[ "" ] && echo T || echo F'
+same_as_bash "test word form"             'test ! -f /nonexistent && echo T || echo F'
+same_as_bash "test numeric compare"       '[ 2 -gt 1 ] && echo T || echo F'
+same_as_bash "test string compare"        '[ "$u" = "" ] && echo T || echo F'
+
+# ---------------------------------------------------------------------------
 printf '\n%s\n' "arithmetic variables"
 # ---------------------------------------------------------------------------
 # ArithParser had no case for '$', so it raised SyntaxError, which
