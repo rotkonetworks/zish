@@ -371,6 +371,19 @@ def _(sh):
     expect_soon(sh, "56")
 
 
+@test("para with no input does not hang the shell")
+def _(sh):
+    # `para ls` with no ::: items and stdin on the terminal used to block on a
+    # read that never returned — an unkillable hang. It must refuse instead.
+    # Only meaningful when the feat is staged (`make feats`); if `para` is not a
+    # command, this reduces to "the shell prints not-found and stays alive".
+    sh.sendline("para ls")
+    # The @test alarm turns a real hang into a FAIL; here we assert liveness by
+    # running another command and seeing its output.
+    sh.sendline("echo still_alive_$((2 + 2))")
+    expect_soon(sh, "still_alive_4")
+
+
 # ---------------------------------------------------------------------------
 print("\nmultiline rendering")
 # ---------------------------------------------------------------------------

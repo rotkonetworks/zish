@@ -37,6 +37,7 @@ const std = @import("std");
 const linux = std.os.linux;
 
 extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
+extern "c" fn isatty(fd: c_int) c_int;
 
 const STDOUT = 1;
 const STDERR = 2;
@@ -227,6 +228,11 @@ pub fn main(init: std.process.Init) void {
     if (in_items or arg_items.items.len > 0) {
         items.appendSlice(alloc, arg_items.items) catch die("out of memory");
     } else {
+        // No ::: items: read them from stdin. But if stdin is the terminal
+        // there is nothing to pipe in, and a blocking read would hang the shell
+        // (`para ls` with no input) — so refuse instead of waiting forever.
+        if (isatty(STDIN) != 0)
+            die("no items — pipe them in (`ls | para gzip {}`) or pass them after ':::'");
         readStdinItems(alloc, &items) catch die("reading stdin");
     }
     if (items.items.len == 0) return;

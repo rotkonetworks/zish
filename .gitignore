@@ -14,3 +14,4 @@ result-*
 .claude/worktrees/
 scripts/__pycache__/
 scripts/shell_training_data.jsonl
+tests/__pycache__/
