@@ -3,7 +3,9 @@
 zish \- a fast shell with vim editing and job control
 .SH SYNOPSIS
 .B zish
+[\fB\-l\fR]
 [\fB\-c\fR \fIcommand\fR]
+[\fB\-\-profile\fR \fIname\fR]
 [\fB\-\-version\fR]
 [\fB\-\-help\fR]
 [\fIscript\fR [\fIarguments\fR...]]
@@ -27,6 +29,45 @@ Print version information and exit.
 .TP
 .BR \-\-help
 Print usage information and exit.
+.TP
+.BR \-l ", " \-\-login
+Start as a login shell.
+.TP
+.BR \-d ", " \-\-debug\-log\-file " " \fIfile\fR
+Write internal debug information to \fIfile\fR.
+.TP
+.BR \-\-profile " " \fIname\fR
+Restrict what this session and every process it starts may touch on the
+filesystem. See
+.B SANDBOXING
+below.
+.SH SANDBOXING
+.B \-\-profile
+applies a Landlock restriction to the shell process at startup. Landlock
+restrictions are inherited by children and cannot be lifted, so the limit
+applies to every command the session runs, and to zish itself.
+.TP
+.B none
+No restriction. This is the default.
+.TP
+.B readonly
+The filesystem may be read and executed from, but not written to.
+.TP
+.B workdir
+As \fBreadonly\fR, plus write access beneath the current directory at the
+time zish started.
+.PP
+Write\-only device sinks (\fI/dev/null\fR, \fI/dev/zero\fR, \fI/dev/tty\fR,
+\fI/dev/urandom\fR and similar) remain writable under every profile, because
+redirecting to them is a write.
+.PP
+The restriction fails closed rather than degrading to no restriction: an
+unknown profile name exits with status 2, and a kernel that cannot enforce the
+requested profile exits with status 1. \fBnone\fR needs no kernel support and
+always starts.
+.PP
+Only filesystem access is restricted. Network access, process creation and
+signals are not.
 .SH SHELL GRAMMAR
 .SS Simple Commands
 A simple command is a sequence of words separated by spaces.
@@ -107,7 +148,7 @@ Variables and command substitution expanded
 .B $'escape sequences'
 Supports \\n, \\t, \\e, \\xHH, etc.
 .TP
-.B \\
+.B \e
 Escape next character
 .SS Variables
 .PP

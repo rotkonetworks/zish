@@ -1,4 +1,4 @@
-//! Per-command capability restriction via Landlock.
+//! Session capability restriction via Landlock.
 //!
 //! The shell is the fork/exec chokepoint, which makes it the only place that
 //! can bound what a command may touch *without* trusting the command. An agent

@@ -1,6 +1,6 @@
 # zish
 
-**A fast, familiar shell written in Zig.**
+**A fast, familiar shell written in Zig — built to be handed to an agent.**
 
 [![release](https://img.shields.io/github/v/release/rotkonetworks/zish?style=for-the-badge&logo=github&label=GitHub&color=24292e)](https://github.com/rotkonetworks/zish/releases/latest)
 [![AUR](https://img.shields.io/aur/version/zish?style=for-the-badge&logo=archlinux&label=AUR&color=1793d1)](https://aur.archlinux.org/packages/zish)
@@ -77,6 +77,7 @@ Linux only. macOS is a preview — see below.
 ```sh
 zish                 # interactive
 zish -c 'echo hi'    # one-shot
+zish --version       # prints the build mode too: zish 0.16.1 (ReleaseSafe)
 man zish             # full documentation
 ```
 
@@ -163,6 +164,12 @@ in-process hooks. See [docs/feat-spec.md](docs/feat-spec.md) for the contract.
 
 ## Driving zish from a program
 
+A shell an agent drives has two jobs a shell you drive doesn't: report what
+happened in a form a program can read, and be containable when the agent is
+wrong.
+
+### Structured output on fd 3
+
 Open file descriptor 3 and zish writes one JSON record per command, so a
 harness never has to parse ANSI escapes or prompt redraws to find out what
 happened:
@@ -177,6 +184,41 @@ It's off unless fd 3 is open — no flag, no config. stdout stays exactly as the
 command left it, and internals (rc sourcing, command substitution) are not
 recorded, only what you actually submitted. Use `ZISH_TRACE_FD` for a
 different descriptor.
+
+### Restricting what a session may touch
+
+```sh
+zish --profile readonly -c 'make test'    # may read; writes are denied
+zish --profile workdir  -c 'make build'   # may write under $PWD, read elsewhere
+zish --profile none                       # the default
+```
+
+Backed by [Landlock](https://docs.kernel.org/userspace-api/landlock.html), the
+kernel's unprivileged sandbox — no root, no container, no `LD_PRELOAD` tricks.
+The restriction is applied once at startup and is **inherited and irrevocable**,
+so it holds for every child process too:
+
+```sh
+$ zish --profile readonly -c '/bin/sh -c "echo x > /tmp/f"'
+/bin/sh: line 1: /tmp/f: Permission denied
+```
+
+Session-scoped rather than per-command, deliberately. Because the kernel is
+enforcing it against the whole process tree, it also bounds **zish itself** — a
+bug in zish's own parser can't write outside the profile either. That is the
+point. Zig's safety checks (on in the shipped build) turn the bugs they cover
+into a clean abort, but no in-process check covers everything, so zish should
+not be the only thing standing between an agent and your filesystem.
+
+It **fails closed**. An unknown profile name, or a kernel without Landlock,
+exits non-zero rather than quietly running unrestricted — a sandbox that
+silently degrades to no sandbox is worse than none, because you stop watching.
+Write-only device sinks (`/dev/null`, `/dev/tty`, ...) stay writable under every
+profile; `cat x >/dev/null` is a write, and a "sandbox" that breaks it is just a
+broken shell.
+
+Network access is not restricted — Landlock's network rules cover TCP
+connect/bind only, so treat this as filesystem containment, not isolation.
 
 ## Ghost text
 
