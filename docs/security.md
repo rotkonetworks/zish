@@ -65,6 +65,10 @@ parser, expander and completion engine running unrestricted — and those are
 exactly the components that take untrusted input. The kernel does not care
 which process has the bug.
 
+`--allow-write` adds writable roots (`:`-separated) so the profile can be made
+usable without being made pointless; see [agents.md](agents.md) for the
+wrapping recipes.
+
 It fails closed. An unknown profile name exits 2; a kernel that cannot enforce
 the request exits 1. Neither degrades to running unrestricted, because a
 sandbox that silently turns itself off is worse than no sandbox — you stop

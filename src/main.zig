@@ -57,18 +57,73 @@ pub fn main(init: std.process.Init) void {
             compat.writeAll(.stderr(), m) catch {};
             std.process.exit(2);
         };
-        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const cwd = compat.posix.getcwd(&cwd_buf) catch "";
-        var cwd_z: [std.fs.max_path_bytes]u8 = undefined;
-        @memcpy(cwd_z[0..cwd.len], cwd);
-        cwd_z[cwd.len] = 0;
-        var roots = [_][*:0]const u8{@ptrCast(&cwd_z)};
-        sandbox.apply(profile, &roots) catch |err| {
+
+        // Write roots: the working directory for `workdir`, plus anything
+        // `--allow-write` named. Wrapping an agent harness is the motivating
+        // case — the harness needs its own state directory writable (`~/.claude`,
+        // `$HERMES_HOME`, a cache dir) or it breaks in ways that look like bugs
+        // in the harness rather than the sandbox.
+        var root_bufs: [max_write_roots][std.fs.max_path_bytes]u8 = undefined;
+        var roots: [max_write_roots][*:0]const u8 = undefined;
+        var n: usize = 0;
+
+        if (profile == .workdir) {
+            const cwd = compat.posix.getcwd(&root_bufs[0]) catch |err| {
+                var eb: [96]u8 = undefined;
+                const m = std.fmt.bufPrint(&eb, "zish: cannot read working directory: {s}\n", .{@errorName(err)}) catch "zish: cannot read working directory\n";
+                compat.writeAll(.stderr(), m) catch {};
+                std.process.exit(1);
+            };
+            root_bufs[0][cwd.len] = 0;
+            roots[0] = @ptrCast(&root_bufs[0]);
+            n = 1;
+        }
+
+        if (res.value("allow-write")) |list| {
+            // Only meaningful when something is being restricted. Silently
+            // accepting it under `none` would tell a caller their write roots
+            // were honoured when nothing was ever enforced.
+            if (profile == .unrestricted) {
+                compat.writeAll(.stderr(), "zish: --allow-write needs a restrictive --profile (readonly|workdir)\n") catch {};
+                std.process.exit(2);
+            }
+            var it = std.mem.splitScalar(u8, list, ':');
+            while (it.next()) |seg| {
+                if (seg.len == 0) continue; // trailing or doubled ':'
+                if (n == max_write_roots) {
+                    compat.writeAll(.stderr(), "zish: too many --allow-write paths (max 8)\n") catch {};
+                    std.process.exit(2);
+                }
+                if (seg.len >= std.fs.max_path_bytes) {
+                    compat.writeAll(.stderr(), "zish: --allow-write path too long\n") catch {};
+                    std.process.exit(2);
+                }
+                @memcpy(root_bufs[n][0..seg.len], seg);
+                root_bufs[n][seg.len] = 0;
+                const pathz: [*:0]const u8 = @ptrCast(&root_bufs[n]);
+                // A path that cannot be granted is fatal, not skipped. The
+                // caller asked for it by name; quietly narrowing the sandbox
+                // hands them a session that fails later, somewhere else.
+                if (compat.posix.statPath(pathz, true) == null) {
+                    var eb: [256]u8 = undefined;
+                    const m = std.fmt.bufPrint(&eb, "zish: --allow-write path does not exist: {s}\n", .{seg}) catch "zish: --allow-write path does not exist\n";
+                    compat.writeAll(.stderr(), m) catch {};
+                    std.process.exit(2);
+                }
+                roots[n] = pathz;
+                n += 1;
+            }
+        }
+
+        sandbox.apply(profile, roots[0..n]) catch |err| {
             var eb: [160]u8 = undefined;
             const m = std.fmt.bufPrint(&eb, "zish: cannot enforce --profile {s}: {s}\n", .{ pname, @errorName(err) }) catch "zish: cannot enforce profile\n";
             compat.writeAll(.stderr(), m) catch {};
             std.process.exit(1);
         };
+    } else if (res.isSet("allow-write")) {
+        compat.writeAll(.stderr(), "zish: --allow-write needs a restrictive --profile (readonly|workdir)\n") catch {};
+        std.process.exit(2);
     }
 
     if (res.isSet("version")) {
@@ -192,7 +247,13 @@ const params = [_]cli.Flag{
     .{ .short = 'd', .long = "debug-log-file", .help = "File to write debug info to.", .takes_value = true, .value_name = "FILE" },
     .{ .short = 'c', .help = "Command to execute.", .takes_value = true, .value_name = "CMD" },
     .{ .long = "profile", .help = "Restrict what commands may touch: none|readonly|workdir.", .takes_value = true, .value_name = "NAME" },
+    .{ .long = "allow-write", .help = "Extra writable paths for --profile, ':'-separated.", .takes_value = true, .value_name = "PATHS" },
 };
+
+/// Write roots the sandbox will accept. One for the working directory plus
+/// room for the handful a wrapped program needs; past that the command line
+/// is describing a policy that wants a file, not a flag.
+const max_write_roots = 8;
 
 /// Best-effort "which argument was bad" for the error message. cli.parse
 /// reports it in the Result, but the Result is gone on the error path, so

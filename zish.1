@@ -6,6 +6,7 @@ zish \- a fast shell with vim editing and job control
 [\fB\-l\fR]
 [\fB\-c\fR \fIcommand\fR]
 [\fB\-\-profile\fR \fIname\fR]
+[\fB\-\-allow\-write\fR \fIpaths\fR]
 [\fB\-\-version\fR]
 [\fB\-\-help\fR]
 [\fIscript\fR [\fIarguments\fR...]]
@@ -41,6 +42,10 @@ Restrict what this session and every process it starts may touch on the
 filesystem. See
 .B SANDBOXING
 below.
+.TP
+.BR \-\-allow\-write " " \fIpaths\fR
+Additional directories the restricted session may write to, separated by
+colons as in \fBPATH\fR. Requires a restrictive \fB\-\-profile\fR.
 .SH SANDBOXING
 .B \-\-profile
 applies a Landlock restriction to the shell process at startup. Landlock
@@ -56,6 +61,20 @@ The filesystem may be read and executed from, but not written to.
 .B workdir
 As \fBreadonly\fR, plus write access beneath the current directory at the
 time zish started.
+.PP
+.PP
+.B \-\-allow\-write
+adds writable roots to \fBreadonly\fR or \fBworkdir\fR, colon\-separated. A
+grant covers the named directory and everything beneath it, and nothing else \-
+not its parent, not a sibling. Wrapping another program is the usual reason to
+need it: an agent or build tool that cannot write its own state or cache
+directory fails in ways that look like bugs in that program rather than
+denials by the sandbox.
+.PP
+A path that does not exist is refused rather than skipped, and
+.B \-\-allow\-write
+without a restrictive profile is an error: a grant that nothing enforces is
+worse than no grant, because the caller stops checking.
 .PP
 Write\-only device sinks (\fI/dev/null\fR, \fI/dev/zero\fR, \fI/dev/tty\fR,
 \fI/dev/urandom\fR and similar) remain writable under every profile, because

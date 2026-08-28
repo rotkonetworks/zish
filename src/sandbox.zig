@@ -193,10 +193,13 @@ pub fn apply(profile: Profile, write_roots: []const [*:0]const u8) Error!void {
         addPathRule(ruleset_fd, dev, (Access.write_file | Access.read_file | Access.ioctl_dev) & handled) catch continue;
     }
 
-    if (profile == .workdir) {
-        for (write_roots) |root| {
-            try addPathRule(ruleset_fd, root, handled);
-        }
+    // Write roots apply to every restrictive profile, not just `workdir`:
+    // `readonly` plus an explicit root is "read anywhere, write only here",
+    // which is the shape a caller wrapping a program usually wants. With no
+    // roots — plain `readonly` — the loop does nothing and the behaviour is
+    // unchanged.
+    for (write_roots) |root| {
+        try addPathRule(ruleset_fd, root, handled);
     }
 
     // Landlock requires no_new_privs so a restricted process cannot regain

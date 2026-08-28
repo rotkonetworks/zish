@@ -193,6 +193,13 @@ zish --profile workdir  -c 'make build'   # may write under $PWD, read elsewhere
 zish --profile none                       # the default
 ```
 
+`--allow-write` adds writable roots, `:`-separated like `PATH`. That is what
+makes it possible to wrap an agent, which needs its own state directory:
+
+```sh
+zish --profile workdir --allow-write "$HOME/.claude:/tmp" -c 'claude'
+```
+
 Backed by [Landlock](https://docs.kernel.org/userspace-api/landlock.html), the
 kernel's unprivileged sandbox — no root, no container, no `LD_PRELOAD` tricks.
 The restriction is applied once at startup and is **inherited and irrevocable**,
@@ -219,6 +226,14 @@ broken shell.
 
 Network access is not restricted — Landlock's network rules cover TCP
 connect/bind only, so treat this as filesystem containment, not isolation.
+
+**You do not have to swap the agent's shell for this to work.** Claude Code
+drives `bash` with no option to change it, and Python's `shell=True` is
+hardcoded to `/bin/sh` — but none of that matters, because the restriction is
+inherited by every descendant whatever shell they use. Wrapping Claude Code
+this way was verified end to end: it runs normally, and with `Bash` allowed it
+cannot write outside the roots you granted. Recipes for that and for other
+harnesses are in [docs/agents.md](docs/agents.md).
 
 ## Ghost text
 

@@ -214,8 +214,49 @@ if "$ZISH" --profile readonly -c 'true' 2>/dev/null; then
         report_pass "restriction inherited by children"
     fi
     rm -f /tmp/zish_sbx_probe
+
+    # --allow-write is what makes wrapping an agent harness possible: the
+    # harness needs its own state directory writable or it fails in ways that
+    # look like harness bugs. The grant must be exactly the named root.
+    sbx_root=$(mktemp -d)
+    if "$ZISH" --profile readonly --allow-write "$sbx_root" -c "echo x > $sbx_root/f" >/dev/null 2>&1 && [ -e "$sbx_root/f" ]; then
+        report_pass "allow-write grants the named root"
+    else
+        report_fail "allow-write grants the named root" "write allowed" "write refused" "grant not applied"
+    fi
+    # A sibling of the granted root must stay denied — a rule that leaked to
+    # the parent directory would silently widen every recipe using this flag.
+    if "$ZISH" --profile readonly --allow-write "$sbx_root" -c "echo x > $sbx_root/../zish_sbx_sibling" >/dev/null 2>&1 \
+       && [ -e "$(dirname "$sbx_root")/zish_sbx_sibling" ]; then
+        rm -f "$(dirname "$sbx_root")/zish_sbx_sibling"
+        report_fail "allow-write does not leak to the parent" "sibling refused" "sibling written" "grant too wide"
+    else
+        report_pass "allow-write does not leak to the parent"
+    fi
+    rm -rf "$sbx_root"
+
+    # A root that cannot be granted is fatal, not skipped: quietly narrowing
+    # the sandbox hands the caller a session that fails later, elsewhere.
+    if "$ZISH" --profile readonly --allow-write /nonexistent/zish_sbx -c 'echo ran' >/dev/null 2>&1; then
+        report_fail "allow-write rejects a missing path" "exit != 0" "ran anyway" "fail-closed"
+    else
+        report_pass "allow-write rejects a missing path"
+    fi
 else
-    SKIP=$((SKIP + 4))
+    SKIP=$((SKIP + 7))
+fi
+
+# --allow-write without a restrictive profile promises a grant that nothing
+# enforces. Refuse rather than imply it was honoured. Needs no kernel support.
+if selected "allow-write requires a profile"; then
+    if "$ZISH" --allow-write /tmp -c 'echo ran' >/dev/null 2>&1 \
+       || "$ZISH" --profile none --allow-write /tmp -c 'echo ran' >/dev/null 2>&1; then
+        report_fail "allow-write requires a profile" "exit != 0" "ran anyway" "fail-closed"
+    else
+        report_pass "allow-write requires a profile"
+    fi
+else
+    SKIP=$((SKIP + 1))
 fi
 
 # An unknown profile must be refused, not silently ignored — a caller that
