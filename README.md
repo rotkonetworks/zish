@@ -152,7 +152,7 @@ $ frq access.log               # field frequency table
 $ pk -t 5 build.log            # last 5 lines
 $ snf src/                     # size, lines, ext, magic per file
 $ jls events.jsonl             # select/tally JSONL fields
-$ ls *.log | parallel grep ERROR {}   # run N-at-a-time, output grouped per job
+$ ls *.log | para grep ERROR {}   # run N at a time, grouped output
 ```
 
 They resolve as ordinary commands, but only as a **fallback** — a feat can

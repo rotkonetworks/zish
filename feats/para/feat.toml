@@ -1,0 +1,6 @@
+name = "para"
+tier = "standard"
+version = "1.0.0"
+help = "run a command over many inputs in parallel, N at a time, grouped output"
+bin = "para"
+usage = "para [-j N] [-n K] CMD {} ::: items   |   ls | para CMD {}   # {}=item, {#}=job no"

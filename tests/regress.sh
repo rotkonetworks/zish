@@ -601,45 +601,45 @@ same_as_bash "positional in function"  'f() { echo $1; }; f arg1'
 same_as_bash "nested subshell value"   'echo $( echo $( echo deep ) )'
 
 # ---------------------------------------------------------------------------
-printf '\n%s\n' "parallel feat"
+printf '\n%s\n' "para feat"
 # ---------------------------------------------------------------------------
 # The parallel runner is a feat (separate binary), so it is only tested when
 # staged (`make feats`). It fans jobs out N-at-a-time with per-job grouped
 # output in input order, execs argv directly (no shell → no injection), and
 # exits with the failure count.
-PAR="$HOME/.zish/feats/standard/parallel/bin/parallel"
+PAR="$HOME/.zish/feats/standard/para/bin/para"
 if [ -x "$PAR" ]; then
     got=$("$PAR" echo {} ::: a b c 2>/dev/null)
-    [ "$got" = $'a\nb\nc' ] && report_pass "parallel: {} substitution + order" \
-        || report_fail "parallel: {} substitution + order" "a|b|c" "$(echo "$got" | tr '\n' '|')" "grouped output"
+    [ "$got" = $'a\nb\nc' ] && report_pass "para: {} substitution + order" \
+        || report_fail "para: {} substitution + order" "a|b|c" "$(echo "$got" | tr '\n' '|')" "grouped output"
     got=$(printf '%s\n' x y | "$PAR" echo got {} 2>/dev/null)
-    [ "$got" = $'got x\ngot y' ] && report_pass "parallel: stdin items" \
-        || report_fail "parallel: stdin items" "got x|got y" "$(echo "$got" | tr '\n' '|')" "stdin"
+    [ "$got" = $'got x\ngot y' ] && report_pass "para: stdin items" \
+        || report_fail "para: stdin items" "got x|got y" "$(echo "$got" | tr '\n' '|')" "stdin"
     # an item with metacharacters must stay one argument
     rm -f "$WORK/PWNED"
     "$PAR" echo ::: "z;touch $WORK/PWNED" >/dev/null 2>&1
-    [ -e "$WORK/PWNED" ] && report_fail "parallel: no shell injection" "no file" "item executed" "injection" \
-        || report_pass "parallel: no shell injection"
+    [ -e "$WORK/PWNED" ] && report_fail "para: no shell injection" "no file" "item executed" "injection" \
+        || report_pass "para: no shell injection"
     # exit status = number of failed jobs
     "$PAR" sh -c 'exit 0' ::: 1 2 3 >/dev/null 2>&1
-    [ $? -eq 0 ] && report_pass "parallel: exit 0 when all succeed" \
-        || report_fail "parallel: exit 0 when all succeed" "0" "$?" "exit status"
+    [ $? -eq 0 ] && report_pass "para: exit 0 when all succeed" \
+        || report_fail "para: exit 0 when all succeed" "0" "$?" "exit status"
     "$PAR" sh -c 'test {} -eq 0' ::: 0 1 1 >/dev/null 2>&1
-    [ $? -eq 2 ] && report_pass "parallel: exit = failure count" \
-        || report_fail "parallel: exit = failure count" "2" "$?" "exit status"
+    [ $? -eq 2 ] && report_pass "para: exit = failure count" \
+        || report_fail "para: exit = failure count" "2" "$?" "exit status"
     # -n N batches items per command, matching xargs -n exactly
     got=$(seq 1 5 | "$PAR" -n 2 echo 2>/dev/null)
     want=$(seq 1 5 | xargs -n 2 echo 2>/dev/null)
-    [ "$got" = "$want" ] && report_pass "parallel: -n matches xargs -n" \
-        || report_fail "parallel: -n matches xargs -n" "$(echo "$want" | tr '\n' '|')" "$(echo "$got" | tr '\n' '|')" "batching"
+    [ "$got" = "$want" ] && report_pass "para: -n matches xargs -n" \
+        || report_fail "para: -n matches xargs -n" "$(echo "$want" | tr '\n' '|')" "$(echo "$got" | tr '\n' '|')" "batching"
     # {} with -n>1 is rejected, not silently wrong
     "$PAR" -n 2 echo {} ::: a b c >/dev/null 2>&1
-    [ $? -eq 2 ] && report_pass "parallel: {} with -n>1 rejected" \
-        || report_fail "parallel: {} with -n>1 rejected" "exit 2" "$?" "ambiguous combo"
+    [ $? -eq 2 ] && report_pass "para: {} with -n>1 rejected" \
+        || report_fail "para: {} with -n>1 rejected" "exit 2" "$?" "ambiguous combo"
     # no leftover temp files
-    ls /tmp/zish_parallel_* >/dev/null 2>&1 \
-        && report_fail "parallel: no leftover temp" "clean" "temp left" "cleanup" \
-        || report_pass "parallel: no leftover temp"
+    ls /tmp/zish_para_* >/dev/null 2>&1 \
+        && report_fail "para: no leftover temp" "clean" "temp left" "cleanup" \
+        || report_pass "para: no leftover temp"
 else
     SKIP=$((SKIP + 8))
 fi

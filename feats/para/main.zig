@@ -1,11 +1,11 @@
-// parallel - run a command over many inputs, N at a time.
+// para - run a command over many inputs in parallel, N at a time.
 //
-//   parallel [-j N] CMD [ARG...] ::: item1 item2 ...     # items from args
-//   printf '%s\n' a b c | parallel [-j N] CMD [ARG...]    # items from stdin
+//   para [-j N] CMD [ARG...] ::: item1 item2 ...     # items from args
+//   printf '%s\n' a b c | para [-j N] CMD [ARG...]    # items from stdin
 //
-//   seq 1 100 | parallel -j8 gzip {}
-//   parallel grep ERROR {} ::: *.log
-//   ls *.jpg | parallel convert {} {}.png
+//   seq 1 100 | para -j8 gzip {}
+//   para grep ERROR {} ::: *.log
+//   ls *.jpg | para convert {} {}.png
 //
 // Why this is a feat, not a shell builtin: it is pure process orchestration —
 // fork, exec, wait, across N slots. It needs nothing from the shell's internal
@@ -18,7 +18,7 @@
 //     With no {}, the item is appended (like xargs).
 //   - The command is exec'd directly as argv — NO shell — so an item with
 //     spaces or metacharacters is one argument and cannot inject. For a shell
-//     command per job, write `parallel sh -c 'CMD {}' ::: ...` and quote it
+//     command per job, write `para sh -c 'CMD {}' ::: ...` and quote it
 //     yourself, deliberately.
 //   - Output is GROUPED, not interleaved: each job's stdout+stderr goes to its
 //     own temp file, copied out atomically when the job finishes, in input
@@ -81,7 +81,7 @@ fn writeStr(fd: i32, s: []const u8) void {
 }
 
 fn die(msg: []const u8) noreturn {
-    writeStr(STDERR, "parallel: ");
+    writeStr(STDERR, "para: ");
     writeStr(STDERR, msg);
     writeStr(STDERR, "\n");
     linux.exit(2);
@@ -93,7 +93,7 @@ fn makeTempFile() !i32 {
     var name: [64]u8 = undefined;
     var attempt: u8 = 0;
     while (true) {
-        const path = std.fmt.bufPrintZ(&name, "/tmp/zish_parallel_{x}", .{rngNext()}) catch return error.NameTooLong;
+        const path = std.fmt.bufPrintZ(&name, "/tmp/zish_para_{x}", .{rngNext()}) catch return error.NameTooLong;
         const flags = linux.O{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true };
         const rc = linux.open(path.ptr, flags, 0o600);
         if (!failed(rc)) {
@@ -260,7 +260,7 @@ fn readStdinItems(alloc: std.mem.Allocator, items: *std.ArrayList([]const u8)) !
     }
 }
 
-fn runAll(alloc: std.mem.Allocator, template: []const []const u8, items: []const []const u8, max_parallel: usize, batch: usize) !void {
+fn runAll(alloc: std.mem.Allocator, template: []const []const u8, items: []const []const u8, max_jobs: usize, batch: usize) !void {
     // One job per chunk of `batch` items (batch==1 is the common one-per case).
     const num_jobs = (items.len + batch - 1) / batch;
     const jobs = try alloc.alloc(Job, num_jobs);
@@ -273,7 +273,7 @@ fn runAll(alloc: std.mem.Allocator, template: []const []const u8, items: []const
     var failures: usize = 0;
 
     while (reaped < num_jobs) {
-        while (active < max_parallel and launched < num_jobs) {
+        while (active < max_jobs and launched < num_jobs) {
             const start = launched * batch;
             const end = @min(start + batch, items.len);
             try launchJob(alloc, &jobs[launched], template, items[start..end], launched + 1);
@@ -348,8 +348,8 @@ fn flushJob(job: *Job) void {
 }
 
 const help_text =
-    \\usage: parallel [-j N] CMD [ARG...] ::: item...
-    \\       ... | parallel [-j N] CMD [ARG...]
+    \\usage: para [-j N] CMD [ARG...] ::: item...
+    \\       ... | para [-j N] CMD [ARG...]
     \\
     \\Run CMD over the items, up to -j N at a time (default: CPU count; -j0 = unbounded).
     \\-n K passes up to K items per command (xargs -n; default 1). {} in CMD is
@@ -357,7 +357,7 @@ const help_text =
     \\CMD is exec'd directly (no shell): an item is always one argument.
     \\Output is grouped per job, in input order. Exit status = number of failed jobs.
     \\
-    \\  seq 1 100 | parallel -j8 gzip {}
-    \\  parallel grep ERROR {} ::: *.log
+    \\  seq 1 100 | para -j8 gzip {}
+    \\  para grep ERROR {} ::: *.log
     \\
 ;

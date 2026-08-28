@@ -1,6 +1,0 @@
-name = "parallel"
-tier = "standard"
-version = "1.0.0"
-help = "run a command over many inputs, N at a time, with grouped output"
-bin = "parallel"
-usage = "parallel [-j N] CMD {} ::: items   |   ls | parallel CMD {}   # {} = item, {#} = job no"
