@@ -127,9 +127,15 @@ pub const Profile = enum {
 fn addPathRule(ruleset_fd: i32, path: [*:0]const u8, allowed: u64) Error!void {
     // O_PATH is enough: Landlock only needs to identify the directory, and
     // opening with it avoids needing read permission on the path itself.
+    //
+    // openat, not open: aarch64 (and other newer arches) have no `open`
+    // syscall at all, only `openat`. AT_FDCWD makes it resolve `path` relative
+    // to the cwd, identical to open. Using `.open` compiled on x86_64 but broke
+    // the aarch64 release build.
     const O_PATH = 0o10000000;
     const O_CLOEXEC = 0o2000000;
-    const fd_rc = linux.syscall3(.open, @intFromPtr(path), O_PATH | O_CLOEXEC, 0);
+    const AT_FDCWD: usize = @bitCast(@as(isize, -100));
+    const fd_rc = linux.syscall4(.openat, AT_FDCWD, @intFromPtr(path), O_PATH | O_CLOEXEC, 0);
     const fd: i32 = @intCast(@as(isize, @bitCast(fd_rc)));
     if (fd < 0) return Error.BadPath;
     defer _ = linux.syscall1(.close, @intCast(fd));
