@@ -313,6 +313,30 @@ def _(sh):
     expect_soon(sh, "123")
 
 
+@test("background job actually runs (not born stopped)")
+def _(sh):
+    # A forked background child used to run the terminal-control dance
+    # (tcsetattr) from its background process group, get SIGTTOU, and stop
+    # BEFORE exec — so `cmd &` never ran at all. It must execute and finish.
+    sh.sendline("(sleep 0.3; echo bg_ran_$((8 + 9))) &")
+    sh.read(timeout=3)
+    expect_soon(sh, "bg_ran_17", timeout=8)
+
+
+@test("a child prompting on /dev/tty with redirected stdin can be answered")
+def _(sh):
+    # age/ssh/sudo read confirmations from /dev/tty, not stdin. When stdin is
+    # redirected the terminal handover was skipped, the child landed in a
+    # background pgroup, its /dev/tty read failed with EIO, and the typed answer
+    # went to the shell's line editor. It must reach the child instead.
+    sh.sendline("printf '#!/bin/sh\\nread a </dev/tty; echo GOT:$a\\n' > ask; chmod +x ask")
+    sh.read(timeout=3)
+    sh.sendline("./ask < /dev/null")   # stdin redirected; prompt still reads /dev/tty
+    time.sleep(0.4)
+    sh.sendline("yes")                  # the answer must reach ./ask, not zish
+    expect_soon(sh, "GOT:yes", timeout=6)
+
+
 # ---------------------------------------------------------------------------
 print("\nline editor")
 # ---------------------------------------------------------------------------

@@ -763,6 +763,62 @@ fn evaluateEchoBuiltinFast(shell: *Shell, node: *const ast.AstNode) !u8 {
     return 0;
 }
 
+/// Controlling-terminal handle for foreground job control.
+///
+/// Job control must key off the session's controlling terminal, not stdin:
+/// stdin can be redirected (heredoc, `< file`, a redirected function call)
+/// while the command still prompts on /dev/tty (age, ssh, sudo). Gating the
+/// tcsetpgrp handover on isatty(0) while calling setpgid unconditionally left
+/// such children in an orphaned background process group whose /dev/tty reads
+/// fail with EIO (SIGTTIN is inherited as SIG_IGN through exec) — the user's
+/// keystroke then landed in the shell's own line editor instead.
+const TtyCtl = struct {
+    /// fd of the controlling tty (stdin when it IS the tty, else /dev/tty),
+    /// or null when the shell has no controlling terminal (scripts, CI).
+    fd: ?compat.posix.fd_t,
+    opened: bool, // fd was opened here and must be closed on release
+
+    fn acquire() TtyCtl {
+        if (compat.posix.isatty(compat.posix.STDIN_FILENO))
+            return .{ .fd = compat.posix.STDIN_FILENO, .opened = false };
+        const fd = compat.posix.open("/dev/tty", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0) catch
+            return .{ .fd = null, .opened = false };
+        return .{ .fd = fd, .opened = true };
+    }
+
+    /// Cooked terminal for the child (canonical input, echo, ISIG).
+    fn cooked(self: TtyCtl, shell: *Shell) void {
+        const fd = self.fd orelse return;
+        if (!self.opened) {
+            shell.disableRawMode();
+        } else if (shell.original_termios) |orig| {
+            compat.posix.tcsetattr(fd, .NOW, orig) catch {};
+        }
+    }
+
+    /// Back to the line editor's raw mode (mirrors Shell.enableRawMode).
+    fn restoreRaw(self: TtyCtl, shell: *Shell) void {
+        const fd = self.fd orelse return;
+        if (!self.opened) {
+            shell.enableRawMode() catch {};
+        } else if (shell.original_termios) |orig| {
+            var raw = orig;
+            raw.lflag.ICANON = false;
+            raw.lflag.ECHO = false;
+            raw.lflag.ISIG = false;
+            raw.iflag.ICRNL = false;
+            raw.iflag.IXON = false;
+            raw.cc[@intFromEnum(compat.posix.V.MIN)] = 1;
+            raw.cc[@intFromEnum(compat.posix.V.TIME)] = 0;
+            compat.posix.tcsetattr(fd, .NOW, raw) catch {};
+        }
+    }
+
+    fn release(self: TtyCtl) void {
+        if (self.opened) compat.posix.close(self.fd.?);
+    }
+};
+
 pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     if (node.children.len == 0) return 1;
 
@@ -1341,15 +1397,22 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     }
 
     // external command
-    // restore terminal to normal mode so child can handle signals properly
-    // only do this if stdin is a tty
-    const is_tty = compat.posix.isatty(compat.posix.STDIN_FILENO);
-    if (is_tty) {
-        shell.disableRawMode();
-    }
-    defer if (is_tty) {
-        shell.enableRawMode() catch {};
-    };
+    // restore terminal to normal mode so child can handle signals properly,
+    // and hand it the terminal foreground. Both must key off the controlling
+    // terminal (TtyCtl), not stdin — see TtyCtl.
+    const tty = TtyCtl.acquire();
+    defer tty.release();
+    // Only the top-level foreground command owns the terminal. A forked child
+    // (a `&` background job, a pipeline stage, a subshell body) must NOT touch
+    // it: doing tcsetattr/tcsetpgrp from a background process group raises
+    // SIGTTOU and stops the child before it can exec — which made every
+    // `cmd &` born-stopped. Gate all terminal manipulation on foreground-ness,
+    // exactly as the pipeline path does; tty_fd going null makes the later
+    // setpgid/tcsetpgrp/reclaim blocks no-ops for a forked child.
+    const is_foreground = tty.fd != null and !shell.forked_child;
+    const tty_fd = if (is_foreground) tty.fd else null;
+    if (is_foreground) tty.cooked(shell);
+    defer if (is_foreground) tty.restoreRaw(shell);
 
     // use cached path lookup for faster execution
     if (shell.lookupCommand(cmd_name)) |full_path| {
@@ -1401,9 +1464,9 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
         // child: create own process group and take terminal control
         // this allows TUI apps (like claude) to work properly
         const child_pid = compat.posix.getpid();
-        compat.posix.setpgid(0, 0) catch {};
-        if (is_tty) {
-            jobs.tcsetpgrp(compat.posix.STDIN_FILENO, child_pid) catch {};
+        if (tty_fd) |fd| {
+            compat.posix.setpgid(0, 0) catch {};
+            jobs.tcsetpgrp(fd, child_pid) catch {};
         }
 
         // Build environment in child process (after fork, safe from parent interference)
@@ -1414,7 +1477,7 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     }
 
     // parent: also set child's pgrp (race avoidance)
-    compat.posix.setpgid(pid, pid) catch {};
+    if (tty_fd != null) compat.posix.setpgid(pid, pid) catch {};
 
     // parent - ignore SIGINT while child runs
     var old_sigint: compat.posix.Sigaction = undefined;
@@ -1433,9 +1496,9 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     const result = compat.posix.waitpid(pid, compat.posix.W.UNTRACED);
 
     // take back terminal control
-    if (is_tty) {
+    if (tty_fd) |fd| {
         const shell_pgid: compat.posix.pid_t = compat.posix.getProcessGroup(0);
-        jobs.tcsetpgrp(compat.posix.STDIN_FILENO, shell_pgid) catch {};
+        jobs.tcsetpgrp(fd, shell_pgid) catch {};
     }
 
     // Child was stopped (Ctrl+Z): register it as a stopped background job so it
@@ -1586,19 +1649,22 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
     // A background job / command substitution runs this function inside a
     // forked subshell with shell.forked_child already true — skip the handoff
     // there so it doesn't steal the terminal from the parent shell.
-    const is_tty = compat.posix.isatty(compat.posix.STDIN_FILENO);
-    const is_foreground = is_tty and !shell.forked_child;
+    // The controlling tty, not stdin: stdin may be redirected (heredoc,
+    // a redirected function call) while a stage still prompts on /dev/tty.
+    const tty = TtyCtl.acquire();
+    defer tty.release();
+    const is_foreground = tty.fd != null and !shell.forked_child;
     if (is_foreground) {
         // Give the pipeline a cooked terminal (canonical input, ISIG) instead
         // of the line editor's raw mode, so read()/tty prompts work.
-        shell.disableRawMode();
+        tty.cooked(shell);
     }
     const shell_pgid: compat.posix.pid_t = @intCast(compat.posix.getProcessGroup(0));
     defer {
         if (is_foreground) {
             // take terminal back and restore the editor's raw mode
-            jobs.tcsetpgrp(compat.posix.STDIN_FILENO, shell_pgid) catch {};
-            shell.enableRawMode() catch {};
+            jobs.tcsetpgrp(tty.fd.?, shell_pgid) catch {};
+            tty.restoreRaw(shell);
         }
     }
 
@@ -1644,12 +1710,12 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
         if (pid == 0) {
             // Child: join the pipeline's process group. The first process is
             // the group leader (pgid == its pid); later processes join it.
-            if (is_tty) {
+            if (tty.fd) |tfd| {
                 if (i == 0) {
                     _ = compat.posix.setpgid(0, 0) catch {};
                     if (is_foreground) {
                         const mypid: compat.posix.pid_t = @intCast(compat.posix.getpid());
-                        jobs.tcsetpgrp(compat.posix.STDIN_FILENO, mypid) catch {};
+                        jobs.tcsetpgrp(tfd, mypid) catch {};
                     }
                 } else {
                     _ = compat.posix.setpgid(0, pids[0]) catch {};
@@ -1698,12 +1764,12 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
             pids[i] = pid;
             // Parent: assign the child to the pipeline's group (both sides
             // call setpgid for race avoidance, as in the single-command path).
-            if (is_tty) {
+            if (tty.fd) |tfd| {
                 const pgid = if (i == 0) pid else pids[0];
                 _ = compat.posix.setpgid(pid, pgid) catch {};
                 if (i == 0 and is_foreground) {
                     // put the pipeline's group in the foreground
-                    jobs.tcsetpgrp(compat.posix.STDIN_FILENO, pid) catch {};
+                    jobs.tcsetpgrp(tfd, pid) catch {};
                 }
             }
         }
