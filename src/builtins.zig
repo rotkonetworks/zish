@@ -710,21 +710,37 @@ fn read(shell: *Shell, args: []const []const u8) !u8 {
 
     const stdin_fd = compat.posix.STDIN_FILENO;
 
-    // save terminal state for silent mode
+    // Cook the terminal for the duration of the read.
+    //
+    // The interactive line editor leaves the terminal in raw mode: no canonical
+    // line discipline, ECHO off, ICRNL off. A `read` running in that state has
+    // no echo (you can't see what you type) and, worse, receives Enter as CR
+    // rather than LF — so this loop, which ends the line on '\n', waits forever.
+    // That is the "overwrite? [y/N] — stuck, can't press y and Enter" bug: the
+    // prompt is a shell function's `printf` + `read`, not the program's own.
+    // bash's read relies on the terminal being cooked; do the same. For -n
+    // (fixed char count) stay non-canonical so it returns without Enter, but
+    // still echo and translate CR->LF. Restore the prior mode on every exit.
     var orig_termios: ?compat.posix.termios = null;
-    if (silent and compat.posix.isatty(stdin_fd)) {
+    if (compat.posix.isatty(stdin_fd)) {
         orig_termios = compat.posix.tcgetattr(stdin_fd) catch null;
         if (orig_termios) |ot| {
-            var new_termios = ot;
-            new_termios.lflag.ECHO = false;
-            compat.posix.tcsetattr(stdin_fd, .NOW, new_termios) catch {};
+            var nt = ot;
+            nt.lflag.ICANON = (nchars == null); // line mode unless -n
+            nt.lflag.ECHO = !silent;
+            nt.lflag.ISIG = true; // Ctrl+C can abort the read
+            nt.iflag.ICRNL = true; // Enter (CR) arrives as LF
+            nt.cc[@intFromEnum(compat.posix.V.MIN)] = 1;
+            nt.cc[@intFromEnum(compat.posix.V.TIME)] = 0;
+            compat.posix.tcsetattr(stdin_fd, .NOW, nt) catch {};
         }
     }
     defer {
         if (orig_termios) |ot| {
             compat.posix.tcsetattr(stdin_fd, .NOW, ot) catch {};
-            // print newline since echo was off
-            _ = compat.posix.write(compat.posix.STDOUT_FILENO, "\n") catch {};
+            // echo was suppressed for -s: move to a fresh line as the user's
+            // Enter was not shown.
+            if (silent) _ = compat.posix.write(compat.posix.STDOUT_FILENO, "\n") catch {};
         }
     }
 

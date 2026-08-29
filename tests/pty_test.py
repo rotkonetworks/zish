@@ -313,6 +313,18 @@ def _(sh):
     expect_soon(sh, "123")
 
 
+@test("interactive read builtin accepts a typed line")
+def _(sh):
+    # The reported "overwrite? [y/N] — stuck" bug: a shell function's
+    # `printf ...; read -r ans` ran while the line editor held the terminal in
+    # raw mode, so there was no echo and Enter arrived as CR, never ending the
+    # read. read must cook the terminal so a typed answer + Enter works.
+    sh.sendline('printf "confirm? [y/N] "; read -r ans; echo "ANS=[$ans]"')
+    time.sleep(0.4)
+    sh.sendline("y")
+    expect_soon(sh, "ANS=[y]", timeout=6)
+
+
 @test("background job actually runs (not born stopped)")
 def _(sh):
     # A forked background child used to run the terminal-control dance
