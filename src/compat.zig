@@ -74,23 +74,6 @@ pub fn sleep(ns: u64) void {
     dur.sleep(io()) catch {};
 }
 
-/// std.time.Timer replacement (monotonic — `.awake` is CLOCK_MONOTONIC on linux).
-pub const Timer = struct {
-    start_ns: i96,
-
-    pub fn start() error{TimerUnsupported}!Timer {
-        return .{ .start_ns = nowNs(.awake) };
-    }
-
-    pub fn read(self: *Timer) u64 {
-        return @intCast(nowNs(.awake) - self.start_ns);
-    }
-
-    pub fn reset(self: *Timer) void {
-        self.start_ns = nowNs(.awake);
-    }
-};
-
 // ---------------------------------------------------------------------------
 // 0.15 File.readAll / File.writeAll replacements (sequential, work on pipes
 // and regular files alike)
@@ -145,7 +128,6 @@ pub const posix = struct {
     pub const sigaction = std.posix.sigaction;
     pub const sigprocmask = std.posix.sigprocmask;
     pub const sigemptyset = std.posix.sigemptyset;
-    pub const sigfillset = std.posix.sigfillset;
     pub const termios = std.posix.termios;
     pub const tcgetattr = std.posix.tcgetattr;
     pub const tcsetattr = std.posix.tcsetattr;
@@ -164,12 +146,6 @@ pub const posix = struct {
     pub const gethostname = std.posix.gethostname;
     pub const kill = std.posix.kill;
     pub const read = std.posix.read;
-    pub const mmap = std.posix.mmap;
-    pub const munmap = std.posix.munmap;
-    pub const madvise = std.posix.madvise;
-    pub const MAP = std.posix.MAP;
-    pub const PROT = std.posix.PROT;
-    pub const MADV = std.posix.MADV;
     pub const errno = std.posix.errno;
     pub const unexpectedErrno = std.posix.unexpectedErrno;
     pub const E = std.posix.E;
@@ -223,16 +199,6 @@ pub const posix = struct {
             if (rc < 0) return error.SeekFailed;
             return @intCast(rc);
         }
-    }
-
-    pub fn dup(old_fd: fd_t) !fd_t {
-        const rc = system.dup(old_fd);
-        return switch (errno(rc)) {
-            .SUCCESS => @intCast(rc),
-            .MFILE => error.ProcessFdQuotaExceeded,
-            .BADF => unreachable,
-            else => |err| unexpectedErrno(err),
-        };
     }
 
     pub fn dup2(old_fd: fd_t, new_fd: fd_t) !void {
