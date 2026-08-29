@@ -24,6 +24,11 @@
 //!       another process's memory. The escape: with yama ptrace_scope=0 a
 //!       restricted process drives an unrestricted one. Denying ptrace alone
 //!       leaves process_vm_* as half the same primitive, so all three go.
+//!   pidfd_getfd  — steal an already-open fd from another same-user process
+//!       (gated by the same PTRACE_MODE_ATTACH_REALCREDS check under
+//!       ptrace_scope=0). Since Landlock checks rights at open() not per-write,
+//!       a stolen O_WRONLY fd writes outside the profile — the third leg of the
+//!       same primitive, so it goes with the others.
 //!   kexec_load, kexec_file_load                  — boot a new kernel. Zero
 //!       legitimate use from a shell; already CAP_SYS_BOOT-gated. Free.
 //!
@@ -94,6 +99,7 @@ fn deniedSyscalls() []const u32 {
         "ptrace",
         "process_vm_readv",
         "process_vm_writev",
+        "pidfd_getfd",
         "kexec_load",
         "kexec_file_load",
     };
@@ -218,6 +224,20 @@ test "denylist resolves and contains ptrace" {
         if (nr == @intFromEnum(linux.SYS.ptrace)) found = true;
     }
     try std.testing.expect(found);
+}
+
+test "denylist contains the full ptrace-family fd-theft primitive" {
+    const denied = comptime deniedSyscalls();
+    inline for (.{ "process_vm_readv", "process_vm_writev", "pidfd_getfd" }) |name| {
+        if (@hasField(linux.SYS, name)) {
+            const want = @intFromEnum(@field(linux.SYS, name));
+            var found = false;
+            for (denied) |nr| {
+                if (nr == want) found = true;
+            }
+            try std.testing.expect(found);
+        }
+    }
 }
 
 test "program length matches layout" {
