@@ -3688,34 +3688,48 @@ fn setPositionals(shell: *Shell, args: []const []const u8) !void {
     try setShellVar(shell, "#", cs);
 }
 
+// Save the caller's $1..$# into `out` (dupes; caller frees). One owner for the
+// "install my own positionals, restore the caller's on return" pattern shared by
+// callFunction and `source`.
+pub fn savePositionals(shell: *Shell, out: *std.ArrayList([]u8)) !void {
+    const count = positionalCount(shell);
+    var i: usize = 1;
+    while (i <= count) : (i += 1) {
+        var nb: [16]u8 = undefined;
+        const ns = std.fmt.bufPrint(&nb, "{d}", .{i}) catch break;
+        const v = shell.variables.get(ns) orelse "";
+        try out.append(shell.allocator, try shell.allocator.dupe(u8, v));
+    }
+}
+
+// Restore positionals previously captured by savePositionals.
+pub fn restorePositionals(shell: *Shell, saved: []const []u8) void {
+    clearPositionals(shell);
+    if (saved.len > 0) {
+        setPositionals(shell, saved) catch {};
+    } else {
+        setShellVar(shell, "#", "0") catch {};
+    }
+}
+
+// Install `args` as $1..$n / $# for the duration of a sourced script or function
+// body, having saved the caller's set. Callers pair this with restorePositionals.
+pub fn installPositionals(shell: *Shell, args: []const []const u8) !void {
+    clearPositionals(shell);
+    try setPositionals(shell, args);
+}
+
 pub fn callFunction(shell: *Shell, name: []const u8, args: []const []const u8) !u8 {
     const body = shell.functions.get(name) orelse return error.FunctionNotFound;
 
-    // Save the caller's positional parameters — a function gets its own $1..$#,
-    // restored on return (POSIX). The old code set $1.. but never $#/$@ (so those
-    // were empty inside functions) and wiped the caller's positionals on return.
-    const saved_count: usize = blk: {
-        const c = shell.variables.get("#") orelse break :blk 0;
-        break :blk std.fmt.parseInt(usize, c, 10) catch 0;
-    };
+    // A function gets its own $1..$#, restored on return (POSIX).
     var saved: std.ArrayList([]u8) = .empty;
     defer {
         for (saved.items) |s| shell.allocator.free(s);
         saved.deinit(shell.allocator);
     }
-    {
-        var i: usize = 1;
-        while (i <= saved_count) : (i += 1) {
-            var nb: [16]u8 = undefined;
-            const ns = std.fmt.bufPrint(&nb, "{d}", .{i}) catch break;
-            const v = shell.variables.get(ns) orelse "";
-            try saved.append(shell.allocator, try shell.allocator.dupe(u8, v));
-        }
-    }
-
-    // Install the function's arguments as $1..$n and $#.
-    clearPositionals(shell);
-    try setPositionals(shell, args);
+    try savePositionals(shell, &saved);
+    try installPositionals(shell, args);
 
     // Give the body its own local-variable scope (restored on return).
     try pushLocalScope(shell);
@@ -3723,16 +3737,7 @@ pub fn callFunction(shell: *Shell, name: []const u8, args: []const []const u8) !
 
     const result = evaluateAst(shell, body);
 
-    // Restore the caller's positional parameters.
-    clearPositionals(shell);
-    if (saved.items.len > 0) {
-        setPositionals(shell, saved.items) catch {};
-    } else {
-        var cb: [16]u8 = undefined;
-        const cs = std.fmt.bufPrint(&cb, "{d}", .{saved_count}) catch "0";
-        setShellVar(shell, "#", cs) catch {};
-    }
-
+    restorePositionals(shell, saved.items);
     return result;
 }
 

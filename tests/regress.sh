@@ -675,6 +675,12 @@ same_as_bash "cd error not captured"       'x=$(cd /nope_zish 2>/dev/null); echo
 same_as_bash "type error to stderr"        'type nosuchcmd_zz 2>/dev/null; echo rc=$?'
 same_as_bash "kill bad signal to stderr"   'kill -NOPE 1 2>/dev/null; echo rc=$?'
 
+# `source file a b c` sets $1..$#/$# for the script then restores the caller's
+# positionals; with no args the caller's are left untouched (was: leaked forever,
+# $# never updated).
+same_as_bash "source args set + restore"   'printf "echo s:\$1,\$#\n" > sc; set -- a b; source ./sc X Y Z; echo a:$1,$#; rm -f sc'
+same_as_bash "source no-args keeps caller"  'printf "echo s:\$1,\$#\n" > sc2; set -- keep1 keep2; source ./sc2; echo a:$1,$#; rm -f sc2'
+
 # `read` builtin: the seekable fast path (block read + lseek-back) must be
 # byte-for-byte identical to the byte path and to bash. The critical invariant
 # is that read consumes EXACTLY one line — a following reader sees the rest.

@@ -1496,12 +1496,24 @@ fn source(shell: *Shell, args: []const []const u8) !u8 {
     };
     defer shell.allocator.free(content);
 
-    // set positional parameters from remaining args
-    for (args[2..], 1..) |arg, i| {
-        var num_buf: [16]u8 = undefined;
-        const num_str = std.fmt.bufPrint(&num_buf, "{d}", .{i}) catch continue;
-        try setVar(shell, num_str, arg);
+    const eval_mod = @import("eval.zig");
+
+    // `source file a b c` runs the script with $1..$n set to a b c (and $#
+    // updated), restoring the caller's positionals afterward — same discipline as
+    // a function call. With no extra args, the caller's positionals are left
+    // untouched (bash). The old code set $1.. but never $# and never restored,
+    // so a sourced script permanently clobbered the caller's $1.
+    var saved: std.ArrayList([]u8) = .empty;
+    defer {
+        for (saved.items) |s| shell.allocator.free(s);
+        saved.deinit(shell.allocator);
     }
+    const have_args = args.len > 2;
+    if (have_args) {
+        try eval_mod.savePositionals(shell, &saved);
+        try eval_mod.installPositionals(shell, args[2..]);
+    }
+    defer if (have_args) eval_mod.restorePositionals(shell, saved.items);
 
     var p = parser.Parser.init(content, shell.allocator) catch {
         try shell.stderr().print("{s}: {s}: Parse error\n", .{ args[0], filename });
@@ -1514,7 +1526,6 @@ fn source(shell: *Shell, args: []const []const u8) !u8 {
         return 1;
     };
 
-    const eval_mod = @import("eval.zig");
     return try eval_mod.evaluateAst(shell, tree);
 }
 
