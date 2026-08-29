@@ -474,6 +474,13 @@ expect "here string small"             $'hello here' 0 'cat <<< "hello here"'
 expect "here string past pipe buffer"  $'70001'      0 'x=$(head -c 70000 /dev/zero | tr "\0" "x"); cat <<< "$x" | wc -c'
 expect "here string 100k"              $'100001'     0 'x=$(head -c 100000 /dev/zero | tr "\0" "x"); cat <<< "$x" | wc -c'
 expect "here string leaves no temp"    $'clean'      0 'cat <<< hi >/dev/null; ls /tmp/zish_herestr_* >/dev/null 2>&1 && echo dirty || echo clean'
+# A numeric-fd redirect (`3>file`) must not clobber the shell's own stdin. The
+# shell parked its fd backups at 3/4/5 via plain dup(); `true 3>file` then
+# dup2'd the file onto fd 3 — the stdin backup — and the restore installed the
+# write-only file as the shell's fd 0, so the next `read` got EOF. Backups now
+# live at fd>=10 with close-on-exec. Fed 'hi' on stdin, read must still see it.
+expect "fd redirect does not clobber stdin" $'got=hi' 0 'printf "hi\n" | { true 3>/tmp/zish_fdc_$$; read x; echo got=$x; }'
+expect "high fd redirect does not clobber"  $'got=ok' 0 'printf "ok\n" | { true 4>/tmp/zish_fdc_$$ 5>/tmp/zish_fdd_$$; read x; echo got=$x; }'
 
 # A heredoc must never write through a symlink planted in world-writable /tmp.
 # The old scheme used a predictable name (/tmp/zish_heredoc_e_<ms>_1) opened

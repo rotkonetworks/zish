@@ -1948,30 +1948,85 @@ pub fn evaluateRedirect(shell: *Shell, node: *const ast.AstNode) !u8 {
     // pre-redirect output isn't diverted into the redirect target.
     shell.stdout().flush() catch {};
 
-    const stdin_backup = try compat.posix.dup(compat.posix.STDIN_FILENO);
-    const stdout_backup = try compat.posix.dup(compat.posix.STDOUT_FILENO);
-    const stderr_backup = try compat.posix.dup(compat.posix.STDERR_FILENO);
+    // Lazily back up every fd a redirect touches (0-9, saved at >=10 with
+    // CLOEXEC) and restore them all afterwards. See FdSaver for why the
+    // backups must live outside the user-addressable fd range.
+    var saver: FdSaver = .{};
     defer {
         // Builtins write through a buffered writer on fd 1; flush it into the
         // redirect target before restoring the original fds.
         shell.stdout().flush() catch {};
-        compat.posix.dup2(stdin_backup, compat.posix.STDIN_FILENO) catch {};
-        compat.posix.dup2(stdout_backup, compat.posix.STDOUT_FILENO) catch {};
-        compat.posix.dup2(stderr_backup, compat.posix.STDERR_FILENO) catch {};
-        compat.posix.close(stdin_backup);
-        compat.posix.close(stdout_backup);
-        compat.posix.close(stderr_backup);
+        saver.restoreAll();
     }
 
     // apply in source order (innermost redirect node = leftmost in source)
     var idx = n;
     while (idx > 0) {
         idx -= 1;
-        try applyRedirect(shell, chain[idx]);
+        try applyRedirect(shell, chain[idx], &saver);
     }
 
     return evaluateAst(shell, command);
 }
+
+/// Backs up the shell's fds around a command's redirections so they can be
+/// restored afterwards.
+///
+/// Backups are parked at fd >= 10 with close-on-exec (same pattern as the
+/// trace channel in trace.zig). Plain `dup()` backups landed at the lowest
+/// free fds — 3, 4, 5 — where a user redirect like `3>file` would clobber
+/// them via `dup2(file, 3)`: after "restore", the shell's own stdin was the
+/// redirect target for the rest of the session. High CLOEXEC backups can
+/// never collide with user redirects (which only address fds 0-9) and never
+/// leak into children across exec.
+///
+/// Saving is lazy and covers every fd a redirect touches, so fds > 2 opened
+/// by `3>file` are also restored (closed again) after the command instead of
+/// persisting in the shell and leaking into every later child.
+const FdSaver = struct {
+    const not_saved: i32 = -2;
+    const was_closed: i32 = -1;
+
+    saved: [10]i32 = @splat(not_saved),
+
+    /// Record the current state of `fd` before a redirect modifies it.
+    /// Call before any dup2-onto-fd or close(fd) in the redirect path.
+    fn save(self: *FdSaver, fd: i32) void {
+        if (fd < 0 or fd >= self.saved.len) return;
+        const i: usize = @intCast(fd);
+        if (self.saved[i] != not_saved) return;
+        // fcntl in compat treats EBADF as unreachable, so probe first: a
+        // closed fd is legitimate here (`3>file` when 3 was never open).
+        _ = compat.posix.fstat(fd) catch |err| {
+            if (err == error.BadFileDescriptor) self.saved[i] = was_closed;
+            // Other fstat failures: leave not_saved. Restoring nothing (a
+            // leaked fd) is safer than closing a live fd we never backed up.
+            return;
+        };
+        self.saved[i] = compat.posix.dupHighCloexec(fd) catch return;
+    }
+
+    /// Restore every saved fd to its pre-redirect state and release the
+    /// backups. Runs on every exit path (defer in evaluateRedirect).
+    fn restoreAll(self: *FdSaver) void {
+        for (&self.saved, 0..) |*bak, i| {
+            const fd: i32 = @intCast(i);
+            if (bak.* == not_saved) continue;
+            if (bak.* == was_closed) {
+                // fd was closed before the redirects; close it again — but
+                // only if a redirect actually (re)opened it, since close()
+                // on a bad fd is unreachable in compat.
+                if (compat.posix.fstat(fd)) |_| {
+                    compat.posix.close(fd);
+                } else |_| {}
+            } else {
+                compat.posix.dup2(bak.*, fd) catch {};
+                compat.posix.close(bak.*);
+            }
+            bak.* = not_saved;
+        }
+    }
+};
 
 // Classify an input-redirect target that is one of our internal heredoc temp
 // files. Returns null for ordinary files, true if the body needs expansion
@@ -2036,7 +2091,7 @@ fn applyHeredocInput(shell: *Shell, path: []const u8, expand: bool) !void {
     try compat.posix.dup2(file.handle, compat.posix.STDIN_FILENO);
 }
 
-fn applyRedirect(shell: *Shell, node: *const ast.AstNode) !void {
+fn applyRedirect(shell: *Shell, node: *const ast.AstNode, saver: *FdSaver) !void {
     const target = node.children[1];
     const redirect_type = node.value;
 
@@ -2049,14 +2104,17 @@ fn applyRedirect(shell: *Shell, node: *const ast.AstNode) !void {
     if (std.mem.eql(u8, redirect_type, ">") or std.mem.eql(u8, redirect_type, ">|")) {
         const file = try std.Io.Dir.cwd().createFile(compat.io(), expanded_target, .{ .truncate = true });
         defer file.close(compat.io());
+        saver.save(compat.posix.STDOUT_FILENO);
         try compat.posix.dup2(file.handle, compat.posix.STDOUT_FILENO);
     } else if (std.mem.eql(u8, redirect_type, ">>")) {
         // create file if doesn't exist, don't truncate if exists
         const file = try std.Io.Dir.cwd().createFile(compat.io(), expanded_target, .{ .truncate = false });
         defer file.close(compat.io());
         if (std.c.lseek(file.handle, 0, std.c.SEEK.END) < 0) return error.Unseekable;
+        saver.save(compat.posix.STDOUT_FILENO);
         try compat.posix.dup2(file.handle, compat.posix.STDOUT_FILENO);
     } else if (std.mem.eql(u8, redirect_type, "<")) {
+        saver.save(compat.posix.STDIN_FILENO);
         // Heredoc bodies are materialised (by preprocessHeredoc) into temp files
         // tagged "_e_" (expand) or "_q_" (literal). Unquoted-delimiter bodies are
         // expanded HERE, at execution time, so they see assignments made earlier on
@@ -2071,28 +2129,37 @@ fn applyRedirect(shell: *Shell, node: *const ast.AstNode) !void {
     } else if (std.mem.eql(u8, redirect_type, "2>")) {
         const file = try std.Io.Dir.cwd().createFile(compat.io(), expanded_target, .{ .truncate = true });
         defer file.close(compat.io());
+        saver.save(compat.posix.STDERR_FILENO);
         try compat.posix.dup2(file.handle, compat.posix.STDERR_FILENO);
     } else if (std.mem.eql(u8, redirect_type, "2>>")) {
         const file = try std.Io.Dir.cwd().createFile(compat.io(), expanded_target, .{ .truncate = false });
         defer file.close(compat.io());
         if (std.c.lseek(file.handle, 0, std.c.SEEK.END) < 0) return error.Unseekable;
+        saver.save(compat.posix.STDERR_FILENO);
         try compat.posix.dup2(file.handle, compat.posix.STDERR_FILENO);
     } else if (std.mem.eql(u8, redirect_type, "2>&1")) {
+        saver.save(compat.posix.STDERR_FILENO);
         try compat.posix.dup2(compat.posix.STDOUT_FILENO, compat.posix.STDERR_FILENO);
     } else if (std.mem.eql(u8, redirect_type, ">&2")) {
+        saver.save(compat.posix.STDOUT_FILENO);
         try compat.posix.dup2(compat.posix.STDERR_FILENO, compat.posix.STDOUT_FILENO);
     } else if (std.mem.eql(u8, redirect_type, "&>")) {
         const file = try std.Io.Dir.cwd().createFile(compat.io(), expanded_target, .{ .truncate = true });
         defer file.close(compat.io());
+        saver.save(compat.posix.STDOUT_FILENO);
+        saver.save(compat.posix.STDERR_FILENO);
         try compat.posix.dup2(file.handle, compat.posix.STDOUT_FILENO);
         try compat.posix.dup2(file.handle, compat.posix.STDERR_FILENO);
     } else if (std.mem.eql(u8, redirect_type, "&>>")) {
         const file = try std.Io.Dir.cwd().createFile(compat.io(), expanded_target, .{ .truncate = false });
         defer file.close(compat.io());
         if (std.c.lseek(file.handle, 0, std.c.SEEK.END) < 0) return error.Unseekable;
+        saver.save(compat.posix.STDOUT_FILENO);
+        saver.save(compat.posix.STDERR_FILENO);
         try compat.posix.dup2(file.handle, compat.posix.STDOUT_FILENO);
         try compat.posix.dup2(file.handle, compat.posix.STDERR_FILENO);
     } else if (std.mem.eql(u8, redirect_type, "<<<")) {
+        saver.save(compat.posix.STDIN_FILENO);
         // Here string, materialised into a temp file rather than a pipe.
         //
         // The pipe version deadlocked: redirects are applied in the parent
@@ -2136,7 +2203,7 @@ fn applyRedirect(shell: *Shell, node: *const ast.AstNode) !void {
         std.Io.Dir.deleteFileAbsolute(compat.io(), tmp_path) catch {};
         try compat.posix.dup2(rf.handle, compat.posix.STDIN_FILENO);
     } else {
-        try applyFdRedirect(redirect_type, expanded_target);
+        try applyFdRedirect(redirect_type, expanded_target, saver);
     }
 }
 
@@ -2146,13 +2213,14 @@ fn applyRedirect(shell: *Shell, node: *const ast.AstNode) !void {
 ///   n>file n>>file n<file
 ///   n>&m n<&m    duplicate fd m into fd n
 ///   n>&-  n<&-   close fd n
-fn applyFdRedirect(op: []const u8, target: []const u8) !void {
+fn applyFdRedirect(op: []const u8, target: []const u8, saver: *FdSaver) !void {
     const STDOUT = compat.posix.STDOUT_FILENO;
     const STDERR = compat.posix.STDERR_FILENO;
 
     if (std.mem.eql(u8, op, ">|")) {
         const file = try std.Io.Dir.cwd().createFile(compat.io(), target, .{ .truncate = true });
         defer file.close(compat.io());
+        saver.save(STDOUT);
         try compat.posix.dup2(file.handle, STDOUT);
         return;
     }
@@ -2161,10 +2229,13 @@ fn applyFdRedirect(op: []const u8, target: []const u8) !void {
         // >&digit -> dup that fd into stdout; >&file -> both stdout+stderr to file
         if (target.len > 0 and allDigits(target)) {
             const src = std.fmt.parseInt(i32, target, 10) catch return;
+            saver.save(STDOUT);
             try compat.posix.dup2(src, STDOUT);
         } else {
             const file = try std.Io.Dir.cwd().createFile(compat.io(), target, .{ .truncate = true });
             defer file.close(compat.io());
+            saver.save(STDOUT);
+            saver.save(STDERR);
             try compat.posix.dup2(file.handle, STDOUT);
             try compat.posix.dup2(file.handle, STDERR);
         }
@@ -2179,21 +2250,31 @@ fn applyFdRedirect(op: []const u8, target: []const u8) !void {
     if (std.mem.eql(u8, rest, ">")) {
         const file = try std.Io.Dir.cwd().createFile(compat.io(), target, .{ .truncate = true });
         defer file.close(compat.io());
+        saver.save(fd);
         try compat.posix.dup2(file.handle, fd);
     } else if (std.mem.eql(u8, rest, ">>")) {
         const file = try std.Io.Dir.cwd().createFile(compat.io(), target, .{ .truncate = false });
         defer file.close(compat.io());
         if (std.c.lseek(file.handle, 0, std.c.SEEK.END) < 0) return error.Unseekable;
+        saver.save(fd);
         try compat.posix.dup2(file.handle, fd);
     } else if (std.mem.eql(u8, rest, "<")) {
         const file = try std.Io.Dir.cwd().openFile(compat.io(), target, .{ .mode = .read_only });
         defer file.close(compat.io());
+        saver.save(fd);
         try compat.posix.dup2(file.handle, fd);
     } else if (std.mem.eql(u8, rest, ">&") or std.mem.eql(u8, rest, "<&")) {
         if (target.len == 1 and target[0] == '-') {
-            compat.posix.close(fd); // n>&- / n<&- : close fd n
+            // n>&- / n<&- : close fd n for the command's duration. save()
+            // records the original state for restore; probe the CURRENT
+            // state (an earlier redirect in the chain may have reopened n)
+            // and skip the close if n is not open — close on a bad fd is
+            // unreachable in compat.
+            saver.save(fd);
+            if (compat.posix.fstat(fd)) |_| compat.posix.close(fd) else |_| {}
         } else if (allDigits(target)) {
             const src = std.fmt.parseInt(i32, target, 10) catch return;
+            saver.save(fd);
             try compat.posix.dup2(src, fd);
         }
     }
@@ -3165,6 +3246,27 @@ pub fn evaluateSelect(shell: *Shell, node: *const ast.AstNode) !u8 {
     var last_status: u8 = 0;
     var need_menu = true;
     var line_buf: [4096]u8 = undefined;
+
+    // Cook the terminal for the duration of the loop: the line editor leaves it
+    // raw, where readSelectLine gets no echo and never sees a line-ending '\n'
+    // (Enter arrives as CR), so `select` would hang uninteractably. Same fix as
+    // the `read` builtin. Restored on exit.
+    const sel_stdin = compat.posix.STDIN_FILENO;
+    var sel_orig: ?compat.posix.termios = null;
+    if (compat.posix.isatty(sel_stdin)) {
+        sel_orig = compat.posix.tcgetattr(sel_stdin) catch null;
+        if (sel_orig) |ot| {
+            var nt = ot;
+            nt.lflag.ICANON = true;
+            nt.lflag.ECHO = true;
+            nt.lflag.ISIG = true;
+            nt.iflag.ICRNL = true;
+            compat.posix.tcsetattr(sel_stdin, .NOW, nt) catch {};
+        }
+    }
+    defer if (sel_orig) |ot| {
+        compat.posix.tcsetattr(sel_stdin, .NOW, ot) catch {};
+    };
 
     while (true) {
         // Flush any pending buffered stdout so the menu/prompt (written straight

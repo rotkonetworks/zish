@@ -325,6 +325,16 @@ def _(sh):
     expect_soon(sh, "ANS=[y]", timeout=6)
 
 
+@test("interactive select accepts a choice")
+def _(sh):
+    # `select` read the raw terminal too — same hang as `read`. Cooking the
+    # terminal for its input loop makes a typed choice + Enter work.
+    sh.sendline("select f in alpha beta; do echo PICK=$f; break; done")
+    time.sleep(0.4)
+    sh.sendline("2")
+    expect_soon(sh, "PICK=beta", timeout=6)
+
+
 @test("background job actually runs (not born stopped)")
 def _(sh):
     # A forked background child used to run the terminal-control dance

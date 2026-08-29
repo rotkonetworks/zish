@@ -403,6 +403,17 @@ pub const posix = struct {
         }
     }
 
+    /// Duplicate `fd` to a descriptor >= 10 with close-on-exec set.
+    ///
+    /// Used for the shell's internal fd bookkeeping (redirect backups, capture
+    /// backups, the trace channel): user redirects can only target fds 0-9, so
+    /// a backup parked at >=10 can never be clobbered by `3>file`, and CLOEXEC
+    /// keeps it from leaking into any child the shell execs.
+    pub fn dupHighCloexec(fd: fd_t) FcntlError!fd_t {
+        const F_DUPFD_CLOEXEC = 1030;
+        return @intCast(try fcntl(fd, F_DUPFD_CLOEXEC, 10));
+    }
+
     pub const FStatError = error{ SystemResources, AccessDenied, BadFileDescriptor, Unexpected };
 
     pub fn fstat(fd: fd_t) FStatError!Stat {

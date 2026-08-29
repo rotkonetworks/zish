@@ -4157,7 +4157,11 @@ fn captureInternal(self: *Shell, command: []const u8) ![]const u8 {
     };
     defer compat.posix.close(capfd);
 
-    const stdout_backup = try compat.posix.dup(compat.posix.STDOUT_FILENO);
+    // Park the backup at fd >= 10 with CLOEXEC (like the redirect backups in
+    // eval.zig): a plain dup() lands at fd 3, where a user redirect `3>file`
+    // inside the captured command would clobber it, and a non-CLOEXEC backup
+    // of the terminal would leak into every child the capture spawns.
+    const stdout_backup = try compat.posix.dupHighCloexec(compat.posix.STDOUT_FILENO);
     defer compat.posix.close(stdout_backup);
 
     // Flush pending buffered stdout before swapping the fd so it lands on the
