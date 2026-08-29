@@ -325,6 +325,23 @@ def _(sh):
     expect_soon(sh, "ANS=[y]", timeout=6)
 
 
+@test("prompt stays raw after a command cooks the terminal")
+def _(sh):
+    # A command (or a misbehaving tool like a broken CLI) can leave the terminal
+    # in cooked mode. The shell must re-assert its own raw mode before the next
+    # prompt, or the prompt echoes "^C" and line-buffers input. Cook the tty via
+    # stty, then confirm the prompt still works and Ctrl+C clears rather than
+    # inserting a literal ^C.
+    sh.sendline("stty icanon echo")
+    sh.read(timeout=3)
+    sh.send("garbage")          # type on the (post-command) prompt
+    time.sleep(0.3)
+    sh.send("\x03")             # Ctrl+C must clear the line, not insert ^C
+    time.sleep(0.3)
+    sh.sendline("echo raw_ok_$((5 + 6))")
+    expect_soon(sh, "raw_ok_11", timeout=6)
+
+
 @test("interactive select accepts a choice")
 def _(sh):
     # `select` read the raw terminal too — same hang as `read`. Cooking the

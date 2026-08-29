@@ -1468,6 +1468,13 @@ fn handleAction(self: *Shell, action: Action) !void {
                 // flush any command output before rendering new prompt
                 try self.stdout().flush();
 
+                // Backstop: guarantee the terminal is back in the line editor's
+                // raw mode before the next prompt, no matter what the command
+                // (or a misbehaving child) left it in. Without this, a command
+                // that leaves the tty cooked makes the prompt echo "^C" and
+                // line-buffer input — the shell must own its input mode.
+                self.ensureRawMode();
+
                 self.clearCommand();
                 self.history_index = -1;
                 self.history_search_prefix_len = 0;
@@ -2505,6 +2512,26 @@ pub fn enableRawMode(self: *Shell) !void {
     if (posix.isatty(posix.STDERR_FILENO)) {
         _ = posix.write(posix.STDERR_FILENO, "\x1b[?2004h") catch {};
     }
+}
+
+/// Re-assert raw mode — termios only, no escape sequences (unlike
+/// enableRawMode, which also toggles bracketed paste). A backstop: called after
+/// every command so the line editor is guaranteed to read a raw terminal, even
+/// if a command left it cooked or otherwise altered its modes. Without this the
+/// prompt could get stuck echoing "^C" and line-buffering input — the shell
+/// must own its input mode by construction, not trust every child to restore
+/// it. Cheap enough to run per command; no per-keystroke cost.
+pub fn ensureRawMode(self: *Shell) void {
+    const orig = self.original_termios orelse return;
+    var t = orig;
+    t.lflag.ICANON = false;
+    t.lflag.ECHO = false;
+    t.lflag.ISIG = false;
+    t.iflag.ICRNL = false;
+    t.iflag.IXON = false;
+    t.cc[@intFromEnum(posix.V.MIN)] = 1;
+    t.cc[@intFromEnum(posix.V.TIME)] = 0;
+    posix.tcsetattr(posix.STDIN_FILENO, .NOW, t) catch {};
 }
 
 pub fn disableRawMode(self: *Shell) void {
