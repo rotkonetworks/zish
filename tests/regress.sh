@@ -681,6 +681,17 @@ same_as_bash "kill bad signal to stderr"   'kill -NOPE 1 2>/dev/null; echo rc=$?
 same_as_bash "source args set + restore"   'printf "echo s:\$1,\$#\n" > sc; set -- a b; source ./sc X Y Z; echo a:$1,$#; rm -f sc'
 same_as_bash "source no-args keeps caller"  'printf "echo s:\$1,\$#\n" > sc2; set -- keep1 keep2; source ./sc2; echo a:$1,$#; rm -f sc2'
 
+# printf: precision was discarded (%.2f -> 3.141590), %c parsed numbers, %q
+# emitted backslash-newline (line continuation, no round-trip).
+same_as_bash "printf %.2f precision"       'printf "%.2f\n" 3.14159'
+same_as_bash "printf %.0f"                  'printf "%.0f\n" 3.7'
+same_as_bash "printf %8.2f width"          'printf "%8.2f|\n" 3.1'
+same_as_bash "printf %.3e"                 'printf "%.3e\n" 31415.9'
+same_as_bash "printf %c is first byte"     'printf "[%c]\n" 65'
+same_as_bash "printf %q space"             "printf '%q\n' 'hello world'"
+same_as_bash "printf %q newline"           'printf "%q\n" "$(printf "a\nb")"'
+same_as_bash "printf %q metachars"         "printf '%q\n' 'a|b;c'"
+
 # `read` builtin: the seekable fast path (block read + lseek-back) must be
 # byte-for-byte identical to the byte path and to bash. The critical invariant
 # is that read consumes EXACTLY one line — a following reader sees the rest.

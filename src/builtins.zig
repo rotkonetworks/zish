@@ -505,6 +505,28 @@ fn printfParseSpec(fmt: []const u8) PrintfSpec {
     };
 }
 
+/// Rewrite Zig's float exponent (`3.142e4`, `1e-4`) into C printf's `e+04` /
+/// `e-04` form, into `out`. `upper` uppercases the `e`. Falls back to the input
+/// if it has no exponent or doesn't fit.
+fn cStyleExponent(out: []u8, s: []const u8, upper: bool) []const u8 {
+    const e_idx = std.mem.indexOfScalar(u8, s, 'e') orelse return s;
+    const mant = s[0..e_idx];
+    var exp = s[e_idx + 1 ..];
+    var neg = false;
+    if (exp.len > 0 and (exp[0] == '+' or exp[0] == '-')) {
+        neg = exp[0] == '-';
+        exp = exp[1..];
+    }
+    const pad: usize = if (exp.len < 2) 2 - exp.len else 0;
+    return std.fmt.bufPrint(out, "{s}{c}{c}{s}{s}", .{
+        mant,
+        @as(u8, if (upper) 'E' else 'e'),
+        @as(u8, if (neg) '-' else '+'),
+        ("00")[0..pad],
+        exp,
+    }) catch s;
+}
+
 /// Format one argument per `spec`. Returns true when a %b argument hit `\c`,
 /// which aborts the entire printf invocation (bash semantics).
 fn printfFormatArg(writer: anytype, spec: PrintfSpec, arg: []const u8) !bool {
@@ -516,15 +538,9 @@ fn printfFormatArg(writer: anytype, spec: PrintfSpec, arg: []const u8) !bool {
             output = if (spec.precision) |p| arg[0..@min(p, arg.len)] else arg;
         },
         'c' => {
-            if (arg.len > 0) {
-                // check if numeric
-                if (std.fmt.parseInt(u8, arg, 0)) |code| {
-                    buf[0] = code;
-                    output = buf[0..1];
-                } else |_| {
-                    output = arg[0..1];
-                }
-            }
+            // bash %c is the FIRST BYTE of the argument, never a numeric code:
+            // printf '%c' 65 prints '6', not 'A'.
+            if (arg.len > 0) output = arg[0..1];
         },
         'd', 'i' => {
             const val = std.fmt.parseInt(i64, arg, 0) catch 0;
@@ -546,14 +562,19 @@ fn printfFormatArg(writer: anytype, spec: PrintfSpec, arg: []const u8) !bool {
             const val = std.fmt.parseInt(u64, arg, 0) catch 0;
             output = std.fmt.bufPrint(&buf, "{o}", .{val}) catch "";
         },
-        'f', 'e', 'g' => {
+        'f', 'F' => {
+            // Honor the requested precision (was hardcoded to 6): %.2f -> 3.14.
             const val = std.fmt.parseFloat(f64, arg) catch 0.0;
             const prec = spec.precision orelse 6;
-            output = std.fmt.bufPrint(&buf, "{d:.6}", .{val}) catch blk: {
-                // manual precision handling
-                _ = prec;
-                break :blk "";
-            };
+            output = std.fmt.bufPrint(&buf, "{d:.[1]}", .{ val, prec }) catch "";
+        },
+        'e', 'E', 'g', 'G' => {
+            const val = std.fmt.parseFloat(f64, arg) catch 0.0;
+            const prec = spec.precision orelse 6;
+            var tmp: [64]u8 = undefined;
+            const raw = std.fmt.bufPrint(&tmp, "{e:.[1]}", .{ val, prec }) catch "";
+            // Zig prints the exponent as `e4`/`e-4`; C printf uses `e+04`.
+            output = cStyleExponent(&buf, raw, spec.specifier == 'E' or spec.specifier == 'G');
         },
         'b' => {
             // string with backslash escapes interpreted (\t, \n, \xNN, \0nnn…)
@@ -574,19 +595,46 @@ fn printfFormatArg(writer: anytype, spec: PrintfSpec, arg: []const u8) !bool {
             return false;
         },
         'q' => {
-            // quote the argument so it can be reused as shell input.
+            // Quote so the result re-reads as this exact word (bash %q):
+            //  - empty            -> ''
+            //  - any control byte -> wrap the WHOLE word in $'...' (so a newline
+            //    becomes $'a\nb', which round-trips; a backslash-newline would
+            //    reparse as a line continuation and NOT round-trip)
+            //  - otherwise        -> backslash-escape shell metacharacters in place
             if (arg.len == 0) {
                 try writer.writeAll("''");
                 return false;
             }
+            var has_ctrl = false;
             for (arg) |c| {
-                const needs_escape = switch (c) {
-                    ' ', '\t', '\n', '|', '&', ';', '<', '>', '(', ')', '$', '`',
-                    '"', '\'', '\\', '*', '?', '[', ']', '{', '}', '~', '#', '!' => true,
-                    else => false,
+                if (c < 0x20 or c == 0x7f) has_ctrl = true;
+            }
+            if (has_ctrl) {
+                try writer.writeAll("$'");
+                for (arg) |c| switch (c) {
+                    '\n' => try writer.writeAll("\\n"),
+                    '\t' => try writer.writeAll("\\t"),
+                    '\r' => try writer.writeAll("\\r"),
+                    '\\' => try writer.writeAll("\\\\"),
+                    '\'' => try writer.writeAll("\\'"),
+                    else => {
+                        if (c < 0x20 or c == 0x7f) {
+                            var ob: [8]u8 = undefined;
+                            try writer.writeAll(std.fmt.bufPrint(&ob, "\\{o:0>3}", .{c}) catch "");
+                        } else try writer.writeByte(c);
+                    },
                 };
-                if (needs_escape) try writer.writeByte('\\');
-                try writer.writeByte(c);
+                try writer.writeAll("'");
+            } else {
+                for (arg) |c| {
+                    const needs_escape = switch (c) {
+                        ' ', '|', '&', ';', '<', '>', '(', ')', '$', '`',
+                        '"', '\'', '\\', '*', '?', '[', ']', '{', '}', '~', '#', '!' => true,
+                        else => false,
+                    };
+                    if (needs_escape) try writer.writeByte('\\');
+                    try writer.writeByte(c);
+                }
             }
             return false;
         },
