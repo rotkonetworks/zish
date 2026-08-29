@@ -123,6 +123,13 @@ pub const History = struct {
         // Security: Input validation
         if (command.len == 0) return;
         if (command.len > MAX_COMMAND_LENGTH) return error.CommandTooLong;
+        // The on-disk log stores each record length in a u16 (see history_log
+        // EntryData.serialize / LogWriter.append). A command near
+        // MAX_COMMAND_LENGTH plus header+crypto overhead overflows that u16 and
+        // used to abort the whole shell on save. History is best-effort: skip
+        // recording anything too large to encode rather than crash. Margin below
+        // 65535 covers the 14-byte header + 40-byte nonce/tag overhead.
+        if (command.len > 65000) return;
 
         // Security: Sanitize command - remove control characters except tab/newline
         if (!isCommandSafe(command)) return error.UnsafeCommand;
@@ -323,9 +330,12 @@ pub const History = struct {
                 // Frequency bonus (commands used more often rank higher)
                 score += @as(f32, @floatFromInt(entry.frequency)) * 0.1;
 
-                // Recency bonus (recent commands rank higher)
+                // Recency bonus (recent commands rank higher). Saturating: a
+                // clock-skewed peer can write a shared-history entry timestamped
+                // in the future; plain u32 subtraction would underflow and panic
+                // on every Ctrl-R until it ages out.
                 const now = @as(u32, @intCast(compat.timestamp()));
-                const age = now - entry.timestamp;
+                const age = now -| entry.timestamp;
                 if (age < 3600) {
                     score += 2.0; // Bonus for commands used in last hour
                 } else if (age < 86400) {

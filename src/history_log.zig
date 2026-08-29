@@ -52,7 +52,8 @@ pub const EntryData = struct {
         std.mem.writeInt(u64, buf[pos..][0..8], self.command_hash, .little);
         pos += 8;
 
-        // command length
+        // command length (u16 on disk) — fail closed rather than @intCast-panic
+        if (self.command.len > std.math.maxInt(u16)) return error.CommandTooLong;
         std.mem.writeInt(u16, buf[pos..][0..2], @intCast(self.command.len), .little);
         pos += 2;
 
@@ -179,7 +180,8 @@ pub const LogWriter = struct {
         const encrypted = try self.crypto.encrypt(plaintext, &aad_buf);
         defer self.allocator.free(encrypted);
 
-        // update header with actual encrypted length
+        // update header with actual encrypted length (u16) — fail closed
+        if (encrypted.len > std.math.maxInt(u16)) return error.CommandTooLong;
         header.entry_len = @intCast(encrypted.len);
 
         // get log file path
@@ -410,6 +412,24 @@ test "serialize and deserialize entry" {
     try std.testing.expectEqual(original.exit_code, deserialized.exit_code);
     try std.testing.expectEqual(original.flags, deserialized.flags);
     try std.testing.expectEqual(original.frequency, deserialized.frequency);
+}
+
+test "serialize fails closed on a command too long for the u16 length field" {
+    const allocator = std.testing.allocator;
+    // Before the guard, @intCast of a >65535-byte command aborted the shell
+    // under release=safe. Now it returns an error and the entry is skipped.
+    const big = try allocator.alloc(u8, 70000);
+    defer allocator.free(big);
+    @memset(big, 'a');
+    const entry = EntryData{
+        .command_hash = 1,
+        .command = big,
+        .exit_code = 0,
+        .flags = 0,
+        .frequency = 1,
+        .timestamp = 0,
+    };
+    try std.testing.expectError(error.CommandTooLong, entry.serialize(allocator));
 }
 
 // test disabled: uses real ~/.config/zish/history.d path, not isolated
