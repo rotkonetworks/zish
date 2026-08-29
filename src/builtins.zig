@@ -8,6 +8,7 @@ const BindableAction = input_mod.BindableAction;
 const editor = @import("editor.zig");
 const linkify = @import("linkify.zig");
 const compat = @import("compat.zig");
+const foreground = @import("foreground.zig");
 
 // directory stack for pushd/popd
 var dir_stack: std.ArrayList([]const u8) = undefined;
@@ -1607,26 +1608,20 @@ fn fg(shell: *Shell, args: []const []const u8) !u8 {
 
     const j = job.?;
     try shell.stdout().print("{s}\n", .{j.command});
+    shell.stdout().flush() catch {};
 
-    // Disable raw mode before giving terminal to job
-    shell.disableRawMode();
-
-    // Put job in foreground and wait
-    const status = shell.job_table.putJobInForeground(j, j.state == .stopped) catch |err| {
-        try shell.stdout().print("fg: failed to put job in foreground: {}\n", .{err});
-        shell.enableRawMode() catch {};
-        return 1;
-    };
-
-    // Re-enable raw mode
-    shell.enableRawMode() catch {};
+    // Same foreground discipline as launching a fresh child, through the
+    // single owner (cooked tty, terminal to the job's pgroup, SIGINT-ignored
+    // UNTRACED wait, reclaim, editor raw mode restored) — replaces the
+    // divergent JobTable.putJobInForeground/shell_tmodes mechanism.
+    const status = foreground.resumeJobForeground(shell, j, j.state == .stopped);
 
     // If job completed, remove it
     if (j.isCompleted()) {
         shell.job_table.removeJob(j.id);
     }
 
-    return @truncate(@as(u32, @bitCast(status)));
+    return status;
 }
 
 fn bg(shell: *Shell, args: []const []const u8) !u8 {
@@ -2012,10 +2007,8 @@ const Rusage = extern struct {
     ru_nivcsw: isize, // involuntary context switches
 };
 
-// wait4 syscall - like waitpid but returns rusage
-fn wait4(pid: compat.posix.pid_t, status: *u32, options: u32, rusage: ?*Rusage) compat.posix.pid_t {
-    return compat.posix.waitRusage(pid, status, options, @ptrCast(rusage));
-}
+// (the wait4-with-rusage wait now happens inside foreground.Session.reap,
+// via its optional rusage argument)
 
 const BenchSample = struct {
     wall_ns: i128,
@@ -2108,26 +2101,31 @@ fn timeCmd(shell: *Shell, args: []const []const u8) !u8 {
     const cmd_args = args[cmd_start..];
     const is_benchmark = iterations > 1;
 
-    // run warmup iterations
+    // run warmup iterations. 148 = the timed child was Ctrl+Z'd and is now a
+    // stopped job — do not fork further iterations on top of it.
     for (0..warmup) |_| {
-        _ = try runTimedCommand(shell, cmd_args);
+        const s = try runTimedCommand(shell, cmd_args);
+        if (s.exit_code == 148) return 148;
     }
 
     // collect samples
     var samples: [10000]BenchSample = undefined;
     var last_exit: u8 = 0;
+    var collected: usize = 0;
 
     for (0..iterations) |iter| {
         samples[iter] = try runTimedCommand(shell, cmd_args);
         last_exit = samples[iter].exit_code;
+        collected = iter + 1;
+        if (last_exit == 148) break; // stopped by Ctrl+Z — stop benchmarking
     }
 
     // compute statistics
-    const stats = computeStats(samples[0..iterations]);
+    const stats = computeStats(samples[0..collected]);
 
     // output results
     if (is_benchmark) {
-        try printBenchmarkResults(writer, stats, iterations, quiet, show_histogram, samples[0..iterations]);
+        try printBenchmarkResults(writer, stats, collected, quiet, show_histogram, samples[0..collected]);
     } else {
         try printSingleResult(writer, samples[0], quiet, verbose);
     }
@@ -2136,6 +2134,16 @@ fn timeCmd(shell: *Shell, args: []const []const u8) !u8 {
 }
 
 fn runTimedCommand(shell: *Shell, cmd_args: []const []const u8) !BenchSample {
+    // Full foreground job-control discipline via the single owner: cooked
+    // tty, own pgroup + terminal for the child, default signals, UNTRACED
+    // wait, stopped-job registration. Before this, `time sleep 30` could not
+    // be Ctrl+C'd (child inherited SIG_IGN through exec) and Ctrl+Z wedged
+    // the shell (non-UNTRACED wait).
+    var fg_session = foreground.Session.begin(shell);
+    defer fg_session.end();
+
+    shell.stdout().flush() catch {};
+
     const start = compat.nanoTimestamp();
 
     // fork and run command
@@ -2148,7 +2156,8 @@ fn runTimedCommand(shell: *Shell, cmd_args: []const []const u8) !BenchSample {
     };
 
     if (pid == 0) {
-        // child - exec the command
+        // child: own pgroup + terminal, then default signals, then exec
+        fg_session.setupChild();
         var argv_buf: [256]?[*:0]const u8 = undefined;
         if (cmd_args.len >= argv_buf.len) {
             compat.posix.exit(126);
@@ -2164,29 +2173,37 @@ fn runTimedCommand(shell: *Shell, cmd_args: []const []const u8) !BenchSample {
         compat.posix.exit(127);
     }
 
-    // parent - wait for child with rusage via wait4
-    var status: u32 = 0;
+    // parent: race-avoidance setpgid, then the owned wait (routed through
+    // wait4 for rusage — the `rusage` argument of Session.reap).
+    fg_session.registerChild(pid);
+
+    var cmd_buf: [512]u8 = undefined;
+    var cmd_len: usize = 0;
+    for (cmd_args, 0..) |a, i| {
+        if (i > 0 and cmd_len < cmd_buf.len) {
+            cmd_buf[cmd_len] = ' ';
+            cmd_len += 1;
+        }
+        const n = @min(a.len, cmd_buf.len - cmd_len);
+        @memcpy(cmd_buf[cmd_len .. cmd_len + n], a[0..n]);
+        cmd_len += n;
+        if (cmd_len >= cmd_buf.len) break;
+    }
+
     var rusage: Rusage = std.mem.zeroes(Rusage);
-    _ = wait4(pid, &status, 0, &rusage);
+    const out = fg_session.reap(pid, cmd_buf[0..cmd_len], @ptrCast(&rusage));
     const end = compat.nanoTimestamp();
 
     const wall_ns = end - start;
     const user_ns = timevalToNs(rusage.ru_utime);
     const sys_ns = timevalToNs(rusage.ru_stime);
 
-    const exit_code: u8 = if (compat.posix.W.IFEXITED(status))
-        compat.posix.W.EXITSTATUS(status)
-    else if (compat.posix.W.IFSIGNALED(status))
-        128 + @as(u8, @truncate(@as(u32, @intCast(@intFromEnum(compat.posix.W.TERMSIG(status))))))
-    else
-        1;
-
     return BenchSample{
         .wall_ns = wall_ns,
         .user_ns = user_ns,
         .sys_ns = sys_ns,
         .maxrss_kb = rusage.ru_maxrss,
-        .exit_code = exit_code,
+        .exit_code = out.code,
     };
 }
 

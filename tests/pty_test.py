@@ -479,6 +479,105 @@ def _(sh):
     expect_soon(sh, "pipe_int_54")
 
 
+@test("ctrl-c interrupts the time builtin's child")
+def _(sh):
+    # The `time` builtin forked/exec'd with NO signal reset, NO pgroup, NO
+    # cooked tty — the timed child inherited SIG_IGN for INT through exec, so
+    # `time sleep 30` could not be Ctrl+C'd at all. It now runs through the
+    # same foreground owner as any external command.
+    sh.sendline("time sleep 30")
+    time.sleep(0.5)
+    sh.send("\x03")
+    sh.read(timeout=6)
+    sh.sendline("echo timed_int_$((21 * 3))")   # computed: proves a live prompt
+    expect_soon(sh, "timed_int_63")
+
+
+@test("ctrl-z stops the time builtin's child, shell survives")
+def _(sh):
+    # The old wait was a non-UNTRACED wait4: Ctrl+Z stopped the child and the
+    # shell sat in wait4 forever — the shell was wedged. The child must become
+    # a stopped job and the prompt must come back.
+    sh.sendline("time sleep 30")
+    time.sleep(0.5)
+    sh.send("\x1a")  # ctrl-Z
+    out = sh.read(timeout=8)
+    assert "Stopped" in out, f"no Stopped notice for timed child; got {out[-300:]!r}"
+    sh.sendline("jobs")
+    expect_soon(sh, "sleep 30")
+    sh.sendline("kill %1")
+    sh.read(timeout=3)
+    sh.sendline("echo timed_stop_$((22 * 3))")
+    expect_soon(sh, "timed_stop_66")
+
+
+@test("ctrl-c interrupts a command reading a process substitution")
+def _(sh):
+    # <(sleep 30): cat blocks on the pipe until the substitution child exits.
+    # Ctrl+C must interrupt the foreground cat and give the prompt back.
+    sh.sendline("cat <(sleep 30)")
+    time.sleep(0.5)
+    sh.send("\x03")
+    sh.read(timeout=6)
+    sh.sendline("echo procsub_int_$((23 * 3))")
+    expect_soon(sh, "procsub_int_69")
+
+
+@test("process substitution child gets default signal dispositions")
+def _(sh):
+    # Discriminating test: the procsub child execs /bin/sh, and sigaction
+    # dispositions survive exec. With the old inherited SIG_IGN the child
+    # shrugged off its own `kill -INT $$` and printed the marker; with default
+    # dispositions the SIGINT kills it before the echo runs.
+    # The bad marker is computed ($((27*3)) -> alive_81) so the pty's echo of
+    # the typed line can never contain it — only a child that survived the
+    # SIGINT and ran the echo can produce it.
+    sh.sendline('cat <(kill -INT $$; echo alive_$((27 * 3))); echo ps_done_$((24 * 3))')
+    out = expect_soon(sh, "ps_done_72", timeout=8)
+    assert "alive_81" not in out, \
+        f"procsub child ignored SIGINT (inherited SIG_IGN through exec): {out[-300:]!r}"
+
+
+@test("fg resumes a stopped job and ctrl-c then kills it")
+def _(sh):
+    # fg went through a divergent mechanism (JobTable.putJobInForeground with
+    # a separately-captured shell_tmodes); it now shares the one foreground
+    # owner. Resume the job, then Ctrl+C must reach it, and the prompt must
+    # come back with a working line editor.
+    sh.sendline("sleep 30")
+    time.sleep(0.4)
+    sh.send("\x1a")
+    out = sh.read(timeout=8)
+    assert "Stopped" in out, f"no Stopped notice; got {out[-300:]!r}"
+    sh.sendline("fg")
+    time.sleep(0.6)
+    sh.send("\x03")
+    sh.read(timeout=6)
+    sh.sendline("echo fg_int_$((25 * 3))")
+    expect_soon(sh, "fg_int_75")
+
+
+@test("fg'd job can be ctrl-z'd again")
+def _(sh):
+    # Second stop through the fg path: the resumed job stops again, the shell
+    # must print a Stopped notice, keep the job, and give back a live prompt.
+    sh.sendline("sleep 30")
+    time.sleep(0.4)
+    sh.send("\x1a")
+    sh.read(timeout=8)
+    sh.sendline("fg")
+    time.sleep(0.6)
+    sh.send("\x1a")
+    out = sh.read(timeout=8)
+    assert "Stopped" in out, f"no Stopped notice on re-stop via fg; got {out[-300:]!r}"
+    sh.sendline("jobs")
+    expect_soon(sh, "sleep 30")
+    sh.sendline("kill %1")
+    sh.read(timeout=3)
+    sh.sendline("echo fg_restop_$((26 * 3))")
+    expect_soon(sh, "fg_restop_78")
+
+
 # ---------------------------------------------------------------------------
 print("\nline editor")
 # ---------------------------------------------------------------------------

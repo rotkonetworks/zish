@@ -1142,9 +1142,8 @@ fn handleAction(self: *Shell, action: Action) !void {
             // than using our cached original_termios
             self.original_termios = null; // force re-read of terminal state
             self.enableRawMode() catch {};
-
-            // also update our cached shell terminal modes for job control
-            self.job_table.shell_tmodes = posix.tcgetattr(posix.STDIN_FILENO) catch self.job_table.shell_tmodes;
+            // (no cached shell_tmodes to refresh: the editor's raw mode is
+            // restored through foreground.Session/original_termios now)
 
             // redraw the prompt
             try self.stdout().writeAll("\n");

@@ -7,6 +7,7 @@ const Shell = @import("Shell.zig");
 const parser = @import("parser.zig");
 const builtins = @import("builtins.zig");
 const jobs = @import("jobs.zig");
+const foreground = @import("foreground.zig");
 
 // ============ "did you mean?" typo suggestions ============
 
@@ -178,6 +179,14 @@ fn expandProcessSubst(shell: *Shell, arg: []const u8) !?[:0]const u8 {
 
     if (pid == 0) {
         // child process - run command
+        //
+        // A process-substitution child is a background-ish helper, not a
+        // foreground job: it stays in the shell's pgroup and never touches
+        // the terminal. But sigaction dispositions survive fork AND exec, so
+        // without this reset the exec'd /bin/sh inherits the interactive
+        // shell's SIG_IGN for INT/QUIT/TSTP and can never be interrupted.
+        // No setpgid/tcsetpgrp here, so no SIGTTOU ordering hazard.
+        jobs.resetChildSignals();
         var child_arena = forkChildArena();
         shell.allocator = child_arena.allocator();
 
@@ -763,61 +772,8 @@ fn evaluateEchoBuiltinFast(shell: *Shell, node: *const ast.AstNode) !u8 {
     return 0;
 }
 
-/// Controlling-terminal handle for foreground job control.
-///
-/// Job control must key off the session's controlling terminal, not stdin:
-/// stdin can be redirected (heredoc, `< file`, a redirected function call)
-/// while the command still prompts on /dev/tty (age, ssh, sudo). Gating the
-/// tcsetpgrp handover on isatty(0) while calling setpgid unconditionally left
-/// such children in an orphaned background process group whose /dev/tty reads
-/// fail with EIO (SIGTTIN is inherited as SIG_IGN through exec) — the user's
-/// keystroke then landed in the shell's own line editor instead.
-const TtyCtl = struct {
-    /// fd of the controlling tty (stdin when it IS the tty, else /dev/tty),
-    /// or null when the shell has no controlling terminal (scripts, CI).
-    fd: ?compat.posix.fd_t,
-    opened: bool, // fd was opened here and must be closed on release
-
-    fn acquire() TtyCtl {
-        if (compat.posix.isatty(compat.posix.STDIN_FILENO))
-            return .{ .fd = compat.posix.STDIN_FILENO, .opened = false };
-        const fd = compat.posix.open("/dev/tty", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0) catch
-            return .{ .fd = null, .opened = false };
-        return .{ .fd = fd, .opened = true };
-    }
-
-    /// Cooked terminal for the child (canonical input, echo, ISIG).
-    fn cooked(self: TtyCtl, shell: *Shell) void {
-        const fd = self.fd orelse return;
-        if (!self.opened) {
-            shell.disableRawMode();
-        } else if (shell.original_termios) |orig| {
-            compat.posix.tcsetattr(fd, .NOW, orig) catch {};
-        }
-    }
-
-    /// Back to the line editor's raw mode (mirrors Shell.enableRawMode).
-    fn restoreRaw(self: TtyCtl, shell: *Shell) void {
-        const fd = self.fd orelse return;
-        if (!self.opened) {
-            shell.enableRawMode() catch {};
-        } else if (shell.original_termios) |orig| {
-            var raw = orig;
-            raw.lflag.ICANON = false;
-            raw.lflag.ECHO = false;
-            raw.lflag.ISIG = false;
-            raw.iflag.ICRNL = false;
-            raw.iflag.IXON = false;
-            raw.cc[@intFromEnum(compat.posix.V.MIN)] = 1;
-            raw.cc[@intFromEnum(compat.posix.V.TIME)] = 0;
-            compat.posix.tcsetattr(fd, .NOW, raw) catch {};
-        }
-    }
-
-    fn release(self: TtyCtl) void {
-        if (self.opened) compat.posix.close(self.fd.?);
-    }
-};
+// TtyCtl (the controlling-terminal handle) moved to foreground.zig — the
+// single owner of foreground job-control discipline.
 
 pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     if (node.children.len == 0) return 1;
@@ -1397,22 +1353,12 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     }
 
     // external command
-    // restore terminal to normal mode so child can handle signals properly,
-    // and hand it the terminal foreground. Both must key off the controlling
-    // terminal (TtyCtl), not stdin — see TtyCtl.
-    const tty = TtyCtl.acquire();
-    defer tty.release();
-    // Only the top-level foreground command owns the terminal. A forked child
-    // (a `&` background job, a pipeline stage, a subshell body) must NOT touch
-    // it: doing tcsetattr/tcsetpgrp from a background process group raises
-    // SIGTTOU and stops the child before it can exec — which made every
-    // `cmd &` born-stopped. Gate all terminal manipulation on foreground-ness,
-    // exactly as the pipeline path does; tty_fd going null makes the later
-    // setpgid/tcsetpgrp/reclaim blocks no-ops for a forked child.
-    const is_foreground = tty.fd != null and !shell.forked_child;
-    const tty_fd = if (is_foreground) tty.fd else null;
-    if (is_foreground) tty.cooked(shell);
-    defer if (is_foreground) tty.restoreRaw(shell);
+    // Foreground job-control discipline (terminal handover, pgroups, signal
+    // reset, UNTRACED wait) is owned by foreground.Session — this is the
+    // reference call site the abstraction was extracted from. See
+    // foreground.zig for the full dance and why each step is ordered.
+    var fg_session = foreground.Session.begin(shell);
+    defer fg_session.end();
 
     // use cached path lookup for faster execution
     if (shell.lookupCommand(cmd_name)) |full_path| {
@@ -1461,19 +1407,10 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     };
 
     if (pid == 0) {
-        // child: create own process group and take terminal control
-        // this allows TUI apps (like claude) to work properly
-        const child_pid = compat.posix.getpid();
-        if (tty_fd) |fd| {
-            compat.posix.setpgid(0, 0) catch {};
-            jobs.tcsetpgrp(fd, child_pid) catch {};
-        }
-
-        // Reset signal dispositions to default AFTER the tcsetpgrp above
-        // (see resetChildSignals for why the order is load-bearing). Without
-        // this the exec'd program inherits the shell's SIG_IGN for
-        // INT/QUIT/TSTP/TTIN/TTOU and can't be Ctrl+C'd or Ctrl+Z'd.
-        jobs.resetChildSignals();
+        // child: own pgroup + terminal, then default signals — the ordered
+        // dance lives in Session.setupChild. This lets TUI apps work and
+        // makes the exec'd program Ctrl+C/Ctrl+Z-able.
+        fg_session.setupChild();
 
         // Build environment in child process (after fork, safe from parent interference)
         const envp = buildEnvironment(shell) catch @as([*:null]const ?[*:0]const u8, @ptrCast(std.c.environ));
@@ -1483,55 +1420,25 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     }
 
     // parent: also set child's pgrp (race avoidance)
-    if (tty_fd != null) compat.posix.setpgid(pid, pid) catch {};
+    fg_session.registerChild(pid);
 
-    // parent - ignore SIGINT while child runs
-    var old_sigint: compat.posix.Sigaction = undefined;
-    const ignore_action = compat.posix.Sigaction{
-        .handler = .{ .handler = compat.posix.SIG.IGN },
-        .mask = std.mem.zeroes(compat.posix.sigset_t),
-        .flags = 0,
-    };
-    compat.posix.sigaction(compat.posix.SIG.INT, &ignore_action, &old_sigint);
-    defer compat.posix.sigaction(compat.posix.SIG.INT, &old_sigint, null);
+    // Display string in case the child is Ctrl+Z'd and becomes a stopped job.
+    var cmd_buf: [512]u8 = undefined;
+    const cmd_display = joinArgs(&cmd_buf, expanded_args.items);
 
-    // wait for child. UNTRACED makes waitpid return when the child is *stopped*
-    // (e.g. by Ctrl+Z / SIGTSTP), not just when it exits. Without this flag a
-    // Ctrl+Z left the shell blocked here forever while the child sat stopped —
-    // the shell appeared to hang.
-    const result = compat.posix.waitpid(pid, compat.posix.W.UNTRACED);
-
-    // take back terminal control
-    if (tty_fd) |fd| {
-        const shell_pgid: compat.posix.pid_t = compat.posix.getProcessGroup(0);
-        jobs.tcsetpgrp(fd, shell_pgid) catch {};
+    // SIGINT-ignore + waitpid(UNTRACED) + status decode + stopped-job
+    // registration + terminal reclaim, all in one owner.
+    const out = fg_session.reap(pid, cmd_display, null);
+    if (out.exited and out.code == 127) {
+        try shell.stdout().print("zish: {s}: command not found\n", .{cmd_name});
+        suggestCommand(shell, cmd_name);
     }
-
-    // Child was stopped (Ctrl+Z): register it as a stopped background job so it
-    // can be resumed with `fg`, tell the user, and return to the prompt instead
-    // of hanging. bash returns 128 + SIGTSTP for this.
-    if (compat.posix.W.IFSTOPPED(result.status)) {
-        registerStoppedForeground(shell, pid, expanded_args.items);
-        return 148; // 128 + SIGTSTP(20)
-    }
-
-    if (compat.posix.W.IFEXITED(result.status)) {
-        const code = compat.posix.W.EXITSTATUS(result.status);
-        if (code == 127) {
-            try shell.stdout().print("zish: {s}: command not found\n", .{cmd_name});
-            suggestCommand(shell, cmd_name);
-        }
-        return code;
-    } else if (compat.posix.W.IFSIGNALED(result.status)) {
-        return @truncate(128 + @as(u32, @intCast(@intFromEnum(compat.posix.W.TERMSIG(result.status)))));
-    }
-    return 127;
+    return out.code;
 }
 
-// Register a foreground command that was just stopped by Ctrl+Z as a stopped
-// background job, and print the standard "[n]+ Stopped  cmd" notice.
-fn registerStoppedForeground(shell: *Shell, pid: compat.posix.pid_t, args: []const [:0]const u8) void {
-    var buf: [512]u8 = undefined;
+// Join argv into a display string for job registration (space-separated,
+// truncated to the buffer).
+fn joinArgs(buf: []u8, args: []const [:0]const u8) []const u8 {
     var len: usize = 0;
     for (args, 0..) |a, i| {
         if (i > 0 and len < buf.len) {
@@ -1543,10 +1450,7 @@ fn registerStoppedForeground(shell: *Shell, pid: compat.posix.pid_t, args: []con
         len += n;
         if (len >= buf.len) break;
     }
-    const cmd = buf[0..len];
-    const job_id = shell.job_table.addStoppedForeground(pid, cmd);
-    shell.stdout().print("\n[{d}]+  Stopped\t\t{s}\n", .{ job_id, cmd }) catch {};
-    shell.stdout().flush() catch {};
+    return buf[0..len];
 }
 
 // Register a foreground pipeline that was just stopped by Ctrl+Z as a stopped
@@ -1695,22 +1599,14 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
     // there so it doesn't steal the terminal from the parent shell.
     // The controlling tty, not stdin: stdin may be redirected (heredoc,
     // a redirected function call) while a stage still prompts on /dev/tty.
-    const tty = TtyCtl.acquire();
-    defer tty.release();
-    const is_foreground = tty.fd != null and !shell.forked_child;
-    if (is_foreground) {
-        // Give the pipeline a cooked terminal (canonical input, ISIG) instead
-        // of the line editor's raw mode, so read()/tty prompts work.
-        tty.cooked(shell);
-    }
-    const shell_pgid: compat.posix.pid_t = @intCast(compat.posix.getProcessGroup(0));
-    defer {
-        if (is_foreground) {
-            // take terminal back and restore the editor's raw mode
-            jobs.tcsetpgrp(tty.fd.?, shell_pgid) catch {};
-            tty.restoreRaw(shell);
-        }
-    }
+    // The multi-pid variant of the foreground discipline: leader pgid, every
+    // stage in the leader's pgroup, reap-all with UNTRACED. Session owns the
+    // terminal handover; the reap loop stays here (per-stage $PIPESTATUS /
+    // pipefail bookkeeping). reclaim + end run from defers so the terminal
+    // comes back on the error path too.
+    var fg_session = foreground.Session.begin(shell);
+    defer fg_session.end();
+    defer fg_session.reclaim();
 
     // cleanup pipes and kill already-forked children on error
     // NOTE: if a child is in D-state (uninterruptible sleep, e.g. blocked on
@@ -1752,25 +1648,13 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
     for (node.children, 0..) |child, i| {
         const pid = try compat.posix.fork();
         if (pid == 0) {
-            // Child: join the pipeline's process group. The first process is
-            // the group leader (pgid == its pid); later processes join it.
-            if (tty.fd) |tfd| {
-                if (i == 0) {
-                    _ = compat.posix.setpgid(0, 0) catch {};
-                    if (is_foreground) {
-                        const mypid: compat.posix.pid_t = @intCast(compat.posix.getpid());
-                        jobs.tcsetpgrp(tfd, mypid) catch {};
-                    }
-                } else {
-                    _ = compat.posix.setpgid(0, pids[0]) catch {};
-                }
-            }
-            // Default signal dispositions for the stage — AFTER the
-            // setpgid/tcsetpgrp above (see resetChildSignals). Applies both to
-            // exec'd programs (dispositions survive exec) and to stages that
-            // stay in-process (builtins), so Ctrl+C/Ctrl+Z reach the whole
+            // Child: join the pipeline's process group (first stage is the
+            // leader), then default signal dispositions — the ordered dance
+            // lives in Session.setupPipelineStage. Applies both to exec'd
+            // programs (dispositions survive exec) and to stages that stay
+            // in-process (builtins), so Ctrl+C/Ctrl+Z reach the whole
             // foreground pipeline group.
-            jobs.resetChildSignals();
+            fg_session.setupPipelineStage(if (i == 0) 0 else pids[0]);
             // Setup pipes first
             if (i > 0) {
                 try compat.posix.dup2(pipes[i - 1][0], compat.posix.STDIN_FILENO);
@@ -1813,15 +1697,9 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
         } else {
             pids[i] = pid;
             // Parent: assign the child to the pipeline's group (both sides
-            // call setpgid for race avoidance, as in the single-command path).
-            if (tty.fd) |tfd| {
-                const pgid = if (i == 0) pid else pids[0];
-                _ = compat.posix.setpgid(pid, pgid) catch {};
-                if (i == 0 and is_foreground) {
-                    // put the pipeline's group in the foreground
-                    jobs.tcsetpgrp(tfd, pid) catch {};
-                }
-            }
+            // call setpgid for race avoidance, as in the single-command path);
+            // the foreground leader also gets the terminal.
+            fg_session.registerPipelineStage(pid, if (i == 0) 0 else pids[0]);
         }
     }
 
@@ -1831,14 +1709,8 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
     }
 
     // ignore SIGINT in shell while waiting for pipeline (children will receive it)
-    var old_sigint: compat.posix.Sigaction = undefined;
-    const ignore_action = compat.posix.Sigaction{
-        .handler = .{ .handler = compat.posix.SIG.IGN },
-        .mask = std.mem.zeroes(compat.posix.sigset_t),
-        .flags = 0,
-    };
-    compat.posix.sigaction(compat.posix.SIG.INT, &ignore_action, &old_sigint);
-    defer compat.posix.sigaction(compat.posix.SIG.INT, &old_sigint, null);
+    var sigint_guard = foreground.SigintGuard.begin();
+    defer sigint_guard.end();
 
     var last_status: u8 = 0;
     var pipefail_status: u8 = 0; // first non-zero status for pipefail
@@ -3345,12 +3217,8 @@ pub fn evaluateSubshell(shell: *Shell, node: *const ast.AstNode) !u8 {
     // own path, and the parent never restored raw mode — the line editor was
     // silently broken at the next prompt; (b) the body ran in the SHELL's
     // process group, so Ctrl+Z during `( sleep 30 )` SIGTSTP'd the shell.
-    const tty = TtyCtl.acquire();
-    defer tty.release();
-    const is_foreground = tty.fd != null and !shell.forked_child;
-    const tty_fd = if (is_foreground) tty.fd else null;
-    if (is_foreground) tty.cooked(shell);
-    defer if (is_foreground) tty.restoreRaw(shell);
+    var fg_session = foreground.Session.begin(shell);
+    defer fg_session.end();
 
     const pid = compat.posix.fork() catch {
         try shell.stdout().writeAll("zish: fork failed\n");
@@ -3360,12 +3228,8 @@ pub fn evaluateSubshell(shell: *Shell, node: *const ast.AstNode) !u8 {
     if (pid == 0) {
         // === CHILD ===
         // own process group + terminal, then default signals — in that order
-        // (see resetChildSignals for why).
-        if (tty_fd) |fd| {
-            compat.posix.setpgid(0, 0) catch {};
-            jobs.tcsetpgrp(fd, compat.posix.getpid()) catch {};
-        }
-        jobs.resetChildSignals();
+        // (Session.setupChild owns the ordered dance).
+        fg_session.setupChild();
         var child_arena = forkChildArena();
         shell.allocator = child_arena.allocator();
         shell.forked_child = true;
@@ -3380,45 +3244,18 @@ pub fn evaluateSubshell(shell: *Shell, node: *const ast.AstNode) !u8 {
 
     // === PARENT ===
     // both sides call setpgid (race avoidance, as in the command path)
-    if (tty_fd != null) compat.posix.setpgid(pid, pid) catch {};
+    fg_session.registerChild(pid);
 
-    // ignore SIGINT while the subshell runs (it receives it directly)
-    var old_sigint: compat.posix.Sigaction = undefined;
-    const ignore_action = compat.posix.Sigaction{
-        .handler = .{ .handler = compat.posix.SIG.IGN },
-        .mask = std.mem.zeroes(compat.posix.sigset_t),
-        .flags = 0,
-    };
-    compat.posix.sigaction(compat.posix.SIG.INT, &ignore_action, &old_sigint);
-    defer compat.posix.sigaction(compat.posix.SIG.INT, &old_sigint, null);
+    // Display string in case the subshell is Ctrl+Z'd and becomes a job.
+    var cmd_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer cmd_buf.deinit(shell.allocator);
+    serializeAst(shell.allocator, &cmd_buf, node) catch {};
+    const cmd: []const u8 = if (cmd_buf.items.len > 0) cmd_buf.items else "( ... )";
 
-    // UNTRACED: a Ctrl+Z'd subshell must return control to the shell, not
-    // leave it blocked here forever.
-    const result = compat.posix.waitpid(pid, compat.posix.W.UNTRACED);
-
-    // take back terminal control before touching termios
-    if (tty_fd) |fd| {
-        const shell_pgid: compat.posix.pid_t = compat.posix.getProcessGroup(0);
-        jobs.tcsetpgrp(fd, shell_pgid) catch {};
-    }
-
-    if (compat.posix.W.IFSTOPPED(result.status)) {
-        var cmd_buf: std.ArrayListUnmanaged(u8) = .empty;
-        defer cmd_buf.deinit(shell.allocator);
-        serializeAst(shell.allocator, &cmd_buf, node) catch {};
-        const cmd: []const u8 = if (cmd_buf.items.len > 0) cmd_buf.items else "( ... )";
-        const job_id = shell.job_table.addStoppedForeground(pid, cmd);
-        shell.stdout().print("\n[{d}]+  Stopped\t\t{s}\n", .{ job_id, cmd }) catch {};
-        shell.stdout().flush() catch {};
-        return 148; // 128 + SIGTSTP(20)
-    }
-
-    if (compat.posix.W.IFEXITED(result.status)) {
-        return compat.posix.W.EXITSTATUS(result.status);
-    } else if (compat.posix.W.IFSIGNALED(result.status)) {
-        return @truncate(128 + @as(u32, @intCast(@intFromEnum(compat.posix.W.TERMSIG(result.status)))));
-    }
-    return 127;
+    // SIGINT-ignore + waitpid(UNTRACED) + decode + stopped-job registration
+    // + terminal reclaim, all in the owner.
+    const out = fg_session.reap(pid, cmd, null);
+    return out.code;
 }
 
 pub fn evaluateBackground(shell: *Shell, node: *const ast.AstNode) !u8 {
@@ -4479,12 +4316,8 @@ fn featExec(shell: *Shell, tier: FeatTier, bin_path: []const u8, sub_args: []con
     // mode, in the shell's own process group, with signals ignored, and a
     // non-UNTRACED wait — so a feat prompting on the tty couldn't be Ctrl+C'd
     // and a Ctrl+Z hung the shell).
-    const tty = TtyCtl.acquire();
-    defer tty.release();
-    const is_foreground = tty.fd != null and !shell.forked_child;
-    const tty_fd = if (is_foreground) tty.fd else null;
-    if (is_foreground) tty.cooked(shell);
-    defer if (is_foreground) tty.restoreRaw(shell);
+    var fg_session = foreground.Session.begin(shell);
+    defer fg_session.end();
 
     shell.stdout().flush() catch {};
 
@@ -4493,49 +4326,18 @@ fn featExec(shell: *Shell, tier: FeatTier, bin_path: []const u8, sub_args: []con
         return 1;
     };
     if (pid == 0) {
-        // own pgroup + terminal, THEN default signals (see resetChildSignals)
-        if (tty_fd) |fd| {
-            compat.posix.setpgid(0, 0) catch {};
-            jobs.tcsetpgrp(fd, compat.posix.getpid()) catch {};
-        }
-        jobs.resetChildSignals();
+        // own pgroup + terminal, THEN default signals (Session.setupChild)
+        fg_session.setupChild();
         compat.posix.execveZ(argv0.ptr, argv_ptr, envp) catch {
             compat.posix.exit(127);
         };
     }
 
-    // parent: also set child's pgrp (race avoidance)
-    if (tty_fd != null) compat.posix.setpgid(pid, pid) catch {};
-
-    // ignore SIGINT while the feat runs (it receives it directly)
-    var old_sigint: compat.posix.Sigaction = undefined;
-    const ignore_action = compat.posix.Sigaction{
-        .handler = .{ .handler = compat.posix.SIG.IGN },
-        .mask = std.mem.zeroes(compat.posix.sigset_t),
-        .flags = 0,
-    };
-    compat.posix.sigaction(compat.posix.SIG.INT, &ignore_action, &old_sigint);
-    defer compat.posix.sigaction(compat.posix.SIG.INT, &old_sigint, null);
-
-    const result = compat.posix.waitpid(pid, compat.posix.W.UNTRACED);
-
-    // take back terminal control
-    if (tty_fd) |fd| {
-        const shell_pgid: compat.posix.pid_t = compat.posix.getProcessGroup(0);
-        jobs.tcsetpgrp(fd, shell_pgid) catch {};
-    }
-
-    if (compat.posix.W.IFSTOPPED(result.status)) {
-        const job_id = shell.job_table.addStoppedForeground(pid, bin_path);
-        shell.stdout().print("\n[{d}]+  Stopped\t\t{s}\n", .{ job_id, bin_path }) catch {};
-        shell.stdout().flush() catch {};
-        return 148; // 128 + SIGTSTP(20)
-    }
-
-    if (compat.posix.W.IFEXITED(result.status)) return compat.posix.W.EXITSTATUS(result.status);
-    if (compat.posix.W.IFSIGNALED(result.status))
-        return @truncate(128 + @as(u32, @intCast(@intFromEnum(compat.posix.W.TERMSIG(result.status)))));
-    return 127;
+    // parent: also set child's pgrp (race avoidance), then the owned
+    // SIGINT-ignore + UNTRACED wait + decode + reclaim.
+    fg_session.registerChild(pid);
+    const out = fg_session.reap(pid, bin_path, null);
+    return out.code;
 }
 
 fn featList(shell: *Shell, alloc: std.mem.Allocator) !u8 {

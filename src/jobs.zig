@@ -129,8 +129,11 @@ pub const JobTable = struct {
     allocator: std.mem.Allocator,
     next_id: u32,
     shell_pgid: posix.pid_t, // shell's process group
+    // NOTE: hardwired to STDIN_FILENO at init; only used for tcgetattr when
+    // capturing a stopping job's terminal modes (fails soft to null when
+    // stdin is not the tty). All tcsetpgrp handover goes through
+    // foreground.Session's controlling-terminal fd instead.
     shell_terminal: posix.fd_t, // terminal fd
-    shell_tmodes: posix.termios, // shell's terminal modes
     current_job: ?u32, // most recent job (for %% and %+)
     previous_job: ?u32, // previous job (for %-)
 
@@ -146,7 +149,6 @@ pub const JobTable = struct {
 
     pub fn init(allocator: std.mem.Allocator) JobTable {
         const terminal = posix.STDIN_FILENO;
-        const tmodes = posix.tcgetattr(terminal) catch std.mem.zeroes(posix.termios);
 
         // get actual process group - tcgetpgrp returns the foreground pgrp,
         // but we want our own pgrp which we can get via getpgid(0)
@@ -162,7 +164,6 @@ pub const JobTable = struct {
             .next_id = 1,
             .shell_pgid = pgid,
             .shell_terminal = terminal,
-            .shell_tmodes = tmodes,
             .current_job = null,
             .previous_job = null,
             .notifications = .empty,
@@ -416,55 +417,9 @@ pub const JobTable = struct {
         }
     }
 
-    /// Put a job in the foreground
-    pub fn putJobInForeground(self: *JobTable, job: *Job, cont: bool) !i32 {
-        // give terminal control to the job's process group
-        tcsetpgrp(self.shell_terminal, job.pgid) catch |err| {
-            std.debug.print("zish: tcsetpgrp to job failed: {}\n", .{err});
-            return error.TerminalControlFailed;
-        };
-
-        // restore job's terminal modes if it was stopped
-        if (cont and job.tmodes != null) {
-            posix.tcsetattr(self.shell_terminal, .FLUSH, job.tmodes.?) catch {};
-        }
-
-        // send SIGCONT if continuing a stopped job
-        if (cont) {
-            posix.kill(-job.pgid, posix.SIG.CONT) catch |err| {
-                std.debug.print("zish: SIGCONT to job failed: {}\n", .{err});
-                // not fatal, job may have exited
-            };
-        }
-
-        job.foreground = true;
-        job.state = .running;
-        // Clear stale per-process stopped flags (bash's mark_job_as_running):
-        // they were set when the job stopped, and waitForJob's loop condition
-        // checks isStopped() — with the flags still set it returned
-        // immediately instead of waiting, so `fg` gave the prompt back while
-        // the resumed job was still running.
-        for (job.processes.items) |*proc| {
-            if (!proc.completed) proc.stopped = false;
-        }
-
-        // wait for job to complete or stop
-        const status = self.waitForJob(job);
-
-        // put shell back in foreground - this must succeed
-        tcsetpgrp(self.shell_terminal, self.shell_pgid) catch |err| {
-            std.debug.print("zish: tcsetpgrp back to shell failed: {}\n", .{err});
-            // try to continue anyway
-        };
-
-        // save job's terminal modes
-        job.tmodes = posix.tcgetattr(self.shell_terminal) catch null;
-
-        // restore shell's terminal modes
-        posix.tcsetattr(self.shell_terminal, .FLUSH, self.shell_tmodes) catch {};
-
-        return status;
-    }
+    // putJobInForeground was replaced by foreground.resumeJobForeground: `fg`
+    // now goes through the same TtyCtl/Session owner as every other
+    // foreground site instead of a separately-captured shell_tmodes.
 
     /// Put a job in the background
     pub fn putJobInBackground(self: *JobTable, job: *Job, cont: bool) void {
@@ -483,7 +438,7 @@ pub const JobTable = struct {
 
     /// Wait for a job to stop or complete
     /// wait for a job to stop or complete, handling EINTR
-    fn waitForJob(self: *JobTable, job: *Job) i32 {
+    pub fn waitForJob(self: *JobTable, job: *Job) i32 {
         while (!job.isStopped() and !job.isCompleted()) {
             // waitpid with EINTR retry loop
             const result = waitpidRetry(-job.pgid, posix.W.UNTRACED);
