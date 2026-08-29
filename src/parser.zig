@@ -869,8 +869,11 @@ pub const Parser = struct {
             try self.nextToken();
         }
 
-        // parse pattern(s) separated by '|'
-        var pattern_buf = try std.ArrayList(u8).initCapacity(allocator, 64);
+        // parse alternation branches separated by '|'. Each branch keeps its own
+        // node (rather than being concatenated into one '|'-joined string) so a
+        // literal '|' inside a quoted/word token is never confused with the
+        // Pipe token that separates real alternatives.
+        var branches = try std.ArrayList(*const ast.AstNode).initCapacity(allocator, 4);
 
         // first pattern
         if (self.current_token.ty != .Word and self.current_token.ty != .String and
@@ -878,19 +881,22 @@ pub const Parser = struct {
         {
             return error.UnexpectedToken;
         }
-        try pattern_buf.appendSlice(allocator, self.current_token.value);
+        {
+            const tok = self.current_token;
+            try branches.append(allocator, try self.builder.createword(tok.value, tok.line, tok.column));
+        }
         try self.nextToken();
 
         // additional patterns separated by '|'
         while (self.current_token.ty == .Pipe) {
             try self.nextToken(); // consume '|'
-            try pattern_buf.append(allocator, '|');
             if (self.current_token.ty != .Word and self.current_token.ty != .String and
                 self.current_token.ty != .DoubleQuotedString and self.current_token.ty != .ParameterExpansion)
             {
                 return error.UnexpectedToken;
             }
-            try pattern_buf.appendSlice(allocator, self.current_token.value);
+            const tok = self.current_token;
+            try branches.append(allocator, try self.builder.createword(tok.value, tok.line, tok.column));
             try self.nextToken();
         }
 
@@ -908,10 +914,18 @@ pub const Parser = struct {
             try self.nextToken(); // consume ';;'
         }
 
+        // children[0] = body, children[1..] = one node per alternation branch
+        // (each branch keeps its own node so a literal '|' inside a quoted/word
+        // token is never confused with the Pipe token that separates real
+        // alternatives — see evaluateCase in eval.zig)
+        var children = try std.ArrayList(*const ast.AstNode).initCapacity(allocator, branches.items.len + 1);
+        try children.append(allocator, body);
+        try children.appendSlice(allocator, branches.items);
+
         return self.builder.createnode(
             .case_item,
-            pattern_buf.items,
-            &[_]*const ast.AstNode{body},
+            "",
+            children.items,
             item_token.line,
             item_token.column,
         );

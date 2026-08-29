@@ -3108,23 +3108,21 @@ pub fn evaluateCase(shell: *Shell, node: *const ast.AstNode) !u8 {
     // iterate through case items (children[1..])
     for (node.children[1..]) |case_item| {
         if (case_item.node_type != .case_item) continue;
+        if (case_item.children.len < 1) continue;
 
-        // patterns are stored in case_item.value, separated by '|'
-        const patterns = case_item.value;
-        var pattern_iter = std.mem.splitScalar(u8, patterns, '|');
-
-        while (pattern_iter.next()) |pattern| {
-            // expand variables in pattern
-            const expanded_pattern = try shell.expandVariables(pattern);
+        // case_item.children[0] = body, children[1..] = one node per
+        // alternation branch. Each branch is its own node (rather than a
+        // '|'-joined string) so a literal '|' inside a quoted/word token is
+        // never mistaken for the Pipe token that separates real alternatives.
+        for (case_item.children[1..]) |branch| {
+            // expand variables in the pattern branch
+            const expanded_pattern = try shell.expandVariables(branch.value);
             defer shell.allocator.free(expanded_pattern);
 
             // check if pattern matches
             if (glob.matchGlob(expanded_pattern, expr_value)) {
                 // execute the body (case_item.children[0])
-                if (case_item.children.len > 0) {
-                    return evaluateAst(shell, case_item.children[0]);
-                }
-                return 0;
+                return evaluateAst(shell, case_item.children[0]);
             }
         }
     }
