@@ -717,6 +717,12 @@ same_as_bash "kill bad signal spec rc"     'kill -NOPESIG 1 2>/dev/null; echo rc
 same_as_bash "signaled child exit 130"     'sh -c "kill -INT \$\$"; echo rc=$?'
 same_as_bash "signaled child exit 137"     'sh -c "kill -KILL \$\$"; echo rc=$?'
 
+# fg/bg/disown/wait indexed spec[0] unchecked; an empty jobspec (fg "") was an
+# out-of-bounds panic. One parseJobSpec owner makes it a clean error.
+same_as_bash "fg empty jobspec no crash"   'fg "" 2>/dev/null; echo alive'
+same_as_bash "bg empty jobspec no crash"   'bg "" 2>/dev/null; echo alive'
+same_as_bash "disown empty jobspec"        'disown "" 2>/dev/null; echo alive'
+
 # `read` builtin: the seekable fast path (block read + lseek-back) must be
 # byte-for-byte identical to the byte path and to bash. The critical invariant
 # is that read consumes EXACTLY one line — a following reader sees the rest.

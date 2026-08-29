@@ -1793,29 +1793,10 @@ fn fg(shell: *Shell, args: []const []const u8) !u8 {
     var job: ?*@import("jobs.zig").Job = null;
 
     if (args.len > 1) {
-        // Parse job spec: %1, %+, %-, or just number
-        const spec = args[1];
-        if (spec[0] == '%') {
-            if (spec.len == 1 or spec[1] == '+' or spec[1] == '%') {
-                job = shell.job_table.getCurrentJob();
-            } else if (spec[1] == '-') {
-                if (shell.job_table.previous_job) |id| {
-                    job = shell.job_table.getJob(id);
-                }
-            } else {
-                const job_id = std.fmt.parseInt(u32, spec[1..], 10) catch {
-                    try shell.stderr().print("fg: {s}: no such job\n", .{spec});
-                    return 1;
-                };
-                job = shell.job_table.getJob(job_id);
-            }
-        } else {
-            // Assume it's a job number
-            const job_id = std.fmt.parseInt(u32, spec, 10) catch {
-                try shell.stderr().print("fg: {s}: no such job\n", .{spec});
-                return 1;
-            };
-            job = shell.job_table.getJob(job_id);
+        job = shell.job_table.parseJobSpec(args[1]);
+        if (job == null) {
+            try shell.stderr().print("fg: {s}: no such job\n", .{args[1]});
+            return 1;
         }
     } else {
         // No args: use current job
@@ -1823,7 +1804,7 @@ fn fg(shell: *Shell, args: []const []const u8) !u8 {
     }
 
     if (job == null) {
-        try shell.stdout().writeAll("fg: no current job\n");
+        try shell.stderr().writeAll("fg: no current job\n");
         return 1;
     }
 
@@ -1852,34 +1833,17 @@ fn bg(shell: *Shell, args: []const []const u8) !u8 {
     var job: ?*@import("jobs.zig").Job = null;
 
     if (args.len > 1) {
-        const spec = args[1];
-        if (spec[0] == '%') {
-            if (spec.len == 1 or spec[1] == '+' or spec[1] == '%') {
-                job = shell.job_table.getCurrentJob();
-            } else if (spec[1] == '-') {
-                if (shell.job_table.previous_job) |id| {
-                    job = shell.job_table.getJob(id);
-                }
-            } else {
-                const job_id = std.fmt.parseInt(u32, spec[1..], 10) catch {
-                    try shell.stderr().print("bg: {s}: no such job\n", .{spec});
-                    return 1;
-                };
-                job = shell.job_table.getJob(job_id);
-            }
-        } else {
-            const job_id = std.fmt.parseInt(u32, spec, 10) catch {
-                try shell.stderr().print("bg: {s}: no such job\n", .{spec});
-                return 1;
-            };
-            job = shell.job_table.getJob(job_id);
+        job = shell.job_table.parseJobSpec(args[1]);
+        if (job == null) {
+            try shell.stderr().print("bg: {s}: no such job\n", .{args[1]});
+            return 1;
         }
     } else {
         job = shell.job_table.getCurrentJob();
     }
 
     if (job == null) {
-        try shell.stdout().writeAll("bg: no current job\n");
+        try shell.stderr().writeAll("bg: no current job\n");
         return 1;
     }
 
@@ -1904,18 +1868,13 @@ fn wait(shell: *Shell, args: []const []const u8) !u8 {
         const spec = args[1];
         var pid: compat.posix.pid_t = 0;
 
-        if (spec[0] == '%') {
-            // Job spec
-            const job_id = std.fmt.parseInt(u32, spec[1..], 10) catch {
+        if (spec.len > 0 and spec[0] == '%') {
+            // Job spec (%N, %+, %-, %%) — shared resolver
+            const job = shell.job_table.parseJobSpec(spec) orelse {
                 try shell.stderr().print("wait: {s}: no such job\n", .{spec});
                 return 127;
             };
-            if (shell.job_table.getJob(job_id)) |job| {
-                pid = job.pgid;
-            } else {
-                try shell.stderr().print("wait: {s}: no such job\n", .{spec});
-                return 127;
-            }
+            pid = job.pgid;
         } else {
             pid = std.fmt.parseInt(compat.posix.pid_t, spec, 10) catch {
                 try shell.stderr().print("wait: {s}: invalid pid\n", .{spec});
@@ -1927,7 +1886,7 @@ fn wait(shell: *Shell, args: []const []const u8) !u8 {
         const result = compat.posix.waitpid(pid, 0);
         if (result.pid > 0) {
             shell.job_table.markProcessStatus(result.pid, result.status);
-            return @truncate(compat.posix.W.EXITSTATUS(result.status));
+            return @import("jobs.zig").JobTable.decodeStatus(result.status).code;
         }
     } else {
         // Wait for all background jobs
@@ -2046,31 +2005,11 @@ fn disown(shell: *Shell, args: []const []const u8) !u8 {
         return 0;
     }
 
-    // Process each job spec
+    // Process each job spec via the shared resolver
     for (args[job_specs_start..]) |spec| {
-        var job_id: ?u32 = null;
-
-        if (spec[0] == '%') {
-            if (spec.len == 1 or spec[1] == '+' or spec[1] == '%') {
-                if (shell.job_table.getCurrentJob()) |job| {
-                    job_id = job.id;
-                }
-            } else if (spec[1] == '-') {
-                job_id = shell.job_table.previous_job;
-            } else {
-                job_id = std.fmt.parseInt(u32, spec[1..], 10) catch null;
-            }
-        } else {
-            job_id = std.fmt.parseInt(u32, spec, 10) catch null;
-        }
-
-        if (job_id) |id| {
-            if (shell.job_table.getJob(id)) |job| {
-                if (!running_only or job.state == .running) {
-                    shell.job_table.removeJob(id);
-                }
-            } else {
-                try shell.stderr().print("disown: {s}: no such job\n", .{spec});
+        if (shell.job_table.parseJobSpec(spec)) |job| {
+            if (!running_only or job.state == .running) {
+                shell.job_table.removeJob(job.id);
             }
         } else {
             try shell.stderr().print("disown: {s}: no such job\n", .{spec});

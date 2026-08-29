@@ -452,6 +452,25 @@ pub const JobTable = struct {
         return .{ .code = 127, .exited = false, .signaled = false, .stopped = false };
     }
 
+    /// Resolve a job specification (`%1`, `%+`/`%%`, `%-`, or a bare number) to a
+    /// job, or null if it is empty/malformed/unknown. One owner for fg/bg/wait/
+    /// disown, which each hand-rolled this and indexed spec[0] unchecked — so an
+    /// empty arg (`fg ""`) was an out-of-bounds panic.
+    pub fn parseJobSpec(self: *JobTable, spec: []const u8) ?*Job {
+        if (spec.len == 0) return null;
+        if (spec[0] == '%') {
+            if (spec.len == 1 or spec[1] == '+' or spec[1] == '%') return self.getCurrentJob();
+            if (spec[1] == '-') {
+                const id = self.previous_job orelse return null;
+                return self.getJob(id);
+            }
+            const id = std.fmt.parseInt(u32, spec[1..], 10) catch return null;
+            return self.getJob(id);
+        }
+        const id = std.fmt.parseInt(u32, spec, 10) catch return null;
+        return self.getJob(id);
+    }
+
     /// wait for a job to stop or complete, handling EINTR
     pub fn waitForJob(self: *JobTable, job: *Job) i32 {
         while (!job.isStopped() and !job.isCompleted()) {
