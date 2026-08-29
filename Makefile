@@ -43,13 +43,15 @@ uninstall: remove-shell
 clean:
 	rm -rf zig-out .zig-cache
 
+# The regression suite (differential against bash) + unit tests are the
+# canonical test surface, and the same thing CI runs. The interactive pty
+# suite needs a tty and python, so it is opt-in via `make test-pty`.
 test: build
-	@command -v shellspec >/dev/null 2>&1 || { echo "shellspec not found. install from: https://shellspec.info"; exit 1; }
-	shellspec
+	./tests/regress.sh
+	zig build test
 
-test-verbose: build
-	@command -v shellspec >/dev/null 2>&1 || { echo "shellspec not found. install from: https://shellspec.info"; exit 1; }
-	shellspec --format documentation
+test-pty: build
+	python3 tests/pty_test.py
 
 # ---- standard feats (python-replacement tier) ----
 # Compiles feats/<name>/main.zig and stages bin + feat.toml into the registry.
