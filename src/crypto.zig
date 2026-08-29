@@ -338,15 +338,8 @@ fn validateKey(key: [KEY_LEN]u8, allocator: std.mem.Allocator) bool {
     // create crypto context with the key
     var ctx = CryptoContext{ .key = key, .allocator = allocator };
 
-    // create AAD (same as during encryption in history_log.zig)
-    var aad_buf: [24]u8 = undefined;
-    @memcpy(aad_buf[0..4], &header.magic);
-    aad_buf[4] = header.version;
-    aad_buf[5] = header.reserved;
-    aad_buf[6] = header.instance;
-    aad_buf[7] = 0; // padding
-    std.mem.writeInt(u64, aad_buf[8..16], header.sequence, .little);
-    std.mem.writeInt(u64, aad_buf[16..24], header.timestamp, .little);
+    // AAD (shared owner: EntryHeader.aad(), see history_log.zig)
+    const aad_buf = header.aad();
 
     // try to decrypt
     const plaintext = ctx.decrypt(encrypted, &aad_buf) catch return false;

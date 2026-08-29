@@ -495,14 +495,8 @@ pub const History = struct {
             header.timestamp = entry.timestamp;
             header.padding = [_]u8{0} ** 6;
 
-            var aad_buf: [24]u8 = undefined;
-            @memcpy(aad_buf[0..4], &header.magic);
-            aad_buf[4] = header.version;
-            aad_buf[5] = header.reserved;
-            aad_buf[6] = header.instance;
-            aad_buf[7] = 0;
-            std.mem.writeInt(u64, aad_buf[8..16], header.sequence, .little);
-            std.mem.writeInt(u64, aad_buf[16..24], header.timestamp, .little);
+            // AAD from metadata fields (shared owner: EntryHeader.aad())
+            const aad_buf = header.aad();
 
             const encrypted = try self.crypto.encrypt(plaintext, &aad_buf);
             defer self.allocator.free(encrypted);

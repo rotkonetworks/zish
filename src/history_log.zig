@@ -29,6 +29,26 @@ pub const EntryHeader = extern struct {
             return error.UnsupportedVersion;
         }
     }
+
+    /// AAD (additional authenticated data) for encrypt/decrypt: the header
+    /// minus entry_len (which changes after encryption and isn't known yet
+    /// at encrypt time), manually serialized to avoid extern-struct padding
+    /// bytes leaking into the authenticated data. This is the ONE owner of
+    /// the 24-byte layout — every encrypt/decrypt site must call this so
+    /// they can never drift apart (drift = silent auth failure = dropped
+    /// history entries).
+    pub fn aad(self: EntryHeader) [24]u8 {
+        var buf: [24]u8 = undefined;
+        @memcpy(buf[0..4], &self.magic);
+        buf[4] = self.version;
+        buf[5] = self.reserved;
+        // skip entry_len (bytes 6-7)
+        buf[6] = self.instance;
+        buf[7] = 0; // padding
+        std.mem.writeInt(u64, buf[8..16], self.sequence, .little);
+        std.mem.writeInt(u64, buf[16..24], self.timestamp, .little);
+        return buf;
+    }
 };
 
 // entry data (encrypted)
@@ -165,16 +185,8 @@ pub const LogWriter = struct {
         header.timestamp = if (entry.timestamp > 0) entry.timestamp else @intCast(compat.timestamp());
         header.padding = [_]u8{0} ** 6;
 
-        // create AAD from metadata fields (manual serialization to avoid padding issues)
-        var aad_buf: [24]u8 = undefined;
-        @memcpy(aad_buf[0..4], &header.magic);
-        aad_buf[4] = header.version;
-        aad_buf[5] = header.reserved;
-        // skip entry_len (bytes 6-7)
-        aad_buf[6] = header.instance;
-        aad_buf[7] = 0; // padding
-        std.mem.writeInt(u64, aad_buf[8..16], header.sequence, .little);
-        std.mem.writeInt(u64, aad_buf[16..24], header.timestamp, .little);
+        // AAD from metadata fields (shared owner: EntryHeader.aad())
+        const aad_buf = header.aad();
 
         // encrypt entry
         const encrypted = try self.crypto.encrypt(plaintext, &aad_buf);
@@ -331,16 +343,8 @@ pub const LogReader = struct {
             pos += data_read;
             if (data_read < header.entry_len) break; // truncated entry
 
-            // create AAD same as during encryption (manual serialization)
-            var aad_buf: [24]u8 = undefined;
-            @memcpy(aad_buf[0..4], &header.magic);
-            aad_buf[4] = header.version;
-            aad_buf[5] = header.reserved;
-            // skip entry_len (bytes 6-7)
-            aad_buf[6] = header.instance;
-            aad_buf[7] = 0; // padding
-            std.mem.writeInt(u64, aad_buf[8..16], header.sequence, .little);
-            std.mem.writeInt(u64, aad_buf[16..24], header.timestamp, .little);
+            // AAD same as during encryption (shared owner: EntryHeader.aad())
+            const aad_buf = header.aad();
 
             // decrypt (silently skip entries from old keys)
             const plaintext = self.crypto.decrypt(encrypted, &aad_buf) catch {
@@ -430,6 +434,103 @@ test "serialize fails closed on a command too long for the u16 length field" {
         .timestamp = 0,
     };
     try std.testing.expectError(error.CommandTooLong, entry.serialize(allocator));
+}
+
+test "EntryHeader.aad is stable and matches across independently-built headers" {
+    // Two headers built with the same field values (as encrypt/decrypt sites
+    // do independently — one from a freshly-constructed header when writing,
+    // one from a header read back off disk) must produce byte-identical AAD.
+    var h1 = std.mem.zeroes(EntryHeader);
+    h1.magic = MAGIC[0..4].*;
+    h1.version = VERSION;
+    h1.reserved = 0;
+    h1.entry_len = 999; // must NOT affect the AAD
+    h1.instance = 42;
+    h1.sequence = 7;
+    h1.timestamp = 1234567890;
+    h1.padding = [_]u8{0xAA} ** 6; // must NOT affect the AAD
+
+    var h2 = std.mem.zeroes(EntryHeader);
+    h2.magic = MAGIC[0..4].*;
+    h2.version = VERSION;
+    h2.reserved = 0;
+    h2.entry_len = 0; // different entry_len than h1
+    h2.instance = 42;
+    h2.sequence = 7;
+    h2.timestamp = 1234567890;
+    h2.padding = [_]u8{0} ** 6; // different padding than h1
+
+    try std.testing.expectEqualSlices(u8, &h1.aad(), &h2.aad());
+
+    // spot-check the layout: magic, version, reserved, instance, 0-pad,
+    // sequence (LE u64), timestamp (LE u64) = 24 bytes.
+    const a = h1.aad();
+    try std.testing.expectEqual(@as(usize, 24), a.len);
+    try std.testing.expectEqualSlices(u8, MAGIC, a[0..4]);
+    try std.testing.expectEqual(VERSION, a[4]);
+    try std.testing.expectEqual(@as(u8, 0), a[5]);
+    try std.testing.expectEqual(@as(u8, 42), a[6]);
+    try std.testing.expectEqual(@as(u8, 0), a[7]);
+    try std.testing.expectEqual(@as(u64, 7), std.mem.readInt(u64, a[8..16], .little));
+    try std.testing.expectEqual(@as(u64, 1234567890), std.mem.readInt(u64, a[16..24], .little));
+}
+
+test "encrypt/decrypt roundtrip using shared EntryHeader.aad()" {
+    // Proves the single aad() owner produces AAD that authenticates
+    // correctly on both the encrypt side and the decrypt side, exercising
+    // exactly the mechanism the four call sites depend on.
+    const allocator = std.testing.allocator;
+
+    var ctx = try CryptoContext.init(allocator);
+    defer ctx.deinit();
+
+    var header = std.mem.zeroes(EntryHeader);
+    header.magic = MAGIC[0..4].*;
+    header.version = VERSION;
+    header.reserved = 0;
+    header.instance = 3;
+    header.sequence = 99;
+    header.timestamp = 42;
+
+    const entry = EntryData{
+        .command_hash = 555,
+        .command = "ls -la",
+        .exit_code = 0,
+        .flags = 0,
+        .frequency = 1,
+        .timestamp = header.timestamp,
+    };
+    const plaintext = try entry.serialize(allocator);
+    defer allocator.free(plaintext);
+
+    // encrypt side builds AAD from the header it just constructed
+    const encrypt_aad = header.aad();
+    const encrypted = try ctx.encrypt(plaintext, &encrypt_aad);
+    defer allocator.free(encrypted);
+
+    // decrypt side rebuilds an equivalent header (as if read back off disk)
+    // and independently derives AAD from it
+    var header_from_disk = std.mem.zeroes(EntryHeader);
+    header_from_disk.magic = header.magic;
+    header_from_disk.version = header.version;
+    header_from_disk.reserved = header.reserved;
+    header_from_disk.entry_len = @intCast(encrypted.len); // set post-encryption, as on disk
+    header_from_disk.instance = header.instance;
+    header_from_disk.sequence = header.sequence;
+    header_from_disk.timestamp = header.timestamp;
+
+    const decrypt_aad = header_from_disk.aad();
+    const decrypted = try ctx.decrypt(encrypted, &decrypt_aad);
+    defer allocator.free(decrypted);
+
+    const roundtripped = try EntryData.deserialize(decrypted, allocator);
+    defer allocator.free(roundtripped.command);
+
+    try std.testing.expectEqual(entry.command_hash, roundtripped.command_hash);
+    try std.testing.expectEqualStrings(entry.command, roundtripped.command);
+    try std.testing.expectEqual(entry.exit_code, roundtripped.exit_code);
+    try std.testing.expectEqual(entry.flags, roundtripped.flags);
+    try std.testing.expectEqual(entry.frequency, roundtripped.frequency);
 }
 
 // test disabled: uses real ~/.config/zish/history.d path, not isolated
