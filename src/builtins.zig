@@ -1943,36 +1943,33 @@ fn wait(shell: *Shell, args: []const []const u8) !u8 {
 
 fn kill(shell: *Shell, args: []const []const u8) !u8 {
     if (args.len < 2) {
-        try shell.stdout().writeAll("kill: usage: kill [-signal] pid\n");
+        try shell.stderr().writeAll("kill: usage: kill [-signal] pid\n");
         return 1;
     }
 
     var sig: u8 = 15; // SIGTERM default
     var pid_start: usize = 1;
 
-    // check for -l (list signals)
+    // -l lists signal names, derived from the one authoritative Signal enum
+    // (shared with `trap`) so the list can never drift from what's accepted.
     if (std.mem.eql(u8, args[1], "-l")) {
-        try shell.stdout().writeAll("HUP INT QUIT ILL TRAP ABRT IOT BUS FPE KILL USR1 SEGV USR2 PIPE ALRM\n");
-        try shell.stdout().writeAll("TERM STKFLT CHLD CLD CONT STOP TSTP TTIN TTOU URG XCPU XFSZ VTALRM PROF\n");
-        try shell.stdout().writeAll("WINCH IO POLL PWR SYS RT<N> RTMIN+<N> RTMAX-<N>\n");
+        inline for (std.meta.fields(Shell.TrapTable.Signal), 0..) |f, i| {
+            if (i > 0) try shell.stdout().writeByte(' ');
+            try shell.stdout().writeAll(f.name);
+        }
+        try shell.stdout().writeByte('\n');
         return 0;
     }
 
-    // parse signal
+    // -SIG / -NN: resolve through the same Signal.fromName `trap` uses, so every
+    // name (USR1, WINCH, SIGHUP, …) and number works, not a hand-picked seven.
     if (args[1][0] == '-') {
         const sig_str = args[1][1..];
-        sig = std.fmt.parseInt(u8, sig_str, 10) catch blk: {
-            // named signals
-            if (std.mem.eql(u8, sig_str, "HUP")) break :blk 1;
-            if (std.mem.eql(u8, sig_str, "INT")) break :blk 2;
-            if (std.mem.eql(u8, sig_str, "QUIT")) break :blk 3;
-            if (std.mem.eql(u8, sig_str, "KILL")) break :blk 9;
-            if (std.mem.eql(u8, sig_str, "TERM")) break :blk 15;
-            if (std.mem.eql(u8, sig_str, "STOP")) break :blk 19;
-            if (std.mem.eql(u8, sig_str, "CONT")) break :blk 18;
-            try shell.stderr().print("kill: invalid signal: {s}\n", .{sig_str});
+        const parsed = Shell.TrapTable.Signal.fromName(sig_str) orelse {
+            try shell.stderr().print("kill: {s}: invalid signal specification\n", .{sig_str});
             return 1;
         };
+        sig = @intFromEnum(parsed);
         pid_start = 2;
     }
 

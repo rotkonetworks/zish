@@ -705,6 +705,13 @@ same_as_bash "prefix assign not persisted"  'FOO=pre printenv FOO >/dev/null; ec
 same_as_bash "prefix assign in pipeline"   'FOO=pre printenv FOO | cat'
 same_as_bash "prefix + export both in env"  'export PX=1; FOO=2 env | grep -E "^(PX|FOO)=" | sort'
 
+# kill accepted only 7 hand-listed signal names (kill -USR1 failed); now every
+# name resolves through the shared Signal enum.
+same_as_bash "kill -USR1 self exit code"   'kill -USR1 $$; echo SURVIVED'
+same_as_bash "kill -SIGHUP prefix form"    'kill -SIGHUP $$; echo SURVIVED'
+same_as_bash "kill -0 existence check"     'kill -0 $$; echo rc=$?'
+same_as_bash "kill bad signal spec rc"     'kill -NOPESIG 1 2>/dev/null; echo rc=$?'
+
 # `read` builtin: the seekable fast path (block read + lseek-back) must be
 # byte-for-byte identical to the byte path and to bash. The critical invariant
 # is that read consumes EXACTLY one line — a following reader sees the rest.
