@@ -179,7 +179,7 @@ fn cd(shell: *Shell, args: []const []const u8) !u8 {
         if (std.mem.eql(u8, arg, "-")) {
             const oldpwd = shell.variables.get("OLDPWD") orelse
                 compat.posix.getenv("OLDPWD") orelse {
-                try shell.stdout().writeAll("cd: OLDPWD not set\n");
+                try shell.stderr().writeAll("cd: OLDPWD not set\n");
                 return 1;
             };
             try shell.stdout().print("{s}\n", .{oldpwd});
@@ -188,13 +188,13 @@ fn cd(shell: *Shell, args: []const []const u8) !u8 {
         break :blk arg;
     } else blk: {
         break :blk compat.posix.getenv("HOME") orelse {
-            try shell.stdout().writeAll("cd: HOME not set\n");
+            try shell.stderr().writeAll("cd: HOME not set\n");
             return 1;
         };
     };
 
     compat.posix.chdir(path) catch {
-        try shell.stdout().print("cd: {s}: no such file or directory\n", .{path});
+        try shell.stderr().print("cd: {s}: no such file or directory\n", .{path});
         return 1;
     };
 
@@ -209,7 +209,7 @@ fn pwd(shell: *Shell, args: []const []const u8) !u8 {
     _ = args;
     var cwd_buf: [4096]u8 = undefined;
     const cwd = compat.posix.getcwd(&cwd_buf) catch {
-        try shell.stdout().writeAll("pwd: cannot get current directory\n");
+        try shell.stderr().writeAll("pwd: cannot get current directory\n");
         return 1;
     };
     try shell.stdout().print("{s}\n", .{cwd});
@@ -218,7 +218,7 @@ fn pwd(shell: *Shell, args: []const []const u8) !u8 {
 
 fn dotdot(shell: *Shell) !u8 {
     compat.posix.chdir("..") catch {
-        try shell.stdout().writeAll("..: cannot go up\n");
+        try shell.stderr().writeAll("..: cannot go up\n");
         return 1;
     };
     return 0;
@@ -226,7 +226,7 @@ fn dotdot(shell: *Shell) !u8 {
 
 fn dotdotdot(shell: *Shell) !u8 {
     compat.posix.chdir("../..") catch {
-        try shell.stdout().writeAll("...: cannot go up\n");
+        try shell.stderr().writeAll("...: cannot go up\n");
         return 1;
     };
     return 0;
@@ -235,7 +235,7 @@ fn dotdotdot(shell: *Shell) !u8 {
 fn dash(shell: *Shell) !u8 {
     const oldpwd = shell.variables.get("OLDPWD") orelse
         compat.posix.getenv("OLDPWD") orelse {
-        try shell.stdout().writeAll("-: OLDPWD not set\n");
+        try shell.stderr().writeAll("-: OLDPWD not set\n");
         return 1;
     };
 
@@ -243,7 +243,7 @@ fn dash(shell: *Shell) !u8 {
     const cwd = compat.posix.getcwd(&cwd_buf) catch "";
 
     compat.posix.chdir(oldpwd) catch {
-        try shell.stdout().print("-: {s}: no such directory\n", .{oldpwd});
+        try shell.stderr().print("-: {s}: no such directory\n", .{oldpwd});
         return 1;
     };
 
@@ -257,7 +257,7 @@ pub fn pushd(shell: *Shell, args: []const []const u8) !u8 {
 
     var cwd_buf: [4096]u8 = undefined;
     const cwd = compat.posix.getcwd(&cwd_buf) catch {
-        try shell.stdout().writeAll("pushd: cannot get current directory\n");
+        try shell.stderr().writeAll("pushd: cannot get current directory\n");
         return 1;
     };
 
@@ -271,7 +271,7 @@ pub fn pushd(shell: *Shell, args: []const []const u8) !u8 {
             return 1;
         };
         compat.posix.chdir(top) catch {
-            try shell.stdout().print("pushd: {s}: no such directory\n", .{top});
+            try shell.stderr().print("pushd: {s}: no such directory\n", .{top});
             dir_stack.append(shell.allocator, top) catch {};
             return 1;
         };
@@ -283,7 +283,7 @@ pub fn pushd(shell: *Shell, args: []const []const u8) !u8 {
 
     const path = args[1];
     compat.posix.chdir(path) catch {
-        try shell.stdout().print("pushd: {s}: no such directory\n", .{path});
+        try shell.stderr().print("pushd: {s}: no such directory\n", .{path});
         return 1;
     };
 
@@ -308,7 +308,7 @@ pub fn popd(shell: *Shell, args: []const []const u8) !u8 {
     defer shell.allocator.free(path);
 
     compat.posix.chdir(path) catch {
-        try shell.stdout().print("popd: {s}: no such directory\n", .{path});
+        try shell.stderr().print("popd: {s}: no such directory\n", .{path});
         return 1;
     };
 
@@ -776,28 +776,28 @@ fn read(shell: *Shell, args: []const []const u8) !u8 {
         if (std.mem.eql(u8, arg, "-p")) {
             i += 1;
             if (i >= args.len) {
-                try shell.stdout().writeAll("read: -p requires prompt string\n");
+                try shell.stderr().writeAll("read: -p requires prompt string\n");
                 return 1;
             }
             prompt = args[i];
         } else if (std.mem.eql(u8, arg, "-t")) {
             i += 1;
             if (i >= args.len) {
-                try shell.stdout().writeAll("read: -t requires timeout\n");
+                try shell.stderr().writeAll("read: -t requires timeout\n");
                 return 1;
             }
             timeout_secs = std.fmt.parseInt(u32, args[i], 10) catch {
-                try shell.stdout().writeAll("read: invalid timeout\n");
+                try shell.stderr().writeAll("read: invalid timeout\n");
                 return 1;
             };
         } else if (std.mem.eql(u8, arg, "-n")) {
             i += 1;
             if (i >= args.len) {
-                try shell.stdout().writeAll("read: -n requires count\n");
+                try shell.stderr().writeAll("read: -n requires count\n");
                 return 1;
             }
             nchars = std.fmt.parseInt(usize, args[i], 10) catch {
-                try shell.stdout().writeAll("read: invalid count\n");
+                try shell.stderr().writeAll("read: invalid count\n");
                 return 1;
             };
         } else if (std.mem.eql(u8, arg, "-s")) {
@@ -1149,7 +1149,7 @@ fn exportVar(shell: *Shell, args: []const []const u8) !u8 {
             const value = arg[eq_pos + 1 ..];
             try setVar(shell, name, value);
         } else {
-            try shell.stdout().print("export: {s}: not a valid identifier\n", .{arg});
+            try shell.stderr().print("export: {s}: not a valid identifier\n", .{arg});
             return 1;
         }
     }
@@ -1238,7 +1238,7 @@ fn set(shell: *Shell, args: []const []const u8) !u8 {
             const enable = arg[0] == '-';
             i += 1;
             if (i >= args.len) {
-                try shell.stdout().writeAll("set: -o requires option name\n");
+                try shell.stderr().writeAll("set: -o requires option name\n");
                 return 1;
             }
             const opt_name = args[i];
@@ -1251,7 +1251,7 @@ fn set(shell: *Shell, args: []const []const u8) !u8 {
             } else if (std.mem.eql(u8, opt_name, "pipefail")) {
                 shell.opt_pipefail = enable;
             } else {
-                try shell.stdout().print("set: unknown option: {s}\n", .{opt_name});
+                try shell.stderr().print("set: unknown option: {s}\n", .{opt_name});
                 return 1;
             }
             continue;
@@ -1267,7 +1267,7 @@ fn set(shell: *Shell, args: []const []const u8) !u8 {
                     'x' => shell.opt_xtrace = enable,
                     'o' => {}, // handled above as -o name
                     else => {
-                        try shell.stdout().print("set: invalid option: -{c}\n", .{c});
+                        try shell.stderr().print("set: invalid option: -{c}\n", .{c});
                         return 1;
                     },
                 }
@@ -1298,7 +1298,7 @@ fn set(shell: *Shell, args: []const []const u8) !u8 {
             shell.ghost.enabled = enabled;
             if (i + 1 < args.len) i += 1;
         } else {
-            try shell.stdout().print("set: unknown option: {s}\n", .{arg});
+            try shell.stderr().print("set: unknown option: {s}\n", .{arg});
             return 1;
         }
     }
@@ -1316,7 +1316,7 @@ fn shift(shell: *Shell, args: []const []const u8) !u8 {
     const argc = std.fmt.parseInt(usize, argc_str, 10) catch 0;
 
     if (n > argc) {
-        try shell.stdout().print("shift: {d}: shift count out of range\n", .{n});
+        try shell.stderr().print("shift: {d}: shift count out of range\n", .{n});
         return 1;
     }
 
@@ -1404,7 +1404,7 @@ fn getopts(shell: *Shell, args: []const []const u8) !u8 {
             var next_buf: [16]u8 = undefined;
             const next_str = std.fmt.bufPrint(&next_buf, "{d}", .{optind}) catch return 1;
             const next_arg = shell.variables.get(next_str) orelse {
-                try shell.stdout().print("getopts: option requires argument -- {c}\n", .{opt});
+                try shell.stderr().print("getopts: option requires argument -- {c}\n", .{opt});
                 return 1;
             };
             try setVar(shell, "OPTARG", next_arg);
@@ -1457,7 +1457,7 @@ fn alias(shell: *Shell, args: []const []const u8) !u8 {
             if (shell.aliases.get(arg)) |value| {
                 try shell.stdout().print("alias {s}='{s}'\n", .{ arg, value });
             } else {
-                try shell.stdout().print("alias: {s}: not found\n", .{arg});
+                try shell.stderr().print("alias: {s}: not found\n", .{arg});
                 return 1;
             }
         }
@@ -1485,13 +1485,13 @@ fn source(shell: *Shell, args: []const []const u8) !u8 {
     const filename = args[1];
 
     const file = std.Io.Dir.cwd().openFile(compat.io(), filename, .{}) catch {
-        try shell.stdout().print("{s}: {s}: No such file or directory\n", .{ args[0], filename });
+        try shell.stderr().print("{s}: {s}: No such file or directory\n", .{ args[0], filename });
         return 1;
     };
     defer file.close(compat.io());
 
     const content = std.Io.Dir.cwd().readFileAlloc(compat.io(), filename, shell.allocator, .limited(1024 * 1024)) catch {
-        try shell.stdout().print("{s}: {s}: Error reading file\n", .{ args[0], filename });
+        try shell.stderr().print("{s}: {s}: Error reading file\n", .{ args[0], filename });
         return 1;
     };
     defer shell.allocator.free(content);
@@ -1504,13 +1504,13 @@ fn source(shell: *Shell, args: []const []const u8) !u8 {
     }
 
     var p = parser.Parser.init(content, shell.allocator) catch {
-        try shell.stdout().print("{s}: {s}: Parse error\n", .{ args[0], filename });
+        try shell.stderr().print("{s}: {s}: Parse error\n", .{ args[0], filename });
         return 1;
     };
     defer p.deinit();
 
     const tree = p.parse() catch {
-        try shell.stdout().print("{s}: {s}: Syntax error\n", .{ args[0], filename });
+        try shell.stderr().print("{s}: {s}: Syntax error\n", .{ args[0], filename });
         return 1;
     };
 
@@ -1543,7 +1543,7 @@ fn eval(shell: *Shell, args: []const []const u8) !u8 {
     defer p.deinit();
 
     const tree = p.parse() catch {
-        try shell.stdout().writeAll("eval: parse error\n");
+        try shell.stderr().writeAll("eval: parse error\n");
         return 1;
     };
 
@@ -1576,7 +1576,7 @@ fn exec(shell: *Shell, args: []const []const u8) !u8 {
 
     const path_z = try shell.allocator.dupeZ(u8, full_path);
     compat.posix.execvpeZ(path_z.ptr, argv, envp) catch {
-        shell.stdout().print("exec: {s}: command not found\n", .{cmd_name}) catch {};
+        shell.stderr().print("exec: {s}: command not found\n", .{cmd_name}) catch {};
         compat.posix.exit(126);
     };
     unreachable;
@@ -1612,7 +1612,7 @@ fn typeCmd(shell: *Shell, args: []const []const u8) !u8 {
             continue;
         }
 
-        try shell.stdout().print("type: {s}: not found\n", .{name});
+        try shell.stderr().print("type: {s}: not found\n", .{name});
         ret = 1;
     }
     return ret;
@@ -1642,7 +1642,7 @@ fn hash(shell: *Shell, args: []const []const u8) !u8 {
         if (shell.lookupCommand(name)) |path| {
             try shell.stdout().print("{s}={s}\n", .{ name, path });
         } else {
-            try shell.stdout().print("hash: {s}: not found\n", .{name});
+            try shell.stderr().print("hash: {s}: not found\n", .{name});
         }
     }
     return 0;
@@ -1651,7 +1651,7 @@ fn hash(shell: *Shell, args: []const []const u8) !u8 {
 fn history(shell: *Shell, args: []const []const u8) !u8 {
     _ = args;
     const h = shell.history orelse {
-        try shell.stdout().writeAll("history: not available\n");
+        try shell.stderr().writeAll("history: not available\n");
         return 1;
     };
 
@@ -1720,7 +1720,7 @@ fn fg(shell: *Shell, args: []const []const u8) !u8 {
                 }
             } else {
                 const job_id = std.fmt.parseInt(u32, spec[1..], 10) catch {
-                    try shell.stdout().print("fg: {s}: no such job\n", .{spec});
+                    try shell.stderr().print("fg: {s}: no such job\n", .{spec});
                     return 1;
                 };
                 job = shell.job_table.getJob(job_id);
@@ -1728,7 +1728,7 @@ fn fg(shell: *Shell, args: []const []const u8) !u8 {
         } else {
             // Assume it's a job number
             const job_id = std.fmt.parseInt(u32, spec, 10) catch {
-                try shell.stdout().print("fg: {s}: no such job\n", .{spec});
+                try shell.stderr().print("fg: {s}: no such job\n", .{spec});
                 return 1;
             };
             job = shell.job_table.getJob(job_id);
@@ -1778,14 +1778,14 @@ fn bg(shell: *Shell, args: []const []const u8) !u8 {
                 }
             } else {
                 const job_id = std.fmt.parseInt(u32, spec[1..], 10) catch {
-                    try shell.stdout().print("bg: {s}: no such job\n", .{spec});
+                    try shell.stderr().print("bg: {s}: no such job\n", .{spec});
                     return 1;
                 };
                 job = shell.job_table.getJob(job_id);
             }
         } else {
             const job_id = std.fmt.parseInt(u32, spec, 10) catch {
-                try shell.stdout().print("bg: {s}: no such job\n", .{spec});
+                try shell.stderr().print("bg: {s}: no such job\n", .{spec});
                 return 1;
             };
             job = shell.job_table.getJob(job_id);
@@ -1802,7 +1802,7 @@ fn bg(shell: *Shell, args: []const []const u8) !u8 {
     const j = job.?;
 
     if (j.state != .stopped) {
-        try shell.stdout().print("bg: job {d} already in background\n", .{j.id});
+        try shell.stderr().print("bg: job {d} already in background\n", .{j.id});
         return 0;
     }
 
@@ -1823,18 +1823,18 @@ fn wait(shell: *Shell, args: []const []const u8) !u8 {
         if (spec[0] == '%') {
             // Job spec
             const job_id = std.fmt.parseInt(u32, spec[1..], 10) catch {
-                try shell.stdout().print("wait: {s}: no such job\n", .{spec});
+                try shell.stderr().print("wait: {s}: no such job\n", .{spec});
                 return 127;
             };
             if (shell.job_table.getJob(job_id)) |job| {
                 pid = job.pgid;
             } else {
-                try shell.stdout().print("wait: {s}: no such job\n", .{spec});
+                try shell.stderr().print("wait: {s}: no such job\n", .{spec});
                 return 127;
             }
         } else {
             pid = std.fmt.parseInt(compat.posix.pid_t, spec, 10) catch {
-                try shell.stdout().print("wait: {s}: invalid pid\n", .{spec});
+                try shell.stderr().print("wait: {s}: invalid pid\n", .{spec});
                 return 1;
             };
         }
@@ -1886,7 +1886,7 @@ fn kill(shell: *Shell, args: []const []const u8) !u8 {
             if (std.mem.eql(u8, sig_str, "TERM")) break :blk 15;
             if (std.mem.eql(u8, sig_str, "STOP")) break :blk 19;
             if (std.mem.eql(u8, sig_str, "CONT")) break :blk 18;
-            try shell.stdout().print("kill: invalid signal: {s}\n", .{sig_str});
+            try shell.stderr().print("kill: invalid signal: {s}\n", .{sig_str});
             return 1;
         };
         pid_start = 2;
@@ -1894,12 +1894,12 @@ fn kill(shell: *Shell, args: []const []const u8) !u8 {
 
     for (args[pid_start..]) |pid_str| {
         const pid = std.fmt.parseInt(compat.posix.pid_t, pid_str, 10) catch {
-            try shell.stdout().print("kill: invalid pid: {s}\n", .{pid_str});
+            try shell.stderr().print("kill: invalid pid: {s}\n", .{pid_str});
             return 1;
         };
         const result = std.c.kill(pid, @enumFromInt(sig));
         if (result != 0) {
-            try shell.stdout().print("kill: {d}: operation not permitted\n", .{pid});
+            try shell.stderr().print("kill: {d}: operation not permitted\n", .{pid});
             return 1;
         }
     }
@@ -1926,7 +1926,7 @@ fn disown(shell: *Shell, args: []const []const u8) !u8 {
                     'r' => running_only = true,
                     'h' => {}, // mark to not receive SIGHUP (no-op for now)
                     else => {
-                        try shell.stdout().print("disown: invalid option: -{c}\n", .{c});
+                        try shell.stderr().print("disown: invalid option: -{c}\n", .{c});
                         return 1;
                     },
                 }
@@ -1989,10 +1989,10 @@ fn disown(shell: *Shell, args: []const []const u8) !u8 {
                     shell.job_table.removeJob(id);
                 }
             } else {
-                try shell.stdout().print("disown: {s}: no such job\n", .{spec});
+                try shell.stderr().print("disown: {s}: no such job\n", .{spec});
             }
         } else {
-            try shell.stdout().print("disown: {s}: no such job\n", .{spec});
+            try shell.stderr().print("disown: {s}: no such job\n", .{spec});
         }
     }
 
@@ -2045,7 +2045,7 @@ fn trap(shell: *Shell, args: []const []const u8) !u8 {
                         try shell.stdout().print("trap -- '{s}' {s}\n", .{ cmd, @tagName(sig) });
                     }
                 } else {
-                    try shell.stdout().print("trap: {s}: invalid signal\n", .{sig_name});
+                    try shell.stderr().print("trap: {s}: invalid signal\n", .{sig_name});
                     return 1;
                 }
             }
@@ -2074,7 +2074,7 @@ fn trap(shell: *Shell, args: []const []const u8) !u8 {
         if (TrapTable.Signal.fromName(sig_name)) |sig| {
             try shell.traps.set(shell.allocator, sig, cmd);
         } else {
-            try shell.stdout().print("trap: {s}: invalid signal\n", .{sig_name});
+            try shell.stderr().print("trap: {s}: invalid signal\n", .{sig_name});
             return 1;
         }
     }

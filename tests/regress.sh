@@ -668,6 +668,13 @@ same_as_bash "command -v function"         'f() { :; }; command -v f'
 same_as_bash "command runs echo"           'command echo hi'
 same_as_bash "command bypasses function"   'echo() { echo NOPE; }; command echo real'
 
+# Builtin diagnostics go to stderr (bash parity): 2>/dev/null silences them and
+# command substitution does not capture them.
+same_as_bash "cd error to stderr"          'cd /nonexistent_zish 2>/dev/null; echo done'
+same_as_bash "cd error not captured"       'x=$(cd /nope_zish 2>/dev/null); echo "x=[$x]"'
+same_as_bash "type error to stderr"        'type nosuchcmd_zz 2>/dev/null; echo rc=$?'
+same_as_bash "kill bad signal to stderr"   'kill -NOPE 1 2>/dev/null; echo rc=$?'
+
 # `read` builtin: the seekable fast path (block read + lseek-back) must be
 # byte-for-byte identical to the byte path and to bash. The critical invariant
 # is that read consumes EXACTLY one line — a following reader sees the rest.
