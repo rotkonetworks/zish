@@ -748,20 +748,26 @@ fn evaluateEchoBuiltinFast(shell: *Shell, node: *const ast.AstNode) !u8 {
     var out_buf: [4096]u8 = undefined;
     var out_pos: usize = 0;
 
+    var escape_stopped = false; // \c suppresses everything after it
     for (arg_slices[0..arg_count], 0..) |arg, i| {
         if (i > 0 and out_pos < out_buf.len) {
             out_buf[out_pos] = ' ';
             out_pos += 1;
         }
         if (interpret_escapes) {
-            out_pos += writeEscapedToBuf(arg, out_buf[out_pos..]);
+            const w = writeEscapedToBuf(arg, out_buf[out_pos..]);
+            out_pos += w.len;
+            if (w.stopped) {
+                escape_stopped = true;
+                break;
+            }
         } else {
             const copy_len = @min(arg.len, out_buf.len - out_pos);
             @memcpy(out_buf[out_pos..][0..copy_len], arg[0..copy_len]);
             out_pos += copy_len;
         }
     }
-    if (print_newline and out_pos < out_buf.len) {
+    if (print_newline and !escape_stopped and out_pos < out_buf.len) {
         out_buf[out_pos] = '\n';
         out_pos += 1;
     }
@@ -1036,6 +1042,13 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
 
     try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, cmd_name));
 
+    // Scratch list reused per argument by the shared expansion pipeline.
+    var fields: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (fields.items) |f| shell.allocator.free(f);
+        fields.deinit(shell.allocator);
+    }
+
     // insert alias extra args (e.g., "--color=auto")
     if (alias_extra_args.len > 0) {
         var iter = std.mem.splitScalar(u8, alias_extra_args, ' ');
@@ -1087,71 +1100,13 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
             continue;
         }
 
-        // Unquoted expansions ($var, ${var}, $(cmd), `cmd`, $((...))) undergo
-        // word splitting on IFS (default: space/tab/newline). POSIX: only the
-        // result of an unquoted expansion is split — a literal word never is,
-        // and a .word node here has no unquoted literal spaces (the lexer split
-        // those into separate nodes), so splitting the whole expansion is safe.
-        const needs_word_split = hasCommandSubstitution(arg) or
-            std.mem.indexOfScalar(u8, arg, '$') != null;
-
-        // Step 1: Brace expansion {a,b,c} or {1..5}
-        const brace_results = if (Shell.hasBracePattern(arg))
-            try Shell.expandBraces(shell.allocator, arg)
-        else
-            null;
-        defer if (brace_results) |br| Shell.freeBraceResults(shell.allocator, br);
-
-        const items_to_expand = if (brace_results) |br| br else &[_][]const u8{arg};
-
-        for (items_to_expand) |item| {
-            // Step 2: Variable expansion (includes command substitution)
-            const var_expanded_result = try shell.expandVariablesZ(item);
-            defer var_expanded_result.deinit(shell.allocator);
-            const var_expanded = var_expanded_result.slice;
-
-            // Step 2.5: Word splitting for unquoted command substitution results
-            // POSIX: unquoted $() results are split on IFS (default: space/tab/newline)
-            if (needs_word_split) {
-                var split_iter = std.mem.tokenizeAny(u8, var_expanded, ifsDelimiters(shell));
-                var has_any = false;
-                while (split_iter.next()) |word| {
-                    has_any = true;
-                    // Step 3: Glob expansion on each split word
-                    if (glob.hasGlobChars(word)) {
-                        const glob_results = try glob.expandGlob(shell.allocator, word);
-                        defer glob.freeGlobResults(shell.allocator, glob_results);
-                        if (glob_results.len == 0) {
-                            try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, word));
-                        } else {
-                            for (glob_results) |match| {
-                                try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, match));
-                            }
-                        }
-                    } else {
-                        try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, word));
-                    }
-                }
-                // If command substitution produced empty output, skip the argument
-                // (POSIX: empty unquoted expansion produces no fields)
-                if (!has_any) continue;
-            } else {
-                // Step 3: Glob expansion (only if pattern contains glob chars)
-                if (glob.hasGlobChars(var_expanded)) {
-                    const glob_results = try glob.expandGlob(shell.allocator, var_expanded);
-                    defer glob.freeGlobResults(shell.allocator, glob_results);
-
-                    if (glob_results.len == 0) {
-                        try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, var_expanded));
-                    } else {
-                        for (glob_results) |match| {
-                            try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, match));
-                        }
-                    }
-                } else {
-                    try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, var_expanded));
-                }
-            }
+        // Shared brace → var → IFS-split → glob pipeline. This caller's only
+        // specific need is NUL-terminated dupes for execvpeZ.
+        for (fields.items) |f| shell.allocator.free(f);
+        fields.clearRetainingCapacity();
+        try expandUnquotedWordInto(shell, arg, &fields);
+        for (fields.items) |field| {
+            try expanded_args.append(shell.allocator, try shell.allocator.dupeZ(u8, field));
         }
     }
 
@@ -2604,303 +2559,39 @@ pub fn evaluateUntil(shell: *Shell, node: *const ast.AstNode) !u8 {
 }
 
 pub fn evaluateFor(shell: *Shell, node: *const ast.AstNode) !u8 {
-    if (node.children.len < 3) return 1;
+    // [variable, word0..wordN, body] — the word list may be empty
+    // (`for x in; do ...; done` runs zero iterations).
+    if (node.children.len < 2) return 1;
 
     const variable = node.children[0];
     const body = node.children[node.children.len - 1];
     const values = node.children[1 .. node.children.len - 1];
 
-    var last_status: u8 = 0;
-    var should_break = false;
-
-    // SectorLambda-inspired: cache variable pointer to avoid repeated hash lookups
-    // Pre-allocate loop variable with generous buffer to avoid reallocation
-    var cached_value_ptr: ?*[]const u8 = null;
-    var loop_buf: [256]u8 = undefined; // stack buffer for small values
-    var heap_buf: ?[]u8 = null;
-    defer if (heap_buf) |hb| shell.allocator.free(hb);
-
-    // Pre-existing heap value: take ownership so we can free it exactly once
-    // when the loop is done (setForVariableFast overwrites the slot without freeing).
-    // EXCEPT when an enclosing for-loop uses the same variable name: then the
-    // current value points at THAT frame's stack buffer and must not be freed.
-    var pre_existing_value: ?[]const u8 = null;
-    const var_is_active_scratch = blk: {
-        for (shell.for_scratch_names[0..shell.for_scratch_depth]) |n| {
-            if (std.mem.eql(u8, n, variable.value)) break :blk true;
-        }
-        break :blk false;
-    };
-
-    // Ensure variable exists with preallocated buffer
-    if (shell.variables.getPtr(variable.value)) |ptr| {
-        cached_value_ptr = ptr;
-        if (!var_is_active_scratch) pre_existing_value = ptr.*;
-    } else {
-        // Create new variable with stack buffer backing
-        const name_copy = try shell.allocator.dupe(u8, variable.value);
-        try shell.variables.put(name_copy, loop_buf[0..0]);
-        cached_value_ptr = shell.variables.getPtr(variable.value);
-    }
-
-    // Mark this variable as scratch for the duration of the loop
-    const pushed_scratch = shell.for_scratch_depth < shell.for_scratch_names.len;
-    if (pushed_scratch) {
-        shell.for_scratch_names[shell.for_scratch_depth] = variable.value;
-        shell.for_scratch_depth += 1;
-    }
-    defer if (pushed_scratch) {
-        shell.for_scratch_depth -= 1;
-    };
-
-    // On EVERY exit path (normal or error): the map value points at
-    // loop_buf/heap_buf, which die with this frame. Replace it with a heap
-    // dupe of the final value so no dangling slice escapes, then free the
-    // pre-existing value we took ownership of above.
-    // NOTE: runs before the heap_buf defer (LIFO), so the source is still alive.
+    // bash expands the ENTIRE word list before the first iteration, so a body
+    // that mutates a variable referenced by a LATER word still iterates over
+    // the pre-loop values. Expanding lazily per-word (as this loop once did)
+    // diverges the moment the body has side effects.
+    var words: std.ArrayList([]const u8) = .empty;
     defer {
-        if (shell.variables.getPtr(variable.value)) |ptr| {
-            ptr.* = shell.allocator.dupe(u8, ptr.*) catch "";
-        }
-        if (pre_existing_value) |old| shell.allocator.free(old);
+        for (words.items) |w| shell.allocator.free(w);
+        words.deinit(shell.allocator);
     }
+    try collectWords(shell, values, &words);
 
-    outer: for (values) |value_node| {
-        const raw_value = value_node.value;
-
-        // Skip all expansion for single-quoted strings
-        if (value_node.node_type == .string) {
-            setForVariableFast(cached_value_ptr.?, raw_value, &loop_buf, &heap_buf, shell.allocator);
-            last_status = try evaluateAst(shell, body);
-            if (last_status == 254) {
-                should_break = true;
-                break :outer;
-            }
-            if (last_status == 253) {
-                if (shell.loop_continue > 1) { should_break = true; break :outer; }
+    var last_status: u8 = 0;
+    for (words.items) |word| {
+        try setPlainVar(shell, variable.value, word);
+        const body_status = try evaluateAst(shell, body);
+        switch (loopControl(shell, body_status)) {
+            .break_loop => return if (shell.loop_break > 0 or shell.loop_continue > 0) body_status else 0,
+            .continue_loop => {
                 last_status = 0;
-            }
-            continue;
-        }
-
-        // Double-quoted: expand vars/cmds but no word splitting or tilde
-        if (value_node.node_type == .double_quoted) {
-            // "$@" is special: iterate once per positional parameter.
-            if (isQuotedAtParam(raw_value)) {
-                const count = positionalCount(shell);
-                var i: usize = 1;
-                while (i <= count) : (i += 1) {
-                    var nb: [16]u8 = undefined;
-                    const ns = std.fmt.bufPrint(&nb, "{d}", .{i}) catch break;
-                    const v = shell.variables.get(ns) orelse "";
-                    setForVariableFast(cached_value_ptr.?, v, &loop_buf, &heap_buf, shell.allocator);
-                    last_status = try evaluateAst(shell, body);
-                    if (last_status == 254) { should_break = true; break :outer; }
-                    if (last_status == 253) {
-                        if (shell.loop_continue > 1) { should_break = true; break :outer; }
-                        last_status = 0;
-                    }
-                }
                 continue;
-            }
-            // "${a[@]}" iterates once per array element.
-            if (quotedArrayAll(raw_value)) |arr_name| {
-                const alen = shell.getArrayLen(arr_name) orelse 0;
-                var ai: usize = 0;
-                while (ai < alen) : (ai += 1) {
-                    const elem = shell.getArrayElement(arr_name, ai) orelse "";
-                    setForVariableFast(cached_value_ptr.?, elem, &loop_buf, &heap_buf, shell.allocator);
-                    last_status = try evaluateAst(shell, body);
-                    if (last_status == 254) { should_break = true; break :outer; }
-                    if (last_status == 253) {
-                        if (shell.loop_continue > 1) { should_break = true; break :outer; }
-                        last_status = 0;
-                    }
-                }
-                continue;
-            }
-            const var_expanded_res = try shell.expandVariablesNoTildeZ(raw_value);
-            defer var_expanded_res.deinit(shell.allocator);
-            const var_expanded = var_expanded_res.slice;
-            setForVariableFast(cached_value_ptr.?, var_expanded, &loop_buf, &heap_buf, shell.allocator);
-            last_status = try evaluateAst(shell, body);
-            if (last_status == 254) {
-                should_break = true;
-                break :outer;
-            }
-            if (last_status == 253) {
-                if (shell.loop_continue > 1) { should_break = true; break :outer; }
-                last_status = 0;
-            }
-            continue;
-        }
-
-        const has_brace = Shell.hasBracePattern(raw_value);
-        const has_tilde = raw_value.len > 0 and raw_value[0] == '~';
-        const needs_var_expansion = has_tilde or std.mem.indexOfScalar(u8, raw_value, '$') != null;
-        const has_glob = glob.hasGlobChars(raw_value);
-        // Unquoted expansions undergo IFS word splitting (see evaluateCommand).
-        const needs_word_split = hasCommandSubstitution(raw_value) or
-            std.mem.indexOfScalar(u8, raw_value, '$') != null;
-
-        // Fast path: no special expansion needed
-        if (!has_brace and !needs_var_expansion and !has_glob) {
-            setForVariableFast(cached_value_ptr.?, raw_value, &loop_buf, &heap_buf, shell.allocator);
-            last_status = try evaluateAst(shell, body);
-            if (last_status == 254) {
-                should_break = true;
-                break :outer;
-            }
-            if (last_status == 253) {
-                if (shell.loop_continue > 1) { should_break = true; break :outer; }
-                last_status = 0;
-            }
-            continue;
-        }
-
-        // Step 1: Brace expansion
-        const brace_results = if (has_brace)
-            try Shell.expandBraces(shell.allocator, raw_value)
-        else
-            null;
-        defer if (brace_results) |br| Shell.freeBraceResults(shell.allocator, br);
-
-        const brace_items = if (brace_results) |br| br else &[_][]const u8{raw_value};
-
-        for (brace_items) |brace_item| {
-            // Step 2: Variable expansion
-            const var_expanded = if (needs_var_expansion or (brace_results != null))
-                try shell.expandVariables(brace_item)
-            else
-                try shell.allocator.dupe(u8, brace_item);
-            defer shell.allocator.free(var_expanded);
-
-            // Step 2.5: Word splitting for unquoted command substitution
-            if (needs_word_split) {
-                var split_iter = std.mem.tokenizeAny(u8, var_expanded, ifsDelimiters(shell));
-                while (split_iter.next()) |word| {
-                    // Step 3: Glob expansion on each split word
-                    if (glob.hasGlobChars(word)) {
-                        const glob_results = try glob.expandGlob(shell.allocator, word);
-                        defer glob.freeGlobResults(shell.allocator, glob_results);
-                        const items = if (glob_results.len == 0)
-                            &[_][]const u8{word}
-                        else
-                            glob_results;
-                        for (items) |item| {
-                            setForVariableFast(cached_value_ptr.?, item, &loop_buf, &heap_buf, shell.allocator);
-                            last_status = try evaluateAst(shell, body);
-                            if (last_status == 254) { should_break = true; break :outer; }
-                            if (last_status == 253) { if (shell.loop_continue > 1) { should_break = true; break :outer; } last_status = 0; continue; }
-                        }
-                    } else {
-                        setForVariableFast(cached_value_ptr.?, word, &loop_buf, &heap_buf, shell.allocator);
-                        last_status = try evaluateAst(shell, body);
-                        if (last_status == 254) { should_break = true; break :outer; }
-                        if (last_status == 253) { if (shell.loop_continue > 1) { should_break = true; break :outer; } last_status = 0; continue; }
-                    }
-                }
-                continue;
-            }
-
-            // Step 3: Glob expansion
-            if (glob.hasGlobChars(var_expanded)) {
-                const glob_results = try glob.expandGlob(shell.allocator, var_expanded);
-                defer glob.freeGlobResults(shell.allocator, glob_results);
-
-                const items = if (glob_results.len == 0)
-                    &[_][]const u8{var_expanded}
-                else
-                    glob_results;
-
-                for (items) |item| {
-                    setForVariableFast(cached_value_ptr.?, item, &loop_buf, &heap_buf, shell.allocator);
-                    last_status = try evaluateAst(shell, body);
-                    if (last_status == 254) {
-                        should_break = true;
-                        break :outer;
-                    }
-                    if (last_status == 253) {
-                        if (shell.loop_continue > 1) { should_break = true; break :outer; }
-                        last_status = 0;
-                        continue;
-                    }
-                }
-            } else {
-                setForVariableFast(cached_value_ptr.?, var_expanded, &loop_buf, &heap_buf, shell.allocator);
-                last_status = try evaluateAst(shell, body);
-                if (last_status == 254) {
-                    should_break = true;
-                    break :outer;
-                }
-                if (last_status == 253) {
-                    if (shell.loop_continue > 1) { should_break = true; break :outer; }
-                    last_status = 0;
-                }
-            }
-        }
-    }
-
-    if (should_break) {
-        // last_status holds the break sentinel (254). Honour break N by
-        // re-propagating to enclosing loops when more levels remain.
-        switch (loopControl(shell, last_status)) {
-            .break_loop => return if (shell.loop_break > 0 or shell.loop_continue > 0) last_status else 0,
-            else => return 0,
+            },
+            .normal => last_status = body_status,
         }
     }
     return last_status;
-}
-
-// Ultra-fast variable assignment using cached pointer - no hash lookup per iteration
-// SectorLambda-inspired: minimize per-iteration overhead
-inline fn setForVariableFast(
-    value_ptr: *[]const u8,
-    value: []const u8,
-    stack_buf: *[256]u8,
-    heap_buf: *?[]u8,
-    allocator: std.mem.Allocator,
-) void {
-    if (value.len <= 256) {
-        // Use stack buffer - zero allocations
-        @memcpy(stack_buf[0..value.len], value);
-        value_ptr.* = stack_buf[0..value.len];
-    } else {
-        // Need heap for large values (rare)
-        if (heap_buf.*) |hb| {
-            if (value.len <= hb.len) {
-                @memcpy(hb[0..value.len], value);
-                value_ptr.* = hb[0..value.len];
-                return;
-            }
-            allocator.free(hb);
-        }
-        heap_buf.* = allocator.dupe(u8, value) catch return;
-        value_ptr.* = heap_buf.*.?;
-    }
-}
-
-// Helper for for-loop variable assignment - reuses existing storage when possible
-fn setForVariable(shell: *Shell, name: []const u8, value: []const u8) !void {
-    // Try to update existing variable in-place
-    if (shell.variables.getPtr(name)) |value_ptr| {
-        const old_value = value_ptr.*;
-        // Reuse buffer if it fits
-        if (value.len <= old_value.len) {
-            const writable: [*]u8 = @ptrCast(@constCast(old_value.ptr));
-            @memcpy(writable[0..value.len], value);
-            value_ptr.* = writable[0..value.len];
-        } else {
-            shell.allocator.free(old_value);
-            value_ptr.* = try shell.allocator.dupe(u8, value);
-        }
-        return;
-    }
-
-    // New variable
-    const name_copy = try shell.allocator.dupe(u8, name);
-    const value_copy = try shell.allocator.dupe(u8, value);
-    try shell.variables.put(name_copy, value_copy);
 }
 
 // Set a shell variable to an owned copy of `value`, freeing any prior value.
@@ -2916,9 +2607,9 @@ fn setPlainVar(shell: *Shell, name: []const u8, value: []const u8) !void {
     try shell.variables.put(name_copy, value_copy);
 }
 
-// Expand for/select word nodes into a flat, owned list of strings. Mirrors the
-// expansion done per-item in evaluateFor (single-quote literal, double-quote var
-// expansion with "$@" special-casing, and unquoted brace/var/split/glob).
+// Expand for/select word nodes into a flat, owned list of strings:
+// single-quote literal, double-quote var expansion with "$@" / "${a[@]}"
+// special-casing, and the shared unquoted pipeline for everything else.
 fn collectWords(shell: *Shell, values: []const *const ast.AstNode, out: *std.ArrayList([]const u8)) !void {
     for (values) |value_node| {
         const raw = value_node.value;
@@ -2929,6 +2620,7 @@ fn collectWords(shell: *Shell, values: []const *const ast.AstNode, out: *std.Arr
         }
 
         if (value_node.node_type == .double_quoted) {
+            // "$@" is special: one field per positional parameter (not joined).
             if (isQuotedAtParam(raw)) {
                 const count = positionalCount(shell);
                 var i: usize = 1;
@@ -2940,57 +2632,80 @@ fn collectWords(shell: *Shell, values: []const *const ast.AstNode, out: *std.Arr
                 }
                 continue;
             }
+            // "${a[@]}" is likewise one field per array element.
+            if (quotedArrayAll(raw)) |arr_name| {
+                const alen = shell.getArrayLen(arr_name) orelse 0;
+                var ai: usize = 0;
+                while (ai < alen) : (ai += 1) {
+                    const elem = shell.getArrayElement(arr_name, ai) orelse "";
+                    try out.append(shell.allocator, try shell.allocator.dupe(u8, elem));
+                }
+                continue;
+            }
             const res = try shell.expandVariablesNoTildeZ(raw);
             defer res.deinit(shell.allocator);
             try out.append(shell.allocator, try shell.allocator.dupe(u8, res.slice));
             continue;
         }
 
-        const has_brace = Shell.hasBracePattern(raw);
-        const needs_var = (raw.len > 0 and raw[0] == '~') or std.mem.indexOfScalar(u8, raw, '$') != null;
-        const has_glob = glob.hasGlobChars(raw);
-        const needs_split = hasCommandSubstitution(raw) or std.mem.indexOfScalar(u8, raw, '$') != null;
+        try expandUnquotedWordInto(shell, raw, out);
+    }
+}
 
-        if (!has_brace and !needs_var and !has_glob) {
-            try out.append(shell.allocator, try shell.allocator.dupe(u8, raw));
-            continue;
-        }
+// The single unquoted-word expansion pipeline: brace expansion → variable /
+// command substitution → IFS field splitting → glob, appending one heap-owned
+// string per resulting field. Shared by evaluateCommand (argument words) and
+// collectWords (for/select word lists) — this used to be hand-copied in three
+// places, and the copies had drifted apart.
+fn expandUnquotedWordInto(shell: *Shell, raw: []const u8, out: *std.ArrayList([]const u8)) !void {
+    // Unquoted expansions ($var, ${var}, $(cmd), `cmd`, $((...))) undergo
+    // word splitting on IFS (default: space/tab/newline). POSIX: only the
+    // RESULT of an unquoted expansion is split — a literal word never is,
+    // and a .word node here has no unquoted literal spaces (the lexer split
+    // those into separate nodes), so splitting the whole expansion is safe.
+    const needs_word_split = hasCommandSubstitution(raw) or
+        std.mem.indexOfScalar(u8, raw, '$') != null;
 
-        const brace_results = if (has_brace) try Shell.expandBraces(shell.allocator, raw) else null;
-        defer if (brace_results) |br| Shell.freeBraceResults(shell.allocator, br);
-        const brace_items = if (brace_results) |br| br else &[_][]const u8{raw};
+    // Step 1: Brace expansion {a,b,c} or {1..5}
+    const brace_results = if (Shell.hasBracePattern(raw))
+        try Shell.expandBraces(shell.allocator, raw)
+    else
+        null;
+    defer if (brace_results) |br| Shell.freeBraceResults(shell.allocator, br);
+    const brace_items = if (brace_results) |br| br else &[_][]const u8{raw};
 
-        for (brace_items) |brace_item| {
-            const var_expanded = if (needs_var or brace_results != null)
-                try shell.expandVariables(brace_item)
-            else
-                try shell.allocator.dupe(u8, brace_item);
-            defer shell.allocator.free(var_expanded);
+    for (brace_items) |item| {
+        // Step 2: Variable expansion (includes command substitution and tilde;
+        // no-op fast path inside when the item has nothing to expand)
+        const var_expanded_result = try shell.expandVariablesZ(item);
+        defer var_expanded_result.deinit(shell.allocator);
+        const var_expanded = var_expanded_result.slice;
 
-            if (needs_split) {
-                var it = std.mem.tokenizeAny(u8, var_expanded, ifsDelimiters(shell));
-                while (it.next()) |word| {
-                    if (glob.hasGlobChars(word)) {
-                        const gr = try glob.expandGlob(shell.allocator, word);
-                        defer glob.freeGlobResults(shell.allocator, gr);
-                        if (gr.len == 0) {
-                            try out.append(shell.allocator, try shell.allocator.dupe(u8, word));
-                        } else for (gr) |m| try out.append(shell.allocator, try shell.allocator.dupe(u8, m));
-                    } else {
-                        try out.append(shell.allocator, try shell.allocator.dupe(u8, word));
-                    }
-                }
-            } else if (glob.hasGlobChars(var_expanded)) {
-                const gr = try glob.expandGlob(shell.allocator, var_expanded);
-                defer glob.freeGlobResults(shell.allocator, gr);
-                if (gr.len == 0) {
-                    try out.append(shell.allocator, try shell.allocator.dupe(u8, var_expanded));
-                } else for (gr) |m| try out.append(shell.allocator, try shell.allocator.dupe(u8, m));
-            } else {
-                try out.append(shell.allocator, try shell.allocator.dupe(u8, var_expanded));
+        // Step 3: IFS field splitting, then glob on each field. An expansion
+        // that comes back empty yields no fields at all (POSIX).
+        if (needs_word_split) {
+            var split_iter = std.mem.tokenizeAny(u8, var_expanded, ifsDelimiters(shell));
+            while (split_iter.next()) |word| {
+                try appendGlobbedField(shell, word, out);
             }
+        } else {
+            try appendGlobbedField(shell, var_expanded, out);
         }
     }
+}
+
+// Step 4 of the pipeline: glob-expand one field, appending each match — or the
+// field itself when the pattern matches nothing (bash keeps the pattern).
+fn appendGlobbedField(shell: *Shell, word: []const u8, out: *std.ArrayList([]const u8)) !void {
+    if (glob.hasGlobChars(word)) {
+        const glob_results = try glob.expandGlob(shell.allocator, word);
+        defer glob.freeGlobResults(shell.allocator, glob_results);
+        if (glob_results.len != 0) {
+            for (glob_results) |m| try out.append(shell.allocator, try shell.allocator.dupe(u8, m));
+            return;
+        }
+    }
+    try out.append(shell.allocator, try shell.allocator.dupe(u8, word));
 }
 
 fn digitCount(n: usize) usize {
@@ -4000,64 +3715,23 @@ pub fn callFunction(shell: *Shell, name: []const u8, args: []const []const u8) !
     return result;
 }
 
-// Buffer-based escape sequence writer - returns bytes written
-fn writeEscapedToBuf(input: []const u8, buf: []u8) usize {
+// Buffer-based escape sequence writer for the echo fast path. Decodes via the
+// single shared decoder (builtins.parseEscape, echo dialect) so the fast path
+// and the echo builtin can never disagree. `stopped` = a \c was hit, which in
+// bash suppresses all further output including the trailing newline.
+const EscapedWrite = struct { len: usize, stopped: bool };
+
+fn writeEscapedToBuf(input: []const u8, buf: []u8) EscapedWrite {
     var out_pos: usize = 0;
     var i: usize = 0;
 
     while (i < input.len and out_pos < buf.len) {
-        if (input[i] == '\\' and i + 1 < input.len) {
-            const next = input[i + 1];
-            const c: u8 = switch (next) {
-                'n' => '\n',
-                't' => '\t',
-                'r' => '\r',
-                '\\' => '\\',
-                'a' => 0x07,
-                'b' => 0x08,
-                'e' => 0x1b,
-                'f' => 0x0c,
-                'v' => 0x0b,
-                '0' => blk: {
-                    // octal escape
-                    var val: u8 = 0;
-                    var j: usize = i + 2;
-                    var digits: usize = 0;
-                    while (j < input.len and digits < 3) {
-                        const ch = input[j];
-                        if (ch >= '0' and ch <= '7') {
-                            val = val * 8 + (ch - '0');
-                            j += 1;
-                            digits += 1;
-                        } else break;
-                    }
-                    i = j;
-                    break :blk val;
-                },
-                'x' => blk: {
-                    // hex escape
-                    if (i + 3 < input.len) {
-                        const hex = input[i + 2 .. i + 4];
-                        if (std.fmt.parseInt(u8, hex, 16)) |val| {
-                            i += 4;
-                            break :blk val;
-                        } else |_| {}
-                    }
-                    buf[out_pos] = input[i];
-                    out_pos += 1;
-                    i += 1;
-                    continue;
-                },
-                else => {
-                    buf[out_pos] = input[i];
-                    out_pos += 1;
-                    i += 1;
-                    continue;
-                },
-            };
-            buf[out_pos] = c;
+        if (input[i] == '\\') {
+            const esc = builtins.parseEscape(input[i + 1 ..], .echo);
+            if (esc.stop) return .{ .len = out_pos, .stopped = true };
+            buf[out_pos] = esc.char;
             out_pos += 1;
-            if (next != '0' and next != 'x') i += 2;
+            i += 1 + esc.len;
         } else {
             buf[out_pos] = input[i];
             out_pos += 1;
@@ -4065,7 +3739,7 @@ fn writeEscapedToBuf(input: []const u8, buf: []u8) usize {
         }
     }
 
-    return out_pos;
+    return .{ .len = out_pos, .stopped = false };
 }
 
 // ============================================================================

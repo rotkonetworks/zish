@@ -370,7 +370,8 @@ fn echo(shell: *Shell, args: []const []const u8) !u8 {
     for (args[start..], 0..) |arg, i| {
         if (i > 0) try shell.stdout().writeAll(" ");
         if (interpret_escapes) {
-            try writeEscaped(shell, arg);
+            // \c suppresses everything after it, including the newline.
+            if (try writeEscaped(shell, arg)) return 0;
         } else {
             try shell.stdout().writeAll(arg);
         }
@@ -379,27 +380,23 @@ fn echo(shell: *Shell, args: []const []const u8) !u8 {
     return 0;
 }
 
-fn writeEscaped(shell: *Shell, s: []const u8) !void {
+/// Write `s` with backslash escapes decoded (echo -e dialect). Returns true if
+/// a `\c` was hit: bash then suppresses ALL further output, including the other
+/// arguments and the trailing newline.
+fn writeEscaped(shell: *Shell, s: []const u8) !bool {
     var i: usize = 0;
     while (i < s.len) {
-        if (s[i] == '\\' and i + 1 < s.len) {
-            switch (s[i + 1]) {
-                'n' => try shell.stdout().writeByte('\n'),
-                't' => try shell.stdout().writeByte('\t'),
-                'r' => try shell.stdout().writeByte('\r'),
-                '\\' => try shell.stdout().writeByte('\\'),
-                '0' => try shell.stdout().writeByte(0),
-                else => {
-                    try shell.stdout().writeByte(s[i]);
-                    try shell.stdout().writeByte(s[i + 1]);
-                },
-            }
-            i += 2;
+        if (s[i] == '\\') {
+            const esc = parseEscape(s[i + 1 ..], .echo);
+            if (esc.stop) return true;
+            try shell.stdout().writeByte(esc.char);
+            i += 1 + esc.len;
         } else {
             try shell.stdout().writeByte(s[i]);
             i += 1;
         }
     }
+    return false;
 }
 
 fn printf(shell: *Shell, args: []const []const u8) !u8 {
@@ -421,8 +418,8 @@ fn printf(shell: *Shell, args: []const []const u8) !u8 {
         const pass_start = arg_idx;
         var i: usize = 0;
         while (i < format.len) {
-            if (format[i] == '\\' and i + 1 < format.len) {
-                const escaped = printfParseEscape(format[i + 1 ..]);
+            if (format[i] == '\\') {
+                const escaped = parseEscape(format[i + 1 ..], .printf_format);
                 try writer.writeByte(escaped.char);
                 i += 1 + escaped.len;
             } else if (format[i] == '%') {
@@ -432,7 +429,9 @@ fn printf(shell: *Shell, args: []const []const u8) !u8 {
                 } else {
                     const arg = if (arg_idx < args.len) args[arg_idx] else "";
                     if (arg_idx < args.len) arg_idx += 1;
-                    try printfFormatArg(writer, spec, arg);
+                    // %b's \c aborts the whole printf: rest of the format,
+                    // remaining arguments, and any format-reuse passes.
+                    if (try printfFormatArg(writer, spec, arg)) return 0;
                 }
                 i += spec.len;
             } else {
@@ -506,7 +505,9 @@ fn printfParseSpec(fmt: []const u8) PrintfSpec {
     };
 }
 
-fn printfFormatArg(writer: anytype, spec: PrintfSpec, arg: []const u8) !void {
+/// Format one argument per `spec`. Returns true when a %b argument hit `\c`,
+/// which aborts the entire printf invocation (bash semantics).
+fn printfFormatArg(writer: anytype, spec: PrintfSpec, arg: []const u8) !bool {
     var buf: [64]u8 = undefined;
     var output: []const u8 = "";
 
@@ -558,8 +559,9 @@ fn printfFormatArg(writer: anytype, spec: PrintfSpec, arg: []const u8) !void {
             // string with backslash escapes interpreted (\t, \n, \xNN, \0nnn…)
             var k: usize = 0;
             while (k < arg.len) {
-                if (arg[k] == '\\' and k + 1 < arg.len) {
-                    const esc = printfParseEscape(arg[k + 1 ..]);
+                if (arg[k] == '\\') {
+                    const esc = parseEscape(arg[k + 1 ..], .printf_b);
+                    if (esc.stop) return true;
                     if (esc.len > 0) {
                         try writer.writeByte(esc.char);
                         k += 1 + esc.len;
@@ -569,13 +571,13 @@ fn printfFormatArg(writer: anytype, spec: PrintfSpec, arg: []const u8) !void {
                 try writer.writeByte(arg[k]);
                 k += 1;
             }
-            return;
+            return false;
         },
         'q' => {
             // quote the argument so it can be reused as shell input.
             if (arg.len == 0) {
                 try writer.writeAll("''");
-                return;
+                return false;
             }
             for (arg) |c| {
                 const needs_escape = switch (c) {
@@ -586,9 +588,9 @@ fn printfFormatArg(writer: anytype, spec: PrintfSpec, arg: []const u8) !void {
                 if (needs_escape) try writer.writeByte('\\');
                 try writer.writeByte(c);
             }
-            return;
+            return false;
         },
-        else => return,
+        else => return false,
     }
 
     // apply width padding
@@ -606,41 +608,87 @@ fn printfFormatArg(writer: anytype, spec: PrintfSpec, arg: []const u8) !void {
             try writer.writeAll(output);
         }
     }
+    return false;
 }
 
-const EscapeResult = struct { char: u8, len: usize };
+/// The three escape dialects bash implements. They agree on the common
+/// sequences (\n \t \r \a \b \e \E \f \v \\ \xHH) and differ only in the octal
+/// form, \c, and \' \" \? — verified against bash 5 byte-for-byte:
+///   echo -e         octal \0nnn;  \c stops all output;  \' \" \? stay literal
+///   printf format   octal \nnn;   \c stays literal;     \' \" \? drop the backslash
+///   printf %b       octal \0nnn or \nnn; \c stops;      \' \" \? stay literal
+pub const EscapeMode = enum { echo, printf_format, printf_b };
 
-fn printfParseEscape(s: []const u8) EscapeResult {
-    if (s.len == 0) return .{ .char = '\\', .len = 0 };
-    return switch (s[0]) {
-        'n' => .{ .char = '\n', .len = 1 },
-        't' => .{ .char = '\t', .len = 1 },
-        'r' => .{ .char = '\r', .len = 1 },
-        'a' => .{ .char = 0x07, .len = 1 },
-        'b' => .{ .char = 0x08, .len = 1 },
-        'f' => .{ .char = 0x0c, .len = 1 },
-        'v' => .{ .char = 0x0b, .len = 1 },
-        '\\' => .{ .char = '\\', .len = 1 },
-        '0' => blk: {
-            // octal \0nnn
+pub const EscapeResult = struct {
+    char: u8,
+    len: usize, // input bytes consumed AFTER the backslash
+    stop: bool = false, // \c: suppress all further output
+};
+
+/// Decode one backslash escape. `s` is the text immediately following a
+/// backslash. An unrecognized (or trailing) escape returns {char='\\', len=0}:
+/// the caller emits the backslash and continues at the next byte, which
+/// reproduces the input literally — exactly what bash does.
+///
+/// This is the ONLY escape decoder; echo (builtin + fast path) and printf all
+/// route through it so the dialects can never drift apart again.
+pub fn parseEscape(s: []const u8, mode: EscapeMode) EscapeResult {
+    const literal: EscapeResult = .{ .char = '\\', .len = 0 };
+    if (s.len == 0) return literal;
+    switch (s[0]) {
+        'n' => return .{ .char = '\n', .len = 1 },
+        't' => return .{ .char = '\t', .len = 1 },
+        'r' => return .{ .char = '\r', .len = 1 },
+        'a' => return .{ .char = 0x07, .len = 1 },
+        'b' => return .{ .char = 0x08, .len = 1 },
+        'e', 'E' => return .{ .char = 0x1b, .len = 1 },
+        'f' => return .{ .char = 0x0c, .len = 1 },
+        'v' => return .{ .char = 0x0b, .len = 1 },
+        '\\' => return .{ .char = '\\', .len = 1 },
+        'c' => return if (mode == .printf_format)
+            literal
+        else
+            .{ .char = 0, .len = 1, .stop = true },
+        '\'', '"', '?' => return if (mode == .printf_format)
+            .{ .char = s[0], .len = 1 }
+        else
+            literal,
+        'x' => {
+            // \xH or \xHH — one or two hex digits, else literal. Overflow wraps
+            // (mod 256), matching bash.
             var val: u8 = 0;
-            var len: usize = 1;
-            while (len < 4 and len < s.len and s[len] >= '0' and s[len] <= '7') : (len += 1) {
-                val = val *| 8 +| (s[len] - '0');
+            var n: usize = 0;
+            while (n < 2 and 1 + n < s.len) : (n += 1) {
+                const d = std.fmt.charToDigit(s[1 + n], 16) catch break;
+                val = val *% 16 +% d;
             }
-            break :blk .{ .char = val, .len = len };
+            if (n == 0) return literal;
+            return .{ .char = val, .len = 1 + n };
         },
-        'x' => blk: {
-            // hex \xNN
-            if (s.len >= 3) {
-                if (std.fmt.parseInt(u8, s[1..3], 16)) |val| {
-                    break :blk .{ .char = val, .len = 3 };
-                } else |_| {}
+        '0'...'7' => {
+            // Octal. The dialects differ only in the leading '0' (see above);
+            // up to 3 value digits either way, wrapping mod 256 like bash.
+            var i: usize = 0;
+            switch (mode) {
+                .echo => {
+                    if (s[0] != '0') return literal;
+                    i = 1;
+                },
+                .printf_b => {
+                    if (s[0] == '0') i = 1;
+                },
+                .printf_format => {},
             }
-            break :blk .{ .char = 'x', .len = 1 };
+            var val: u8 = 0;
+            var n: usize = 0;
+            while (n < 3 and i < s.len and s[i] >= '0' and s[i] <= '7') : (n += 1) {
+                val = val *% 8 +% (s[i] - '0');
+                i += 1;
+            }
+            return .{ .char = val, .len = i };
         },
-        else => .{ .char = s[0], .len = 1 },
-    };
+        else => return literal,
+    }
 }
 
 fn read(shell: *Shell, args: []const []const u8) !u8 {

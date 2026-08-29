@@ -231,10 +231,6 @@ exec_in_place_node: ?*const ast.AstNode = null,
 // set by the break/continue builtins, consumed by loop evaluators.
 loop_break: u32 = 0,
 loop_continue: u32 = 0,
-// names of variables currently used as for-loop scratch (value points at a
-// stack buffer in an active evaluateFor frame, must not be freed)
-for_scratch_names: [16][]const u8 = [_][]const u8{""} ** 16,
-for_scratch_depth: usize = 0,
 // process substitution tracking
 proc_subst_pids: [16]posix.pid_t = [_]posix.pid_t{0} ** 16,
 proc_subst_fds: [16]posix.fd_t = [_]posix.fd_t{-1} ** 16,

@@ -368,7 +368,9 @@ fn validatenode(node: *const AstNode) !void {
             if (node.children.len != 2) return error.InvalidLoop;
         },
         .for_loop => {
-            if (node.children.len < 3) return error.InvalidFor;
+            // [variable, word0..wordN, body] — an EMPTY word list is valid
+            // (`for x in; do ...; done` runs zero iterations in bash).
+            if (node.children.len < 2) return error.InvalidFor;
         },
         .pipeline => {
             if (node.children.len < 2) return error.InvalidPipeline;

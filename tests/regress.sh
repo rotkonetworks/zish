@@ -607,6 +607,37 @@ same_as_bash "function definition"     'f() { echo in_func; }; f'
 same_as_bash "positional in function"  'f() { echo $1; }; f arg1'
 same_as_bash "nested subshell value"   'echo $( echo $( echo deep ) )'
 
+# --- one escape decoder: echo -e (fast path + builtin), printf format, %b ---
+# The three copies had drifted: the echo builtin (hit when an arg contains
+# ${...}) knew only \n \t \r \0, so `echo -e "\a"` beeped but
+# `echo -e "${x}\a"` printed a literal \a. One decoder now serves all of them.
+same_as_bash "echo -e full escape set"    "echo -e '\a\b\t\n\r\v\f\e\\\\'"
+same_as_bash "echo -e via variable"       'x=pre; echo -e "${x}\t\a\x41\0101"'
+same_as_bash "echo -e backslash-c stops"  "echo -e 'a\cb c'"
+same_as_bash "echo -e \\c via variable"   'x=pre; echo -e "${x}a\cb c"'
+same_as_bash "echo without -e is literal" "echo '\a\t\n'"
+same_as_bash "echo no -e via variable"    'x=lit; echo "${x}\a\t"'
+same_as_bash "printf %b escape set"       'printf "%b" "\a\t\x41"'
+same_as_bash "printf %b \\c aborts all"   'printf "%b-" "a\cb" "x"; printf end'
+same_as_bash "printf fmt unknown escape"  'printf "\q\e\x4Z"'
+same_as_bash "printf fmt vs %b octal"     'printf "\101Z \0101Z"; printf "%b" "\101Z \0101Z"'
+same_as_bash "echo -e octal + hex edges"  'echo -e "\0101Z \101Z \x4Z \xgZ \08Z \0400Z"'
+
+# --- one word-expansion pipeline: for-loop words expand before iteration ---
+# bash expands the ENTIRE for-word list before the first iteration; zish used
+# to expand lazily per word, so a body mutating a variable used in a LATER
+# word iterated over the wrong values.
+same_as_bash "for words expand up front"  'v=x; for w in $v ${v}2; do v=CHANGED; printf "%s " "$w"; done'
+same_as_bash "for brace expansion"        'for w in a{1,2} b; do printf "%s " "$w"; done'
+same_as_bash "for glob words"             'mkdir -p g && touch g/a.zz g/b.zz; for f in g/*.zz; do printf "%s " "$f"; done'
+same_as_bash "for custom IFS split"       'IFS=:; for x in a:b:c; do printf "[%s]" "$x"; done'
+same_as_bash "for quoted word one field"  'for x in "a b" c; do printf "[%s]" "$x"; done'
+same_as_bash "for empty word list"        'for x in; do echo no; done'
+same_as_bash "for escaped dollar literal" 'for x in \$HOME; do echo "$x"; done'
+same_as_bash "for cmdsubst split + break" 'for x in $(echo a b) lit; do printf "[%s]" "$x"; done'
+same_as_bash "for continue N"             'for i in 1 2 3; do for j in a b; do continue 2; done; echo "$i"; done'
+same_as_bash "for nested same variable"   'for x in 1 2; do for x in a b; do printf %s "$x"; done; printf "[%s]" "$x"; done'
+
 # ---------------------------------------------------------------------------
 printf '\n%s\n' "para feat"
 # ---------------------------------------------------------------------------
