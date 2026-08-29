@@ -145,6 +145,8 @@ pub const JobTable = struct {
         state: JobState,
         command: []const u8,
         exit_status: u8,
+        signaled: bool, // killed by a signal (print "Terminated"/"Killed", not "Done")
+        term_signal: u8, // the signal number when signaled
     };
 
     pub fn init(allocator: std.mem.Allocator) JobTable {
@@ -382,10 +384,11 @@ pub const JobTable = struct {
 
         for (self.jobs.items) |*job| {
             if (!job.notified and !job.foreground) {
-                const exit_status: u8 = if (job.lastProcess()) |proc|
-                    @truncate(posix.W.EXITSTATUS(proc.status))
+                // Decode properly: a signal-killed job is not "Done" with exit 0.
+                const oc = if (job.lastProcess()) |proc|
+                    decodeStatus(proc.status)
                 else
-                    0;
+                    Outcome{ .code = 0, .exited = true, .signaled = false, .stopped = false };
 
                 const cmd_copy = try self.allocator.dupe(u8, job.command);
                 errdefer self.allocator.free(cmd_copy);
@@ -394,7 +397,9 @@ pub const JobTable = struct {
                     .job_id = job.id,
                     .state = job.state,
                     .command = cmd_copy,
-                    .exit_status = exit_status,
+                    .exit_status = oc.code,
+                    .signaled = oc.signaled,
+                    .term_signal = if (oc.signaled) oc.code -| 128 else 0,
                 });
                 job.notified = true;
             }
@@ -403,14 +408,16 @@ pub const JobTable = struct {
         return pending.toOwnedSlice(self.allocator);
     }
 
-    /// Clean up completed jobs that have been notified
+    /// Clean up completed jobs that have been notified. Delegates to removeJob so
+    /// the current_job/previous_job fixup happens here too — otherwise a stale
+    /// current_job id survived removal and bare `fg`/`bg` reported "no current
+    /// job" while another job was still running.
     pub fn cleanupDoneJobs(self: *JobTable) void {
         var i: usize = 0;
         while (i < self.jobs.items.len) {
             const job = &self.jobs.items[i];
             if (job.state == .done and job.notified) {
-                var removed = self.jobs.orderedRemove(i);
-                removed.deinit(self.allocator);
+                self.removeJob(job.id); // removes + fixes current/previous; element at i is now the next one
             } else {
                 i += 1;
             }

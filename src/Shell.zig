@@ -2795,7 +2795,13 @@ fn notifyBackgroundJobs(self: *Shell) void {
             ' ';
 
         const line = switch (notif.state) {
-            .done => if (notif.exit_status == 0)
+            .done => if (notif.signaled)
+                std.fmt.allocPrint(self.allocator, "[{d}]{c}  {s}              {s}\n", .{
+                    notif.job_id, marker,
+                    if (notif.term_signal == 9) "Killed" else "Terminated",
+                    notif.command,
+                }) catch continue
+            else if (notif.exit_status == 0)
                 std.fmt.allocPrint(self.allocator, "[{d}]{c}  Done                    {s}\n", .{
                     notif.job_id, marker, notif.command,
                 }) catch continue

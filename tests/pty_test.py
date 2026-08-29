@@ -308,6 +308,44 @@ def _(sh):
     assert "Done" in out and "sleep" in out, f"no Done notice for finished bg job; got {out[-400:]!r}"
 
 
+@test("a finished job's cleanup does not break the current job")
+def _(sh):
+    # Regression: cleanupDoneJobs (fired every prompt by the Done-notice poll)
+    # removed jobs WITHOUT the current_job/previous_job fixup that removeJob does,
+    # leaving current_job pointing at the removed id. Result: after any Done
+    # notice, bare `fg`/`bg` said "no current job" while another job still ran.
+    sh.sendline("sleep 5 &")     # job 1: stays running, must remain current
+    sh.read(timeout=3)
+    sh.sendline("sleep 0.2 &")   # job 2: finishes and gets cleaned up
+    sh.read(timeout=3)
+    time.sleep(0.4)
+    sh.sendline("")              # fresh prompt: Done notice + cleanupDoneJobs
+    sh.read(timeout=5)
+    sh.sendline("jobs")
+    out = sh.read(timeout=5)
+    # The survivor is still listed and is the current job (`+`), not stale.
+    assert "sleep 5" in out, f"surviving job vanished after cleanup; got {out[-400:]!r}"
+    assert "no current job" not in out
+    sh.sendline("bg")            # bare bg must find the current job, not error
+    out2 = sh.read(timeout=5)
+    assert "no current job" not in out2, f"current job broken after cleanup; got {out2[-400:]!r}"
+
+
+@test("signal-killed background job notice says Terminated, not Done")
+def _(sh):
+    # getPendingNotifications used raw EXITSTATUS (0 for a signaled job), so a
+    # killed bg job wrongly printed "Done". It now decodes via decodeStatus.
+    sh.sendline("sleep 5 &")
+    sh.read(timeout=3)
+    sh.sendline("kill $!")       # SIGTERM the background job
+    sh.read(timeout=3)
+    time.sleep(0.3)
+    sh.sendline("")             # fresh prompt: notice fires
+    out = sh.read(timeout=5)
+    assert "Terminated" in out and "Done" not in out, \
+        f"signaled bg job should say Terminated not Done; got {out[-400:]!r}"
+
+
 @test("shell survives ctrl-c and keeps its prompt")
 def _(sh):
     sh.sendline("sleep 30")

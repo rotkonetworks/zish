@@ -2828,7 +2828,10 @@ fn logCompletionImpl(cmd: []const u8, word_start: usize, prefix: []const u8, com
         else => return,
     };
     defer file.close(compat.io());
-    _ = compat.posix.lseek(file.handle, 0, 2) catch {}; // 2 = SEEK_END
+    // 2 = SEEK_END. On failure (e.g. a non-seekable file planted at the log
+    // path), return WITHOUT writing — otherwise the append would land at offset
+    // 0 and clobber the head of the log. Matches the original std.c.lseek guard.
+    _ = compat.posix.lseek(file.handle, 0, 2) catch return;
 
     const ctx = cmd[0..@min(word_start, cmd.len)];
     const ts: u64 = @bitCast(compat.timestamp());

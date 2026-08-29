@@ -207,8 +207,12 @@ pub const posix = struct {
                 .SUCCESS => return,
                 .BUSY, .INTR => continue,
                 .MFILE => return error.ProcessFdQuotaExceeded,
-                .INVAL => unreachable,
-                .BADF => unreachable,
+                // A user redirect supplies these fds — `echo hi >&9` dup2s a fd
+                // that was never opened (EBADF), and `n>&m` can pass a bad/large
+                // fd (EINVAL). These are user error, NOT a shell bug: return an
+                // error so the redirect fails cleanly instead of aborting the
+                // whole shell on `unreachable`.
+                .INVAL, .BADF => return error.BadFileDescriptor,
                 else => |err| return unexpectedErrno(err),
             }
         }

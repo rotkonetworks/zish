@@ -1778,6 +1778,9 @@ fn jobs(shell: *Shell, args: []const []const u8) !u8 {
 
     for (shell.job_table.jobs.items) |*job| {
         try shell.job_table.formatJob(job, shell.stdout(), verbose);
+        // Mark done jobs notified here so the prompt-time notifier doesn't print
+        // a second "Done" line for a job the user already saw via `jobs`.
+        if (job.state == .done) job.notified = true;
     }
 
     // Clean up done jobs after displaying

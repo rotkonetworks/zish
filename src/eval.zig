@@ -1834,10 +1834,26 @@ pub fn evaluateRedirect(shell: *Shell, node: *const ast.AstNode) !u8 {
     var idx = n;
     while (idx > 0) {
         idx -= 1;
-        try applyRedirect(shell, chain[idx], &saver);
+        // A failed redirect (bad fd like `>&9`, unwritable target, …) fails the
+        // COMMAND with exit 1 and a diagnostic — it must not abort the whole
+        // shell/script. The defer above restores any fds already swapped.
+        applyRedirect(shell, chain[idx], &saver) catch |err| {
+            shell.stderr().print("zish: {s}\n", .{redirectErrorText(err)}) catch {};
+            return 1;
+        };
     }
 
     return evaluateAst(shell, command);
+}
+
+fn redirectErrorText(err: anyerror) []const u8 {
+    return switch (err) {
+        error.BadFileDescriptor => "bad file descriptor",
+        error.AccessDenied => "permission denied",
+        error.FileNotFound => "no such file or directory",
+        error.IsDir => "is a directory",
+        else => "redirection error",
+    };
 }
 
 /// Backs up the shell's fds around a command's redirections so they can be

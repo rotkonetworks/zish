@@ -719,6 +719,12 @@ same_as_bash "kill -SIGHUP prefix form"    'kill -SIGHUP $$; echo SURVIVED'
 same_as_bash "kill -0 existence check"     'kill -0 $$; echo rc=$?'
 same_as_bash "kill bad signal spec rc"     'kill -NOPESIG 1 2>/dev/null; echo rc=$?'
 
+# A failed redirect (bad fd `>&9`, unwritable target) fails THAT command with
+# exit 1 and continues — it must not abort the shell (it used to panic on an
+# unreachable in dup2). stderr suppressed: only exit-code + continuation compared.
+same_as_bash "bad fd redirect no crash"    'echo hi >&9 2>/dev/null; echo after=$?'
+same_as_bash "bad dir redirect fails cmd"  'echo x > /noexist_zzq/f 2>/dev/null; echo after=$?'
+
 # A child killed by a signal reports $?=128+signo, not a bare exit code. The
 # foreground reap and the `fg` wait now share one decoder (jobs.decodeStatus).
 same_as_bash "signaled child exit 130"     'sh -c "kill -INT \$\$"; echo rc=$?'
