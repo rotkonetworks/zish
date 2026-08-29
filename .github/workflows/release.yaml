@@ -44,6 +44,12 @@ jobs:
     needs: verify
     runs-on: ubuntu-latest
     strategy:
+      # Serialize the arch builds: both attach to the same GitHub release, and
+      # softprops/action-gh-release CREATES it if missing. Run in parallel and
+      # the two jobs race to create it — one wins, the other 422s
+      # ("already_exists") and the release ships with only one arch's binary.
+      # One at a time: the first creates the release, the second just uploads.
+      max-parallel: 1
       matrix:
         target: [x86_64-linux, aarch64-linux]
     steps:
