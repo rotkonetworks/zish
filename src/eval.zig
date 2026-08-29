@@ -249,8 +249,14 @@ pub fn buildEnvironment(shell: *Shell) ![*:null]const ?[*:0]const u8 {
         }
     }
 
-    // Add shell variables
-    count += shell.variables.count();
+    // Add shell variables — ONLY the exported ones. A plain `x=1` is
+    // shell-local and must never enter a child's environment.
+    {
+        var vit = shell.variables.keyIterator();
+        while (vit.next()) |k| {
+            if (shell.isExported(k.*)) count += 1;
+        }
+    }
 
     // Allocate array (count + 1 for null terminator)
     var env_ptrs = try shell.allocator.alloc(?[*:0]const u8, count + 1);
@@ -271,11 +277,12 @@ pub fn buildEnvironment(shell: *Shell) ![*:null]const ?[*:0]const u8 {
         }
     }
 
-    // Add shell variables
+    // Add exported shell variables
     var var_iter = shell.variables.iterator();
     while (var_iter.next()) |kv| {
-        // Build "NAME=value\0" string (leaked - child exits after exec)
         const name = kv.key_ptr.*;
+        if (!shell.isExported(name)) continue;
+        // Build "NAME=value\0" string (leaked - child exits after exec)
         const value = kv.value_ptr.*;
         const env_str = try shell.allocator.alloc(u8, name.len + 1 + value.len + 1);
         @memcpy(env_str[0..name.len], name);
@@ -804,6 +811,10 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     var prefix_old_vals: [16][]const u8 = undefined;
     var prefix_tmp_vals: [16][]const u8 = undefined;
     var prefix_tmp_owned: [16]bool = undefined;
+    // Prefix assignments (`FOO=1 cmd`) are exported to the command's environment
+    // but only for its duration; track which were already exported so cleanup
+    // removes only the marks we added.
+    var prefix_was_exported: [16]bool = undefined;
     const actual_prefix = @min(n_prefix, 16);
 
     for (0..actual_prefix) |i| {
@@ -829,6 +840,9 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
 
         prefix_names[i] = name;
         prefix_tmp_vals[i] = expanded;
+        // Export for the command (bash: `FOO=1 cmd` puts FOO in cmd's env).
+        prefix_was_exported[i] = shell.isExported(name);
+        if (!prefix_was_exported[i]) shell.markExported(name) catch {};
         if (shell.variables.getPtr(name)) |val_ptr| {
             prefix_had_old[i] = true;
             prefix_old_vals[i] = val_ptr.*;
@@ -851,6 +865,10 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
         while (i > 0) {
             i -= 1;
             if (prefix_names[i].len == 0) continue;
+            // Undo a temporary export (leave pre-existing exports alone).
+            if (!prefix_was_exported[i]) {
+                if (shell.exported.fetchRemove(prefix_names[i])) |kv| shell.allocator.free(kv.key);
+            }
             if (prefix_had_old[i]) {
                 // restore old value, free the temp
                 if (shell.variables.getPtr(prefix_names[i])) |val_ptr| {
@@ -1643,8 +1661,13 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
                 compat.posix.close(pipe_fds[1]);
             }
 
-            // Fast path: simple external command - exec directly without evaluateAst
-            if (child.node_type == .command and child.children.len > 0) {
+            // Fast path: simple external command - exec directly without evaluateAst.
+            // Skip it when the first child is a prefix assignment (`FOO=1 cmd`):
+            // that path would exec the assignment as the command AND drop the
+            // variable from the child's environment. Fall through to evaluateCommand.
+            if (child.node_type == .command and child.children.len > 0 and
+                child.children[0].node_type != .assignment)
+            {
                 const cmd_name = child.children[0].value;
                 // Check if it's a simple external command (not a builtin, no
                 // special chars) that actually exists in PATH.

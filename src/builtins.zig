@@ -1192,16 +1192,32 @@ fn testCmd(shell: *Shell, args: []const []const u8) !u8 {
 
 fn exportVar(shell: *Shell, args: []const []const u8) !u8 {
     for (args[1..]) |arg| {
+        // Accept a leading `-p`/`--` gracefully (ignore); real work is names.
+        if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--")) continue;
         if (std.mem.indexOfScalar(u8, arg, '=')) |eq_pos| {
             const name = arg[0..eq_pos];
-            const value = arg[eq_pos + 1 ..];
-            try setVar(shell, name, value);
+            try setVar(shell, name, arg[eq_pos + 1 ..]);
+            try shell.markExported(name);
         } else {
-            try shell.stderr().print("export: {s}: not a valid identifier\n", .{arg});
-            return 1;
+            // `export NAME` marks an existing (or future) variable exported
+            // without assigning — bash accepts this; it is not an error.
+            if (!isValidName(arg)) {
+                try shell.stderr().print("export: `{s}': not a valid identifier\n", .{arg});
+                return 1;
+            }
+            try shell.markExported(arg);
         }
     }
     return 0;
+}
+
+fn isValidName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (!(std.ascii.isAlphabetic(name[0]) or name[0] == '_')) return false;
+    for (name[1..]) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '_')) return false;
+    }
+    return true;
 }
 
 fn unset(shell: *Shell, args: []const []const u8) !u8 {
@@ -1210,6 +1226,8 @@ fn unset(shell: *Shell, args: []const []const u8) !u8 {
             shell.allocator.free(kv.key);
             shell.allocator.free(kv.value);
         }
+        // Drop the export mark too, so a later same-name assignment stays local.
+        if (shell.exported.fetchRemove(arg)) |kv| shell.allocator.free(kv.key);
     }
     return 0;
 }

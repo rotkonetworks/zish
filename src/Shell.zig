@@ -187,6 +187,11 @@ history_search_prefix_len: usize,
 original_termios: ?posix.termios = null,
 aliases: std.StringHashMap([]const u8),
 variables: std.StringHashMap([]const u8),
+// Names that are EXPORTED to child processes. A plain assignment (`x=1`) sets a
+// shell-local variable that must NOT reach children; only `export`ed names and
+// variables inherited from the environment at startup do. Without this every
+// shell variable — including secrets — leaked into every child's environment.
+exported: std.StringHashMap(void),
 arrays: std.StringHashMap(std.ArrayListUnmanaged([]const u8)), // array variables
 functions: std.StringHashMap(*const ast.AstNode), // name -> body AST
 traps: TrapTable = .{}, // signal handlers
@@ -322,6 +327,7 @@ fn initWithOptions(allocator: std.mem.Allocator, load_config: bool) !*Shell {
         .original_termios = null,
         .aliases = std.StringHashMap([]const u8).init(allocator),
         .variables = std.StringHashMap([]const u8).init(allocator),
+        .exported = std.StringHashMap(void).init(allocator),
         .arrays = std.StringHashMap(std.ArrayListUnmanaged([]const u8)).init(allocator),
         .functions = std.StringHashMap(*const ast.AstNode).init(allocator),
         // new modular editor
@@ -351,6 +357,19 @@ fn initWithOptions(allocator: std.mem.Allocator, load_config: bool) !*Shell {
         .job_table = jobs.JobTable.init(allocator),
     };
 
+    // Every variable inherited from the environment is exported by definition —
+    // record their names so that reassigning one (e.g. PATH=...) keeps it in the
+    // child environment, while a brand-new `x=1` does not.
+    {
+        const env_ptr = std.c.environ;
+        var ei: usize = 0;
+        while (env_ptr[ei]) |entry| : (ei += 1) {
+            const slice = std.mem.sliceTo(entry, 0);
+            const eq = std.mem.indexOfScalar(u8, slice, '=') orelse continue;
+            shell.markExported(slice[0..eq]) catch {};
+        }
+    }
+
     // don't enable raw mode here - will be enabled by run() for interactive mode
     // this prevents issues with child processes in non-interactive mode
 
@@ -377,6 +396,11 @@ pub fn deinit(self: *Shell) void {
         self.allocator.free(entry.value_ptr.*);
     }
     self.aliases.deinit();
+
+    // cleanup exported-name set (owns its keys)
+    var ex_it = self.exported.keyIterator();
+    while (ex_it.next()) |k| self.allocator.free(k.*);
+    self.exported.deinit();
 
     // cleanup variables
     var var_it = self.variables.iterator();
@@ -866,6 +890,20 @@ pub inline fn stdout(self: *Shell) *std.Io.Writer {
 pub inline fn stderr(self: *Shell) *std.Io.Writer {
     self.stdout_writer.interface.flush() catch {};
     return &self.stderr_writer.interface;
+}
+
+/// Mark `name` as exported to child processes (idempotent; owns a copy of the
+/// name). Called by `export` and for every variable inherited from the env.
+pub fn markExported(self: *Shell, name: []const u8) !void {
+    if (self.exported.contains(name)) return;
+    const owned = try self.allocator.dupe(u8, name);
+    errdefer self.allocator.free(owned);
+    try self.exported.put(owned, {});
+}
+
+/// Whether `name` should be placed in a child process's environment.
+pub fn isExported(self: *Shell, name: []const u8) bool {
+    return self.exported.contains(name);
 }
 
 // cursor styles for vim modes

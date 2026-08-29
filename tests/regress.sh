@@ -693,6 +693,18 @@ same_as_bash "printf %q newline"           'printf "%q\n" "$(printf "a\nb")"'
 same_as_bash "printf %q metachars"         "printf '%q\n' 'a|b;c'"
 same_as_bash "exec passes exported var"   'export ZQ=hi; exec printenv ZQ'
 
+# Export tracking: a plain assignment is shell-local and must NOT leak into a
+# child's environment (it did — every shell variable, incl. secrets, was
+# exported). Only `export`ed names, inherited env vars, and prefix assignments
+# reach children.
+same_as_bash "unexported var not in env"   'SECRETX=hunter2; env | grep "^SECRETX=" || echo hidden'
+same_as_bash "exported var in env"         'export PUBX=yes; env | grep "^PUBX="'
+same_as_bash "export bare marks existing"  'VX=1; export VX; env | grep "^VX="'
+same_as_bash "prefix assign exported"      'FOO=pre printenv FOO'
+same_as_bash "prefix assign not persisted"  'FOO=pre printenv FOO >/dev/null; echo "[${FOO:-unset}]"'
+same_as_bash "prefix assign in pipeline"   'FOO=pre printenv FOO | cat'
+same_as_bash "prefix + export both in env"  'export PX=1; FOO=2 env | grep -E "^(PX|FOO)=" | sort'
+
 # `read` builtin: the seekable fast path (block read + lseek-back) must be
 # byte-for-byte identical to the byte path and to bash. The critical invariant
 # is that read consumes EXACTLY one line — a following reader sees the rest.
