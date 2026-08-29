@@ -2107,19 +2107,66 @@ fn returnCmd(shell: *Shell, args: []const []const u8) !u8 {
 }
 
 fn builtinCmd(shell: *Shell, args: []const []const u8) !u8 {
-    // run builtin directly, bypassing alias lookup
-    _ = shell;
+    // `builtin NAME [args]` runs NAME as a builtin only, bypassing any function
+    // or alias of the same name. Re-dispatch through the builtin table (which is
+    // exactly "builtins only, no alias/function"); error if NAME isn't a builtin.
     if (args.len < 2) return 0;
-    // TODO: implement proper builtin dispatch
-    return 0;
+    if (try dispatch(shell, args[1], args[1..])) |rc| return rc;
+    try shell.stderr().print("builtin: {s}: not a shell builtin\n", .{args[1]});
+    return 1;
 }
 
 fn commandCmd(shell: *Shell, args: []const []const u8) !u8 {
-    // run command directly, bypassing alias/function lookup
-    // just return null to let eval.zig handle external command
-    _ = shell;
-    _ = args;
-    return 127; // fall through to external command
+    // `command -v/-V NAME` — resolution query used pervasively in scripts
+    // (`if command -v foo >/dev/null; then ...`). `command NAME [args]` runs NAME
+    // ignoring functions/aliases; the builtin case is handled here, the external
+    // case still falls through to eval (see below).
+    if (args.len < 2) return 0;
+
+    if (std.mem.eql(u8, args[1], "-v") or std.mem.eql(u8, args[1], "-V")) {
+        if (args.len < 3) return 1;
+        const verbose = std.mem.eql(u8, args[1], "-V");
+        const name = args[2];
+        if (shell.aliases.get(name)) |val| {
+            if (verbose)
+                try shell.stdout().print("{s} is aliased to `{s}'\n", .{ name, val })
+            else
+                try shell.stdout().print("alias {s}='{s}'\n", .{ name, val });
+            return 0;
+        }
+        if (shell.functions.get(name) != null) {
+            if (verbose)
+                try shell.stdout().print("{s} is a function\n", .{name})
+            else
+                try shell.stdout().print("{s}\n", .{name});
+            return 0;
+        }
+        if (isBuiltin(name)) {
+            if (verbose)
+                try shell.stdout().print("{s} is a shell builtin\n", .{name})
+            else
+                try shell.stdout().print("{s}\n", .{name});
+            return 0;
+        }
+        if (shell.lookupCommand(name)) |path| {
+            if (verbose)
+                try shell.stdout().print("{s} is {s}\n", .{ name, path })
+            else
+                try shell.stdout().print("{s}\n", .{path});
+            return 0;
+        }
+        if (verbose) try shell.stderr().print("{s}: not found\n", .{name});
+        return 1;
+    }
+
+    // `command NAME args` where NAME is a builtin: dispatch it directly.
+    if (isBuiltin(args[1])) {
+        if (try dispatch(shell, args[1], args[1..])) |rc| return rc;
+    }
+    // External NAME: eval owns the fork/exec + foreground discipline, and the
+    // function/alias-bypass belongs in its resolution order. Signal that eval
+    // should run args[1..] as an external command, not treat "command" as one.
+    return error.RunAsCommand;
 }
 
 // ============ time builtin - criterion-style benchmarking ============

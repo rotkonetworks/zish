@@ -282,6 +282,7 @@ terminal_height: usize = 24,
 last_resize_time: i64 = 0,
 
 stdout_writer: std.Io.File.Writer,
+stderr_writer: std.Io.File.Writer,
 log_file: ?std.Io.File = null,
 
 // PATH lookup cache - maps command name -> full path
@@ -342,6 +343,10 @@ fn initWithOptions(allocator: std.mem.Allocator, load_config: bool) !*Shell {
         // correct now that the shell is single-threaded (the one reason to
         // prefer positional — seek-position thread-safety — no longer applies).
         .stdout_writer = std.Io.File.Writer.initStreaming(std.Io.File.stdout(), compat.io(), writer_buffer),
+        // Unbuffered (empty buffer → every write drains straight to fd 2): builtin
+        // diagnostics must reach the terminal immediately and must not sit in a
+        // buffer that a redirect or `2>` never flushes.
+        .stderr_writer = std.Io.File.Writer.initStreaming(std.Io.File.stderr(), compat.io(), &.{}),
         .path_cache = std.StringHashMap([]const u8).init(allocator),
         .job_table = jobs.JobTable.init(allocator),
     };
@@ -851,6 +856,16 @@ pub fn run(self: *Shell) !void {
 
 pub inline fn stdout(self: *Shell) *std.Io.Writer {
     return &self.stdout_writer.interface;
+}
+
+/// Diagnostics writer (fd 2). Flushes any pending buffered stdout first so a
+/// preceding line of normal output still appears before the error, then writes
+/// straight through (the stderr writer is unbuffered). Builtins send every
+/// error here, matching bash — so `cmd 2>/dev/null` silences them and
+/// `x=$(cmd)` does not capture them.
+pub inline fn stderr(self: *Shell) *std.Io.Writer {
+    self.stdout_writer.interface.flush() catch {};
+    return &self.stderr_writer.interface;
 }
 
 // cursor styles for vim modes

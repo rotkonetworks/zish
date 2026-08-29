@@ -998,7 +998,10 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     // expand command name (for ~/path/to/cmd)
     const cmd_name_result = try shell.expandVariablesZ(raw_cmd);
     defer cmd_name_result.deinit(shell.allocator);
-    const cmd_name = cmd_name_result.slice;
+    var cmd_name = cmd_name_result.slice;
+    // set when `command NAME ...` strips its prefix: NAME then resolves as an
+    // external command with functions/aliases bypassed (command's whole point).
+    var skip_functions = false;
 
     // alias expansion - substitute alias value for command name
     // but prevent infinite recursion for self-referencing aliases like "alias ls='ls --color=auto'"
@@ -1126,8 +1129,21 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     }
 
     // dispatch to builtins module
-    if (try builtins.dispatch(shell, cmd_name, expanded_args.items)) |result| {
-        return result;
+    if (builtins.dispatch(shell, cmd_name, expanded_args.items)) |maybe_result| {
+        if (maybe_result) |result| return result;
+    } else |err| switch (err) {
+        // `command NAME args`: NAME is external. Strip the "command" prefix and
+        // resolve NAME as an external command below, with functions/aliases
+        // bypassed (so `ls() { command ls; }` doesn't recurse).
+        error.RunAsCommand => {
+            if (expanded_args.items.len >= 2) {
+                shell.allocator.free(expanded_args.items[0]);
+                _ = expanded_args.orderedRemove(0);
+                cmd_name = expanded_args.items[0];
+                skip_functions = true;
+            } else return 0;
+        },
+        else => return err,
     }
 
     if (std.mem.eql(u8, cmd_name, "feat"))
@@ -1277,8 +1293,8 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
         return 0;
     }
 
-    // check if it's a function call
-    if (shell.functions.get(cmd_name)) |_| {
+    // check if it's a function call (skipped after a `command` prefix)
+    if (!skip_functions and shell.functions.get(cmd_name) != null) {
         // call function with remaining arguments
         return callFunction(shell, cmd_name, expanded_args.items[1..]) catch |err| {
             if (err == error.FunctionNotFound) {

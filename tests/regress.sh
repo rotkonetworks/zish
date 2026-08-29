@@ -658,6 +658,16 @@ same_as_bash "for no-list over quoted \$@" 'set -- "x y" z; for i; do echo "[$i]
 same_as_bash "for no-list simple"          'set -- a b c; for i; do printf "%s." "$i"; done'
 same_as_bash "for no-list no-semicolon"    'set -- "a b" "c d"; for i do echo "<$i>"; done'
 
+# `builtin` / `command` were broken stubs (builtin echo -> silent success 0;
+# command echo -> exit 127). `command` must bypass a shadowing function/alias.
+same_as_bash "builtin runs a builtin"      'builtin echo hi'
+same_as_bash "builtin unknown fails"       'builtin nosuchbuiltin 2>/dev/null; echo rc=$?'
+same_as_bash "command -v builtin"          'command -v echo'
+same_as_bash "command -v missing rc"       'command -v nosuchcmd_zzz; echo rc=$?'
+same_as_bash "command -v function"         'f() { :; }; command -v f'
+same_as_bash "command runs echo"           'command echo hi'
+same_as_bash "command bypasses function"   'echo() { echo NOPE; }; command echo real'
+
 # `read` builtin: the seekable fast path (block read + lseek-back) must be
 # byte-for-byte identical to the byte path and to bash. The critical invariant
 # is that read consumes EXACTLY one line — a following reader sees the rest.
