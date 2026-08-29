@@ -345,7 +345,7 @@ fn evaluateTestBuiltinFast(shell: *Shell, node: *const ast.AstNode) !u8 {
 
     // Expand arguments into stack buffers
     for (node.children[start_idx..end_idx]) |arg_node| {
-        if (arg_count >= 8) break; // max args
+        if (arg_count >= 8) return error.BufferTooSmall; // fall back; don't drop args
 
         const arg = arg_node.value;
 
@@ -718,16 +718,16 @@ fn evaluateEchoBuiltinFast(shell: *Shell, node: *const ast.AstNode) !u8 {
 
     // Expand remaining arguments into stack buffers
     for (node.children[arg_start..]) |arg_node| {
-        if (arg_count >= 16) break;
+        if (arg_count >= 16) return error.BufferTooSmall; // fall back; don't drop args
 
         const arg = arg_node.value;
         const dest = &arg_buffers[arg_count];
 
         // For string nodes (single-quoted), no expansion needed
         if (arg_node.node_type == .string) {
-            const len = @min(arg.len, 256);
-            @memcpy(dest[0..len], arg[0..len]);
-            arg_slices[arg_count] = dest[0..len];
+            if (arg.len > dest.len) return error.BufferTooSmall; // don't truncate
+            @memcpy(dest[0..arg.len], arg);
+            arg_slices[arg_count] = dest[0..arg.len];
         } else {
             const expanded_len = try expandVariableFast(shell, arg, dest);
             // An unquoted $var that expands to nothing produces no field at all
@@ -750,7 +750,8 @@ fn evaluateEchoBuiltinFast(shell: *Shell, node: *const ast.AstNode) !u8 {
 
     var escape_stopped = false; // \c suppresses everything after it
     for (arg_slices[0..arg_count], 0..) |arg, i| {
-        if (i > 0 and out_pos < out_buf.len) {
+        if (i > 0) {
+            if (out_pos >= out_buf.len) return error.BufferTooSmall; // fall back
             out_buf[out_pos] = ' ';
             out_pos += 1;
         }
@@ -761,13 +762,17 @@ fn evaluateEchoBuiltinFast(shell: *Shell, node: *const ast.AstNode) !u8 {
                 escape_stopped = true;
                 break;
             }
+            // writeEscapedToBuf caps at the slice it was given; a full buffer
+            // means we may have truncated — fall back rather than emit a short line.
+            if (out_pos >= out_buf.len and !w.stopped) return error.BufferTooSmall;
         } else {
-            const copy_len = @min(arg.len, out_buf.len - out_pos);
-            @memcpy(out_buf[out_pos..][0..copy_len], arg[0..copy_len]);
-            out_pos += copy_len;
+            if (arg.len > out_buf.len - out_pos) return error.BufferTooSmall; // don't truncate
+            @memcpy(out_buf[out_pos..][0..arg.len], arg);
+            out_pos += arg.len;
         }
     }
-    if (print_newline and !escape_stopped and out_pos < out_buf.len) {
+    if (print_newline and !escape_stopped) {
+        if (out_pos >= out_buf.len) return error.BufferTooSmall; // no room for '\n'
         out_buf[out_pos] = '\n';
         out_pos += 1;
     }
@@ -3249,18 +3254,18 @@ fn evaluateUnaryTest(shell: *Shell, opc: u8, operand: []const u8) bool {
             break :blk true;
         },
         'x' => blk: {
-            const file = cwd.openFile(compat.io(), operand, .{}) catch break :blk false;
-            defer file.close(compat.io());
-            const stat = file.stat(compat.io()) catch break :blk false;
-            break :blk (stat.permissions.toMode() & 0o111) != 0;
+            // stat, don't open: open(2) on a FIFO with no writer blocks forever,
+            // so `[ -x fifo ]` used to hang the shell. statPosix never opens.
+            const st = statPosix(operand) orelse break :blk false;
+            break :blk (st.mode & 0o111) != 0;
         },
         's' => blk: {
             const stat = cwd.statFile(compat.io(), operand, .{}) catch break :blk false;
             break :blk stat.size > 0;
         },
-        'g' => statModeBit(cwd, operand, 0o2000),
-        'u' => statModeBit(cwd, operand, 0o4000),
-        'k' => statModeBit(cwd, operand, 0o1000),
+        'g' => statModeBit(operand, 0o2000),
+        'u' => statModeBit(operand, 0o4000),
+        'k' => statModeBit(operand, 0o1000),
         'O' => blk: {
             const st = statPosix(operand) orelse break :blk false;
             break :blk st.uid == compat.posix.geteuid();
@@ -3292,11 +3297,11 @@ fn statKindIs(cwd: std.Io.Dir, path: []const u8, kind: std.Io.File.Kind) bool {
     return stat.kind == kind;
 }
 
-fn statModeBit(cwd: std.Io.Dir, path: []const u8, bit: u32) bool {
-    const file = cwd.openFile(compat.io(), path, .{}) catch return false;
-    defer file.close(compat.io());
-    const stat = file.stat(compat.io()) catch return false;
-    return (stat.permissions.toMode() & bit) != 0;
+fn statModeBit(path: []const u8, bit: u32) bool {
+    // stat, don't open — an open on a FIFO/device can block; -g/-u/-k are pure
+    // mode-bit checks that statPosix answers without touching the file.
+    const st = statPosix(path) orelse return false;
+    return (st.mode & bit) != 0;
 }
 
 /// stat(2) via libc. Portable, unlike the statx it replaced — std.c.Stat

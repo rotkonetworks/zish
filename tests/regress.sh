@@ -673,6 +673,17 @@ same_as_bash "mapfile -s skip"             'printf "l1\nl2\nl3\n" > mf4.$$; mapf
 same_as_bash "mapfile partial last line"   'printf "p\nq" > mf5.$$; mapfile -t a < mf5.$$; echo "${#a[@]}:${a[1]}"; rm -f mf5.$$'
 same_as_bash "mapfile -n then read rest"   'printf "l1\nl2\nl3\nl4\n" > mf6.$$; { mapfile -n 2 -t two; cat; } < mf6.$$; rm -f mf6.$$'
 
+# Fast-path caps must FALL BACK to the full path, never silently truncate.
+same_as_bash "[ ] beyond 8 args"           '[ a = b -o c = d -o e = e ] && echo yes || echo no'
+same_as_bash "[ ] many -a args"            '[ a = a -a b = b -a c = c -a d = d ] && echo y || echo n'
+same_as_bash "echo 17 args"                'echo a1 a2 a3 a4 a5 a6 a7 a8 a9 a10 a11 a12 a13 a14 a15 a16 a17'
+same_as_bash "echo long quoted arg"        'echo "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'
+# -x / -g / -k on a FIFO must not open (open blocks forever) — use a real path.
+same_as_bash "[ -x on non-exec file"       '[ -x /etc/hostname ] && echo yes || echo no'
+# The FIFO itself: old zish hung here (open with no writer blocks); harness
+# timeout makes a regression fail red. bash and fixed zish both return 1 fast.
+same_as_bash "[ -x fifo no hang"           'mkfifo hangfifo; [ -x hangfifo ]; echo $?; rm -f hangfifo'
+
 # ---------------------------------------------------------------------------
 printf '\n%s\n' "para feat"
 # ---------------------------------------------------------------------------
