@@ -59,10 +59,8 @@ pub const TokenType = enum {
     Case, Esac, Function,
 
     // special
-    Dollar,
     ParameterExpansion,
     CommandSubstitution,
-    ArithmeticExpansion,
     Eof,
 };
 
@@ -98,19 +96,8 @@ const State = enum {
     tick_esc,
     // comment
     comment,
-    // operators
-    pipe,
-    amp,
-    gt,
-    lt,
-    lt_lt,
     // escape
     esc,
-    // bracket
-    lbracket,
-    rbracket,
-    // fd redirect (e.g., 2>)
-    fd_num,
     // URL (e.g., https://example.com?a=1&b=2)
     url,
 };
@@ -1258,11 +1245,6 @@ pub const Lexer = struct {
                     // Allow all other chars including & ? = # etc.
                     self.bufAppend(ch);
                     _ = self.advance();
-                },
-
-                else => {
-                    _ = self.advance();
-                    self.state = .normal;
                 },
             }
         }

@@ -28,7 +28,6 @@ pub const NodeType = enum {
     word,
     double_quoted, // double-quoted string: expand vars/cmds but no word splitting or glob
     string,
-    number,
 };
 
 // immutable ast node - no cleanup needed, arena handles lifetime
@@ -47,27 +46,6 @@ pub const AstNode = struct {
         .line = 0,
         .column = 0,
     };
-
-    pub fn iscommand(self: *const AstNode) bool {
-        return self.node_type == .command;
-    }
-
-    pub fn iscontrol(self: *const AstNode) bool {
-        return switch (self.node_type) {
-            .if_statement, .while_loop, .until_loop, .for_loop, .case_statement => true,
-            else => false,
-        };
-    }
-
-    // safe child access with bounds checking
-    pub fn getchild(self: *const AstNode, index: usize) ?*const AstNode {
-        if (index >= self.children.len) return null;
-        return self.children[index];
-    }
-
-    pub fn childcount(self: *const AstNode) usize {
-        return self.children.len;
-    }
 
     // Deep clone AST node into a different allocator (for persistent storage)
     pub fn clone(self: *const AstNode, allocator: std.mem.Allocator) !*AstNode {
@@ -112,7 +90,6 @@ pub const AstNode = struct {
 // typestate-based ast builder with security guarantees
 pub const AstBuilder = struct {
     arena: std.heap.ArenaAllocator,
-    depth: u8,
     node_count: u32,  // prevent ast explosion
 
     const max_nodes = 1024;  // prevent dos via massive asts
@@ -121,7 +98,6 @@ pub const AstBuilder = struct {
     pub fn init(parent_allocator: std.mem.Allocator) Self {
         return Self{
             .arena = std.heap.ArenaAllocator.init(parent_allocator),
-            .depth = 0,
             .node_count = 0,
         };
     }
@@ -142,11 +118,6 @@ pub const AstBuilder = struct {
         // prevent ast explosion attacks
         if (self.node_count >= max_nodes) {
             return error.AstTooComplex;
-        }
-
-        // prevent stack overflow in traversal
-        if (self.depth >= 64) {
-            return error.ParseTooDeep;
         }
 
         const allocator = self.arena.allocator();
@@ -197,9 +168,6 @@ pub const AstBuilder = struct {
     }
 
     pub fn createif(self: *Self, condition: *const AstNode, then_branch: *const AstNode, else_branch: ?*const AstNode, line: u32, column: u32) !*const AstNode {
-        self.depth += 1;
-        defer self.depth -= 1;
-
         var children_buf: [3]*const AstNode = undefined;
         var child_count: usize = 2;
 
@@ -215,17 +183,11 @@ pub const AstBuilder = struct {
     }
 
     pub fn createwhile(self: *Self, condition: *const AstNode, body: *const AstNode, line: u32, column: u32) !*const AstNode {
-        self.depth += 1;
-        defer self.depth -= 1;
-
         const children = [_]*const AstNode{ condition, body };
         return self.createnode(.while_loop, "", &children, line, column);
     }
 
     pub fn createuntil(self: *Self, condition: *const AstNode, body: *const AstNode, line: u32, column: u32) !*const AstNode {
-        self.depth += 1;
-        defer self.depth -= 1;
-
         const children = [_]*const AstNode{ condition, body };
         return self.createnode(.until_loop, "", &children, line, column);
     }
@@ -236,9 +198,6 @@ pub const AstBuilder = struct {
     }
 
     pub fn createfor(self: *Self, variable: *const AstNode, values: []const *const AstNode, body: *const AstNode, line: u32, column: u32) !*const AstNode {
-        self.depth += 1;
-        defer self.depth -= 1;
-
         const allocator = self.arena.allocator();
 
         // create children array: [variable, value1, value2, ..., body]
@@ -253,9 +212,6 @@ pub const AstBuilder = struct {
     // select name in words; do body; done — same child layout as for_loop:
     // [variable, word1, ..., wordN, body]
     pub fn createselect(self: *Self, variable: *const AstNode, values: []const *const AstNode, body: *const AstNode, line: u32, column: u32) !*const AstNode {
-        self.depth += 1;
-        defer self.depth -= 1;
-
         const allocator = self.arena.allocator();
 
         var children = try allocator.alloc(*const AstNode, values.len + 2);
