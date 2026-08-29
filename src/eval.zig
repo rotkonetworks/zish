@@ -1950,7 +1950,9 @@ fn applyHeredocInput(shell: *Shell, path: []const u8, expand: bool) !void {
     const exp_path = std.fmt.bufPrint(&name_buf, "{s}_x{s}", .{ path, std.fmt.bytesToHex(rnd, .lower) }) catch return error.OutOfMemory;
 
     {
-        const wf = try std.Io.Dir.cwd().createFile(compat.io(), exp_path, .{ .truncate = true, .exclusive = true });
+        // 0600: the expanded body holds substituted variable values (possibly
+        // secrets); a co-tenant UID must not read it from /tmp.
+        const wf = try std.Io.Dir.cwd().createFile(compat.io(), exp_path, .{ .truncate = true, .exclusive = true, .permissions = .fromMode(0o600) });
         defer wf.close(compat.io());
         compat.writeAll(wf, exp) catch {};
     }
@@ -2055,7 +2057,7 @@ fn applyRedirect(shell: *Shell, node: *const ast.AstNode, saver: *FdSaver) !void
         const tmp_path = while (true) {
             compat.posix.randomBytes(&rnd);
             const p = std.fmt.bufPrint(&name_buf, "/tmp/zish_herestr_{s}", .{std.fmt.bytesToHex(rnd, .lower)}) catch return error.OutOfMemory;
-            if (std.Io.Dir.cwd().createFile(compat.io(), p, .{ .truncate = true, .exclusive = true })) |f| {
+            if (std.Io.Dir.cwd().createFile(compat.io(), p, .{ .truncate = true, .exclusive = true, .permissions = .fromMode(0o600) })) |f| {
                 wf = f;
                 break p;
             } else |err| {

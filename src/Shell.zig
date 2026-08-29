@@ -4545,7 +4545,7 @@ fn preprocessHeredoc(self: *Shell, command: []const u8, delimiter: []const u8) !
     const tmp_path = while (true) {
         compat.posix.randomBytes(&rnd);
         const p = std.fmt.bufPrint(&path_buf, "/tmp/zish_heredoc_{c}_{s}", .{ mode_tag, std.fmt.bytesToHex(rnd, .lower) }) catch return error.OutOfMemory;
-        if (std.Io.Dir.createFileAbsolute(compat.io(), p, .{ .truncate = true, .exclusive = true })) |f| {
+        if (std.Io.Dir.createFileAbsolute(compat.io(), p, .{ .truncate = true, .exclusive = true, .permissions = .fromMode(0o600) })) |f| {
             file = f;
             break p;
         } else |err| {
