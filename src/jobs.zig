@@ -439,6 +439,14 @@ pub const JobTable = struct {
 
         job.foreground = true;
         job.state = .running;
+        // Clear stale per-process stopped flags (bash's mark_job_as_running):
+        // they were set when the job stopped, and waitForJob's loop condition
+        // checks isStopped() — with the flags still set it returned
+        // immediately instead of waiting, so `fg` gave the prompt back while
+        // the resumed job was still running.
+        for (job.processes.items) |*proc| {
+            if (!proc.completed) proc.stopped = false;
+        }
 
         // wait for job to complete or stop
         const status = self.waitForJob(job);
@@ -466,6 +474,11 @@ pub const JobTable = struct {
         }
         job.foreground = false;
         job.state = .running;
+        // mark_job_as_running: clear stale stopped flags so a later state
+        // check doesn't classify the resumed job as still stopped
+        for (job.processes.items) |*proc| {
+            if (!proc.completed) proc.stopped = false;
+        }
     }
 
     /// Wait for a job to stop or complete
@@ -543,6 +556,23 @@ pub fn launchProcess(pid: posix.pid_t, pgid: posix.pid_t, foreground: bool, term
     }
 
     // restore default signal handlers - child should respond to signals normally
+    resetChildSignals();
+}
+
+/// Reset job-control signal dispositions to SIG_DFL in a forked child.
+///
+/// The interactive shell ignores SIGINT/SIGQUIT/SIGTSTP/SIGTTIN/SIGTTOU for
+/// itself, and sigaction dispositions survive fork AND exec (an exec'd child
+/// inherits SIG_IGN). Every fork-to-exec child must call this between fork and
+/// exec or the resulting program cannot be interrupted (Ctrl+C), suspended
+/// (Ctrl+Z), or stopped on background tty access — which is what turned a
+/// SIGTTIN stop into a hard EIO for /dev/tty prompts.
+///
+/// ORDER MATTERS: call this AFTER setpgid/tcsetpgrp. The child's tcsetpgrp
+/// from its brand-new (not yet foreground) process group only succeeds because
+/// SIGTTOU is still ignored; resetting first would stop the child on SIGTTOU
+/// before it ever execs (the born-stopped bug, in a new spot).
+pub fn resetChildSignals() void {
     const default_action = posix.Sigaction{
         .handler = .{ .handler = posix.SIG.DFL },
         .mask = std.mem.zeroes(posix.sigset_t),

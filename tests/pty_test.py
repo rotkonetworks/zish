@@ -337,6 +337,109 @@ def _(sh):
     expect_soon(sh, "GOT:yes", timeout=6)
 
 
+@test("ctrl-z suspends a pipeline, shell survives")
+def _(sh):
+    # The pipeline reap loop waited without WUNTRACED, so ^Z on `a | b` left
+    # the shell blocked in waitpid forever while both stages sat stopped.
+    sh.sendline("sleep 30 | cat")
+    time.sleep(0.5)
+    sh.send("\x1a")  # ctrl-Z
+    out = sh.read(timeout=8)
+    assert "Stopped" in out, f"no Stopped notice for pipeline; got {out[-300:]!r}"
+    sh.sendline("jobs")
+    out = expect_soon(sh, "Stopped")
+    assert "sleep" in out, f"pipeline not listed in jobs: {out[-300:]!r}"
+    sh.sendline("echo alive_$((14 * 3))")  # computed: proves a working prompt
+    expect_soon(sh, "alive_42")
+
+
+@test("ctrl-z suspends a subshell, shell survives")
+def _(sh):
+    # The subshell body ran in the SHELL's own process group, so ^Z during
+    # `( sleep 30 )` SIGTSTP'd the whole shell, and the wait had no WUNTRACED.
+    sh.sendline("( sleep 30 )")
+    time.sleep(0.5)
+    sh.send("\x1a")
+    out = sh.read(timeout=8)
+    assert "Stopped" in out, f"no Stopped notice for subshell; got {out[-300:]!r}"
+    sh.sendline("echo alive_$((15 * 3))")
+    expect_soon(sh, "alive_45")
+
+
+@test("line editor still works after a subshell ran an external")
+def _(sh):
+    # `( external )` exec'd in place in the child, which cooked the tty; the
+    # parent never restored raw mode, so the next prompt's line editor was
+    # silently broken (cooked mode: keystrokes buffered by the kernel).
+    sh.sendline("( /bin/echo sub_$((5 * 5)) )")
+    expect_soon(sh, "sub_25")
+    sh.sendline("echo editor_$((16 * 3))")
+    expect_soon(sh, "editor_48")
+
+
+@test("ctrl-c kills a child prompting on the terminal")
+def _(sh):
+    # The interactive shell ignores SIGINT for itself, and dispositions
+    # survive exec — every fork-to-exec child must reset them to SIG_DFL or a
+    # program blocked reading the tty can never be Ctrl+C'd.
+    sh.sendline("printf '#!/bin/sh\\nread a; echo GOT:$a\\n' > asker; chmod +x asker")
+    sh.read(timeout=3)
+    sh.sendline("./asker")
+    time.sleep(0.5)
+    sh.send("\x03")  # ctrl-C must reach ./asker, not be eaten by inherited IGN
+    sh.read(timeout=6)
+    sh.sendline("echo killed_$((17 * 3))")
+    expect_soon(sh, "killed_51")
+
+
+@test("ctrl-z at an idle prompt is a clean no-op")
+def _(sh):
+    # zish is the session leader on this pty (no parent job-control shell to
+    # return to), so self-suspend is meaningless: Ctrl+Z at an empty prompt
+    # used to echo "^Z" repeatedly and garble the redraw. It must do nothing.
+    for _ in range(3):
+        sh.send("\x1a")
+        time.sleep(0.15)
+    out = sh.read(timeout=3)
+    assert "^Z" not in out, f"idle ctrl-Z echoed ^Z garbage: {out[-300:]!r}"
+    sh.sendline("echo idle_$((19 * 3))")
+    expect_soon(sh, "idle_57")
+
+
+@test("a foreground child is always escapable (ctrl-c and ctrl-z)")
+def _(sh):
+    # The invariant: while a foreground child runs the terminal is cooked
+    # (ISIG on) and the shell's wait is WUNTRACED, so the user ALWAYS has an
+    # exit — Ctrl+C interrupts, Ctrl+Z stops — and the shell regains control.
+    # Ctrl+Z leg: stop it, see it in jobs, prompt works.
+    sh.sendline("sleep 300")
+    time.sleep(0.5)
+    sh.send("\x1a")
+    out = sh.read(timeout=8)
+    assert "Stopped" in out, f"ctrl-Z did not stop the child: {out[-300:]!r}"
+    sh.sendline("jobs")
+    expect_soon(sh, "sleep 300")
+    sh.sendline("kill %1")
+    sh.read(timeout=3)
+    # Ctrl+C leg: interrupt a fresh child, prompt works.
+    sh.sendline("sleep 300")
+    time.sleep(0.5)
+    sh.send("\x03")
+    sh.read(timeout=6)
+    sh.sendline("echo escape_$((20 * 3))")
+    expect_soon(sh, "escape_60")
+
+
+@test("ctrl-c kills a pipeline blocked on the terminal")
+def _(sh):
+    sh.sendline("sleep 30 | cat")
+    time.sleep(0.5)
+    sh.send("\x03")
+    sh.read(timeout=6)
+    sh.sendline("echo pipe_int_$((18 * 3))")
+    expect_soon(sh, "pipe_int_54")
+
+
 # ---------------------------------------------------------------------------
 print("\nline editor")
 # ---------------------------------------------------------------------------

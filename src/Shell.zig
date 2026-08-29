@@ -43,6 +43,11 @@ const CTRL_G = input_mod.CTRL_G;
 const CTRL_L = input_mod.CTRL_L;
 const CTRL_D = input_mod.CTRL_D;
 const CTRL_Z = input_mod.CTRL_Z;
+
+/// POSIX getsid — session id of a process (0 = calling process). Used to tell
+/// a top-level/login zish (session leader; Ctrl+Z self-suspend is meaningless)
+/// from a zish running as a job under a parent job-control shell.
+extern "c" fn getsid(pid: std.c.pid_t) std.c.pid_t;
 const CTRL_R = input_mod.CTRL_R;
 
 // global shell instance for signal handler - must use atomic access
@@ -930,7 +935,15 @@ fn setupResizeHandler(self: *Shell) void {
 
 /// Set up signal handlers for job control
 /// Interactive shells must ignore SIGTTIN/SIGTTOU to avoid being stopped
-/// when terminal control is temporarily given to a child process group
+/// when terminal control is temporarily given to a child process group,
+/// and SIGINT/SIGQUIT/SIGTSTP so that Ctrl+C/Ctrl+Z with the terminal in
+/// cooked mode (while a foreground child runs, or in any race window at the
+/// prompt) cannot kill or stop the shell itself. This is only called from
+/// run(), so scripts keep default dispositions. Forked children reset all of
+/// these to SIG_DFL before exec (jobs.resetChildSignals), so foreground
+/// programs still receive Ctrl+C/Ctrl+Z normally. The `suspend_shell` action
+/// and the executeExternal spawn path temporarily restore defaults around
+/// their specific needs.
 fn setupJobControlSignals() void {
     const ignore_action = posix.Sigaction{
         .handler = .{ .handler = posix.SIG.IGN },
@@ -943,6 +956,11 @@ fn setupJobControlSignals() void {
 
     // Ignore SIGTTOU - sent when bg process writes to terminal
     posix.sigaction(posix.SIG.TTOU, &ignore_action, null);
+
+    // Ignore keyboard signals for the shell itself (bash does the same).
+    posix.sigaction(posix.SIG.INT, &ignore_action, null);
+    posix.sigaction(posix.SIG.QUIT, &ignore_action, null);
+    posix.sigaction(posix.SIG.TSTP, &ignore_action, null);
 }
 
 fn handleResize(self: *Shell) !void {
@@ -1082,6 +1100,16 @@ fn handleAction(self: *Shell, action: Action) !void {
         },
 
         .suspend_shell => {
+            // Ctrl+Z at the prompt. Suspending the shell only makes sense
+            // when zish itself runs as a job under a parent job-control
+            // shell. When zish is the session leader (login shell, top-level
+            // shell on a pty) there is no parent shell to return to — the
+            // self-suspend dance just echoed "^Z" and garbled the redraw.
+            // bash ignores SIGTSTP for itself and does nothing here; so do
+            // we: a clean no-op, no echo, no redraw.
+            const pid = compat.posix.getpid();
+            if (getsid(0) == pid) return;
+
             // suspend the shell with Ctrl+Z
             try self.stdout().writeAll("^Z\n");
             try self.stdout().flush();
@@ -1089,9 +1117,24 @@ fn handleAction(self: *Shell, action: Action) !void {
             // restore terminal to original state before suspending
             self.disableRawMode();
 
-            // send SIGTSTP to ourselves - we'll be stopped here
-            const pid = compat.posix.getpid();
+            // send SIGTSTP to ourselves - we'll be stopped here.
+            // The shell durably ignores SIGTSTP (setupJobControlSignals), so
+            // temporarily restore the default disposition around the raise —
+            // the same dance bash's `suspend` builtin does.
+            const default_action = posix.Sigaction{
+                .handler = .{ .handler = posix.SIG.DFL },
+                .mask = std.mem.zeroes(posix.sigset_t),
+                .flags = 0,
+            };
+            const ignore_action = posix.Sigaction{
+                .handler = .{ .handler = posix.SIG.IGN },
+                .mask = std.mem.zeroes(posix.sigset_t),
+                .flags = 0,
+            };
+            posix.sigaction(posix.SIG.TSTP, &default_action, null);
             _ = posix.kill(pid, posix.SIG.TSTP) catch {};
+            // === EXECUTION RESUMES HERE AFTER SIGCONT === (re-ignore first)
+            posix.sigaction(posix.SIG.TSTP, &ignore_action, null);
 
             // === EXECUTION RESUMES HERE AFTER SIGCONT ===
             // the parent shell may have changed terminal settings while we
@@ -4246,8 +4289,27 @@ fn executeExternal(self: *Shell, command: []const u8) !u8 {
         self.enableRawMode() catch {};
     };
 
-    // spawn child first, THEN ignore SIGINT in parent
-    // (child must not inherit SIG_IGN or it can't be interrupted)
+    // std.process.spawn has no pre-exec hook, so the child inherits our
+    // dispositions. The interactive shell durably ignores INT/QUIT/TSTP
+    // (setupJobControlSignals) — restore defaults around the spawn so the
+    // child can be interrupted, then re-ignore in the parent. The tiny window
+    // where the shell itself has default INT is the standard price for a
+    // spawn-style API (bash pays the same with posix_spawn).
+    const dfl_action = posix.Sigaction{
+        .handler = .{ .handler = posix.SIG.DFL },
+        .mask = std.mem.zeroes(posix.sigset_t),
+        .flags = 0,
+    };
+    var old_int: posix.Sigaction = undefined;
+    var old_quit: posix.Sigaction = undefined;
+    var old_tstp: posix.Sigaction = undefined;
+    posix.sigaction(posix.SIG.INT, &dfl_action, &old_int);
+    posix.sigaction(posix.SIG.QUIT, &dfl_action, &old_quit);
+    posix.sigaction(posix.SIG.TSTP, &dfl_action, &old_tstp);
+    defer posix.sigaction(posix.SIG.INT, &old_int, null);
+    defer posix.sigaction(posix.SIG.QUIT, &old_quit, null);
+    defer posix.sigaction(posix.SIG.TSTP, &old_tstp, null);
+
     // environment is inherited from parent by default
     var child = std.process.spawn(compat.io(), .{
         .argv = args.items,
@@ -4262,15 +4324,14 @@ fn executeExternal(self: *Shell, command: []const u8) !u8 {
         else => return err,
     };
 
-    // now ignore SIGINT in shell while child runs
-    var old_sigint: posix.Sigaction = undefined;
+    // now ignore SIGINT in shell while child runs; the defer above restores
+    // the shell's pre-spawn disposition (the durable ignore) on any exit
     const ignore_action = posix.Sigaction{
         .handler = .{ .handler = posix.SIG.IGN },
         .mask = std.mem.zeroes(posix.sigset_t),
         .flags = 0,
     };
-    posix.sigaction(posix.SIG.INT, &ignore_action, &old_sigint);
-    defer posix.sigaction(posix.SIG.INT, &old_sigint, null);
+    posix.sigaction(posix.SIG.INT, &ignore_action, null);
 
     const term = try child.wait(compat.io());
     return switch (term) {

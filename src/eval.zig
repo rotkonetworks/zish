@@ -1469,6 +1469,12 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
             jobs.tcsetpgrp(fd, child_pid) catch {};
         }
 
+        // Reset signal dispositions to default AFTER the tcsetpgrp above
+        // (see resetChildSignals for why the order is load-bearing). Without
+        // this the exec'd program inherits the shell's SIG_IGN for
+        // INT/QUIT/TSTP/TTIN/TTOU and can't be Ctrl+C'd or Ctrl+Z'd.
+        jobs.resetChildSignals();
+
         // Build environment in child process (after fork, safe from parent interference)
         const envp = buildEnvironment(shell) catch @as([*:null]const ?[*:0]const u8, @ptrCast(std.c.environ));
         compat.posix.execvpeZ(argv[0].?, argv, envp) catch {
@@ -1539,6 +1545,44 @@ fn registerStoppedForeground(shell: *Shell, pid: compat.posix.pid_t, args: []con
     }
     const cmd = buf[0..len];
     const job_id = shell.job_table.addStoppedForeground(pid, cmd);
+    shell.stdout().print("\n[{d}]+  Stopped\t\t{s}\n", .{ job_id, cmd }) catch {};
+    shell.stdout().flush() catch {};
+}
+
+// Register a foreground pipeline that was just stopped by Ctrl+Z as a stopped
+// job (all stages), mirroring addStoppedForeground for the single-command path.
+fn registerStoppedPipeline(
+    shell: *Shell,
+    node: *const ast.AstNode,
+    pids: []const compat.posix.pid_t,
+    stopped: []const bool,
+    statuses: []const u32,
+) void {
+    var cmd_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer cmd_buf.deinit(shell.allocator);
+    serializeAst(shell.allocator, &cmd_buf, node) catch {};
+    const cmd: []const u8 = if (cmd_buf.items.len > 0) cmd_buf.items else "pipeline";
+
+    // foreground=false, like addStoppedForeground: getPendingNotifications
+    // skips foreground jobs, so foreground=true would silence every future
+    // notification for this job.
+    const job_id = shell.job_table.addPipelineJob(pids, pids[0], cmd, false) catch return;
+    if (shell.job_table.getJob(job_id)) |job| {
+        job.state = .stopped;
+        job.notified = true; // we print our own Stopped notice below
+        job.tmodes = compat.posix.tcgetattr(shell.job_table.shell_terminal) catch null;
+        for (job.processes.items, 0..) |*proc, i| {
+            if (i < statuses.len) proc.status = statuses[i];
+            if (i < stopped.len and !stopped[i]) {
+                // this stage had already exited before the stop
+                proc.completed = true;
+                proc.stopped = false;
+            } else {
+                proc.stopped = true;
+                proc.completed = false;
+            }
+        }
+    }
     shell.stdout().print("\n[{d}]+  Stopped\t\t{s}\n", .{ job_id, cmd }) catch {};
     shell.stdout().flush() catch {};
 }
@@ -1721,6 +1765,12 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
                     _ = compat.posix.setpgid(0, pids[0]) catch {};
                 }
             }
+            // Default signal dispositions for the stage — AFTER the
+            // setpgid/tcsetpgrp above (see resetChildSignals). Applies both to
+            // exec'd programs (dispositions survive exec) and to stages that
+            // stay in-process (builtins), so Ctrl+C/Ctrl+Z reach the whole
+            // foreground pipeline group.
+            jobs.resetChildSignals();
             // Setup pipes first
             if (i > 0) {
                 try compat.posix.dup2(pipes[i - 1][0], compat.posix.STDIN_FILENO);
@@ -1797,10 +1847,27 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
     var pstat_bufs: [16][4]u8 = undefined;
     var pstat_vals: [16][]const u8 = undefined;
 
+    // Per-stage stopped flags + raw statuses, so a Ctrl+Z'd pipeline can be
+    // registered as a stopped job with accurate per-process state.
+    var stage_stopped: [8]bool = @splat(false);
+    var stage_status: [8]u32 = @splat(0);
+    var any_stopped = false;
+
     for (pids, 0..) |pid, idx| {
-        const result = compat.posix.waitpid(pid, 0);
+        // UNTRACED: without it a Ctrl+Z'd stage is never noticed and the
+        // shell blocks here forever (same fix as the single-command path).
+        const result = compat.posix.waitpid(pid, compat.posix.W.UNTRACED);
+        if (idx < stage_status.len) stage_status[idx] = result.status;
         var status: u8 = 0;
-        if (compat.posix.W.IFEXITED(result.status)) {
+        if (compat.posix.W.IFSTOPPED(result.status)) {
+            // Stage stopped (Ctrl+Z hits the whole foreground group). Keep
+            // reaping the remaining stages with UNTRACED — each either exits
+            // or stops too — then register the pipeline as a stopped job
+            // below. bash behaves the same way.
+            any_stopped = true;
+            if (idx < stage_stopped.len) stage_stopped[idx] = true;
+            status = 148; // 128 + SIGTSTP(20)
+        } else if (compat.posix.W.IFEXITED(result.status)) {
             status = compat.posix.W.EXITSTATUS(result.status);
         } else if (compat.posix.W.IFSIGNALED(result.status)) {
             status = @truncate(128 + @as(u32, @intCast(@intFromEnum(compat.posix.W.TERMSIG(result.status)))));
@@ -1815,6 +1882,15 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
         if (shell.opt_pipefail and status != 0 and pipefail_status == 0) {
             pipefail_status = status;
         }
+    }
+
+    // Some stage was stopped by Ctrl+Z: register the whole pipeline as a
+    // stopped job so it can be resumed with fg/bg, print the notice, and
+    // return 148 (128+SIGTSTP) like bash. The foreground defer above reclaims
+    // the terminal and restores the editor's raw mode on return.
+    if (any_stopped) {
+        registerStoppedPipeline(shell, node, pids, stage_stopped[0..], stage_status[0..]);
+        return 148;
     }
 
     // Expose the per-stage exit statuses as $PIPESTATUS.
@@ -3160,6 +3236,20 @@ pub fn evaluateSubshell(shell: *Shell, node: *const ast.AstNode) !u8 {
     // flush buffered output so the child doesn't inherit and re-emit it
     shell.stdout().flush() catch {};
 
+    // Foreground job-control discipline, mirroring the single-command path:
+    // cook the terminal for the body, give the subshell its OWN process group
+    // with the terminal, and take both back afterwards. Without this
+    // (a) `( external )` exec'd in place in the child, cooked the tty via its
+    // own path, and the parent never restored raw mode — the line editor was
+    // silently broken at the next prompt; (b) the body ran in the SHELL's
+    // process group, so Ctrl+Z during `( sleep 30 )` SIGTSTP'd the shell.
+    const tty = TtyCtl.acquire();
+    defer tty.release();
+    const is_foreground = tty.fd != null and !shell.forked_child;
+    const tty_fd = if (is_foreground) tty.fd else null;
+    if (is_foreground) tty.cooked(shell);
+    defer if (is_foreground) tty.restoreRaw(shell);
+
     const pid = compat.posix.fork() catch {
         try shell.stdout().writeAll("zish: fork failed\n");
         return 1;
@@ -3167,6 +3257,13 @@ pub fn evaluateSubshell(shell: *Shell, node: *const ast.AstNode) !u8 {
 
     if (pid == 0) {
         // === CHILD ===
+        // own process group + terminal, then default signals — in that order
+        // (see resetChildSignals for why).
+        if (tty_fd) |fd| {
+            compat.posix.setpgid(0, 0) catch {};
+            jobs.tcsetpgrp(fd, compat.posix.getpid()) catch {};
+        }
+        jobs.resetChildSignals();
         var child_arena = forkChildArena();
         shell.allocator = child_arena.allocator();
         shell.forked_child = true;
@@ -3180,6 +3277,9 @@ pub fn evaluateSubshell(shell: *Shell, node: *const ast.AstNode) !u8 {
     }
 
     // === PARENT ===
+    // both sides call setpgid (race avoidance, as in the command path)
+    if (tty_fd != null) compat.posix.setpgid(pid, pid) catch {};
+
     // ignore SIGINT while the subshell runs (it receives it directly)
     var old_sigint: compat.posix.Sigaction = undefined;
     const ignore_action = compat.posix.Sigaction{
@@ -3190,7 +3290,27 @@ pub fn evaluateSubshell(shell: *Shell, node: *const ast.AstNode) !u8 {
     compat.posix.sigaction(compat.posix.SIG.INT, &ignore_action, &old_sigint);
     defer compat.posix.sigaction(compat.posix.SIG.INT, &old_sigint, null);
 
-    const result = compat.posix.waitpid(pid, 0);
+    // UNTRACED: a Ctrl+Z'd subshell must return control to the shell, not
+    // leave it blocked here forever.
+    const result = compat.posix.waitpid(pid, compat.posix.W.UNTRACED);
+
+    // take back terminal control before touching termios
+    if (tty_fd) |fd| {
+        const shell_pgid: compat.posix.pid_t = compat.posix.getProcessGroup(0);
+        jobs.tcsetpgrp(fd, shell_pgid) catch {};
+    }
+
+    if (compat.posix.W.IFSTOPPED(result.status)) {
+        var cmd_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer cmd_buf.deinit(shell.allocator);
+        serializeAst(shell.allocator, &cmd_buf, node) catch {};
+        const cmd: []const u8 = if (cmd_buf.items.len > 0) cmd_buf.items else "( ... )";
+        const job_id = shell.job_table.addStoppedForeground(pid, cmd);
+        shell.stdout().print("\n[{d}]+  Stopped\t\t{s}\n", .{ job_id, cmd }) catch {};
+        shell.stdout().flush() catch {};
+        return 148; // 128 + SIGTSTP(20)
+    }
+
     if (compat.posix.W.IFEXITED(result.status)) {
         return compat.posix.W.EXITSTATUS(result.status);
     } else if (compat.posix.W.IFSIGNALED(result.status)) {
@@ -4252,16 +4372,64 @@ fn featExec(shell: *Shell, tier: FeatTier, bin_path: []const u8, sub_args: []con
 
     const argv_ptr: [*:null]const ?[*:0]const u8 = argv[0..n :null];
 
+    // A feat is an external foreground command and gets the same job-control
+    // discipline as one (previously it forked with the terminal still in raw
+    // mode, in the shell's own process group, with signals ignored, and a
+    // non-UNTRACED wait — so a feat prompting on the tty couldn't be Ctrl+C'd
+    // and a Ctrl+Z hung the shell).
+    const tty = TtyCtl.acquire();
+    defer tty.release();
+    const is_foreground = tty.fd != null and !shell.forked_child;
+    const tty_fd = if (is_foreground) tty.fd else null;
+    if (is_foreground) tty.cooked(shell);
+    defer if (is_foreground) tty.restoreRaw(shell);
+
+    shell.stdout().flush() catch {};
+
     const pid = compat.posix.fork() catch {
         try shell.stdout().print("zish: fork failed\n", .{});
         return 1;
     };
     if (pid == 0) {
+        // own pgroup + terminal, THEN default signals (see resetChildSignals)
+        if (tty_fd) |fd| {
+            compat.posix.setpgid(0, 0) catch {};
+            jobs.tcsetpgrp(fd, compat.posix.getpid()) catch {};
+        }
+        jobs.resetChildSignals();
         compat.posix.execveZ(argv0.ptr, argv_ptr, envp) catch {
             compat.posix.exit(127);
         };
     }
-    const result = compat.posix.waitpid(pid, 0);
+
+    // parent: also set child's pgrp (race avoidance)
+    if (tty_fd != null) compat.posix.setpgid(pid, pid) catch {};
+
+    // ignore SIGINT while the feat runs (it receives it directly)
+    var old_sigint: compat.posix.Sigaction = undefined;
+    const ignore_action = compat.posix.Sigaction{
+        .handler = .{ .handler = compat.posix.SIG.IGN },
+        .mask = std.mem.zeroes(compat.posix.sigset_t),
+        .flags = 0,
+    };
+    compat.posix.sigaction(compat.posix.SIG.INT, &ignore_action, &old_sigint);
+    defer compat.posix.sigaction(compat.posix.SIG.INT, &old_sigint, null);
+
+    const result = compat.posix.waitpid(pid, compat.posix.W.UNTRACED);
+
+    // take back terminal control
+    if (tty_fd) |fd| {
+        const shell_pgid: compat.posix.pid_t = compat.posix.getProcessGroup(0);
+        jobs.tcsetpgrp(fd, shell_pgid) catch {};
+    }
+
+    if (compat.posix.W.IFSTOPPED(result.status)) {
+        const job_id = shell.job_table.addStoppedForeground(pid, bin_path);
+        shell.stdout().print("\n[{d}]+  Stopped\t\t{s}\n", .{ job_id, bin_path }) catch {};
+        shell.stdout().flush() catch {};
+        return 148; // 128 + SIGTSTP(20)
+    }
+
     if (compat.posix.W.IFEXITED(result.status)) return compat.posix.W.EXITSTATUS(result.status);
     if (compat.posix.W.IFSIGNALED(result.status))
         return @truncate(128 + @as(u32, @intCast(@intFromEnum(compat.posix.W.TERMSIG(result.status)))));
