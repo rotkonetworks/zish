@@ -638,6 +638,17 @@ same_as_bash "for cmdsubst split + break" 'for x in $(echo a b) lit; do printf "
 same_as_bash "for continue N"             'for i in 1 2 3; do for j in a b; do continue 2; done; echo "$i"; done'
 same_as_bash "for nested same variable"   'for x in 1 2; do for x in a b; do printf %s "$x"; done; printf "[%s]" "$x"; done'
 
+# Redirections applied to a COMPOUND command (while/for/if/brace/subshell).
+# Regression: the parser attached redirects to simple commands only, so the
+# canonical `while read x; do ..; done < file` idiom was a parse error.
+same_as_bash "while-read redir from file"  'printf "1 2\n3 4\n" > rf.$$; while read -r a b; do printf "%s+%s " "$a" "$b"; done < rf.$$; rm -f rf.$$'
+same_as_bash "while-read count from file"  'printf "a\nb\nc\n" > rc.$$; n=0; while read -r x; do n=$((n+1)); done < rc.$$; echo $n; rm -f rc.$$'
+same_as_bash "for redir stdin from file"   'printf "z\n" > rf2.$$; for i in 1 2; do printf "%s " "$i"; done < rf2.$$; rm -f rf2.$$'
+same_as_bash "if redir stdin from file"    'printf "x\n" > ri.$$; if true; then cat; fi < ri.$$; rm -f ri.$$'
+same_as_bash "brace group redir in"        'printf "one\ntwo\n" > rb.$$; { read -r a; read -r b; } < rb.$$; echo "$a|$b"; rm -f rb.$$'
+same_as_bash "for redir stdout to file"    'for i in a b c; do echo "$i"; done > ro.$$; cat ro.$$; rm -f ro.$$'
+same_as_bash "subshell redir in"           'printf "hi\n" > rs.$$; ( cat ) < rs.$$; rm -f rs.$$'
+
 # ---------------------------------------------------------------------------
 printf '\n%s\n' "para feat"
 # ---------------------------------------------------------------------------

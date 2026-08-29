@@ -244,20 +244,29 @@ pub const Parser = struct {
         self.recursion_depth = try types.checkedAdd(types.RecursionDepth, self.recursion_depth, 1);
         defer self.recursion_depth -= 1;
 
-        return switch (self.current_token.ty) {
-            .If => self.parseif(),
-            .While => self.parsewhile(),
-            .Until => self.parseuntil(),
-            .For => self.parsefor(),
-            .Select => self.parseselect(),
-            .Case => self.parsecase(),
-            .LeftBrace => self.parsegroup(),
-            .LeftParen => self.parsesubshell(),
-            .Function => self.parsefunction(),
-            .TestOpen => self.parsetest(),
-            .ArithCommand => self.parsearithcommand(),
-            else => self.parsesimplecommand(),
+        // Compound commands accept trailing redirects that apply to the whole
+        // construct — `while read x; do ...; done < file`, `{ ...; } > out`,
+        // `for i in ..; do ..; done 2>err`. Parse the construct, then run it
+        // through the same parseredirects() the simple-command path uses so the
+        // redirect wraps the entire compound node (evaluateRedirect applies the
+        // fds around the whole subtree). parsesimplecommand already absorbs its
+        // own redirects; function/test/arith do not take a trailing redirect
+        // here, so they return directly.
+        const compound = switch (self.current_token.ty) {
+            .If => try self.parseif(),
+            .While => try self.parsewhile(),
+            .Until => try self.parseuntil(),
+            .For => try self.parsefor(),
+            .Select => try self.parseselect(),
+            .Case => try self.parsecase(),
+            .LeftBrace => try self.parsegroup(),
+            .LeftParen => try self.parsesubshell(),
+            .Function => return self.parsefunction(),
+            .TestOpen => return self.parsetest(),
+            .ArithCommand => return self.parsearithcommand(),
+            else => return self.parsesimplecommand(),
         };
+        return self.parseredirects(compound);
     }
 
     // A leading word is a variable assignment only when the name left of '=' is a
