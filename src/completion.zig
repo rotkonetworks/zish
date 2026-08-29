@@ -2828,7 +2828,7 @@ fn logCompletionImpl(cmd: []const u8, word_start: usize, prefix: []const u8, com
         else => return,
     };
     defer file.close(compat.io());
-    if (std.posix.errno(std.c.lseek(file.handle, 0, std.c.SEEK.END)) != .SUCCESS) return;
+    _ = compat.posix.lseek(file.handle, 0, 2) catch {}; // 2 = SEEK_END
 
     const ctx = cmd[0..@min(word_start, cmd.len)];
     const ts: u64 = @bitCast(compat.timestamp());
