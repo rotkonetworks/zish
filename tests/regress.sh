@@ -649,6 +649,21 @@ same_as_bash "brace group redir in"        'printf "one\ntwo\n" > rb.$$; { read 
 same_as_bash "for redir stdout to file"    'for i in a b c; do echo "$i"; done > ro.$$; cat ro.$$; rm -f ro.$$'
 same_as_bash "subshell redir in"           'printf "hi\n" > rs.$$; ( cat ) < rs.$$; rm -f rs.$$'
 
+# `read` builtin: the seekable fast path (block read + lseek-back) must be
+# byte-for-byte identical to the byte path and to bash. The critical invariant
+# is that read consumes EXACTLY one line — a following reader sees the rest.
+same_as_bash "read then cat remainder"     'printf "L1\nL2\nL3\n" > rr.$$; { read -r a; echo "first=$a"; cat; } < rr.$$; rm -f rr.$$'
+same_as_bash "read x2 then cat remainder"  'printf "L1\nL2\nL3\n" > rr2.$$; { read -r a; read -r b; echo "$a/$b"; cat; } < rr2.$$; rm -f rr2.$$'
+same_as_bash "read partial last line rc"   'printf "a\nb" > rp.$$; while read -r x; do echo "got:$x"; done < rp.$$; echo "rc-loop-done"; rm -f rp.$$'
+same_as_bash "read blank lines preserved"  'printf "a\n\nb\n" > rbl.$$; while read -r x; do echo "<$x>"; done < rbl.$$; rm -f rbl.$$'
+same_as_bash "read empty file rc"          ': > re.$$; if read -r x < re.$$; then echo yes; else echo no; fi; rm -f re.$$'
+same_as_bash "read multi-var last rest"    'printf "one two three four\n" > rmv.$$; read -r a b c < rmv.$$; echo "$a|$b|$c"; rm -f rmv.$$'
+same_as_bash "read from pipe (byte path)"  'printf "p1\np2\n" | while read -r x; do echo "got:$x"; done'
+# KNOWN LIMITATION (pre-existing, not a regression): `read` truncates a line
+# longer than its 4095-byte buffer, where bash reads it whole. Fixing needs a
+# growable line buffer (see project-read-builtin-perf-gap). No test asserts the
+# >4096 case until that lands, to keep the suite green-means-correct.
+
 # ---------------------------------------------------------------------------
 printf '\n%s\n' "para feat"
 # ---------------------------------------------------------------------------

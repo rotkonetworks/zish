@@ -691,6 +691,65 @@ pub fn parseEscape(s: []const u8, mode: EscapeMode) EscapeResult {
     }
 }
 
+// Result of the seekable fast path: bytes of the line body sit in the caller's
+// buf[0..pos]; hit_eof mirrors the byte-path's EOF flag.
+const FastLine = struct { pos: usize, hit_eof: bool };
+
+// Read one line by over-reading a block and rewinding the fd past the consumed
+// newline — bash's strategy, ~1 read/line instead of ~1 poll+read per byte.
+//
+// SAFETY (micay): over-reading is only correct on a fd we can rewind. We probe
+// with lseek BEFORE touching any data; a non-seekable fd (pipe/tty/socket)
+// returns null and the caller uses the byte path — the over-read branch is
+// unreachable unless rewind is proven. INVARIANT: the kernel fd offset is
+// authoritative at every return — we always lseek back past bytes we read but
+// did not consume, so a following reader (even a process sharing the OFD) sees
+// the correct position. No userspace buffer outlives the call.
+//
+// Parity with the byte path is exact, including the max_chars truncation of an
+// over-long line (stop at the budget, leaving the newline unconsumed for the
+// next read). Returns error only on a genuine read/seek failure on a fd already
+// proven seekable — treated as read failure by the caller (fail closed).
+fn readLineRewind(fd: compat.posix.fd_t, buf: []u8, max_chars: usize) !?FastLine {
+    const SEEK_CUR: u32 = 1;
+    // Probe: a non-seekable fd cannot be rewound after over-reading.
+    _ = compat.posix.lseek(fd, 0, SEEK_CUR) catch return null;
+
+    var pos: usize = 0;
+    while (true) {
+        var block: [4096]u8 = undefined;
+        const n = compat.posix.read(fd, block[0..]) catch return error.ReadFailed;
+        if (n == 0) return FastLine{ .pos = pos, .hit_eof = true };
+
+        const nl = std.mem.indexOfScalar(u8, block[0..n], '\n');
+        const body = nl orelse n; // bytes before the newline (or the whole block)
+        const room = max_chars - pos;
+
+        if (nl != null and body <= room) {
+            // Line terminates within budget: take the body, consume through the
+            // newline, rewind whatever we read past it.
+            @memcpy(buf[pos..][0..body], block[0..body]);
+            pos += body;
+            const excess = n - (nl.? + 1); // bytes after '\n'
+            if (excess > 0) _ = compat.posix.lseek(fd, -@as(i64, @intCast(excess)), SEEK_CUR) catch return error.ReadFailed;
+            return FastLine{ .pos = pos, .hit_eof = false };
+        }
+
+        // No newline in budget: fill what fits. If that exhausts the buffer,
+        // stop here WITHOUT consuming a newline (byte-path truncation parity),
+        // rewinding everything we read but did not commit.
+        const take = @min(body, room);
+        @memcpy(buf[pos..][0..take], block[0..take]);
+        pos += take;
+        if (pos >= max_chars) {
+            const excess = n - take;
+            if (excess > 0) _ = compat.posix.lseek(fd, -@as(i64, @intCast(excess)), SEEK_CUR) catch return error.ReadFailed;
+            return FastLine{ .pos = pos, .hit_eof = false };
+        }
+        // Buffer not full and no newline: we took the whole block; read the next.
+    }
+}
+
 fn read(shell: *Shell, args: []const []const u8) !u8 {
     // parse options
     var prompt: ?[]const u8 = null;
@@ -805,18 +864,35 @@ fn read(shell: *Shell, args: []const []const u8) !u8 {
     // end of input). without this, `while read x` never terminates on a pipe.
     var hit_eof = false;
 
-    while (pos < max_chars) {
-        // use poll for timeout support
-        var fds = [_]compat.posix.pollfd{.{
-            .fd = stdin_fd,
-            .events = compat.posix.POLL.IN,
-            .revents = 0,
-        }};
+    // Fast path for the hot case — `while read -r x; do ..; done < file`. Only
+    // for a plain raw whole-line read on a seekable fd; readLineRewind probes
+    // seekability and returns null (→ byte path) for pipes/ttys. -n/-t/non-raw
+    // change the stop condition, so they stay on the byte path.
+    var used_fast = false;
+    if (raw and nchars == null and timeout_secs == null) {
+        const fast = readLineRewind(stdin_fd, buf[0..], max_chars) catch return 1;
+        if (fast) |f| {
+            pos = f.pos;
+            hit_eof = f.hit_eof;
+            used_fast = true;
+        }
+    }
 
-        const poll_result = compat.posix.poll(&fds, timeout_ms) catch return 1;
-        if (poll_result == 0) {
-            // timeout
-            return 1;
+    // Byte-at-a-time path: non-seekable fds, or modes the fast path excludes.
+    // poll() is only needed to honour -t; without a timeout it is pure syscall
+    // overhead, so gate it.
+    while (!used_fast and pos < max_chars) {
+        if (timeout_secs != null) {
+            var fds = [_]compat.posix.pollfd{.{
+                .fd = stdin_fd,
+                .events = compat.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const poll_result = compat.posix.poll(&fds, timeout_ms) catch return 1;
+            if (poll_result == 0) {
+                // timeout
+                return 1;
+            }
         }
 
         var c: [1]u8 = undefined;
@@ -889,8 +965,12 @@ fn read(shell: *Shell, args: []const []const u8) !u8 {
         }
     }
 
-    // bash/POSIX: read fails (non-zero) when EOF is reached and no data was read.
-    return if (hit_eof and pos == 0) 1 else 0;
+    // bash/POSIX: read returns non-zero when EOF is reached before a line
+    // delimiter. hit_eof is set only in that case (a newline-terminated line
+    // breaks/returns before EOF is seen), so a partial final line without a
+    // trailing newline still reports failure — its data is assigned, but a
+    // `while read` loop correctly skips the body for it, matching bash.
+    return if (hit_eof) 1 else 0;
 }
 
 // mapfile / readarray — read lines of stdin into an array variable.
