@@ -691,6 +691,7 @@ same_as_bash "printf %c is first byte"     'printf "[%c]\n" 65'
 same_as_bash "printf %q space"             "printf '%q\n' 'hello world'"
 same_as_bash "printf %q newline"           'printf "%q\n" "$(printf "a\nb")"'
 same_as_bash "printf %q metachars"         "printf '%q\n' 'a|b;c'"
+same_as_bash "exec passes exported var"   'export ZQ=hi; exec printenv ZQ'
 
 # `read` builtin: the seekable fast path (block read + lseek-back) must be
 # byte-for-byte identical to the byte path and to bash. The critical invariant

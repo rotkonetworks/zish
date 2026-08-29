@@ -1612,7 +1612,7 @@ fn eval(shell: *Shell, args: []const []const u8) !u8 {
 
 fn exec(shell: *Shell, args: []const []const u8) !u8 {
     if (args.len < 2) {
-        try shell.stdout().writeAll("exec: usage: exec command [arguments]\n");
+        try shell.stderr().writeAll("exec: usage: exec command [arguments]\n");
         return 1;
     }
 
@@ -1620,10 +1620,13 @@ fn exec(shell: *Shell, args: []const []const u8) !u8 {
     const full_path = shell.lookupCommand(cmd_name) orelse cmd_name;
 
     var argv_buf: [256]?[*:0]const u8 = undefined;
+    // Fail closed rather than silently exec with a truncated argv.
+    if (args.len - 1 >= argv_buf.len) {
+        try shell.stderr().writeAll("exec: too many arguments\n");
+        return 1;
+    }
     var arg_count: usize = 0;
-
     for (args[1..]) |arg| {
-        if (arg_count >= 255) break;
         const duped = try shell.allocator.dupeZ(u8, arg);
         argv_buf[arg_count] = duped.ptr;
         arg_count += 1;
@@ -1631,7 +1634,11 @@ fn exec(shell: *Shell, args: []const []const u8) !u8 {
     argv_buf[arg_count] = null;
 
     const argv = argv_buf[0..arg_count :null];
-    const envp = @as([*:null]const ?[*:0]const u8, @ptrCast(std.c.environ));
+    // Pass the shell's full environment (exported vars set this session), not the
+    // raw process environ — otherwise `FOO=1; exec env` loses FOO.
+    const eval_mod = @import("eval.zig");
+    const envp = eval_mod.buildEnvironment(shell) catch
+        @as([*:null]const ?[*:0]const u8, @ptrCast(std.c.environ));
 
     const path_z = try shell.allocator.dupeZ(u8, full_path);
     compat.posix.execvpeZ(path_z.ptr, argv, envp) catch {

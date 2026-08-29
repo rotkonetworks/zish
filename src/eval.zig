@@ -231,7 +231,7 @@ fn expandProcessSubst(shell: *Shell, arg: []const u8) !?[:0]const u8 {
 
 // Build environment array merging system env with shell variables
 // Shell variables override system environment
-fn buildEnvironment(shell: *Shell) ![*:null]const ?[*:0]const u8 {
+pub fn buildEnvironment(shell: *Shell) ![*:null]const ?[*:0]const u8 {
     // Count total entries needed
     var count: usize = 0;
 
