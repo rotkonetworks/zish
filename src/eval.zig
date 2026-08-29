@@ -1338,7 +1338,7 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
             // Same rule as `feat run`: untrusted extra feats never run as root.
             // Reached by a different path, so the check has to be repeated here
             // rather than assumed.
-            if (f.tier == .extra and std.c.geteuid() == 0) {
+            if (f.tier == .extra and compat.posix.geteuid() == 0) {
                 try shell.stdout().writeAll("feat: refusing to run extra feat as root\n");
                 return 126;
             }
@@ -1964,6 +1964,29 @@ fn applyHeredocInput(shell: *Shell, path: []const u8, expand: bool) !void {
     try compat.posix.dup2(file.handle, compat.posix.STDIN_FILENO);
 }
 
+/// Open `target` for a single-fd redirect and dup2 it onto `fd`, saving the
+/// original `fd` first. Covers the common "open/create -> defer close ->
+/// save -> dup2" shape shared by >, >>, <, 2>, 2>>, and the numbered n>/n>>/n<
+/// forms. Redirects that dup2 the same open file onto two fds at once (&>,
+/// &>>, >&file) are NOT routed through this helper: opening the target twice
+/// would give stdout and stderr independent file offsets instead of the
+/// shared one a single open+dup2-twice produces, which is observable for
+/// interleaved writes in append mode.
+fn redirectFdTo(shell: *Shell, fd: i32, target: []const u8, mode: enum { trunc, append, read }, saver: *FdSaver) !void {
+    _ = shell;
+    const file = switch (mode) {
+        .trunc => try std.Io.Dir.cwd().createFile(compat.io(), target, .{ .truncate = true }),
+        .append => try std.Io.Dir.cwd().createFile(compat.io(), target, .{ .truncate = false }),
+        .read => try std.Io.Dir.cwd().openFile(compat.io(), target, .{ .mode = .read_only }),
+    };
+    defer file.close(compat.io());
+    if (mode == .append) {
+        _ = compat.posix.lseek(file.handle, 0, 2) catch return error.Unseekable; // SEEK_END
+    }
+    saver.save(fd);
+    try compat.posix.dup2(file.handle, fd);
+}
+
 fn applyRedirect(shell: *Shell, node: *const ast.AstNode, saver: *FdSaver) !void {
     const target = node.children[1];
     const redirect_type = node.value;
@@ -1975,17 +1998,10 @@ fn applyRedirect(shell: *Shell, node: *const ast.AstNode, saver: *FdSaver) !void
     defer shell.allocator.free(expanded_target);
 
     if (std.mem.eql(u8, redirect_type, ">") or std.mem.eql(u8, redirect_type, ">|")) {
-        const file = try std.Io.Dir.cwd().createFile(compat.io(), expanded_target, .{ .truncate = true });
-        defer file.close(compat.io());
-        saver.save(compat.posix.STDOUT_FILENO);
-        try compat.posix.dup2(file.handle, compat.posix.STDOUT_FILENO);
+        try redirectFdTo(shell, compat.posix.STDOUT_FILENO, expanded_target, .trunc, saver);
     } else if (std.mem.eql(u8, redirect_type, ">>")) {
         // create file if doesn't exist, don't truncate if exists
-        const file = try std.Io.Dir.cwd().createFile(compat.io(), expanded_target, .{ .truncate = false });
-        defer file.close(compat.io());
-        if (std.c.lseek(file.handle, 0, std.c.SEEK.END) < 0) return error.Unseekable;
-        saver.save(compat.posix.STDOUT_FILENO);
-        try compat.posix.dup2(file.handle, compat.posix.STDOUT_FILENO);
+        try redirectFdTo(shell, compat.posix.STDOUT_FILENO, expanded_target, .append, saver);
     } else if (std.mem.eql(u8, redirect_type, "<")) {
         saver.save(compat.posix.STDIN_FILENO);
         // Heredoc bodies are materialised (by preprocessHeredoc) into temp files
@@ -1995,21 +2011,12 @@ fn applyRedirect(shell: *Shell, node: *const ast.AstNode, saver: *FdSaver) !void
         if (heredocTempMode(expanded_target)) |expand| {
             try applyHeredocInput(shell, expanded_target, expand);
         } else {
-            const file = try std.Io.Dir.cwd().openFile(compat.io(), expanded_target, .{ .mode = .read_only });
-            defer file.close(compat.io());
-            try compat.posix.dup2(file.handle, compat.posix.STDIN_FILENO);
+            try redirectFdTo(shell, compat.posix.STDIN_FILENO, expanded_target, .read, saver);
         }
     } else if (std.mem.eql(u8, redirect_type, "2>")) {
-        const file = try std.Io.Dir.cwd().createFile(compat.io(), expanded_target, .{ .truncate = true });
-        defer file.close(compat.io());
-        saver.save(compat.posix.STDERR_FILENO);
-        try compat.posix.dup2(file.handle, compat.posix.STDERR_FILENO);
+        try redirectFdTo(shell, compat.posix.STDERR_FILENO, expanded_target, .trunc, saver);
     } else if (std.mem.eql(u8, redirect_type, "2>>")) {
-        const file = try std.Io.Dir.cwd().createFile(compat.io(), expanded_target, .{ .truncate = false });
-        defer file.close(compat.io());
-        if (std.c.lseek(file.handle, 0, std.c.SEEK.END) < 0) return error.Unseekable;
-        saver.save(compat.posix.STDERR_FILENO);
-        try compat.posix.dup2(file.handle, compat.posix.STDERR_FILENO);
+        try redirectFdTo(shell, compat.posix.STDERR_FILENO, expanded_target, .append, saver);
     } else if (std.mem.eql(u8, redirect_type, "2>&1")) {
         saver.save(compat.posix.STDERR_FILENO);
         try compat.posix.dup2(compat.posix.STDOUT_FILENO, compat.posix.STDERR_FILENO);
@@ -2026,7 +2033,7 @@ fn applyRedirect(shell: *Shell, node: *const ast.AstNode, saver: *FdSaver) !void
     } else if (std.mem.eql(u8, redirect_type, "&>>")) {
         const file = try std.Io.Dir.cwd().createFile(compat.io(), expanded_target, .{ .truncate = false });
         defer file.close(compat.io());
-        if (std.c.lseek(file.handle, 0, std.c.SEEK.END) < 0) return error.Unseekable;
+        _ = compat.posix.lseek(file.handle, 0, 2) catch return error.Unseekable; // SEEK_END
         saver.save(compat.posix.STDOUT_FILENO);
         saver.save(compat.posix.STDERR_FILENO);
         try compat.posix.dup2(file.handle, compat.posix.STDOUT_FILENO);
@@ -2076,7 +2083,7 @@ fn applyRedirect(shell: *Shell, node: *const ast.AstNode, saver: *FdSaver) !void
         std.Io.Dir.deleteFileAbsolute(compat.io(), tmp_path) catch {};
         try compat.posix.dup2(rf.handle, compat.posix.STDIN_FILENO);
     } else {
-        try applyFdRedirect(redirect_type, expanded_target, saver);
+        try applyFdRedirect(shell, redirect_type, expanded_target, saver);
     }
 }
 
@@ -2086,17 +2093,13 @@ fn applyRedirect(shell: *Shell, node: *const ast.AstNode, saver: *FdSaver) !void
 ///   n>file n>>file n<file
 ///   n>&m n<&m    duplicate fd m into fd n
 ///   n>&-  n<&-   close fd n
-fn applyFdRedirect(op: []const u8, target: []const u8, saver: *FdSaver) !void {
+fn applyFdRedirect(shell: *Shell, op: []const u8, target: []const u8, saver: *FdSaver) !void {
     const STDOUT = compat.posix.STDOUT_FILENO;
     const STDERR = compat.posix.STDERR_FILENO;
 
-    if (std.mem.eql(u8, op, ">|")) {
-        const file = try std.Io.Dir.cwd().createFile(compat.io(), target, .{ .truncate = true });
-        defer file.close(compat.io());
-        saver.save(STDOUT);
-        try compat.posix.dup2(file.handle, STDOUT);
-        return;
-    }
+    // Note: ">|" is not handled here. applyRedirect matches ">" and ">|"
+    // together before falling through to this function, so this function is
+    // never reached with op == ">|" — a dead branch used to sit here.
 
     if (std.mem.eql(u8, op, ">&")) {
         // >&digit -> dup that fd into stdout; >&file -> both stdout+stderr to file
@@ -2121,21 +2124,11 @@ fn applyFdRedirect(op: []const u8, target: []const u8, saver: *FdSaver) !void {
     const rest = op[1..];
 
     if (std.mem.eql(u8, rest, ">")) {
-        const file = try std.Io.Dir.cwd().createFile(compat.io(), target, .{ .truncate = true });
-        defer file.close(compat.io());
-        saver.save(fd);
-        try compat.posix.dup2(file.handle, fd);
+        try redirectFdTo(shell, fd, target, .trunc, saver);
     } else if (std.mem.eql(u8, rest, ">>")) {
-        const file = try std.Io.Dir.cwd().createFile(compat.io(), target, .{ .truncate = false });
-        defer file.close(compat.io());
-        if (std.c.lseek(file.handle, 0, std.c.SEEK.END) < 0) return error.Unseekable;
-        saver.save(fd);
-        try compat.posix.dup2(file.handle, fd);
+        try redirectFdTo(shell, fd, target, .append, saver);
     } else if (std.mem.eql(u8, rest, "<")) {
-        const file = try std.Io.Dir.cwd().openFile(compat.io(), target, .{ .mode = .read_only });
-        defer file.close(compat.io());
-        saver.save(fd);
-        try compat.posix.dup2(file.handle, fd);
+        try redirectFdTo(shell, fd, target, .read, saver);
     } else if (std.mem.eql(u8, rest, ">&") or std.mem.eql(u8, rest, "<&")) {
         if (target.len == 1 and target[0] == '-') {
             // n>&- / n<&- : close fd n for the command's duration. save()
@@ -4047,7 +4040,7 @@ fn featCmd(shell: *Shell, args: []const []const u8) !u8 {
         };
         defer alloc.free(resolved.bin);
         // redshiftzero rule: untrusted extra feats never run as root.
-        if (resolved.tier == .extra and std.c.geteuid() == 0) {
+        if (resolved.tier == .extra and compat.posix.geteuid() == 0) {
             try shell.stdout().writeAll("feat: refusing to run extra feat as root\n");
             return 126;
         }
