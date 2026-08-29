@@ -1,8 +1,0 @@
-{
-  "name": "GitBlame",
-  "description": "Show git blame for a file with author and date",
-  "command": "git blame --date=short {file_path}",
-  "parameters": {
-    "file_path": { "type": "string", "description": "Path to file" }
-  }
-}

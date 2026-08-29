@@ -15,3 +15,4 @@ result-*
 scripts/__pycache__/
 scripts/shell_training_data.jsonl
 tests/__pycache__/
+__pycache__/
