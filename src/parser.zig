@@ -261,9 +261,12 @@ pub const Parser = struct {
             .Case => try self.parsecase(),
             .LeftBrace => try self.parsegroup(),
             .LeftParen => try self.parsesubshell(),
+            .TestOpen => try self.parsetest(), // `[[ .. ]] 2>/dev/null`
+            .ArithCommand => try self.parsearithcommand(), // `(( .. )) 2>x`
+            // A function definition's redirects bind at CALL time, not
+            // definition time, so it must NOT be wrapped here — it keeps its own
+            // exit and handles redirects on the stored body.
             .Function => return self.parsefunction(),
-            .TestOpen => return self.parsetest(),
-            .ArithCommand => return self.parsearithcommand(),
             else => return self.parsesimplecommand(),
         };
         return self.parseredirects(compound);
@@ -686,7 +689,12 @@ pub const Parser = struct {
         // `for x; do ...` / `for x do ...` (no `in`) iterates over "$@"
         if (self.current_token.ty != .In) {
             if (self.current_token.ty == .Semicolon or self.current_token.ty == .NewLine or self.current_token.ty == .Do) {
-                const at = try self.builder.createword("\"$@\"", for_token.line, for_token.column);
+                // `for x` with no list iterates over "$@" — a QUOTED expansion,
+                // so each positional is one field and no re-splitting occurs. A
+                // plain word node holding the literal `"$@"` would expand
+                // unquoted and leak the quote characters into the fields (matches
+                // parseselect's createdoublequoted form).
+                const at = try self.builder.createdoublequoted("$@", for_token.line, for_token.column);
                 try values.append(self.builder.arena.allocator(), at);
                 // skip optional separator, then expect 'do'
                 if (self.current_token.ty == .Semicolon or self.current_token.ty == .NewLine) {

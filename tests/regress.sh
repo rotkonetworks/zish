@@ -648,6 +648,15 @@ same_as_bash "if redir stdin from file"    'printf "x\n" > ri.$$; if true; then 
 same_as_bash "brace group redir in"        'printf "one\ntwo\n" > rb.$$; { read -r a; read -r b; } < rb.$$; echo "$a|$b"; rm -f rb.$$'
 same_as_bash "for redir stdout to file"    'for i in a b c; do echo "$i"; done > ro.$$; cat ro.$$; rm -f ro.$$'
 same_as_bash "subshell redir in"           'printf "hi\n" > rs.$$; ( cat ) < rs.$$; rm -f rs.$$'
+same_as_bash "[[ ]] with redirect"         '[[ -n x ]] 2>/dev/null && echo yes'
+same_as_bash "(( )) with redirect"         '(( 1 + 1 )) 2>/dev/null && echo ok'
+same_as_bash "[[ ]] redirect stdout rc"    '[[ -f /nonexistent ]] > /dev/null; echo rc=$?'
+
+# `for x` with no list iterates over "$@" as a QUOTED expansion (each positional
+# one field), not a literal word that leaks the quote characters.
+same_as_bash "for no-list over quoted \$@" 'set -- "x y" z; for i; do echo "[$i]"; done'
+same_as_bash "for no-list simple"          'set -- a b c; for i; do printf "%s." "$i"; done'
+same_as_bash "for no-list no-semicolon"    'set -- "a b" "c d"; for i do echo "<$i>"; done'
 
 # `read` builtin: the seekable fast path (block read + lseek-back) must be
 # byte-for-byte identical to the byte path and to bash. The critical invariant
