@@ -7,7 +7,7 @@
 pkgname=zish
 pkgver=0.0.0
 pkgrel=1
-pkgdesc="fast zsh-compatible shell written in zig, with local GGUF ghost-text completion"
+pkgdesc="fast, familiar POSIX/bash shell in Zig with kernel-enforced (Landlock+seccomp) sandboxing"
 arch=('x86_64')
 url="https://github.com/rotkonetworks/zish"
 license=('MIT')
@@ -19,7 +19,7 @@ sha256sums=('SKIP')
 
 build() {
     cd "$pkgname-$pkgver"
-    zig build --release=fast
+    zig build --release=safe
 }
 
 # No check(): `zig build test` builds the test exe in Debug (all modules +
