@@ -3160,46 +3160,6 @@ pub fn cycleGhostCandidate(self: *Shell, direction: i8) bool {
 // it should not also be a model runtime.
 
 
-fn writeJsonEscapedToFile(file: std.Io.File, s: []const u8) void {
-    for (s) |c| {
-        switch (c) {
-            '"' => compat.writeAll(file, "\\\"") catch return,
-            '\\' => compat.writeAll(file, "\\\\") catch return,
-            '\n' => compat.writeAll(file, "\\n") catch return,
-            '\r' => compat.writeAll(file, "\\r") catch return,
-            '\t' => compat.writeAll(file, "\\t") catch return,
-            else => if (c < 0x20) {} else {
-                compat.writeAll(file, &.{c}) catch return;
-            },
-        }
-    }
-}
-
-fn logRejection(cmd: []const u8, predicted: []const u8) void {
-    var path_buf: [512]u8 = undefined;
-    const home = compat.getEnvVarOwned(std.heap.page_allocator, "HOME") catch return;
-    defer std.heap.page_allocator.free(home);
-    const path = std.fmt.bufPrint(&path_buf, "{s}/.zish/ghost_rejections.jsonl", .{home}) catch return;
-
-    const file = std.Io.Dir.cwd().openFile(compat.io(), path, .{ .mode = .write_only }) catch |e| switch (e) {
-        error.FileNotFound => std.Io.Dir.cwd().createFile(compat.io(), path, .{}) catch return,
-        else => return,
-    };
-    defer file.close(compat.io());
-    if (std.posix.errno(std.c.lseek(file.handle, 0, std.c.SEEK.END)) != .SUCCESS) return;
-
-    const ts: u64 = @bitCast(compat.timestamp());
-
-    // Write JSON manually with proper string escaping
-    compat.writeAll(file, "{\"ctx\":\"") catch return;
-    writeJsonEscapedToFile(file, cmd[0..@min(cmd.len, 200)]);
-    compat.writeAll(file, "\",\"predicted\":\"") catch return;
-    writeJsonEscapedToFile(file, predicted[0..@min(predicted.len, 100)]);
-    var ts_buf: [32]u8 = undefined;
-    const ts_str = std.fmt.bufPrint(&ts_buf, "\",\"ts\":{d}}}\n", .{ts}) catch return;
-    compat.writeAll(file, ts_str) catch {};
-}
-
 /// Accept ghost text — append it to the edit buffer.
 /// Returns true if ghost text was accepted.
 pub fn acceptGhostText(self: *Shell) bool {

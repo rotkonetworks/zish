@@ -153,10 +153,6 @@ pub const EditBuffer = struct {
         return true;
     }
 
-    pub fn moveHome(self: *Self) void {
-        self.moveLineStart();
-    }
-
     pub fn moveEnd(self: *Self) void {
         self.moveLineEnd();
     }
@@ -246,114 +242,11 @@ pub const EditBuffer = struct {
         return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c >= 0x80;
     }
 
-    /// move forward to start of next word (vi 'w')
-    pub fn wordForward(self: *Self) void {
-        // skip current word chars
-        while (self.cursor < self.len and isWordChar(self.text[self.cursor])) self.cursor += 1;
-        // skip non-word chars (punctuation/spaces)
-        while (self.cursor < self.len and !isWordChar(self.text[self.cursor]) and self.text[self.cursor] != '\n')
-            self.cursor += 1;
-    }
-
-    /// move backward to start of previous word (vi 'b')
-    pub fn wordBack(self: *Self) void {
-        if (self.cursor == 0) return;
-        self.cursor -= 1;
-        // skip non-word chars
-        while (self.cursor > 0 and !isWordChar(self.text[self.cursor])) self.cursor -= 1;
-        // skip word chars to find start
-        while (self.cursor > 0 and isWordChar(self.text[self.cursor - 1])) self.cursor -= 1;
-    }
-
-    /// move forward to end of word (vi 'e')
-    pub fn wordEnd(self: *Self) void {
-        if (self.cursor >= self.len) return;
-        self.cursor += 1;
-        // skip non-word chars
-        while (self.cursor < self.len and !isWordChar(self.text[self.cursor])) self.cursor += 1;
-        // skip to end of word
-        while (self.cursor < self.len and isWordChar(self.text[self.cursor])) self.cursor += 1;
-        // Back up to last char of word, snapping to UTF-8 lead byte
-        if (self.cursor > 0) {
-            self.cursor -= 1;
-            while (self.cursor > 0 and (self.text[self.cursor] & 0xC0) == 0x80)
-                self.cursor -= 1;
-        }
-    }
-
-    /// delete from cursor to end of line (vi 'D' / 'd$')
-    pub fn deleteToEnd(self: *Self) void {
-        var end = self.cursor;
-        while (end < self.len and self.text[end] != '\n') end += 1;
-        if (end > self.cursor) {
-            // shift remaining text
-            const remaining = self.len - end;
-            if (remaining > 0)
-                std.mem.copyForwards(u8, self.text[self.cursor..self.cursor + remaining], self.text[end..self.len]);
-            self.len -= @intCast(end - self.cursor);
-        }
-    }
-
-    /// delete word under/after cursor (vi 'dw')
-    pub fn deleteWord(self: *Self) void {
-        const start = self.cursor;
-        self.wordForward();
-        const end = self.cursor;
-        self.cursor = @intCast(start);
-        if (end > start) {
-            const remaining = self.len - end;
-            if (remaining > 0)
-                std.mem.copyForwards(u8, self.text[start..start + remaining], self.text[end..self.len]);
-            self.len -= @intCast(end - start);
-        }
-    }
-
-    /// delete entire current line content (vi 'dd')
-    pub fn deleteLine(self: *Self) void {
-        self.moveLineStart();
-        self.deleteToEnd();
-        // Also remove the trailing newline (vi 'dd' removes the whole line)
-        if (self.cursor < self.len and self.text[self.cursor] == '\n') {
-            _ = self.deleteForward();
-        } else if (self.cursor > 0 and self.cursor == self.len) {
-            // Last line: remove the preceding newline instead
-            self.cursor -= 1;
-            _ = self.deleteForward();
-        }
-    }
-
-    /// replace character under cursor (vi 'r')
-    pub fn replaceChar(self: *Self, c: u8) void {
-        if (self.cursor < self.len) {
-            self.text[self.cursor] = c;
-        }
-    }
-
-    /// delete character under cursor in normal mode (vi 'x')
-    pub fn deleteAt(self: *Self) bool {
-        return self.deleteForward();
-    }
-
     /// put cursor at first non-blank of line (vi '^')
     pub fn moveFirstNonBlank(self: *Self) void {
         self.moveLineStart();
         while (self.cursor < self.len and (self.text[self.cursor] == ' ' or self.text[self.cursor] == '\t'))
             self.cursor += 1;
-    }
-
-    /// get the text of a specific line (0-indexed)
-    pub fn getLine(self: *const Self, line_idx: u16) []const u8 {
-        var current_line: u16 = 0;
-        var start: usize = 0;
-        for (self.text[0..self.len], 0..) |c, i| {
-            if (c == '\n') {
-                if (current_line == line_idx) return self.text[start..i];
-                current_line += 1;
-                start = i + 1;
-            }
-        }
-        if (current_line == line_idx) return self.text[start..self.len];
-        return "";
     }
 };
 
@@ -609,26 +502,11 @@ pub const TermView = struct {
         return self.emit(s);
     }
 
-    /// emit SGR (color/style)
-    pub fn emitSGR(self: *Self, code: u8) bool {
-        var buf: [8]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, "\x1b[{d}m", .{code}) catch return false;
-        return self.emit(s);
-    }
-
     /// flush to terminal
     pub fn flush(self: *Self) !void {
         if (self.out_len == 0) return;
         _ = try compat.posix.write(self.fd, self.out[0..self.out_len]);
         self.out_len = 0;
-    }
-
-    /// move cursor relatively
-    pub fn moveRel(self: *Self, dr: i16, dc: i16) void {
-        if (dr < 0) _ = self.emitCSI("{d}A", .{@as(u16, @intCast(-dr))});
-        if (dr > 0) _ = self.emitCSI("{d}B", .{@as(u16, @intCast(dr))});
-        if (dc < 0) _ = self.emitCSI("{d}D", .{@as(u16, @intCast(-dc))});
-        if (dc > 0) _ = self.emitCSI("{d}C", .{@as(u16, @intCast(dc))});
     }
 
     /// move to row/col relative to our region
@@ -648,11 +526,6 @@ pub const TermView = struct {
     /// clear line from cursor
     pub fn clearToEOL(self: *Self) void {
         _ = self.emit("\x1b[K");
-    }
-
-    /// clear entire line
-    pub fn clearLine(self: *Self) void {
-        _ = self.emit("\x1b[2K");
     }
 
     /// Render the edit buffer to the terminal.
@@ -898,13 +771,6 @@ pub const TermView = struct {
         self.last_cursor = 0xFFFF;
     }
 
-    /// call on terminal resize
-    pub fn resize(self: *Self, width: u16, height: u16) void {
-        self.term.width = width;
-        self.term.height = height;
-        // force redraw
-        self.last_hash = 0xDEADBEEF;
-    }
 };
 
 // tests

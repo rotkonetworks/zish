@@ -17,7 +17,6 @@ const tty = @import("tty.zig");
 const input_mod = @import("input.zig");
 const completion_mod = @import("completion.zig");
 const eval = @import("eval.zig");
-const git = @import("git.zig");
 const jobs = @import("jobs.zig");
 const editor = @import("editor.zig");
 const vim = @import("vim.zig");
@@ -249,9 +248,6 @@ term_view: editor.TermView,
 vi: vim.Vim = .{},
 keybindings: input_mod.KeyBindings = .{},
 
-// vim clipboard for yank/paste operations (legacy, now in vi.yank_buf)
-clipboard: []u8,
-clipboard_len: usize = 0,
 // search state
 search_mode: bool = false,
 in_prompt_command: bool = false, // re-entrancy guard for $PROMPT_COMMAND
@@ -293,8 +289,6 @@ log_file: ?std.Io.File = null,
 // PATH lookup cache - maps command name -> full path
 path_cache: std.StringHashMap([]const u8),
 
-// Voice mode state
-
 pub fn init(allocator: std.mem.Allocator) !*Shell {
     return initWithOptions(allocator, true);
 }
@@ -312,7 +306,6 @@ fn initWithOptions(allocator: std.mem.Allocator, load_config: bool) !*Shell {
     else
         null;
 
-    const clipboard_buffer = try allocator.alloc(u8, types.MAX_COMMAND_LENGTH);
     const search_buffer = try allocator.alloc(u8, 256); // search queries are usually short
 
     const writer_buffer = try allocator.alloc(u8, types.MAX_COMMAND_LENGTH + types.MAX_PROMPT_LENGTH);
@@ -334,8 +327,6 @@ fn initWithOptions(allocator: std.mem.Allocator, load_config: bool) !*Shell {
         .edit_buf = .{},
         .term_view = editor.TermView.init(posix.STDERR_FILENO),
         .vi = .{},
-        .clipboard = clipboard_buffer,
-        .clipboard_len = 0,
         .search_mode = false,
         .search_buffer = search_buffer,
         .search_len = 0,
@@ -452,7 +443,6 @@ pub fn deinit(self: *Shell) void {
     // from dereferencing freed memory if SIGWINCH arrives during shutdown.
     @atomicStore(?*Shell, &global_shell, null, .release);
 
-    self.allocator.free(self.clipboard);
     self.allocator.free(self.search_buffer);
     self.allocator.free(self.stdout().buffer);
     self.allocator.destroy(self);
@@ -869,8 +859,7 @@ pub fn run(self: *Shell) !void {
         try self.stdout().flush();
     }
 
-    // restore terminal and exit immediately — background threads
-    // (agent, ghost inference) are cleaned up by the OS on process exit
+    // restore terminal and exit immediately
     self.disableRawMode();
     self.setCursorStyle(.default) catch {};
     self.stdout().flush() catch {};

@@ -135,24 +135,6 @@ pub const Action = union(enum) {
 
 const CTRL_W = 23;
 
-/// Get action for insert mode keypress
-pub fn insertModeAction(char: u8) Action {
-    return switch (char) {
-        '\n' => .execute_command,
-        CTRL_C => .cancel,
-        CTRL_L => .clear_screen,
-        CTRL_D => .exit_shell,
-        CTRL_R => .{ .enter_search_mode = .backward }, // reverse history search
-        CTRL_G => .cancel_agent,
-        CTRL_Z => .suspend_shell,
-        CTRL_W => .delete_word_backward,
-        '\t' => .tap_complete,
-        8, 127 => .backspace,
-        32...126 => .{ .input_char = char },
-        else => .none,
-    };
-}
-
 /// Get action for vim normal mode keypress
 pub fn normalModeAction(char: u8) Action {
     return switch (char) {
@@ -201,76 +183,6 @@ pub fn normalModeAction(char: u8) Action {
 
         else => .none,
     };
-}
-
-/// Parse escape sequence from stdin
-pub fn parseEscapeSequence() !Action {
-    const stdin = std.Io.File.stdin();
-    var temp_buf: [3]u8 = undefined;
-
-    const flags = compat.posix.fcntl(stdin.handle, std.posix.F.GETFL, 0) catch 0;
-    const nonblock: usize = @as(u32, @bitCast(compat.posix.O{ .NONBLOCK = true }));
-    _ = compat.posix.fcntl(stdin.handle, std.posix.F.SETFL, flags | nonblock) catch {};
-    defer _ = compat.posix.fcntl(stdin.handle, std.posix.F.SETFL, flags) catch {};
-
-    compat.sleep(10 * std.time.ns_per_ms);
-
-    const bytes_read = compat.posix.read(stdin.handle, &temp_buf) catch |err| {
-        if (err == error.WouldBlock) {
-            return .{ .vim_mode = .{ .set_mode = .normal } };
-        }
-        return .none;
-    };
-
-    if (bytes_read < 2) return .none;
-
-    if (temp_buf[0] == '[') {
-        return switch (temp_buf[1]) {
-            'A' => .{ .move_cursor = .line_up },
-            'B' => .{ .move_cursor = .line_down },
-            'C' => .{ .move_cursor = .{ .relative = 1 } },
-            'D' => .{ .move_cursor = .{ .relative = -1 } },
-            'H' => .{ .move_cursor = .to_line_start },
-            'F' => .{ .move_cursor = .to_line_end },
-            'Z' => .{ .cycle_complete = .backward },
-            '3' => if (bytes_read >= 3 and temp_buf[2] == '~')
-                .{ .delete = .char_under_cursor }
-            else
-                .none,
-            '1' => handleExtendedSequence(stdin, temp_buf[2]),
-            else => .none,
-        };
-    }
-
-    return .none;
-}
-
-fn handleExtendedSequence(stdin: std.Io.File, first_byte: u8) Action {
-    if (first_byte != ';') return .none;
-
-    var temp_buf: [2]u8 = undefined;
-    const modifier_read = compat.posix.read(stdin.handle, temp_buf[0..1]) catch return .none;
-    if (modifier_read == 0 or temp_buf[0] != '5') return .none;
-
-    const direction_read = compat.posix.read(stdin.handle, temp_buf[0..1]) catch return .none;
-    if (direction_read == 0) return .none;
-
-    return switch (temp_buf[0]) {
-        'C' => .{ .move_cursor = .{ .word_forward = .word } },
-        'D' => .{ .move_cursor = .{ .word_backward = .word } },
-        'A' => .{ .move_cursor = .to_line_start },
-        'B' => .{ .move_cursor = .to_line_end },
-        else => .none,
-    };
-}
-
-/// Word character detection
-pub fn isWordChar(c: u8) bool {
-    return std.ascii.isAlphanumeric(c) or c == '_';
-}
-
-pub fn isWhitespace(c: u8) bool {
-    return c == ' ' or c == '\t';
 }
 
 // ── Configurable Keybindings ──
