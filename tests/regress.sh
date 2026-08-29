@@ -659,10 +659,19 @@ same_as_bash "read blank lines preserved"  'printf "a\n\nb\n" > rbl.$$; while re
 same_as_bash "read empty file rc"          ': > re.$$; if read -r x < re.$$; then echo yes; else echo no; fi; rm -f re.$$'
 same_as_bash "read multi-var last rest"    'printf "one two three four\n" > rmv.$$; read -r a b c < rmv.$$; echo "$a|$b|$c"; rm -f rmv.$$'
 same_as_bash "read from pipe (byte path)"  'printf "p1\np2\n" | while read -r x; do echo "got:$x"; done'
-# KNOWN LIMITATION (pre-existing, not a regression): `read` truncates a line
-# longer than its 4095-byte buffer, where bash reads it whole. Fixing needs a
-# growable line buffer (see project-read-builtin-perf-gap). No test asserts the
-# >4096 case until that lands, to keep the suite green-means-correct.
+# Growable line buffer: a line longer than one 4KB block must read whole (was
+# truncated at 4095 before LineReader) and leave the fd correctly positioned.
+same_as_bash "read long line (>4KB)"       'head -c 5000 /dev/zero | tr "\0" A > rlong; echo >> rlong; echo tail >> rlong; read -r x < rlong; echo "${#x}"; rm -f rlong'
+same_as_bash "read long line then next"    'head -c 5000 /dev/zero | tr "\0" A > rlong2; echo >> rlong2; echo tail >> rlong2; { read -r x; read -r y; echo "$y"; } < rlong2; rm -f rlong2'
+
+# mapfile / readarray share the LineReader owner. Verify the array semantics and
+# that -n early-stop reconciles the fd (a later reader sees the unread lines).
+same_as_bash "mapfile -t basic"            'printf "l1\nl2\nl3\n" > mf.$$; mapfile -t a < mf.$$; printf "%s\n" "${a[@]}"; echo "n=${#a[@]}"; rm -f mf.$$'
+same_as_bash "mapfile keeps delimiter"     'printf "l1\nl2\n" > mf2.$$; mapfile a < mf2.$$; printf "[%s]" "${a[@]}"; rm -f mf2.$$'
+same_as_bash "mapfile -n limit"            'printf "l1\nl2\nl3\n" > mf3.$$; mapfile -n 2 -t a < mf3.$$; echo "${#a[@]}:${a[0]}:${a[1]}"; rm -f mf3.$$'
+same_as_bash "mapfile -s skip"             'printf "l1\nl2\nl3\n" > mf4.$$; mapfile -s 1 -t a < mf4.$$; printf "%s," "${a[@]}"; rm -f mf4.$$'
+same_as_bash "mapfile partial last line"   'printf "p\nq" > mf5.$$; mapfile -t a < mf5.$$; echo "${#a[@]}:${a[1]}"; rm -f mf5.$$'
+same_as_bash "mapfile -n then read rest"   'printf "l1\nl2\nl3\nl4\n" > mf6.$$; { mapfile -n 2 -t two; cat; } < mf6.$$; rm -f mf6.$$'
 
 # ---------------------------------------------------------------------------
 printf '\n%s\n' "para feat"

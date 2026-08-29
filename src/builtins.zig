@@ -691,64 +691,73 @@ pub fn parseEscape(s: []const u8, mode: EscapeMode) EscapeResult {
     }
 }
 
-// Result of the seekable fast path: bytes of the line body sit in the caller's
-// buf[0..pos]; hit_eof mirrors the byte-path's EOF flag.
-const FastLine = struct { pos: usize, hit_eof: bool };
-
-// Read one line by over-reading a block and rewinding the fd past the consumed
-// newline — bash's strategy, ~1 read/line instead of ~1 poll+read per byte.
+// One owner for delimiter-terminated reads from an fd — backs both `read` and
+// `mapfile`. It over-reads a block and serves lines out of it (bash's strategy:
+// ~1 read/line instead of ~1 poll+read per byte), growing the caller's buffer so
+// there is no line-length limit, and reconciling the fd offset on pushback().
 //
-// SAFETY (micay): over-reading is only correct on a fd we can rewind. We probe
-// with lseek BEFORE touching any data; a non-seekable fd (pipe/tty/socket)
-// returns null and the caller uses the byte path — the over-read branch is
-// unreachable unless rewind is proven. INVARIANT: the kernel fd offset is
-// authoritative at every return — we always lseek back past bytes we read but
-// did not consume, so a following reader (even a process sharing the OFD) sees
-// the correct position. No userspace buffer outlives the call.
-//
-// Parity with the byte path is exact, including the max_chars truncation of an
-// over-long line (stop at the budget, leaving the newline unconsumed for the
-// next read). Returns error only on a genuine read/seek failure on a fd already
-// proven seekable — treated as read failure by the caller (fail closed).
-fn readLineRewind(fd: compat.posix.fd_t, buf: []u8, max_chars: usize) !?FastLine {
+// SAFETY (micay): over-reading past a delimiter is only sound on a fd we can
+// rewind. init() probes with lseek; a non-seekable fd (pipe/tty/socket) drops to
+// byte-at-a-time so it never reads past what it returns — the over-read branch
+// is unreachable unless rewind is proven. INVARIANT: after pushback() the kernel
+// fd offset sits exactly past the last byte returned, so a following reader (even
+// a process sharing the OFD) sees the exact remainder. Buffered bytes never
+// outlive a pushback().
+const LineReader = struct {
     const SEEK_CUR: u32 = 1;
-    // Probe: a non-seekable fd cannot be rewound after over-reading.
-    _ = compat.posix.lseek(fd, 0, SEEK_CUR) catch return null;
 
-    var pos: usize = 0;
-    while (true) {
-        var block: [4096]u8 = undefined;
-        const n = compat.posix.read(fd, block[0..]) catch return error.ReadFailed;
-        if (n == 0) return FastLine{ .pos = pos, .hit_eof = true };
+    fd: compat.posix.fd_t,
+    buf: [4096]u8 = undefined,
+    start: usize = 0, // unconsumed region is buf[start..end]
+    end: usize = 0,
+    overread: bool, // block-read (seekable) vs byte-at-a-time (non-seekable)
 
-        const nl = std.mem.indexOfScalar(u8, block[0..n], '\n');
-        const body = nl orelse n; // bytes before the newline (or the whole block)
-        const room = max_chars - pos;
-
-        if (nl != null and body <= room) {
-            // Line terminates within budget: take the body, consume through the
-            // newline, rewind whatever we read past it.
-            @memcpy(buf[pos..][0..body], block[0..body]);
-            pos += body;
-            const excess = n - (nl.? + 1); // bytes after '\n'
-            if (excess > 0) _ = compat.posix.lseek(fd, -@as(i64, @intCast(excess)), SEEK_CUR) catch return error.ReadFailed;
-            return FastLine{ .pos = pos, .hit_eof = false };
-        }
-
-        // No newline in budget: fill what fits. If that exhausts the buffer,
-        // stop here WITHOUT consuming a newline (byte-path truncation parity),
-        // rewinding everything we read but did not commit.
-        const take = @min(body, room);
-        @memcpy(buf[pos..][0..take], block[0..take]);
-        pos += take;
-        if (pos >= max_chars) {
-            const excess = n - take;
-            if (excess > 0) _ = compat.posix.lseek(fd, -@as(i64, @intCast(excess)), SEEK_CUR) catch return error.ReadFailed;
-            return FastLine{ .pos = pos, .hit_eof = false };
-        }
-        // Buffer not full and no newline: we took the whole block; read the next.
+    fn init(fd: compat.posix.fd_t) LineReader {
+        // Seekable ⇒ we can lseek unconsumed bytes back, so over-reading is safe.
+        var overread = true;
+        _ = compat.posix.lseek(fd, 0, SEEK_CUR) catch {
+            overread = false;
+        };
+        return .{ .fd = fd, .overread = overread };
     }
-}
+
+    // Refill buf when empty; returns bytes now available (0 = EOF). Reads a full
+    // block when we can rewind, a single byte when we cannot.
+    fn fill(self: *LineReader) !usize {
+        if (self.start < self.end) return self.end - self.start;
+        self.start = 0;
+        self.end = 0;
+        const cap: usize = if (self.overread) self.buf.len else 1;
+        self.end = compat.posix.read(self.fd, self.buf[0..cap]) catch return error.ReadFailed;
+        return self.end;
+    }
+
+    // Append bytes up to and including the next `delim` into `out` (grows as
+    // needed). Returns true if a delimiter was consumed, false at EOF first.
+    fn nextLine(self: *LineReader, alloc: std.mem.Allocator, out: *std.ArrayList(u8), delim: u8) !bool {
+        while (true) {
+            if (try self.fill() == 0) return false; // EOF
+            const region = self.buf[self.start..self.end];
+            if (std.mem.indexOfScalar(u8, region, delim)) |i| {
+                try out.appendSlice(alloc, region[0 .. i + 1]); // include the delim
+                self.start += i + 1;
+                return true;
+            }
+            try out.appendSlice(alloc, region);
+            self.start = self.end; // whole buffer consumed; read more
+        }
+    }
+
+    // Reconcile the fd: push buffered-but-unconsumed bytes back so the offset
+    // sits exactly past the last byte returned. No-op in byte mode (nothing is
+    // ever over-read) and at EOF (buffer drained).
+    fn pushback(self: *LineReader) void {
+        const leftover = self.end - self.start;
+        if (leftover == 0 or !self.overread) return;
+        _ = compat.posix.lseek(self.fd, -@as(i64, @intCast(leftover)), SEEK_CUR) catch {};
+        self.start = self.end;
+    }
+};
 
 fn read(shell: *Shell, args: []const []const u8) !u8 {
     // parse options
@@ -864,21 +873,30 @@ fn read(shell: *Shell, args: []const []const u8) !u8 {
     // end of input). without this, `while read x` never terminates on a pipe.
     var hit_eof = false;
 
-    // Fast path for the hot case — `while read -r x; do ..; done < file`. Only
-    // for a plain raw whole-line read on a seekable fd; readLineRewind probes
-    // seekability and returns null (→ byte path) for pipes/ttys. -n/-t/non-raw
-    // change the stop condition, so they stay on the byte path.
+    // The bytes read this call; either LineReader's growable buffer (fast path)
+    // or buf[0..pos] (byte path).
+    var value: []const u8 = &.{};
+    var line_buf: std.ArrayList(u8) = .empty;
+    defer line_buf.deinit(shell.allocator);
+
+    // Fast path for the hot case — a plain raw whole-line read. LineReader
+    // block-reads on a seekable fd and byte-reads on a pipe/tty, growing the
+    // buffer so there is no line-length limit; pushback() leaves the fd exactly
+    // past the line. -n (char count), -t (timeout), and non-raw (backslash
+    // processing) change the stop condition, so they keep the byte path below.
     var used_fast = false;
     if (raw and nchars == null and timeout_secs == null) {
-        const fast = readLineRewind(stdin_fd, buf[0..], max_chars) catch return 1;
-        if (fast) |f| {
-            pos = f.pos;
-            hit_eof = f.hit_eof;
-            used_fast = true;
-        }
+        var lr = LineReader.init(stdin_fd);
+        const had_delim = lr.nextLine(shell.allocator, &line_buf, '\n') catch return 1;
+        lr.pushback();
+        var v = line_buf.items;
+        if (had_delim and v.len > 0 and v[v.len - 1] == '\n') v = v[0 .. v.len - 1];
+        value = v;
+        hit_eof = !had_delim; // EOF before a delimiter ⇒ read reports failure
+        used_fast = true;
     }
 
-    // Byte-at-a-time path: non-seekable fds, or modes the fast path excludes.
+    // Byte-at-a-time path: modes the fast path excludes (-n / -t / non-raw).
     // poll() is only needed to honour -t; without a timeout it is pure syscall
     // overhead, so gate it.
     while (!used_fast and pos < max_chars) {
@@ -930,7 +948,7 @@ fn read(shell: *Shell, args: []const []const u8) !u8 {
         if (nchars != null and pos >= max_chars) break;
     }
 
-    const value = buf[0..pos];
+    if (!used_fast) value = buf[0..pos];
 
     // assign to variable(s)
     if (varnames_start >= args.len) {
@@ -1027,44 +1045,35 @@ fn mapfile(shell: *Shell, args: []const []const u8) !u8 {
     }
 
     const stdin_fd = compat.posix.STDIN_FILENO;
-    var cur: std.ArrayList(u8) = .empty;
+    var lr = LineReader.init(stdin_fd);
+    var cur: std.ArrayList(u8) = .empty; // one buffer, recycled per line
     defer cur.deinit(shell.allocator);
 
     var skipped: usize = 0;
     var kept: usize = 0;
-    read_loop: while (true) {
+    while (true) {
         if (max_count != 0 and kept >= max_count) break;
-        var c: [1]u8 = undefined;
-        const n = compat.posix.read(stdin_fd, &c) catch break;
-        if (n == 0) {
-            // flush any trailing partial line (no delimiter at EOF)
-            if (cur.items.len > 0) {
-                if (skipped < skip) {
-                    skipped += 1;
-                } else {
-                    try lines.append(shell.allocator, try shell.allocator.dupe(u8, cur.items));
-                    kept += 1;
-                }
-                cur.clearRetainingCapacity();
+        cur.clearRetainingCapacity();
+        // nextLine appends up to and including `delim` (or to EOF); had_delim is
+        // false only when EOF was reached first.
+        const had_delim = lr.nextLine(shell.allocator, &cur, delim) catch break;
+        if (!had_delim and cur.items.len == 0) break; // clean EOF
+
+        if (skipped < skip) {
+            skipped += 1;
+        } else {
+            var line = cur.items;
+            if (strip and line.len > 0 and line[line.len - 1] == delim) {
+                line = line[0 .. line.len - 1];
             }
-            break;
+            try lines.append(shell.allocator, try shell.allocator.dupe(u8, line));
+            kept += 1;
         }
-        try cur.append(shell.allocator, c[0]);
-        if (c[0] == delim) {
-            if (skipped < skip) {
-                skipped += 1;
-            } else {
-                var line = cur.items;
-                if (strip and line.len > 0 and line[line.len - 1] == delim) {
-                    line = line[0 .. line.len - 1];
-                }
-                try lines.append(shell.allocator, try shell.allocator.dupe(u8, line));
-                kept += 1;
-            }
-            cur.clearRetainingCapacity();
-            if (max_count != 0 and kept >= max_count) break :read_loop;
-        }
+        if (!had_delim) break; // trailing partial line (no delimiter at EOF)
     }
+    // Reconcile the fd when we stopped early (-n) on a seekable fd, so a later
+    // reader sees the lines we did not consume — parity with bash's mapfile.
+    lr.pushback();
 
     if (origin) |o| {
         // -O: assign starting at index origin, keeping existing elements.
