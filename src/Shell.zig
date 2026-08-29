@@ -840,6 +840,7 @@ pub fn run(self: *Shell) !void {
     const initial_cursor = if (self.vim_mode == .normal) CursorStyle.block else CursorStyle.bar;
     try self.setCursorStyle(initial_cursor);
 
+    self.notifyBackgroundJobs();
     self.runPromptCommand();
     try self.renderLine();
 
@@ -1525,6 +1526,7 @@ fn handleAction(self: *Shell, action: Action) !void {
                 if (self.running) {
                     // sync history from other sessions before next prompt
                     if (self.history) |h| h.sync();
+                    self.notifyBackgroundJobs();
                     self.runPromptCommand();
                     try self.renderLine();
                 }
@@ -2765,6 +2767,55 @@ fn cleanupHeredocTemps(self: *Shell, mark: usize) void {
         std.Io.Dir.deleteFileAbsolute(compat.io(), p) catch {};
         self.allocator.free(p);
     }
+}
+
+/// Reap finished background jobs and print their "[N]+ Done ..." notices,
+/// matching bash's behavior of checking job status right before a fresh
+/// prompt. There is no SIGCHLD handler — the core is single-threaded and a
+/// handler would add reentrancy hazards — so this synchronous poll at prompt
+/// time is the only place background children get reaped and their
+/// completion reported; without it they stay unreaped until `jobs`/`wait`
+/// happens to run. Only called from the interactive prompt loop in run() and
+/// right after a command finishes, never mid-line-edit, and never from
+/// `zish -c` (which never reaches run()).
+fn notifyBackgroundJobs(self: *Shell) void {
+    self.job_table.updateJobStatuses();
+
+    const pending = self.job_table.getPendingNotifications() catch return;
+    defer self.allocator.free(pending);
+
+    for (pending) |notif| {
+        defer self.allocator.free(notif.command);
+
+        const marker: u8 = if (self.job_table.current_job == notif.job_id)
+            '+'
+        else if (self.job_table.previous_job == notif.job_id)
+            '-'
+        else
+            ' ';
+
+        const line = switch (notif.state) {
+            .done => if (notif.exit_status == 0)
+                std.fmt.allocPrint(self.allocator, "[{d}]{c}  Done                    {s}\n", .{
+                    notif.job_id, marker, notif.command,
+                }) catch continue
+            else
+                std.fmt.allocPrint(self.allocator, "[{d}]{c}  Exit {d}                  {s}\n", .{
+                    notif.job_id, marker, notif.exit_status, notif.command,
+                }) catch continue,
+            .stopped => std.fmt.allocPrint(self.allocator, "[{d}]{c}  Stopped                 {s}\n", .{
+                notif.job_id, marker, notif.command,
+            }) catch continue,
+            .running => continue,
+        };
+        defer self.allocator.free(line);
+        // Through the shell's stderr writer (flushes pending stdout first) so the
+        // notice lands cleanly before the next prompt, consistent with builtin
+        // diagnostics.
+        self.stderr().writeAll(line) catch {};
+    }
+
+    self.job_table.cleanupDoneJobs();
 }
 
 /// Run $PROMPT_COMMAND (if set) just before displaying an interactive prompt,

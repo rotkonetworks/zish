@@ -292,6 +292,22 @@ def _(sh):
     assert "Running" in out or "sleep" in out, f"job not running after bg: {out[-300:]!r}"
 
 
+@test("finished background job prints a Done notice at the next prompt")
+def _(sh):
+    # There is no SIGCHLD handler (the core is single-threaded), so a
+    # background child's completion is only ever discovered by polling the
+    # job table. Before the fix, nothing polled it between commands: the
+    # child zombied and "[1]+ Done" was never printed until the user
+    # happened to run `jobs` or `wait`. The poll must run right before a
+    # fresh prompt, so pressing Enter with no command is enough to trigger it.
+    sh.sendline("sleep 0.2 &")
+    sh.read(timeout=3)
+    time.sleep(0.4)  # let the background job finish
+    sh.sendline("")  # fresh prompt: this is where the poll must fire
+    out = sh.read(timeout=5)
+    assert "Done" in out and "sleep" in out, f"no Done notice for finished bg job; got {out[-400:]!r}"
+
+
 @test("shell survives ctrl-c and keeps its prompt")
 def _(sh):
     sh.sendline("sleep 30")
