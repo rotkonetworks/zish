@@ -437,6 +437,21 @@ pub const JobTable = struct {
     }
 
     /// Wait for a job to stop or complete
+    /// Decoded child wait(2) status. One owner so the foreground reap and job
+    /// waits report $? identically — a signaled or stopped child is 128+signo,
+    /// never a bare exit code.
+    pub const Outcome = struct { code: u8, exited: bool, signaled: bool, stopped: bool };
+
+    pub fn decodeStatus(status: u32) Outcome {
+        if (posix.W.IFEXITED(status))
+            return .{ .code = posix.W.EXITSTATUS(status), .exited = true, .signaled = false, .stopped = false };
+        if (posix.W.IFSIGNALED(status))
+            return .{ .code = @truncate(128 + @as(u32, @intCast(@intFromEnum(posix.W.TERMSIG(status))))), .exited = false, .signaled = true, .stopped = false };
+        if (posix.W.IFSTOPPED(status))
+            return .{ .code = @truncate(128 + @as(u32, @intCast(@intFromEnum(posix.W.STOPSIG(status))))), .exited = false, .signaled = false, .stopped = true };
+        return .{ .code = 127, .exited = false, .signaled = false, .stopped = false };
+    }
+
     /// wait for a job to stop or complete, handling EINTR
     pub fn waitForJob(self: *JobTable, job: *Job) i32 {
         while (!job.isStopped() and !job.isCompleted()) {
@@ -451,7 +466,9 @@ pub const JobTable = struct {
         }
 
         if (job.lastProcess()) |proc| {
-            return @as(i32, posix.W.EXITSTATUS(proc.status));
+            // Decode properly: a job killed by a signal is $?=128+N, not 0. Using
+            // EXITSTATUS unconditionally reported a Ctrl+C'd `fg` as exit 0.
+            return @as(i32, decodeStatus(proc.status).code);
         }
         return 0;
     }

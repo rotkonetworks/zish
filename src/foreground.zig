@@ -266,20 +266,16 @@ pub const Session = struct {
 
         self.reclaim();
 
-        if (compat.posix.W.IFSTOPPED(status)) {
+        // Shared decoder (jobs.decodeStatus) so foreground and job waits report
+        // $? identically: 128+signo for a signaled/stopped child, never 0.
+        const oc = jobs.JobTable.decodeStatus(status);
+        if (oc.stopped) {
             const job_id = self.shell.job_table.addStoppedForeground(pid, cmd);
             self.shell.stdout().print("\n[{d}]+  Stopped\t\t{s}\n", .{ job_id, cmd }) catch {};
             self.shell.stdout().flush() catch {};
-            return .{ .code = 148, .stopped = true, .exited = false }; // 128 + SIGTSTP(20)
+            return .{ .code = oc.code, .stopped = true, .exited = false };
         }
-        if (compat.posix.W.IFEXITED(status)) {
-            return .{ .code = compat.posix.W.EXITSTATUS(status), .stopped = false, .exited = true };
-        }
-        if (compat.posix.W.IFSIGNALED(status)) {
-            const code: u8 = @truncate(128 + @as(u32, @intCast(@intFromEnum(compat.posix.W.TERMSIG(status)))));
-            return .{ .code = code, .stopped = false, .exited = false };
-        }
-        return .{ .code = 127, .stopped = false, .exited = false };
+        return .{ .code = oc.code, .stopped = false, .exited = oc.exited };
     }
 };
 

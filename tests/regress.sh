@@ -712,6 +712,11 @@ same_as_bash "kill -SIGHUP prefix form"    'kill -SIGHUP $$; echo SURVIVED'
 same_as_bash "kill -0 existence check"     'kill -0 $$; echo rc=$?'
 same_as_bash "kill bad signal spec rc"     'kill -NOPESIG 1 2>/dev/null; echo rc=$?'
 
+# A child killed by a signal reports $?=128+signo, not a bare exit code. The
+# foreground reap and the `fg` wait now share one decoder (jobs.decodeStatus).
+same_as_bash "signaled child exit 130"     'sh -c "kill -INT \$\$"; echo rc=$?'
+same_as_bash "signaled child exit 137"     'sh -c "kill -KILL \$\$"; echo rc=$?'
+
 # `read` builtin: the seekable fast path (block read + lseek-back) must be
 # byte-for-byte identical to the byte path and to bash. The critical invariant
 # is that read consumes EXACTLY one line — a following reader sees the rest.
