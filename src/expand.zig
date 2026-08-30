@@ -215,7 +215,7 @@ pub fn allocOpt(sh: *Shell, input: []const u8, expand_tilde: bool) ![]const u8 {
                     i += 1; // consume )
 
                     // Execute command and capture output
-                    const cmd_output = sh.executeCommandAndCapture(command) catch "";
+                    const cmd_output = executeCommandAndCapture(sh, command) catch "";
                     defer if (cmd_output.len > 0) sh.allocator.free(cmd_output);
                     try result.appendSlice(sh.allocator, std.mem.trimEnd(u8, cmd_output, "\n\r"));
                     continue;
@@ -685,7 +685,7 @@ pub fn allocOpt(sh: *Shell, input: []const u8, expand_tilde: bool) ![]const u8 {
                 i += 1; // consume closing `
 
                 // Execute command and capture output
-                const cmd_output = sh.executeCommandAndCapture(command) catch "";
+                const cmd_output = executeCommandAndCapture(sh, command) catch "";
                 defer if (cmd_output.len > 0) sh.allocator.free(cmd_output);
                 try result.appendSlice(sh.allocator, std.mem.trimEnd(u8, cmd_output, "\n\r"));
             } else {
@@ -708,4 +708,111 @@ pub fn allocOpt(sh: *Shell, input: []const u8, expand_tilde: bool) ![]const u8 {
     }
 
     return try result.toOwnedSlice(sh.allocator);
+}
+
+// ---------------------------------------------------------------------------
+// Command substitution backend
+//
+// $(...) and `...` capture a command's stdout. These live here because command
+// substitution is part of expansion; they drive the shell's own evaluator
+// (sh.executeCommandInternal) so shell-local variables, functions, and builtins
+// behave exactly as in an interactive session, and only fall back to /bin/sh
+// when the internal path errors.
+// ---------------------------------------------------------------------------
+
+pub fn executeCommandAndCapture(sh: *Shell, command: []const u8) ![]const u8 {
+    // Execute a command and capture its output using zish's own evaluator so
+    // that shell-local variables, functions, nested substitutions and builtins
+    // (echo, printf, ...) behave exactly as in an interactive session.
+    const trimmed_cmd = std.mem.trim(u8, command, " \t\n\r");
+    if (trimmed_cmd.len == 0) return sh.allocator.dupe(u8, "");
+
+    // pwd fast path (pure builtin, no output-affecting state)
+    if (std.mem.eql(u8, trimmed_cmd, "pwd")) {
+        var buf: [4096]u8 = undefined;
+        const cwd = compat.posix.getcwd(&buf) catch return sh.allocator.dupe(u8, "");
+        return sh.allocator.dupe(u8, cwd);
+    }
+
+    return captureInternal(sh, trimmed_cmd) catch
+        executeExternalAndCapture(sh, trimmed_cmd) catch
+        sh.allocator.dupe(u8, "");
+}
+
+/// Run a command through zish's own evaluator with stdout captured, returning
+/// the output. stdout is restored afterwards.
+///
+/// The capture sink is an unlinked temp file, not a pipe. This is the whole
+/// point: a regular file never blocks on `write`, so a command emitting more
+/// than a pipe buffer (64 KiB) cannot deadlock — which a pipe would, because
+/// `executeCommandInternal` runs the command and `waitpid`s for it on this same
+/// thread, with nothing draining the pipe until after it returns. Draining the
+/// pipe on a background thread would make the shell briefly multi-threaded while
+/// it `fork`s to exec — a latent deadlock (a child inheriting a mutex the
+/// vanished reader thread held). No thread means the bug class cannot occur.
+///
+/// The file is created O_EXCL with a random name and unlinked immediately, so
+/// there is no on-disk artifact and no symlink/TOCTOU window: after the create
+/// only our fd reaches the inode. It costs no more than the pipe+thread it
+/// replaces — an unlinked tmpfs file versus a `clone` per substitution.
+fn captureInternal(sh: *Shell, command: []const u8) ![]const u8 {
+    const O = compat.posix.O;
+    var rnd: [8]u8 = undefined;
+    var name_buf: [64]u8 = undefined;
+    var attempt: u8 = 0;
+    const capfd = while (true) {
+        compat.posix.randomBytes(&rnd);
+        const path = std.fmt.bufPrintZ(&name_buf, "/tmp/zish_capture_{s}", .{std.fmt.bytesToHex(rnd, .lower)}) catch return error.NameTooLong;
+        if (compat.posix.openZ(path.ptr, O{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true }, 0o600)) |fd| {
+            // Unlink now: the inode lives as long as this fd, leaves nothing on
+            // disk, and cannot be reached by name (so no symlink swap).
+            std.Io.Dir.deleteFileAbsolute(compat.io(), path) catch {};
+            break fd;
+        } else |err| {
+            attempt += 1;
+            if (err == error.PathAlreadyExists and attempt < 8) continue;
+            return err;
+        }
+    };
+    defer compat.posix.close(capfd);
+
+    // Park the backup at fd >= 10 with CLOEXEC (like the redirect backups in
+    // eval.zig): a plain dup() lands at fd 3, where a user redirect `3>file`
+    // inside the captured command would clobber it, and a non-CLOEXEC backup
+    // of the terminal would leak into every child the capture spawns.
+    const stdout_backup = try compat.posix.dupHighCloexec(compat.posix.STDOUT_FILENO);
+    defer compat.posix.close(stdout_backup);
+
+    // Flush pending buffered stdout before swapping the fd so it lands on the
+    // terminal, not in the capture.
+    sh.stdout().flush() catch {};
+    try compat.posix.dup2(capfd, compat.posix.STDOUT_FILENO);
+
+    _ = sh.executeCommandInternal(command) catch {};
+    sh.stdout().flush() catch {};
+
+    // Restore stdout, then read the capture back from the start.
+    compat.posix.dup2(stdout_backup, compat.posix.STDOUT_FILENO) catch {};
+    _ = compat.posix.lseek(capfd, 0, 0) catch return error.SeekFailed; // SEEK_SET
+
+    var buffer: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buffer.deinit(sh.allocator);
+    var tmp: [4096]u8 = undefined;
+    while (true) {
+        const n = compat.posix.read(capfd, &tmp) catch break;
+        if (n == 0) break;
+        try buffer.appendSlice(sh.allocator, tmp[0..n]);
+    }
+    return buffer.toOwnedSlice(sh.allocator);
+}
+
+fn executeExternalAndCapture(sh: *Shell, command: []const u8) ![]const u8 {
+    // Execute external command and capture output
+    const result = try std.process.run(sh.allocator, compat.io(), .{
+        .argv = &[_][]const u8{ "/bin/sh", "-c", command },
+        .stdout_limit = .limited(4096),
+    });
+    defer sh.allocator.free(result.stderr);
+
+    return result.stdout; // caller owns this memory
 }
