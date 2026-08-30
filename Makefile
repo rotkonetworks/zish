@@ -49,6 +49,7 @@ clean:
 test: build
 	./tests/regress.sh
 	zig build test
+	zig test feats/agent/main.zig
 
 test-pty: build
 	python3 tests/pty_test.py
@@ -58,7 +59,7 @@ test-pty: build
 ZISH_FEAT_DIR ?= $(HOME)/.zish/feats/standard
 FEAT_NAMES := cnt pk frq snf jls calc para agent
 # Feats needing libc (para uses execvp for PATH+env resolution).
-FEAT_LIBC := para
+FEAT_LIBC := para agent
 
 .PHONY: feats
 feats:

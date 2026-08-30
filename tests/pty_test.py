@@ -1207,6 +1207,56 @@ def _(sh):
         shutil.rmtree(featroot, ignore_errors=True)
 
 
+@test("agent model loop drives a tool call end to end (mock transport)")
+def _(sh):
+    # The real agent feat, transport mocked: a tool-call response runs a
+    # command through zish, then a final-text response ends the turn. Proves
+    # the whole loop — request build, response parse, run-frame mapping,
+    # result feedback — with no network. The transcript is the evidence the
+    # tool executed with REAL output (the mock's canned text alone wouldn't
+    # prove the run happened).
+    import json as _json
+    mock = os.path.join(tempfile.mkdtemp(prefix="zish-mock-"), "m.jsonl")
+    tool_resp = _json.dumps({"choices": [{"message": {"tool_calls": [
+        {"id": "c1", "type": "function", "function": {
+            "name": "run_command",
+            "arguments": _json.dumps({"command": "echo agentmark_$((20+2))"})}}]}}]})
+    final_resp = _json.dumps({"choices": [{"message": {"content": "ran it, got agentmark_22"}}]})
+    with open(mock, "w") as f:
+        f.write(_json.dumps({"status": 200, "body": tool_resp}) + "\n")
+        f.write(_json.dumps({"status": 200, "body": final_resp}) + "\n")
+    # the agent feat is a compiled binary staged by `make feats` into the real
+    # HOME; the pty shell uses a throwaway HOME, so point a fresh shell at the
+    # staged root (and own its cleanup — the decorator only closes `sh`).
+    feats_root = os.path.expanduser("~/.zish/feats")
+    if not os.path.isdir(os.path.join(feats_root, "standard", "agent")):
+        # Graceful degrade like the para test: `make test-pty` depends on
+        # `build`, not `feats`, so a fresh checkout has no staged agent feat.
+        shutil.rmtree(os.path.dirname(mock), ignore_errors=True)
+        print("        (agent feat not staged — run `make feats`; skipping)")
+        return
+    a = Shell(env_extra={"ZISH_FEAT_PATH": feats_root})
+    try:
+        a.read()
+        a.sendline(f"agent --mock {mock} echo something for me")
+        # wait once for the last marker; the say batches with it, so assert the
+        # say against the accumulated buffer rather than racing two reads.
+        expect_soon(a, "ended")
+        buf = clean(a.buf)
+        assert "started" in buf, f"session never started: {buf[-400:]!r}"
+        assert "ran it, got agentmark_22" in buf, \
+            f"final say missing: {buf[-400:]!r}"
+        # transcript proves the run executed with real captured output
+        a.sendline("cat ~/.zish/sessions/*agent*.log")
+        out = expect_soon(a, "agentmark_22")
+        assert "$ echo agentmark_" in out, \
+            f"tool command not audited in transcript: {out[-400:]!r}"
+    finally:
+        a.close()
+        sh.vt = None
+        shutil.rmtree(os.path.dirname(mock), ignore_errors=True)
+
+
 @test("session feat with redirected stdout uses the sync host")
 def _(sh):
     # isatty(stdout) is the async/sync discriminator: redirected, the feat is

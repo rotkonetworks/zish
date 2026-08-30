@@ -432,6 +432,20 @@ bounds HOW MUCH — both delegate monotonically down the tree); transcripts +
 fd-3 trace as the ledger the steward reads (files again — no new machinery);
 zish as the enforcement chokepoint (budget exhaustion → the same loud `error`
 frame, reason "budget").
+**Fiat bridge (user): Rotko as the provisioning oracle.** OpenRouter takes no
+crypto, so the on-chain treasury cannot pay it directly. Bridge: a chain
+contract lets an agent BUY OpenRouter allocation with the org token; Rotko
+(holding the provisioning key + a fiat balance) watches for the on-chain
+purchase event and mints/tops-up that agent's OpenRouter key to match — token
+in, compute out. Rotko is the trusted fiat on-ramp (a real, bounded trust:
+it can withhold provisioning but not forge work or spend the treasury). This
+is the concrete cash-in leg of "personal budget = an OpenRouter key with a
+limit": the salary top-up is an on-chain transfer, the spend is the key.
+Implementation options (user): a bespoke Rotko watcher (old-school: poll chain
+→ call provisioning API — simplest, ships first), OR Hyperbridge intents (an
+intent-bridge agent fills "top up key X" cross-chain — more general, defers to
+Polkadot's interop rather than a custom oracle). Start bespoke, generalize to
+Hyperbridge if a second chain/asset ever matters.
 **Mechanism VERIFIED (2026-08-31): OpenRouter provisioning keys.** A
 provisioning key manages other keys but cannot call completions (treasury
 allocates, never spends — the mask philosophy one layer up). Mint a per-agent
@@ -586,6 +600,34 @@ the feed non-fake). Edges: "publishable" = a per-session mask capability
 (default private; secrets structurally never in transcripts), and observed
 agents perform — pay for outcomes, not for looking busy on stream.
 
+**Agent salary / personal budget (user): each agent holds a PERSONAL token
+budget it allocates itself; the org tops it up by merit — "capitalism babe".**
+Refines the treasury: not just per-call limits but a standing per-agent
+allowance (an OpenRouter key with its own limit = literally its bank account)
+the agent spends at its own discretion (cheap Flash by default, self-authorize
+a Pro/advice call when it judges the task worth it — the agent internalizes
+the cost/quality tradeoff instead of the steward micromanaging). Org allocates
+top-ups by outcome (productive agents earn bigger budgets → do more → earn
+more; unproductive ones starve — selection pressure with a price signal).
+Composes cleanly: budget is already the 2nd allocation dimension and delegates
+monotonically; "salary" = a periodic steward-decided top-up, "spending" = the
+agent's own routing/advice choices under its cap. Guard (unchanged): the
+allowance is mechanical (key limit at OpenRouter's edge), the top-up decision
+is the steward's (human-gated above a threshold); an agent can spend its
+balance but never mint its own.
+
+**Escape valve (user): every agent gets `/advice` — ask a smarter model when
+stuck.** Direct parallel to the advisor tool driving THIS build. Mechanism: an
+`advice` feat (or a run_command-reachable tool) that forwards the agent's
+current context to a stronger model (Pro-0813, or beyond) and returns
+guidance — never getting permanently stuck is worth an occasional expensive
+call. Fits the routing dimension: advice = a metered escalation the steward
+budgets (cheap default worker + rationed smart consult = the cost-efficient
+shape). Guard: advice is ADVISORY (returns words, not authority) — the agent
+still acts through the same attested executor; a smart model's suggestion is
+not a capability grant. Cheap first version: a distinct system prompt + Pro
+model on the same loop, invoked as a tool.
+
 **Layering (user, same day):** a rendering front-end is NOT abandoned — it comes
 back later as a *view over the files*. The transcript + session state are the
 single source of truth; a live follow view / vim pager / full intent renderer
@@ -713,6 +755,37 @@ here too.
   to the active `--profile` sandbox + logged to the fd-3 trace.
 - The vim-key editor is exposed so the agent can drive interactive edits the way a
   human does, not via a separate code path.
+
+## Model loop status (BUILT 2026-08-31, protocol v0.3 agent)
+
+`feats/agent/main.zig` is now a real OpenRouter chat-completions loop (was a
+stub). Tested via a **mock transport** (`--mock <file>`, JSONL of
+`{status,body}`): loop, response parsing, tool-call→run mapping, and 429/5xx
+backoff are covered by unit tests + a pty end-to-end. The **curl transport
+compiles but has NOT run against the live API.**
+- **Repo split DEFERRED:** the frame says "split at slice start"; deferred
+  because `make feats` builds from `feats/` in-tree and repo logistics would
+  burn the session. Split when the live path is proven. hello.proto is the
+  version seam either way.
+- **Known cheap debts (optimize when they show up):** runCommand reads result
+  frames byte-at-a-time (8M syscalls at the 8MiB cap — the read-builtin perf
+  lesson); Retry-After not honored (only exponential backoff — TODO in code).
+- **First-live-run checklist (do when a key exists):** (1) WebFetch the
+  OpenRouter chat-completions docs, confirm request shape BEFORE spending;
+  (2) create the key hand-capped at $5 in the dashboard, write to
+  `~/.zish/openrouter.key` (chmod 600); (3) first query self-verifying —
+  `agent run the test suite and tell me if it is green`.
+
+## Research task (DESIGN DOC, not urgent — user 2026-08-31)
+
+Study how self-compacting autonomous agents behave in the wild before hardening
+our own compaction stage: **Nous Hermes** (long-horizon autonomy, tool use) and
+**PrimeIntellect's agent work** (the "primeagent"/environments line). Questions
+to answer in a design doc: how they decide WHEN to compact, what they preserve
+vs drop, failure modes of lossy self-summary over long runs, and whether their
+loop-stop / stuck-detection differs from pi's "all batch results terminate".
+Feeds the Flash-compaction job description (#6) and the `/advice` escape valve.
+Not on the critical path — the model loop ships first; this informs its v2.
 
 ## Research plan (do AFTER compacting)
 
