@@ -63,7 +63,7 @@ jobs:
 
       - name: build ${{ matrix.target }}
         run: |
-          zig build --release=safe -Dtarget=${{ matrix.target }} -Dlto=false
+          zig build --release=safe -Dstrip=true -Dtarget=${{ matrix.target }} -Dlto=false
           mv zig-out/bin/zish zig-out/bin/zish-${{ matrix.target }}
 
       # install.sh refuses to install a binary it cannot verify, so the

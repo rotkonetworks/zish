@@ -29,6 +29,11 @@ pub fn build(b: *std.Build) void {
     const enable_simd = b.option(bool, "simd", "Enable SIMD optimizations") orelse true;
     const enable_lto = b.option(bool, "lto", "Enable Link Time Optimization") orelse (optimize != .Debug);
     const profile_guided = b.option(bool, "pgo", "Enable Profile Guided Optimization") orelse false;
+    // Strip debug symbols. Off by default so local/dev builds stay debuggable;
+    // release artifacts pass -Dstrip=true — release=safe's runtime checks are
+    // unaffected (strip removes symbols, not check code), it just drops the
+    // debug info end users don't need (~8.3M -> ~1.5M).
+    const strip_symbols = b.option(bool, "strip", "Strip debug symbols (for release artifacts)") orelse false;
 
     const mod = b.addModule("zish", .{
         .root_source_file = b.path("src/root.zig"),
@@ -41,6 +46,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip_symbols,
             // Link libc for dlopen/dlsym (GPU Vulkan compute)
             .link_libc = true,
         }),
