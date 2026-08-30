@@ -839,12 +839,8 @@ def _(sh):
 
 @test("e settles on the last char instead of overshooting past end")
 def _(sh):
-    # Regression: word-end motions could walk buf.cursor to buf.len (one past
-    # the last char) in normal mode, and nothing clamped it back — so spamming
-    # `e` overshot the end of "abc" and the cursor wrapped to column 0. An
-    # append there landed in the wrong place. Correct vi: `e` stops on the last
-    # char and stays; `a` then appends right after it. Five e's on "echo abc"
-    # must leave the cursor on the final 'c', so "END" appends to the tail.
+    # `e` must stop on the last char; five e's then `a` appends "END" to the
+    # tail. If it overshoots past buf.len the cursor wraps and END lands early.
     vi_edit(sh, "echo abc", "0eeeeea", insert_text="END")
     sh.send("\n")
     out = expect_soon(sh, "abcEND")
@@ -868,6 +864,21 @@ def _(sh):
     vi_edit(sh, "echo aaa bbb", "0wdwu\x12")  # dw, undo, redo (Ctrl-R)
     sh.send("\n")
     expect_soon(sh, "bbb")
+
+
+@test("G jumps to the last line of a multi-line command, not line 1's end")
+def _(sh):
+    # Paste two lines, gg to the top, G to the last line, append X. A G that
+    # only reached line 1's end would put X on "echo AA".
+    sh.send("\x1b[200~echo AA\necho BB\x1b[201~")
+    sh.read(quiet_for=0.2, timeout=2.0)
+    vi_normal(sh)
+    sh.send("ggGAX")
+    sh.read(quiet_for=0.2, timeout=2.0)
+    vi_normal(sh)
+    sh.send("\n")
+    out = expect_soon(sh, "BBX")
+    assert "AAX" not in out, f"G landed on line 1: {out!r}"
 
 
 @test("visual mode y yanks exactly the selection, not the whole line")
@@ -955,9 +966,7 @@ def _(sh):
         seen = [t for t in order if t in screen]
         assert seen, f"nothing rendered\n        screen: {screen!r}"
 
-        # Continuation lines must render flush-left with no decorative gutter
-        # glyph — a "│" marker used to prefix each wrapped line and landed in
-        # every copy of a multi-line command pasted out of the terminal.
+        # Continuation lines render flush-left, no gutter glyph in copied text.
         assert "│" not in screen, f"continuation gutter leaked into render: {screen!r}"
 
         # Must end at the last line and be gap-free back from there.

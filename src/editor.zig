@@ -200,7 +200,8 @@ pub const EditBuffer = struct {
     }
 
     pub fn moveEnd(self: *Self) void {
-        self.moveLineEnd();
+        // G: end of the whole buffer, not just the current line.
+        self.cursor = self.len;
     }
 
     /// move to start of current line (after newline or pos 0)
@@ -604,11 +605,8 @@ pub const TermView = struct {
         }
 
         const w = self.term.width;
-        // Continuation lines of a multi-line command render flush-left with no
-        // gutter glyph. A decorative "│ " marker looked nice but a terminal has
-        // no way to mark it non-selectable, so it landed in every copy of the
-        // command and had to be hand-stripped. Flush-left keeps the on-screen
-        // text a faithful, round-trippable view of the buffer (micay/deidrec).
+        // No gutter glyph on continuation lines: a decoration is not
+        // selectable-excludable and would land in copied text.
         const cont_marker_len: u16 = 0;
 
         // When the prompt is wider than the terminal it is truncated on emit to
