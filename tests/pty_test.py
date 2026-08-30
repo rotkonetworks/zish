@@ -225,6 +225,45 @@ def expect_soon(sh, needle, timeout=10.0):
     return seen
 
 
+def vi_normal(sh):
+    """Send Esc and land in vi normal mode.
+
+    A bare Esc followed immediately by more bytes races the shell's own
+    escape-sequence reader: escapeSequenceAction() does a non-blocking peek
+    at the next byte to distinguish Esc from an arrow-key/Alt sequence, and
+    if our next keystroke is already queued behind it (which it will be if
+    sent back-to-back with no gap), that peek consumes it as a candidate
+    Alt-sequence byte instead of delivering it as a normal-mode command. A
+    real human typing has that gap for free; a script does not, so this
+    inserts one and drains the mode-change redraw before returning.
+    """
+    sh.send("\x1b")
+    time.sleep(0.08)
+    sh.read(quiet_for=0.1, timeout=1.0)
+
+
+def vi_edit(sh, typed, vi_keys, insert_text=None, quiet_for=0.15):
+    """Type `typed`, Esc to vi normal mode, run `vi_keys`, optionally type
+    `insert_text` if the sequence lands in insert mode — then drain.
+
+    Does not send the trailing Enter: callers do that themselves and assert
+    with expect_soon() on the fresh output that follows, so the assertion
+    only ever sees what the *executed* command printed, never a substring of
+    the on-screen editing that preceded it (the original typed text is still
+    sitting in the pty's scrollback-in-flight at that point, and matching
+    against it blindly would be a false pass).
+    """
+    sh.send(typed)
+    sh.read(quiet_for=quiet_for, timeout=2.0)
+    vi_normal(sh)
+    sh.send(vi_keys)
+    sh.read(quiet_for=quiet_for, timeout=2.0)
+    if insert_text is not None:
+        sh.send(insert_text)
+        sh.read(quiet_for=quiet_for, timeout=2.0)
+    sh.read(quiet_for=quiet_for, timeout=2.0)  # settle before caller sends Enter
+
+
 # ---------------------------------------------------------------------------
 print("\n\033[2mzish pty suite — %s\033[0m\n" % ZISH)
 print("basics")
@@ -701,6 +740,168 @@ def _(sh):
     # running another command and seeing its output.
     sh.sendline("echo still_alive_$((2 + 2))")
     expect_soon(sh, "still_alive_4")
+
+
+# ---------------------------------------------------------------------------
+print("\nvi mode")
+# ---------------------------------------------------------------------------
+
+
+@test("fX finds char forward, x deletes it")
+def _(sh):
+    vi_edit(sh, "echo aXbXcX", "0fXx")
+    sh.send("\n")
+    expect_soon(sh, "abXcX")
+
+
+@test("dtX deletes up to (not through) the found char")
+def _(sh):
+    vi_edit(sh, "echo aaaXbbb", "0wdtX")
+    sh.send("\n")
+    out = expect_soon(sh, "Xbbb")
+    # "Xbbb" alone is a weak check: it's a suffix of the untouched original
+    # text too, so a `t` that silently no-ops (as on the pre-fix binary,
+    # where a `d`-then-unhandled-key clears pending_op without deleting
+    # anything) would still satisfy it. Confirm the "aaa" prefix is gone.
+    assert "aaa" not in out, f"'t' motion deleted nothing: {out!r}"
+
+
+@test("df) deletes through the found char, inclusive")
+def _(sh):
+    vi_edit(sh, "echo (abc) tail", "0wdf)")
+    sh.send("\n")
+    out = expect_soon(sh, "tail")
+    assert "abc" not in out, f"paren contents survived: {out!r}"
+
+
+@test("cf, changes through comma then inserts replacement")
+def _(sh):
+    # `w` first, so the operator range starts at "hello," rather than at the
+    # buffer's absolute start (which would eat "echo" itself too).
+    vi_edit(sh, "echo hello, world", "0wcf,", insert_text="bye")
+    sh.send("\n")
+    expect_soon(sh, "bye world")
+
+
+@test("; repeats last find, , repeats it reversed")
+def _(sh):
+    # a,b,c,d — f, lands on comma 1; ; advances to comma 2, then comma 3;
+    # , reverses back to comma 2, which x then deletes.
+    vi_edit(sh, "echo a,b,c,d", "0f,;;,x")
+    sh.send("\n")
+    expect_soon(sh, "a,bc,d")
+
+
+@test("3fa finds the third occurrence")
+def _(sh):
+    vi_edit(sh, "echo banana", "03fax")
+    sh.send("\n")
+    expect_soon(sh, "banan")
+
+
+@test("% jumps to the matching paren")
+def _(sh):
+    # % from '(' lands on ')'; x deletes it, proving the jump landed exactly
+    # on the close paren rather than somewhere else in the line. The parens
+    # are inside a quoted argument — zish (like bash) treats a bare unquoted
+    # '(' as a subshell-opening metacharacter, which is a shell-parsing
+    # concern orthogonal to what this test is checking (vim.zig's bracket
+    # matching operates on raw buffer bytes and does not know about quoting).
+    vi_edit(sh, 'echo "(a b) c"', "0w%x")
+    sh.send("\n")
+    expect_soon(sh, "(a b c")
+
+
+@test("ciw changes the word under the cursor")
+def _(sh):
+    vi_edit(sh, "echo hello world", "0wciw", insert_text="bye")
+    sh.send("\n")
+    expect_soon(sh, "bye world")
+
+
+@test('di" empties a quoted string in place')
+def _(sh):
+    vi_edit(sh, 'echo "QUOTEDMARKER" tail', '0f"di"')
+    sh.send("\n")
+    out = expect_soon(sh, "tail")
+    assert "QUOTEDMARKER" not in out, f"quoted content survived: {out!r}"
+
+
+@test("ci( changes the contents of parens")
+def _(sh):
+    # Parens inside a quoted argument, same rationale as the % test above.
+    vi_edit(sh, 'echo "(PARENMARKER)" tail', "0f(ci(", insert_text="x")
+    sh.send("\n")
+    out = expect_soon(sh, "tail")
+    assert "PARENMARKER" not in out, f"paren content survived: {out!r}"
+    expect(out, "(x) tail")
+
+
+@test("u undoes a change, Ctrl-R redoes it")
+def _(sh):
+    # `w` first so dw deletes "aaa " (leaving "echo bbb"), not "echo " itself
+    # (leaving "aaa bbb" as an unknown-command line).
+    vi_edit(sh, "echo aaa bbb", "0wdw")
+    sh.send("\n")
+    expect_soon(sh, "bbb")
+
+    # Same trick on a fresh line: dw, then u should restore "aaa bbb" so the
+    # executed command prints both words; Ctrl-R should undo the undo.
+    vi_edit(sh, "echo aaa bbb", "0wdwu")
+    sh.send("\n")
+    expect_soon(sh, "aaa bbb")
+
+    vi_edit(sh, "echo aaa bbb", "0wdwu\x12")  # dw, undo, redo (Ctrl-R)
+    sh.send("\n")
+    expect_soon(sh, "bbb")
+
+
+@test("visual mode y yanks exactly the selection, not the whole line")
+def _(sh):
+    # Confirmed bug: `v` + word motion + `y` yanked the entire line instead
+    # of the selected word, because every visual-mode key except a narrow
+    # operator-starting subset bypassed vim.zig's selection-aware handleVisual
+    # and fell through to the plain single-key normalModeAction — whose 'y'
+    # unconditionally yanks the whole line. On "echo one two three", `0` goes
+    # to the start, `w` lands on "one", `v e y` selects+yanks exactly "one",
+    # `$ p` pastes it after the last char — the executed line must end with
+    # "...threeone", not a second full copy of the whole command.
+    vi_edit(sh, "echo one two three", "0wvey$p")
+    sh.send("\n")
+    expect_soon(sh, "one two threeone")
+
+
+@test("visual mode l l y yanks exactly three chars")
+def _(sh):
+    # `ww` lands on "two"; `v ll` extends the selection right two more
+    # columns (3 chars total: "two"), y yanks exactly that — not the whole
+    # line. (Picked "two" rather than the first word: the whole-line-yank bug
+    # pastes "echo one two three" back in, and a 3-char marker starting with
+    # "ech" would be a substring of that buggy output too — a false pass.)
+    vi_edit(sh, "echo one two three", "0wwvlly$p")
+    sh.send("\n")
+    expect_soon(sh, "one two threetwo")
+
+
+@test("ctrl-c still escapes visual mode")
+def _(sh):
+    # Guards the routing fix above, not a pre-existing bug: routing every key
+    # in visual mode through vim.zig's handleVisual (whose `else` arm
+    # silently consumes anything unrecognized) would make Ctrl-C a dead key
+    # there instead of aborting the line — passes on the old binary too,
+    # which is expected; it documents behavior that must not regress.
+    vi_edit(sh, "echo should-not-run", "v")
+    sh.send("\x03")
+    sh.read()
+    sh.sendline("echo ok_$((3 * 3))")
+    expect_soon(sh, "ok_9")
+
+
+@test("enter still executes from visual mode")
+def _(sh):
+    vi_edit(sh, "echo vis_$((2 * 2))", "v")
+    sh.send("\n")
+    expect_soon(sh, "vis_4")
 
 
 # ---------------------------------------------------------------------------

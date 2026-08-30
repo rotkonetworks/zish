@@ -2212,12 +2212,38 @@ fn clampCursorNormal(self: *Shell) void {
 
 fn normalModeDispatch(self: *Shell, char: u8) !Action {
     const v = &self.vi;
+    // Visual / visual-line mode has its own selection-aware key handling in
+    // vim.zig (handleVisual): motions extend the selection, and d/x/c/s/y
+    // operate on exactly the selected range. normalModeAction() below knows
+    // nothing about a selection — e.g. its 'y' always yanks the whole line —
+    // so every key must route through the vim.zig state machine while a
+    // selection is active, not just the operator-starting subset used in
+    // normal mode.
+    if (v.mode == .visual or v.mode == .visual_line) {
+        // Structural keys stay structural even mid-selection: handleVisual's
+        // `else` arm silently consumes anything it doesn't recognize, which
+        // would otherwise make Enter and Ctrl-C dead keys in visual mode (no
+        // way out except remembering Esc). Both of these already reset
+        // vi.mode to .insert in their handlers, so the selection is properly
+        // abandoned either way.
+        return switch (char) {
+            '\n', '\r', CTRL_C, CTRL_Z => normalModeAction(char),
+            else => self.viStateMachineKey(char),
+        };
+    }
     // A sequence is already in progress, or this key starts one.
     const in_sequence = v.pending_op != .none or v.awaiting_text_obj or
-        v.pending_g or v.mode == .replace or v.count != 0;
+        v.awaiting_find or v.pending_g or v.mode == .replace or v.count != 0;
     const starts_sequence = switch (char) {
         'd', 'c', 'r', 'g' => true,
         '1'...'9' => true,
+        // find-char motions (f/F/t/T await a target char), their repeat keys
+        // (;/,), the matching-bracket motion (%), plain undo (u, so it goes
+        // through vim.zig's real multi-level undo instead of the unrelated
+        // .undo Action below, which just clears the line), and redo
+        // (Ctrl-R, 0x12 — dead in normal mode otherwise: it's only bound to
+        // reverse-search in insert mode's keybindings table).
+        'f', 'F', 't', 'T', ';', ',', '%', 'u', 0x12 => true,
         else => false,
     };
     if (in_sequence or starts_sequence) {

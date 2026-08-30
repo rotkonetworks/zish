@@ -25,6 +25,17 @@ pub const RENDER_BUF_SIZE = 65536; // 64KB for large multiline content
 
 pub const ViMode = enum { insert, normal };
 
+/// bounded number of undo levels kept (each snapshot is a full LINE_BUF_SIZE
+/// copy; Shell is heap-allocated via allocator.create so this is fine memory-
+/// wise, but keep it small — it's a line editor, not a full text editor).
+pub const UNDO_HISTORY = 16;
+
+const Snapshot = struct {
+    text: [LINE_BUF_SIZE]u8 = undefined,
+    len: u16 = 0,
+    cursor: u16 = 0,
+};
+
 /// pure text buffer - no rendering logic
 pub const EditBuffer = struct {
     text: [LINE_BUF_SIZE]u8 = undefined,
@@ -32,29 +43,64 @@ pub const EditBuffer = struct {
     cursor: u16 = 0,
     vi_mode: ViMode = .insert,
 
-    // Undo: single-level snapshot (saved before destructive operations)
-    undo_text: [LINE_BUF_SIZE]u8 = undefined,
-    undo_len: u16 = 0,
-    undo_cursor: u16 = 0,
-    has_undo: bool = false,
+    // Undo/redo: bounded ring of full-buffer snapshots. `saveUndo()` pushes
+    // the pre-edit state onto the undo stack and clears the redo stack (a
+    // new edit invalidates any redo history — matches vim). `undo()` pops
+    // the undo stack, pushing the *current* state onto the redo stack first
+    // so `Ctrl-R` can restore it. `redo()` is the mirror image.
+    undo_stack: [UNDO_HISTORY]Snapshot = undefined,
+    undo_top: u8 = 0, // number of valid entries in undo_stack
+    redo_stack: [UNDO_HISTORY]Snapshot = undefined,
+    redo_top: u8 = 0,
 
     const Self = @This();
 
-    /// Save current state for undo. Call before destructive edits.
-    pub fn saveUndo(self: *Self) void {
-        @memcpy(self.undo_text[0..self.len], self.text[0..self.len]);
-        self.undo_len = self.len;
-        self.undo_cursor = self.cursor;
-        self.has_undo = true;
+    fn snapshotCurrent(self: *const Self) Snapshot {
+        var s = Snapshot{ .len = self.len, .cursor = self.cursor };
+        @memcpy(s.text[0..self.len], self.text[0..self.len]);
+        return s;
     }
 
-    /// Restore from undo snapshot.
+    fn applySnapshot(self: *Self, s: *const Snapshot) void {
+        @memcpy(self.text[0..s.len], s.text[0..s.len]);
+        self.len = s.len;
+        self.cursor = s.cursor;
+    }
+
+    /// Save current state for undo. Call before destructive edits.
+    /// Clears the redo stack — a fresh edit invalidates old redo history.
+    pub fn saveUndo(self: *Self) void {
+        if (self.undo_top >= UNDO_HISTORY) {
+            // drop the oldest entry to make room (shift down)
+            for (0..UNDO_HISTORY - 1) |i| self.undo_stack[i] = self.undo_stack[i + 1];
+            self.undo_top = UNDO_HISTORY - 1;
+        }
+        self.undo_stack[self.undo_top] = self.snapshotCurrent();
+        self.undo_top += 1;
+        self.redo_top = 0;
+    }
+
+    /// Restore the most recent undo snapshot, pushing the current state to redo.
     pub fn undo(self: *Self) bool {
-        if (!self.has_undo) return false;
-        @memcpy(self.text[0..self.undo_len], self.undo_text[0..self.undo_len]);
-        self.len = self.undo_len;
-        self.cursor = self.undo_cursor;
-        self.has_undo = false;
+        if (self.undo_top == 0) return false;
+        if (self.redo_top < UNDO_HISTORY) {
+            self.redo_stack[self.redo_top] = self.snapshotCurrent();
+            self.redo_top += 1;
+        }
+        self.undo_top -= 1;
+        self.applySnapshot(&self.undo_stack[self.undo_top]);
+        return true;
+    }
+
+    /// Re-apply the most recently undone change.
+    pub fn redo(self: *Self) bool {
+        if (self.redo_top == 0) return false;
+        if (self.undo_top < UNDO_HISTORY) {
+            self.undo_stack[self.undo_top] = self.snapshotCurrent();
+            self.undo_top += 1;
+        }
+        self.redo_top -= 1;
+        self.applySnapshot(&self.redo_stack[self.redo_top]);
         return true;
     }
 
