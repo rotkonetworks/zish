@@ -61,28 +61,6 @@ pub const DeleteAction = union(enum) {
     char_at: usize,
 };
 
-pub const YankAction = union(enum) {
-    line,
-    selection: struct { start: usize, end: usize },
-};
-
-pub const PasteAction = enum {
-    after_cursor,
-    before_cursor,
-};
-
-pub const InsertAtPosition = enum {
-    cursor,
-    after_cursor,
-    line_end,
-    line_start,
-};
-
-pub const OpenLineDirection = enum {
-    below, // o - open line below
-    above, // O - open line above
-};
-
 pub const VimModeAction = union(enum) {
     set_mode: VimMode,
 };
@@ -110,10 +88,6 @@ pub const Action = union(enum) {
     enter_search_mode: SearchDirection,
     exit_search_mode: bool,
     search_next_match, // Ctrl+R again: step to the next (older) match
-    yank: YankAction,
-    paste: PasteAction,
-    insert_at_position: InsertAtPosition,
-    open_line: OpenLineDirection,
     undo,
     enter_paste_mode,
     exit_paste_mode,
@@ -129,55 +103,6 @@ pub const Action = union(enum) {
 
 const CTRL_W = 23;
 
-/// Get action for vim normal mode keypress
-pub fn normalModeAction(char: u8) Action {
-    return switch (char) {
-        'h' => .{ .move_cursor = .{ .relative = -1 } },
-        'l' => .{ .move_cursor = .{ .relative = 1 } },
-        '0' => .{ .move_cursor = .to_line_start },
-        '$' => .{ .move_cursor = .to_line_end },
-
-        'w' => .{ .move_cursor = .{ .word_forward = .word } },
-        'W' => .{ .move_cursor = .{ .word_forward = .WORD } },
-        'b' => .{ .move_cursor = .{ .word_backward = .word } },
-        'B' => .{ .move_cursor = .{ .word_backward = .WORD } },
-        'e' => .{ .move_cursor = .{ .word_forward = .word_end } },
-        'E' => .{ .move_cursor = .{ .word_forward = .WORD_end } },
-
-        'j' => .{ .move_cursor = .line_down },
-        'k' => .{ .move_cursor = .line_up },
-
-        'i' => .{ .vim_mode = .{ .set_mode = .insert } },
-
-        'a' => .{ .insert_at_position = .after_cursor },
-        'A' => .{ .insert_at_position = .line_end },
-        'I' => .{ .insert_at_position = .line_start },
-
-        'o' => .{ .open_line = .below },
-        'O' => .{ .open_line = .above },
-
-        'x' => .{ .delete = .char_under_cursor },
-        'D' => .{ .delete = .to_line_end },
-
-        'p' => .{ .paste = .after_cursor },
-        'P' => .{ .paste = .before_cursor },
-
-        'y' => .{ .yank = .line },
-
-        'u' => .undo,
-
-        '/' => .{ .enter_search_mode = .forward },
-        '?' => .{ .enter_search_mode = .backward },
-
-        '\n' => .execute_command,
-
-        CTRL_C => .cancel,
-        CTRL_G => .cancel_agent,
-        CTRL_Z => .suspend_shell,
-
-        else => .none,
-    };
-}
 
 // ── Configurable Keybindings ──
 
