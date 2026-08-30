@@ -623,16 +623,23 @@ pub const TermView = struct {
         // compute cursor position in content
         var cursor_row: u16 = 0;
         var cursor_col: u16 = effective_prompt_vis;
+        // Whether the cursor's current row was reached by a hard '\n' (not a
+        // width-wrap). A col-0 position from a newline is a real terminal row;
+        // one from a wrap is the deferred-wrap phantom (physical cursor still on
+        // the row above at col=width). positionCursor must not correct the former.
+        var cursor_via_newline = false;
 
         for (text[0..buf.cursor]) |c| {
             if (c == '\n') {
                 cursor_row += 1;
                 cursor_col = cont_marker_len;
+                cursor_via_newline = true;
             } else {
                 cursor_col += 1;
                 if (w > 0 and cursor_col >= w) {
                     cursor_row += 1;
                     cursor_col = 0;
+                    cursor_via_newline = false;
                 }
             }
         }
@@ -683,6 +690,7 @@ pub const TermView = struct {
         // width, matching cursor_col above — see effective_prompt_vis note)
         var render_row: u16 = 0;
         var render_col: u16 = effective_prompt_vis;
+        var render_via_newline = false; // see cursor_via_newline above
 
         // emit content with syntax highlighting and continuation markers
         var hl = SyntaxHighlighter{};
@@ -700,12 +708,14 @@ pub const TermView = struct {
                 hl.first_word = true;
                 render_row += 1;
                 render_col = cont_marker_len;
+                render_via_newline = true;
             } else {
                 hl.feed(self, c);
                 render_col += 1;
                 if (w > 0 and render_col >= w) {
                     render_row += 1;
                     render_col = 0;
+                    render_via_newline = false;
                 }
             }
         }
@@ -733,6 +743,7 @@ pub const TermView = struct {
                 if (w > 0 and render_col >= w) {
                     render_row += 1;
                     render_col = 0;
+                    render_via_newline = false;
                 }
             }
             // right: future (italic = placeholder, never reads as committed)
@@ -745,6 +756,7 @@ pub const TermView = struct {
                 if (w > 0 and render_col >= w) {
                     render_row += 1;
                     render_col = 0;
+                    render_via_newline = false;
                 }
             }
             _ = self.emit(Color.reset);
@@ -765,6 +777,8 @@ pub const TermView = struct {
             w,
             hash,
             buf.cursor,
+            render_via_newline,
+            cursor_via_newline,
         );
 
         // Optional render trace for debugging the small-window blank bug.

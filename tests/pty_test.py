@@ -866,6 +866,35 @@ def _(sh):
     expect_soon(sh, "bbb")
 
 
+@test("o then Esc on a multi-line buffer redraws in place, no prompt pile-up")
+def _(sh):
+    # `o` inserts a newline (open line below); repeated o/Esc builds an empty
+    # multi-line buffer, and the vi-mode indicator in the built-in prompt (PS1="")
+    # forces a redraw on every keystroke. The redraw must stay one prompt with
+    # blank continuation lines — not re-emit a whole prompt per keystroke (a
+    # deferred-wrap miscount on col-0 hard-newline rows piled up six prompt copies
+    # in scrollback). Needs the built-in prompt: a static PS1 has no mode
+    # indicator, so mode toggles don't redraw and the pile-up never shows.
+    small = Shell(env_extra={"PS1": ""}, cols=80, rows=24)
+    try:
+        small.read()
+        small.send("abc")
+        small.read(quiet_for=0.2, timeout=2.0)
+        for _ in range(3):
+            vi_normal(small)        # Esc (with the anti-race gap) -> normal
+            small.send("o")         # open line below -> insert
+            small.read(quiet_for=0.15, timeout=2.0)
+        vi_normal(small)
+        small.read(quiet_for=0.2, timeout=2.0)
+        screen = small.vt.visible_text()
+        prompts = screen.count("$ abc")
+        assert prompts == 1, f"prompt pile-up: {prompts} copies of '$ abc'\n" + \
+            "\n".join("        | " + l for l in screen.splitlines() if l.strip())
+    finally:
+        small.close()
+        sh.vt = None
+
+
 @test("G jumps to the last line of a multi-line command, not line 1's end")
 def _(sh):
     # Paste two lines, gg to the top, G to the last line, append X. A G that

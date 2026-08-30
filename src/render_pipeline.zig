@@ -29,6 +29,12 @@ pub fn positionCursor(
     width: u16,
     hash: u64,
     cursor_pos: u16,
+    // A col-0 position is a deferred wrap ONLY when it was reached by filling the
+    // line to `width`. Reached by a hard '\n' (an empty continuation line), col 0
+    // is a real terminal row and must not be corrected up — otherwise term.row is
+    // one short, the next redraw moves up too little, and prompts pile up.
+    render_via_newline: bool,
+    cursor_via_newline: bool,
 ) void {
     // Viewport-overflow / wrap-induced scroll correction.
     //
@@ -49,7 +55,7 @@ pub fn positionCursor(
     const max_visible_row: u16 = if (height > 0) height - 1 else render_row;
 
     // Deferred wrap correction for render position
-    const in_deferred_wrap = render_col == 0 and render_row > 0;
+    const in_deferred_wrap = render_col == 0 and render_row > 0 and !render_via_newline;
     const raw_row: u16 = if (in_deferred_wrap) render_row - 1 else render_row;
     view.term.row = @min(raw_row, max_visible_row);
     view.term.col = if (in_deferred_wrap) width else render_col;
@@ -61,7 +67,7 @@ pub fn positionCursor(
         render_row - max_visible_row
     else
         0;
-    const cursor_deferred = cursor_col == 0 and cursor_row > 0 and cursor_at_end;
+    const cursor_deferred = cursor_col == 0 and cursor_row > 0 and cursor_at_end and !cursor_via_newline;
     const target_row: u16 = if (cursor_deferred) cursor_row - 1 else cursor_row;
     view.moveTo(
         target_row -| scrolled_off,
@@ -86,7 +92,7 @@ test "deferred-wrap: render_col==0 corrects terminal row" {
     view.term.col = 0;
 
     // Content filled exactly 2 rows (render_col=0, render_row=2 → deferred wrap)
-    positionCursor(&view, 2, 0, 0, 5, false, 80, 0x1234, 5);
+    positionCursor(&view, 2, 0, 0, 5, false, 80, 0x1234, 5, false, false);
 
     // moveTo targets cursor (row 0, col 5); intermediate correction was row=1, col=80
     try std.testing.expectEqual(@as(u16, 0), view.term.row);
@@ -99,7 +105,7 @@ test "deferred-wrap: no adjustment when render_col != 0" {
     var view = TermView.init(compat.posix.STDERR_FILENO);
     view.term.width = 80;
 
-    positionCursor(&view, 1, 50, 1, 30, false, 80, 0xABCD, 90);
+    positionCursor(&view, 1, 50, 1, 30, false, 80, 0xABCD, 90, false, false);
 
     try std.testing.expectEqual(@as(u16, 1), view.term.row);
     try std.testing.expectEqual(@as(u16, 30), view.term.col);
@@ -110,10 +116,25 @@ test "deferred-wrap: cursor at exact fill corrects cursor target" {
     view.term.width = 80;
 
     // cursor_col=0, cursor_row=1, cursor_at_end=true → deferred wrap for cursor too
-    positionCursor(&view, 1, 0, 1, 0, true, 80, 0, 80);
+    positionCursor(&view, 1, 0, 1, 0, true, 80, 0, 80, false, false);
 
     // Both render and cursor corrected: row 1 → 0
     try std.testing.expectEqual(@as(u16, 0), view.term.row);
+}
+
+test "hard newline: col 0 from a newline is NOT a deferred wrap" {
+    var view = TermView.init(compat.posix.STDERR_FILENO);
+    view.term.width = 80;
+
+    // Buffer "abc\n\n\n": cursor on an empty continuation line reached by a hard
+    // '\n', so render_col==0/render_row==3 but via_newline=true. term.row must be
+    // the real row 3, not corrected to 2 — else the next redraw moves up one too
+    // few and prompts pile up (the o/Esc regression).
+    positionCursor(&view, 3, 0, 3, 0, true, 80, 0x5151, 6, true, true);
+
+    try std.testing.expectEqual(@as(u16, 3), view.term.row);
+    try std.testing.expectEqual(@as(u16, 0), view.term.col);
+    try std.testing.expectEqual(@as(u16, 4), view.term.rows_owned);
 }
 
 test "viewport overflow: term.row clamped to height-1 (small-window blank fix)" {
@@ -123,7 +144,7 @@ test "viewport overflow: term.row clamped to height-1 (small-window blank fix)" 
 
     // Content wrapped to 5 rows in a 3-row viewport — the terminal scrolled, so
     // the prompt anchor is off-screen. render_row=4, cursor at the end.
-    positionCursor(&view, 4, 6, 4, 6, true, 12, 0xBEEF, 60);
+    positionCursor(&view, 4, 6, 4, 6, true, 12, 0xBEEF, 60, false, false);
 
     // term.row must never exceed height-1, or the next render's \x1b[{row}A
     // overshoots and \x1b[J blanks the whole viewport.
@@ -136,7 +157,7 @@ test "viewport overflow: height==0 (unknown) falls back to no clamp" {
     view.term.width = 80;
     view.term.height = 0; // size not yet known
 
-    positionCursor(&view, 3, 10, 3, 10, false, 80, 0, 40);
+    positionCursor(&view, 3, 10, 3, 10, false, 80, 0, 40, false, false);
     // With unknown height, behave as before (no clamp): term.row == render_row
     try std.testing.expectEqual(@as(u16, 3), view.term.row);
 }
