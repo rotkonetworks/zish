@@ -9,6 +9,7 @@ const editor = @import("editor.zig");
 const linkify = @import("linkify.zig");
 const compat = @import("compat.zig");
 const foreground = @import("foreground.zig");
+const session_mod = @import("session.zig");
 
 // directory stack for pushd/popd
 var dir_stack: std.ArrayList([]const u8) = undefined;
@@ -142,6 +143,8 @@ pub const table = [_]Builtin{
 
     .{ .name = "feat", .run = bElsewhere },
     .{ .name = "chpw", .run = bElsewhere },
+
+    .{ .name = "session", .run = withArgs(sessionCmd) },
 };
 
 fn lookup(name: []const u8) ?Builtin {
@@ -1928,6 +1931,72 @@ fn kill(shell: *Shell, args: []const []const u8) !u8 {
         }
     }
     return 0;
+}
+
+/// `session` — inspect and drive async agent sessions (the file/command
+/// surface of the agent armor):
+///   session [list]              list live sessions
+///   session answer <id> <text>  answer a session's pending question
+///   session kill <id>           end a session (SIGKILL if it lingers)
+///   session log <id>            print a session's transcript path
+fn sessionCmd(shell: *Shell, args: []const []const u8) !u8 {
+    const out = shell.stdout();
+    if (args.len < 2 or std.mem.eql(u8, args[1], "list")) {
+        if (shell.sessions.items.len == 0) {
+            try out.writeAll("session: none active\n");
+            return 0;
+        }
+        for (shell.sessions.items) |*s| {
+            const state: []const u8 = if (s.pending_q != null) "awaiting answer" else "running";
+            try out.print("[{d}] {s}  {s}  {s}\n", .{ s.id, s.name, state, s.transcript_path });
+            if (s.pending_q) |q| try out.print("    ? {s}\n", .{q});
+        }
+        return 0;
+    }
+
+    const sub = args[1];
+    if (std.mem.eql(u8, sub, "answer")) {
+        if (args.len < 4) {
+            try shell.stderr().writeAll("session: usage: session answer <id> <text>\n");
+            return 1;
+        }
+        const id = std.fmt.parseInt(u32, args[2], 10) catch {
+            try shell.stderr().writeAll("session: invalid session id\n");
+            return 1;
+        };
+        // join the remaining words back into one answer string
+        var text: std.ArrayListUnmanaged(u8) = .empty;
+        defer text.deinit(shell.allocator);
+        for (args[3..], 0..) |a, i| {
+            if (i > 0) try text.append(shell.allocator, ' ');
+            try text.appendSlice(shell.allocator, a);
+        }
+        return session_mod.answerSession(shell, id, text.items);
+    }
+
+    if (std.mem.eql(u8, sub, "kill") or std.mem.eql(u8, sub, "log")) {
+        if (args.len < 3) {
+            try shell.stderr().print("session: usage: session {s} <id>\n", .{sub});
+            return 1;
+        }
+        const id = std.fmt.parseInt(u32, args[2], 10) catch {
+            try shell.stderr().writeAll("session: invalid session id\n");
+            return 1;
+        };
+        const idx = session_mod.findById(shell, id) orelse {
+            try shell.stderr().print("session: no session {d}\n", .{id});
+            return 1;
+        };
+        if (sub[0] == 'k') {
+            session_mod.finishSession(shell, idx);
+        } else {
+            try out.print("{s}\n", .{shell.sessions.items[idx].transcript_path});
+        }
+        return 0;
+    }
+
+    try shell.stderr().writeAll("session: usage: session [list | answer <id> <text> | kill <id> | log <id>]\n");
+    return 1;
 }
 
 fn disown(shell: *Shell, args: []const []const u8) !u8 {

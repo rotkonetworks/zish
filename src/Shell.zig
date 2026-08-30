@@ -28,6 +28,7 @@ const trace = @import("trace.zig");
 const heredoc = @import("heredoc.zig");
 const expand = @import("expand.zig");
 const line_editor = @import("line_editor.zig");
+const session_mod = @import("session.zig");
 
 // Re-export from input module (for compatibility)
 const VimMode = input_mod.VimMode;
@@ -245,6 +246,10 @@ proc_subst_count: usize = 0,
 // job control
 job_table: jobs.JobTable,
 
+// async session feats (agent armor) — serviced from readNextAction's poll
+sessions: std.ArrayListUnmanaged(session_mod.Session) = .empty,
+next_session_id: u32 = 1,
+
 // new modular editor
 edit_buf: editor.EditBuffer = .{},
 term_view: editor.TermView,
@@ -377,6 +382,11 @@ fn initWithOptions(allocator: std.mem.Allocator, load_config: bool) !*Shell {
 }
 
 pub fn deinit(self: *Shell) void {
+    // kill + reap live agent sessions first: an exiting shell leaves no
+    // orphaned agent running unattended (fail-closed)
+    session_mod.shutdownAll(self);
+    self.sessions.deinit(self.allocator);
+
     // restore terminal mode before cleanup
     self.disableRawMode();
 
@@ -621,7 +631,9 @@ pub fn run(self: *Shell) !void {
         try self.stdout().flush();
     }
 
-    // restore terminal and exit immediately
+    // restore terminal and exit immediately (std.process.exit skips deinit,
+    // so live agent sessions must be killed + reaped here — fail-closed)
+    session_mod.shutdownAll(self);
     self.disableRawMode();
     self.setCursorStyle(.default) catch {};
     self.stdout().flush() catch {};
@@ -936,9 +948,35 @@ fn readNextAction(self: *Shell) !Action {
     // keystroke. std.posix.poll and readStreaming both retry EINTR internally,
     // so use the libc poll directly — it returns -1/EINTR, and run() then sees
     // the terminal_resized flag on the next loop turn.
-    var pfd = [_]std.c.pollfd{.{ .fd = std.posix.STDIN_FILENO, .events = std.c.POLL.IN, .revents = 0 }};
-    const prc = std.c.poll(&pfd, 1, -1);
+    // Multiplex {stdin} ∪ {session-feat fds}: an agent session's frames are
+    // serviced between keystrokes, so the prompt stays live while a session
+    // feat runs (the agent-armor async substrate). Sessions are polled and
+    // serviced first; stdin readiness then falls through to the key read.
+    var pfds: [1 + session_mod.MAX_SESSIONS]std.c.pollfd = undefined;
+    pfds[0] = .{ .fd = std.posix.STDIN_FILENO, .events = std.c.POLL.IN, .revents = 0 };
+    var nfds: usize = 1;
+    for (self.sessions.items) |*s| {
+        if (nfds >= pfds.len) break;
+        pfds[nfds] = .{ .fd = s.r, .events = std.c.POLL.IN, .revents = 0 };
+        nfds += 1;
+    }
+    const prc = std.c.poll(&pfds, @intCast(nfds), -1);
     if (prc <= 0) return .none; // EINTR (SIGWINCH) or spurious wake — loop again
+
+    if (nfds > 1) {
+        // Collect ready fds first: servicing can remove sessions (done/EOF),
+        // which mutates the table the pfds were built from.
+        var ready: [session_mod.MAX_SESSIONS]posix.fd_t = undefined;
+        var nready: usize = 0;
+        for (pfds[1..nfds]) |p| {
+            if (p.revents != 0) { // IN, HUP or ERR all mean "go read it"
+                ready[nready] = p.fd;
+                nready += 1;
+            }
+        }
+        for (ready[0..nready]) |fd| session_mod.serviceByFd(self, fd);
+    }
+    if ((pfds[0].revents & std.c.POLL.IN) == 0) return .none;
 
     var temp_buf: [1]u8 = undefined;
     const count = try compat.readAll(std.Io.File.stdin(), temp_buf[0..]);

@@ -1343,8 +1343,16 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
                 try shell.stdout().writeAll("feat: refusing to run extra feat as root\n");
                 return 126;
             }
-            if (f.kind == .session)
+            if (f.kind == .session) {
+                // Async when there is a live interactive prompt to return to;
+                // sync (blocking host) everywhere else. isatty(stdout) is the
+                // whole discriminator: command substitution and session `run`
+                // frames swap stdout to a capture file, `zish -c` never enters
+                // run() — all of those need the blocking host.
+                if (shell.running and compat.posix.isatty(compat.posix.STDOUT_FILENO))
+                    return try session.launchSession(shell, cmd_name, f.bin, expanded_args.items[1..]);
                 return try session.hostSessionFeat(shell, f.bin, expanded_args.items[1..]);
+            }
             return try featExec(shell, f.tier, f.bin, expanded_args.items[1..]);
         }
     }

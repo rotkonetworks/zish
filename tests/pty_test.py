@@ -1039,6 +1039,90 @@ def _(sh):
 
 
 # ---------------------------------------------------------------------------
+print("\nsession feats (agent armor async substrate)")
+# ---------------------------------------------------------------------------
+
+PESTER_SCRIPT = """#!/bin/sh
+printf '%s\\n' '{"t":"say","text":"hello-\\u001b[31mred"}'
+printf '%s\\n' '{"t":"run","cmd":"echo tool_ran_ok"}'
+read result_line
+sleep 0.4
+printf '%s\\n' '{"t":"prompt","text":"proceed?"}'
+read answer_line
+printf '%s\\n' '{"t":"say","text":"answered-ok"}'
+printf '%s\\n' '{"t":"done"}'
+"""
+
+
+def make_session_featroot(name, script):
+    """A temp feat root holding one session-feat backed by a shell script."""
+    featroot = tempfile.mkdtemp(prefix="zish-featroot-")
+    d = os.path.join(featroot, "standard", name)
+    os.makedirs(os.path.join(d, "bin"))
+    with open(os.path.join(d, "feat.toml"), "w") as f:
+        f.write(f'name = "{name}"\ntier = "standard"\nkind = "session"\nbin = "{name}"\n')
+    p = os.path.join(d, "bin", name)
+    with open(p, "w") as f:
+        f.write(script)
+    os.chmod(p, 0o755)
+    return featroot
+
+
+@test("session feat runs async: prompt stays live, say sanitized, answer round-trip")
+def _(sh):
+    # The whole async substrate in one arc. Fails fast on the old blocking
+    # host: there the shell sits inside hostSessionFeat until the feat exits,
+    # so the `echo alive` below never runs (the feat is parked awaiting its
+    # prompt answer, which the old binary can neither display nor deliver).
+    featroot = make_session_featroot("pester", PESTER_SCRIPT)
+    small = Shell(env_extra={"ZISH_FEAT_PATH": featroot})
+    try:
+        small.read()
+        small.sendline("pester")
+        expect_soon(small, "started")
+        # 1. liveness: the prompt is usable while the session runs
+        small.sendline("echo alive_$((3 + 4))")
+        expect_soon(small, "alive_7")
+        # 2. prompt frame parks as a pending question (this also syncs us past
+        #    the say frame, which may arrive in the same burst)
+        expect_soon(small, "asks: proceed?")
+        # 3. hostile say: sanitized text arrived, raw SGR never reached the tty
+        assert "hello-red" in clean(small.buf), f"sanitized say missing: {clean(small.buf)[-400:]!r}"
+        assert "\x1b[31mred" not in small.buf, "raw SGR from feat reached the terminal"
+        small.sendline("session answer 1 yes")
+        # `ended` is last in the stream; the answered say precedes it in the burst
+        out = expect_soon(small, "ended")
+        assert "answered-ok" in out, f"post-answer say missing: {out[-400:]!r}"
+        # 4. the run hypercall was executed and audited: transcript has it,
+        #    sanitized (cat of a transcript is terminal-safe by construction)
+        small.sendline("cat ~/.zish/sessions/*.log")
+        expect_soon(small, "tool_ran_ok")
+        assert "\x1b[31mred" not in small.buf, "raw SGR leaked into the transcript"
+    finally:
+        small.close()
+        shutil.rmtree(featroot, ignore_errors=True)
+
+
+@test("session feat with redirected stdout uses the sync host")
+def _(sh):
+    # isatty(stdout) is the async/sync discriminator: redirected, the feat is
+    # hosted blocking and its say output lands in the redirect target; the
+    # prompt frame is auto-cancelled (nobody to ask) so the script completes.
+    featroot = make_session_featroot("pester", PESTER_SCRIPT)
+    small = Shell(env_extra={"ZISH_FEAT_PATH": featroot})
+    try:
+        small.read()
+        small.sendline("pester > ~/psync.out; echo sync_rc_$?; cat ~/psync.out")
+        # answered-ok is last in the stream; the accumulated read holds the rest
+        out = expect_soon(small, "answered-ok")
+        assert "sync_rc_0" in out, f"sync host exit marker missing: {out[-400:]!r}"
+        assert "started" not in out, "redirected session feat went async"
+    finally:
+        small.close()
+        shutil.rmtree(featroot, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
 total = passed + failed
 print()
 if failed == 0:
