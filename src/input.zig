@@ -83,14 +83,8 @@ pub const OpenLineDirection = enum {
     above, // O - open line above
 };
 
-pub const VisualModeType = enum {
-    char,  // v
-    line,  // V
-};
-
 pub const VimModeAction = union(enum) {
     set_mode: VimMode,
-    enter_visual: VisualModeType,
 };
 
 // Main action type

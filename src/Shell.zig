@@ -1329,10 +1329,6 @@ fn handleAction(self: *Shell, action: Action) !void {
                         }
                     }
                 },
-                .enter_visual => |vtype| {
-                    self.vi.mode = if (vtype == .line) .visual_line else .visual;
-                    self.vi.visual_start = self.edit_buf.cursor;
-                },
             }
             // update cursor style to match vim mode
             const cursor = if (self.vim_mode == .normal) CursorStyle.block else CursorStyle.bar;
@@ -2003,11 +1999,10 @@ fn normalModeDispatch(self: *Shell, char: u8) !Action {
         v.awaiting_find or v.pending_g or v.mode == .replace or v.count != 0;
     if (in_sequence) return self.viStateMachineKey(char);
     return switch (char) {
-        // Shell-integration keys (history nav, search, submit, signals) and
-        // visual entry — v/V go through the .enter_visual Action, which forces
-        // the selection-highlight redraw that vim.zig's plain mode-change does
-        // not; handleVisual then owns every key while the selection is live.
-        'j', 'k', '/', '?', 'v', 'V', '\n', '\r', CTRL_C, CTRL_G, CTRL_Z => normalModeAction(char),
+        // The ONLY normal-mode keys not owned by vim.zig: history navigation,
+        // incremental search, line submit, and the signal keys. Everything else
+        // — including visual entry (v/V) — goes to the one state machine.
+        'j', 'k', '/', '?', '\n', '\r', CTRL_C, CTRL_G, CTRL_Z => normalModeAction(char),
         else => self.viStateMachineKey(char),
     };
 }
@@ -2021,10 +2016,22 @@ fn viStateMachineKey(self: *Shell, char: u8) !Action {
     if (self.history_index != -1) {
         self.history_search_prefix_len = self.edit_buf.len;
     }
+    // Visual / visual-line: vim.zig owns the selection state. Do NOT route
+    // through the set_mode Action — its handler forces vi.mode back to normal
+    // (vi.mode = if (mode == .normal) .normal else .insert), which would abandon
+    // the selection the instant we entered it — that is what made a visual `y`
+    // fall through to the whole-line yank. Just sync the block-cursor mode, force
+    // the selection-highlight redraw (buffer text is unchanged, only the
+    // selection moved, so the render hash must be invalidated), and render.
+    if (self.vi.mode == .visual or self.vi.mode == .visual_line) {
+        self.vim_mode = .normal;
+        self.term_view.last_hash = 0xDEADBEEF;
+        return .redraw_line;
+    }
     // Reconcile the shell's mode with the state machine's. vim.zig is not
     // reliable about returning .mode_changed (e.g. cc/dd clear pending_op
     // before checking it), so sync straight off self.vi.mode instead. replace
-    // and visual sub-modes leave vim_mode == .normal (block cursor).
+    // leaves vim_mode == .normal (block cursor).
     const now_insert = self.vi.mode == .insert;
     if (now_insert != was_insert or result == .mode_changed) {
         self.vim_mode = if (now_insert) .insert else .normal;
@@ -2060,12 +2067,6 @@ fn normalModeAction(char: u8) Action {
 
         '/' => .{ .enter_search_mode = .forward },
         '?' => .{ .enter_search_mode = .backward },
-
-        // Visual entry: sets vi.mode + visual_start and forces the highlight
-        // redraw. Once in visual mode, normalModeDispatch routes every key to
-        // vim.zig's selection-aware handleVisual.
-        'v' => .{ .vim_mode = .{ .enter_visual = .char } },
-        'V' => .{ .vim_mode = .{ .enter_visual = .line } },
 
         // Enter accepts the line (readline vi-command-mode). In raw mode the
         // terminal delivers CR (\r) for Return, so both must submit.
