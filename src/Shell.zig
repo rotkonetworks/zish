@@ -1992,25 +1992,24 @@ fn normalModeDispatch(self: *Shell, char: u8) !Action {
             else => self.viStateMachineKey(char),
         };
     }
-    // A sequence is already in progress, or this key starts one.
+    // vim.zig is the SINGLE owner of vi editing. A key that is mid-sequence
+    // (3j, dj, dfx, ciw) always completes it there; otherwise every key routes
+    // to the state machine EXCEPT the handful that are shell-integration, not
+    // editing: history navigation (j/k), incremental search (/ ?), line submit,
+    // and the signal keys. Keeping two parallel normal-mode handlers is exactly
+    // what let normalModeAction's whole-line 'y' shadow vim.zig's selection —
+    // there is now one path.
     const in_sequence = v.pending_op != .none or v.awaiting_text_obj or
         v.awaiting_find or v.pending_g or v.mode == .replace or v.count != 0;
-    const starts_sequence = switch (char) {
-        'd', 'c', 'r', 'g' => true,
-        '1'...'9' => true,
-        // find-char motions (f/F/t/T await a target char), their repeat keys
-        // (;/,), the matching-bracket motion (%), plain undo (u, so it goes
-        // through vim.zig's real multi-level undo instead of the unrelated
-        // .undo Action below, which just clears the line), and redo
-        // (Ctrl-R, 0x12 — dead in normal mode otherwise: it's only bound to
-        // reverse-search in insert mode's keybindings table).
-        'f', 'F', 't', 'T', ';', ',', '%', 'u', 0x12 => true,
-        else => false,
+    if (in_sequence) return self.viStateMachineKey(char);
+    return switch (char) {
+        // Shell-integration keys (history nav, search, submit, signals) and
+        // visual entry — v/V go through the .enter_visual Action, which forces
+        // the selection-highlight redraw that vim.zig's plain mode-change does
+        // not; handleVisual then owns every key while the selection is live.
+        'j', 'k', '/', '?', 'v', 'V', '\n', '\r', CTRL_C, CTRL_G, CTRL_Z => normalModeAction(char),
+        else => self.viStateMachineKey(char),
     };
-    if (in_sequence or starts_sequence) {
-        return self.viStateMachineKey(char);
-    }
-    return normalModeAction(char);
 }
 
 // Feed one key to the vim.zig state machine and translate the result back into
@@ -2050,45 +2049,21 @@ fn resolveInsertAction(self: *Shell, char: u8) Action {
     };
 }
 
+// Normal-mode keys that are NOT vi editing — shell integration only. Every
+// editing key (h/l/w/b/e/i/a/x/p/y/u/v/…) is now owned by vim.zig and reached
+// through viStateMachineKey; this handles just the four things vim.zig doesn't:
+// history navigation, incremental search, line submit, and the signal keys.
 fn normalModeAction(char: u8) Action {
     return switch (char) {
-        'h' => .{ .move_cursor = .{ .relative = -1 } },
-        'l' => .{ .move_cursor = .{ .relative = 1 } },
-        '0' => .{ .move_cursor = .to_line_start },
-        '$' => .{ .move_cursor = .to_line_end },
-
-        'w' => .{ .move_cursor = .{ .word_forward = .word } },
-        'W' => .{ .move_cursor = .{ .word_forward = .WORD } },
-        'b' => .{ .move_cursor = .{ .word_backward = .word } },
-        'B' => .{ .move_cursor = .{ .word_backward = .WORD } },
-        'e' => .{ .move_cursor = .{ .word_forward = .word_end } },
-        'E' => .{ .move_cursor = .{ .word_forward = .WORD_end } },
-
-        'j' => .{ .move_cursor = .line_down },
-        'k' => .{ .move_cursor = .line_up },
-
-        'i' => .{ .vim_mode = .{ .set_mode = .insert } },
-
-        'a' => .{ .insert_at_position = .after_cursor },
-        'A' => .{ .insert_at_position = .line_end },
-        'I' => .{ .insert_at_position = .line_start },
-
-        'o' => .{ .open_line = .below },
-        'O' => .{ .open_line = .above },
-
-        'x' => .{ .delete = .char_under_cursor },
-        'D' => .{ .delete = .to_line_end },
-
-        'p' => .{ .paste = .after_cursor },
-        'P' => .{ .paste = .before_cursor },
-
-        'y' => .{ .yank = .line },
-
-        'u' => .undo,
+        'j' => .{ .move_cursor = .line_down }, // history: next
+        'k' => .{ .move_cursor = .line_up }, // history: prev
 
         '/' => .{ .enter_search_mode = .forward },
         '?' => .{ .enter_search_mode = .backward },
 
+        // Visual entry: sets vi.mode + visual_start and forces the highlight
+        // redraw. Once in visual mode, normalModeDispatch routes every key to
+        // vim.zig's selection-aware handleVisual.
         'v' => .{ .vim_mode = .{ .enter_visual = .char } },
         'V' => .{ .vim_mode = .{ .enter_visual = .line } },
 
