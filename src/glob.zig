@@ -20,7 +20,7 @@ pub fn expandGlob(allocator: std.mem.Allocator, pattern: []const u8) ![][]const 
     }
 }
 
-// Glob character check using lookup table - SectorLambda-inspired
+// Glob character check using lookup table
 const glob_char_table: [256]bool = blk: {
     var table = [_]bool{false} ** 256;
     table['*'] = true;

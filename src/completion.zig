@@ -1782,9 +1782,9 @@ fn trySubcommandCompletion(self: *Shell, cmd: []const u8, word_result: WordResul
 /// '.', and nothing outside a conservative character set. Every shell
 /// metacharacter is rejected as a side effect.
 ///
-/// This is defense in depth. Callers below no longer invoke a shell at all,
-/// so metacharacters are already inert; this keeps them inert even if some
-/// future caller reintroduces one.
+/// This is defense in depth. Callers below do not invoke a shell at all, so
+/// metacharacters are already inert; this keeps them inert even if some future
+/// caller reintroduces one.
 fn isSafeProbeName(name: []const u8) bool {
     if (name.len == 0 or name.len > 32) return false;
     if (name[0] == '-' or name[0] == '.') return false;
@@ -1799,10 +1799,9 @@ fn isSafeProbeName(name: []const u8) bool {
 /// Spawn `argv` with stdout and stderr merged into a single pipe and read up
 /// to `buf.len` bytes of it. Returns the byte count (0 on any failure).
 ///
-/// The merge reproduces the `2>&1` that the old `/bin/sh -c "..."` string
-/// provided — many tools print --help to stderr — but without a shell in the
-/// loop, so argv elements reach execve verbatim and are never parsed as shell
-/// syntax.
+/// The merge reproduces `2>&1` (many tools print --help to stderr) but without
+/// a shell in the loop, so argv elements reach execve verbatim and are never
+/// parsed as shell syntax.
 ///
 /// If the child outputs more than `buf.len` we stop reading and close the read
 /// end; the child then takes EPIPE/SIGPIPE and exits, rather than blocking
@@ -2805,8 +2804,6 @@ pub fn displayCompletions(self: *Shell) !void {
 // Accepted: user pressed Tab/Right to accept ghost text → positive signal
 // Rejected: user typed a different character while ghost text was visible → negative signal
 // Format: {"ctx":"text","pfx":"prefix","cmp":"completion","src":"ghost_h","act":"accept|reject","ts":N}
-// This data enables Libratus-style counterfactual regret training:
-// the model learns from its mistakes by seeing what the user actually typed.
 const CompletionSource = enum { tab, ghost_history, history_menu };
 
 fn logCompletionWith(cmd: []const u8, word_start: usize, prefix: []const u8, completion: []const u8, source: CompletionSource) void {

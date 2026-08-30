@@ -1,6 +1,6 @@
 //! Fuzz targets for zish.
 //!
-//!   zig build fuzz            run every target: randomized sweep + one Smith pass
+//!   zig build fuzz            run every target once (randomized sweep)
 //!   zig build fuzz --fuzz     coverage-guided search (see TOOLCHAIN NOTE)
 //!   zig build test            same targets, wired into the normal suite
 //!

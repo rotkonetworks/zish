@@ -744,7 +744,7 @@ pub fn parseEscape(s: []const u8, mode: EscapeMode) EscapeResult {
 // ~1 read/line instead of ~1 poll+read per byte), growing the caller's buffer so
 // there is no line-length limit, and reconciling the fd offset on pushback().
 //
-// SAFETY (micay): over-reading past a delimiter is only sound on a fd we can
+// SAFETY: over-reading past a delimiter is only sound on a fd we can
 // rewind. init() probes with lseek; a non-seekable fd (pipe/tty/socket) drops to
 // byte-at-a-time so it never reads past what it returns — the over-read branch
 // is unreachable unless rewind is proven. INVARIANT: after pushback() the kernel
@@ -1162,28 +1162,9 @@ fn testCmd(shell: *Shell, args: []const []const u8) !u8 {
 
     if (test_args.len == 0) return 1;
 
-    // Delegate to the one evaluator.
-    //
-    // This was a second implementation of `test`, and the *shortcut* in
-    // eval.zig was the more capable one: it handled `!`, `-a`/`-o` and
-    // -nt/-ot/-ef, none of which existed here. Since the fast path bails to
-    // this function whenever an operand is quoted — and the parser normalises
-    // "$x" to ${x}, so that is *every* quoted variable — adding quotes flipped
-    // the answer:
-    //
-    //     [ ! -f /nonexistent ]   -> fast path -> true   (correct)
-    //     [ ! -f "$missing" ]     -> here      -> false  (wrong)
-    //
-    // `!` was not handled at all, so the three arguments `!`, `-f`, `` fell
-    // into the binary-operator branch with left="!", op="-f" and matched
-    // nothing. Features were added to the shortcut because that is where the
-    // debugging happened, and the general path rotted underneath.
-    //
-    // With one evaluator the fast path is what it should always have been: an
-    // argument-expansion optimisation, not a separate dialect of `test`.
-    // Imported here rather than at module scope, matching the other eval.zig
-    // uses in this file (eval imports builtins, so the cycle is broken at the
-    // call site).
+    // Delegate to the one `test` evaluator (handles !, -a/-o, -nt/-ot/-ef).
+    // Imported here rather than at module scope: eval imports builtins, so the
+    // cycle is broken at the call site.
     const eval_mod = @import("eval.zig");
     return if (eval_mod.evaluateTestExprFlat(shell, test_args)) 0 else 1;
 }
@@ -2192,7 +2173,7 @@ fn commandCmd(shell: *Shell, args: []const []const u8) !u8 {
     return error.RunAsCommand;
 }
 
-// ============ time builtin - criterion-style benchmarking ============
+// ============ time builtin - statistical benchmarking ============
 
 // rusage struct for Linux (matches kernel definition)
 const Rusage = extern struct {

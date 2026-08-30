@@ -907,8 +907,7 @@ pub const Vim = struct {
         // the cursor sits ON the closing bracket, that bracket is not part
         // of the backward scan itself — start looking just before it, or a
         // naive scan sees `)` first (depth 1), then the matching `(`
-        // immediately after decrements right back to a false "not found"
-        // (previously: `di)` with the cursor on `)` silently did nothing).
+        // immediately after decrements right back to a false "not found".
         const scan_from: i32 = if (cursor < buf.len and text[cursor] == close)
             @as(i32, @intCast(cursor)) - 1
         else

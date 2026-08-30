@@ -89,7 +89,7 @@ fn suggestCommand(shell: *Shell, typo: []const u8) void {
     }
 }
 
-// Fast integer parsing for small numbers - SectorLambda-inspired
+// Fast integer parsing for small numbers
 // Optimized for the common case of small positive integers (loop counters, etc.)
 inline fn fastParseI64(s: []const u8) ?i64 {
     if (s.len == 0 or s.len > 19) return null;
@@ -126,8 +126,8 @@ inline fn fastParseI64(s: []const u8) ?i64 {
 /// A forked child must not keep using the parent's GeneralPurposeAllocator: if
 /// another thread (ghost inference) held its lock at fork time, the child would
 /// deadlock on the first allocation. But it also cannot simply switch to
-/// page_allocator, which was the previous approach — the child inherits a heap
-/// full of GPA-owned pointers (PWD, variables, aliases), and the first builtin
+/// page_allocator: the child inherits a heap full of GPA-owned pointers (PWD,
+/// variables, aliases), and the first builtin
 /// that frees one, e.g. `( cd / )` reaching setVar, hands a GPA pointer to
 /// PageAllocator.free. That panics on "incorrect alignment" in a safety build
 /// and corrupts memory in ReleaseFast.
@@ -389,8 +389,7 @@ fn evaluateTestBuiltinFast(shell: *Shell, node: *const ast.AstNode) !u8 {
 /// Evaluate a flat `test` argument list: unary and binary operators, `!`
 /// negation, and `-a`/`-o` grouping.
 ///
-/// Public because builtins.testCmd delegates here. It used to be a second,
-/// less capable implementation of the same thing — see the note there.
+/// Public because builtins.testCmd delegates here.
 pub fn evaluateTestExprFlat(shell: *Shell, args: []const []const u8) bool {
     if (args.len == 0) return false;
 
@@ -751,7 +750,7 @@ fn evaluateEchoBuiltinFast(shell: *Shell, node: *const ast.AstNode) !u8 {
     }
 
     // Output - batch into single buffer to minimize syscalls
-    // SectorLambda-inspired: single write() is faster than multiple
+    // single write() is faster than multiple
     var out_buf: [4096]u8 = undefined;
     var out_pos: usize = 0;
 
@@ -1973,8 +1972,8 @@ fn applyHeredocInput(shell: *Shell, path: []const u8, expand: bool) !void {
         compat.writeAll(wf, exp) catch {};
     }
     const file = try std.Io.Dir.cwd().openFile(compat.io(), exp_path, .{ .mode = .read_only });
-    // Both cleanups must be defers: a failing dup2 previously skipped them,
-    // leaking the descriptor and leaving the temp file behind on every error.
+    // Both cleanups must be defers: a failing dup2 must not skip them, or the
+    // descriptor leaks and the temp file is left behind on every error.
     defer std.Io.Dir.deleteFileAbsolute(compat.io(), exp_path) catch {};
     defer file.close(compat.io());
     try compat.posix.dup2(file.handle, compat.posix.STDIN_FILENO);
@@ -2115,7 +2114,7 @@ fn applyFdRedirect(shell: *Shell, op: []const u8, target: []const u8, saver: *Fd
 
     // Note: ">|" is not handled here. applyRedirect matches ">" and ">|"
     // together before falling through to this function, so this function is
-    // never reached with op == ">|" — a dead branch used to sit here.
+    // never reached with op == ">|".
 
     if (std.mem.eql(u8, op, ">&")) {
         // >&digit -> dup that fd into stdout; >&file -> both stdout+stderr to file
@@ -2433,11 +2432,11 @@ pub fn evaluateAssignment(shell: *Shell, node: *const ast.AstNode) !u8 {
         var result_buf: [32]u8 = undefined;
         const result_str = std.fmt.bufPrint(&result_buf, "{d}", .{arith_result}) catch return 1;
 
-        // Store safely: free the old value and dupe a fresh buffer. The former
-        // in-place @memcpy mutated the variable's existing storage and shrank the
-        // slice below its allocation — which corrupts a later wrong-length free,
-        // and rewrites any command text still aliasing that storage (a
-        // self-referential PROMPT_COMMAND='n=$((n+1))' clobbered itself).
+        // Store safely: free the old value and dupe a fresh buffer. An in-place
+        // @memcpy would mutate the variable's existing storage and shrink the
+        // slice below its allocation — corrupting a later wrong-length free, and
+        // rewriting any command text still aliasing that storage (e.g. a
+        // self-referential PROMPT_COMMAND='n=$((n+1))').
         if (shell.variables.getPtr(name)) |value_ptr| {
             shell.allocator.free(value_ptr.*);
             value_ptr.* = try shell.allocator.dupe(u8, result_str);
@@ -2710,8 +2709,7 @@ fn collectWords(shell: *Shell, values: []const *const ast.AstNode, out: *std.Arr
 // The single unquoted-word expansion pipeline: brace expansion → variable /
 // command substitution → IFS field splitting → glob, appending one heap-owned
 // string per resulting field. Shared by evaluateCommand (argument words) and
-// collectWords (for/select word lists) — this used to be hand-copied in three
-// places, and the copies had drifted apart.
+// collectWords (for/select word lists) — one owner so they cannot drift.
 fn expandUnquotedWordInto(shell: *Shell, raw: []const u8, out: *std.ArrayList([]const u8)) !void {
     // Unquoted expansions ($var, ${var}, $(cmd), `cmd`, $((...))) undergo
     // word splitting on IFS (default: space/tab/newline). POSIX: only the
@@ -3302,8 +3300,8 @@ fn evaluateUnaryTest(shell: *Shell, opc: u8, operand: []const u8) bool {
             break :blk true;
         },
         'x' => blk: {
-            // stat, don't open: open(2) on a FIFO with no writer blocks forever,
-            // so `[ -x fifo ]` used to hang the shell. statPosix never opens.
+            // stat, don't open: open(2) on a FIFO with no writer blocks forever.
+            // statPosix never opens.
             const st = statPosix(operand) orelse break :blk false;
             break :blk (st.mode & 0o111) != 0;
         },
@@ -3960,10 +3958,8 @@ fn featExec(shell: *Shell, tier: FeatTier, bin_path: []const u8, sub_args: []con
     const argv_ptr: [*:null]const ?[*:0]const u8 = argv[0..n :null];
 
     // A feat is an external foreground command and gets the same job-control
-    // discipline as one (previously it forked with the terminal still in raw
-    // mode, in the shell's own process group, with signals ignored, and a
-    // non-UNTRACED wait — so a feat prompting on the tty couldn't be Ctrl+C'd
-    // and a Ctrl+Z hung the shell).
+    // discipline as one: own pgroup + terminal, default signals, UNTRACED wait —
+    // so a feat prompting on the tty can be Ctrl+C'd and Ctrl+Z doesn't hang.
     var fg_session = foreground.Session.begin(shell);
     defer fg_session.end();
 
@@ -4055,7 +4051,7 @@ fn featCmd(shell: *Shell, args: []const []const u8) !u8 {
             return 127;
         };
         defer alloc.free(resolved.bin);
-        // redshiftzero rule: untrusted extra feats never run as root.
+        // untrusted extra feats never run as root.
         if (resolved.tier == .extra and compat.posix.geteuid() == 0) {
             try shell.stdout().writeAll("feat: refusing to run extra feat as root\n");
             return 126;

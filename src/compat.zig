@@ -499,10 +499,9 @@ pub const posix = struct {
         }
     }
 
-    // libc-backed and therefore portable, unlike the raw std.os.linux syscall
-    // wrappers these replaced. A raw `syscall1(.getpgid, 0)` compiles for any
-    // target but emits a Linux syscall, so it is wrong at runtime everywhere
-    // else rather than failing to build.
+    // libc-backed and therefore portable. A raw `syscall1(.getpgid, 0)` compiles
+    // for any target but emits a Linux syscall, so it is wrong at runtime
+    // everywhere else rather than failing to build.
 
     // Zig 0.16 has no std.c binding for these two, so declare them. Going
     // through libc rather than a raw syscall is what makes them portable: a

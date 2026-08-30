@@ -1,9 +1,8 @@
 //! Tiny command-line parser.
 //!
-//! Replaces the `clap` dependency, which was pulled in to parse five flags.
-//! For a shell whose whole pitch is a self-contained binary, one build
-//! dependency for argument parsing is a poor trade — especially one fetched
-//! from `archive/refs/heads/master.tar.gz`, a moving branch.
+//! A shell whose whole pitch is a self-contained binary should not pull a build
+//! dependency just to parse five flags — least of all one fetched from
+//! `archive/refs/heads/master.tar.gz`, a moving branch.
 //!
 //! Two properties worth having that a general parser cannot offer:
 //!

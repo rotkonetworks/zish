@@ -2379,7 +2379,7 @@ pub const ExpandResult = struct {
 };
 
 /// Expand variables without allocation when possible
-// Expansion character lookup table - SectorLambda-inspired
+// Expansion character lookup table
 const expansion_char_table: [256]bool = blk: {
     var table = [_]bool{false} ** 256;
     table['$'] = true;
@@ -3168,11 +3168,10 @@ fn executeCommandAndCapture(self: *Shell, command: []const u8) ![]const u8 {
 /// point: a regular file never blocks on `write`, so a command emitting more
 /// than a pipe buffer (64 KiB) cannot deadlock — which a pipe would, because
 /// `executeCommandInternal` runs the command and `waitpid`s for it on this same
-/// thread, with nothing draining the pipe until after it returns. The previous
-/// design drained the pipe on a background thread; that made the shell
-/// briefly multi-threaded while it `fork`s to exec, which is a latent deadlock
-/// (a child inheriting a mutex the vanished reader thread held) avoided only by
-/// careful discipline. No thread means the bug class cannot occur at all.
+/// thread, with nothing draining the pipe until after it returns. Draining the
+/// pipe on a background thread would make the shell briefly multi-threaded while
+/// it `fork`s to exec — a latent deadlock (a child inheriting a mutex the
+/// vanished reader thread held). No thread means the bug class cannot occur.
 ///
 /// The file is created O_EXCL with a random name and unlinked immediately, so
 /// there is no on-disk artifact and no symlink/TOCTOU window: after the create
@@ -3257,9 +3256,9 @@ fn executeCommandInternal(self: *Shell, command: []const u8) !u8 {
 
 /// Find heredoc delimiter in command (e.g., << 'EOF' or << EOF or <<EOF)
 /// Byte offset of the first heredoc operator `<<` (not `<<<`) that is NOT
-/// inside quotes and not in a comment. The old scanners walked raw bytes, so a
-/// literal `<<` in a string (`echo "a << b"`) was mistaken for a heredoc and
-/// the real one later in the script was never found.
+/// inside quotes and not in a comment. A raw-byte scan would mistake a literal
+/// `<<` in a string (`echo "a << b"`) for a heredoc and miss the real one later
+/// in the script.
 fn findHeredocOp(command: []const u8) ?usize {
     var i: usize = 0;
     var in_single = false;
@@ -3415,8 +3414,8 @@ fn preprocessHeredoc(self: *Shell, command: []const u8, delimiter: []const u8) !
 
     // Everything between the end of the delimiter word and the newline belongs
     // to the COMMAND, not to the heredoc: `cat <<A >out.txt`, `cat <<A | tr`,
-    // `cat <<A && echo`, `cat <<A ; cat <<B`. Previously this span was skipped
-    // and silently dropped, so the redirect/pipe never happened.
+    // `cat <<A && echo`, `cat <<A ; cat <<B`. Dropping this span would silently
+    // lose the redirect/pipe.
     const delim_end = heredocDelimEnd(command, heredoc_pos);
     var content_start: usize = delim_end;
     while (content_start < command.len and command[content_start] != '\n') : (content_start += 1) {}

@@ -6,18 +6,13 @@ pub fn build(b: *std.Build) void {
     // Target options with performance-focused defaults
     const target = b.standardTargetOptions(.{});
 
-    // No preferred_optimize_mode.
-    //
-    // It used to be `.preferred_optimize_mode = .ReleaseFast`, which makes
-    // standardOptimizeOption *ignore* `--release=<mode>` entirely: `zig build
-    // --release=safe` silently produced a ReleaseFast binary. The Makefile had
-    // been asking for safety checks and never getting them, and neither did
-    // anyone building from source.
-    //
-    // That matters more than speed here. ReleaseFast removes the bounds,
-    // overflow and alignment checks that turn a memory bug into a clean abort
-    // instead of undefined behaviour — in a shell an agent drives, those checks
-    // are the difference between a crash and an exploitable primitive.
+    // No preferred_optimize_mode: setting it makes standardOptimizeOption
+    // *ignore* `--release=<mode>`, so `zig build --release=safe` would silently
+    // produce a ReleaseFast binary. Safety matters more than speed here:
+    // ReleaseFast removes the bounds, overflow and alignment checks that turn a
+    // memory bug into a clean abort instead of undefined behaviour — in a shell
+    // an agent drives, those checks are the difference between a crash and an
+    // exploitable primitive.
     //
     // Releases build with `--release=safe`. Measured cost: still 1.19-1.80x
     // faster than bash across the whole bench.sh suite, versus 1.30-2.01x

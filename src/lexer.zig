@@ -1326,7 +1326,6 @@ pub const Lexer = struct {
 };
 
 // Operator check using lookup table - faster than switch for hot path
-// Inspired by SectorLambda's minimal instruction approach
 const operator_table: [256]bool = blk: {
     var table = [_]bool{false} ** 256;
     for ([_]u8{ ' ', '\t', '\n', '|', '&', ';', '(', ')', '<', '>', '{', '}' }) |c| {
@@ -1349,7 +1348,7 @@ fn hexDigit(c: u8) ?u8 {
 }
 
 // Fast keyword classification using length-based dispatch
-// SectorLambda-inspired: minimize comparisons by filtering on length first
+// minimize comparisons by filtering on length first
 fn classifyWord(word: []const u8) TokenType {
     return switch (word.len) {
         2 => {

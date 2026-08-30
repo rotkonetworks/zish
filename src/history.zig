@@ -109,9 +109,9 @@ pub const History = struct {
 
     /// Ensure the string pool has room for `needed` more bytes, growing it if
     /// necessary. Commands are referenced by offset (see getCommand), so a
-    /// realloc that moves the buffer keeps every stored entry valid. This
-    /// replaces the old fixed-256KB pool that returned StringPoolFull once full
-    /// — which silently froze history (new + cross-session commands dropped).
+    /// realloc that moves the buffer keeps every stored entry valid. A fixed
+    /// pool would return StringPoolFull once full, silently freezing history
+    /// (new + cross-session commands dropped).
     fn ensurePoolSpace(self: *Self, needed: usize) !void {
         if (self.string_pool_used + needed <= self.string_pool.len) return;
         var new_size = self.string_pool.len;
@@ -125,8 +125,8 @@ pub const History = struct {
         if (command.len > MAX_COMMAND_LENGTH) return error.CommandTooLong;
         // The on-disk log stores each record length in a u16 (see history_log
         // EntryData.serialize / LogWriter.append). A command near
-        // MAX_COMMAND_LENGTH plus header+crypto overhead overflows that u16 and
-        // used to abort the whole shell on save. History is best-effort: skip
+        // MAX_COMMAND_LENGTH plus header+crypto overhead overflows that u16,
+        // which would abort the shell on save. History is best-effort: skip
         // recording anything too large to encode rather than crash. Margin below
         // 65535 covers the 14-byte header + 40-byte nonce/tag overhead.
         if (command.len > 65000) return;
@@ -426,9 +426,9 @@ pub const History = struct {
 
     /// sort entries by timestamp and rebuild hash_map indices
     fn sortByTimestamp(self: *Self) void {
-        // O(n log n) heap sort. The previous insertion sort was O(n²) and made
-        // interactive startup crawl on large history files (Boot: ~0.37s on a
-        // 686 KB log). Heap sort is equivalent for our purpose (equal timestamps
+        // O(n log n) heap sort. An insertion sort would be O(n²) and make
+        // interactive startup crawl on large history files. Heap sort is
+        // equivalent for our purpose (equal timestamps
         // have no required order) and keeps the same O(1) memory profile.
         std.sort.heap(HistoryEntry, self.entries.items, {}, struct {
             fn lessThan(_: void, a: HistoryEntry, b: HistoryEntry) bool {

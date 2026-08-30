@@ -3,10 +3,8 @@
 // Every place the shell runs a child in the foreground must perform the same
 // dance, and getting any step wrong produces a subtly broken shell (a child
 // that can't be Ctrl+C'd, a Ctrl+Z that wedges the shell, a prompt left in
-// cooked mode). Before this module the dance was hand-copied at five sites and
-// `fg` used a sixth divergent mechanism; two copies had already regressed.
-// The discipline now lives here, structurally, and the call sites only choose
-// what the child *body* does.
+// cooked mode). The discipline lives here, structurally, and the call sites
+// only choose what the child *body* does.
 //
 // The dance, in full (mirrors the known-correct single-external-command path):
 //
@@ -287,7 +285,7 @@ pub const Session = struct {
 /// TtyCtl + restoreRaw owner as every other foreground site.
 ///
 /// With no controlling tty the terminal handover is silently skipped (job
-/// control is meaningless without one) - the old code errored out of `fg`.
+/// control is meaningless without one).
 pub fn resumeJobForeground(shell: *Shell, job: *jobs.Job, cont: bool) u8 {
     var fg = Session.begin(shell);
     defer fg.end();

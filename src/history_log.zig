@@ -205,10 +205,10 @@ pub const LogWriter = struct {
         defer self.allocator.free(log_path);
 
         // Build the whole record (header + ciphertext) contiguously and append
-        // it with a SINGLE O_APPEND write. The old code read file.length() then
-        // writePositionalAll at that offset — a TOCTOU race: two shells sharing
-        // the history read the same end offset and overwrote each other's
-        // entries (concurrent-write data loss). With O_APPEND the kernel does
+        // it with a SINGLE O_APPEND write. file.length() then writePositionalAll
+        // at that offset is a TOCTOU race: two shells sharing the history read
+        // the same end offset and overwrite each other's entries (concurrent-
+        // write data loss). With O_APPEND the kernel does
         // seek-to-end + write as one atomic step, and a single write of a small
         // (<PIPE_BUF) record is not interleaved with other appenders.
         const header_bytes = std.mem.asBytes(&header);
