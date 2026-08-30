@@ -9,6 +9,7 @@ const parser = @import("parser.zig");
 const builtins = @import("builtins.zig");
 const jobs = @import("jobs.zig");
 const foreground = @import("foreground.zig");
+const session = @import("session.zig");
 
 // ============ "did you mean?" typo suggestions ============
 
@@ -1342,6 +1343,8 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
                 try shell.stdout().writeAll("feat: refusing to run extra feat as root\n");
                 return 126;
             }
+            if (f.kind == .session)
+                return try session.hostSessionFeat(shell, f.bin, expanded_args.items[1..]);
             return try featExec(shell, f.tier, f.bin, expanded_args.items[1..]);
         }
     }
@@ -3808,6 +3811,10 @@ fn writeEscapedToBuf(input: []const u8, buf: []u8) EscapedWrite {
 
 const FeatTier = enum { standard, extra };
 const FEAT_TIER_NAMES = [_][]const u8{ "standard", "extra" };
+// A feat is either a one-shot filter (fork+exec+argv+stdio, reap) or a session
+// feat (feat.toml `kind = "session"`) hosted over the frame protocol in
+// session.zig. Default is oneshot — the manifest opts in to session.
+const FeatKind = enum { oneshot, session };
 
 fn featRoot(alloc: std.mem.Allocator, buf: []u8) ?[]const u8 {
     if (compat.getEnvVarOwned(alloc, "ZISH_FEAT_PATH")) |p| {
@@ -3864,7 +3871,7 @@ fn featParseRef(raw: []const u8) ?struct { tier: ?FeatTier, name: []const u8 } {
 }
 
 /// Resolve a feat reference to an absolute executable path + tier, or null.
-fn featResolve(alloc: std.mem.Allocator, raw: []const u8) ?struct { tier: FeatTier, bin: []u8 } {
+fn featResolve(alloc: std.mem.Allocator, raw: []const u8) ?struct { tier: FeatTier, bin: []u8, kind: FeatKind } {
     const parsed = featParseRef(raw) orelse return null;
 
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -3894,6 +3901,7 @@ fn featResolve(alloc: std.mem.Allocator, raw: []const u8) ?struct { tier: FeatTi
         // default bin name == feat name; honor an opt-in `bin` manifest field.
         var mf_path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const mf_path = std.fmt.bufPrint(&mf_path_buf, "{s}/{s}/feat.toml", .{ tier_dir, parsed.name }) catch continue;
+        var kind: FeatKind = .oneshot;
         if (std.Io.Dir.cwd().readFileAlloc(compat.io(), mf_path, alloc, .limited(16 * 1024))) |content| {
             defer alloc.free(content);
             if (featManifestField(content, "bin")) |b| {
@@ -3902,12 +3910,15 @@ fn featResolve(alloc: std.mem.Allocator, raw: []const u8) ?struct { tier: FeatTi
                     _ = w;
                 }
             }
+            if (featManifestField(content, "kind")) |kv| {
+                if (std.mem.eql(u8, kv, "session")) kind = .session;
+            }
         } else |_| {}
 
         // must exist and be a regular file
         const f = std.Io.Dir.cwd().openFile(compat.io(), bin_path, .{}) catch continue;
         f.close(compat.io());
-        return .{ .tier = tier, .bin = alloc.dupe(u8, bin_path) catch return null };
+        return .{ .tier = tier, .bin = alloc.dupe(u8, bin_path) catch return null, .kind = kind };
     }
     return null;
 }
