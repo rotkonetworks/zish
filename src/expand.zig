@@ -755,25 +755,32 @@ pub fn executeCommandAndCapture(sh: *Shell, command: []const u8) ![]const u8 {
 /// there is no on-disk artifact and no symlink/TOCTOU window: after the create
 /// only our fd reaches the inode. It costs no more than the pipe+thread it
 /// replaces — an unlinked tmpfs file versus a `clone` per substitution.
-fn captureInternal(sh: *Shell, command: []const u8) ![]const u8 {
+/// An unlinked O_EXCL temp file for capturing command output. A regular file
+/// never blocks on `write`, so a command emitting more than a pipe buffer
+/// cannot deadlock a single-threaded reader-after-the-fact; unlinked
+/// immediately, only the returned fd reaches the inode (no symlink/TOCTOU
+/// window). Shared by command substitution and the session tool-child runner.
+pub fn createCaptureFile() !compat.posix.fd_t {
     const O = compat.posix.O;
     var rnd: [8]u8 = undefined;
     var name_buf: [64]u8 = undefined;
     var attempt: u8 = 0;
-    const capfd = while (true) {
+    while (true) {
         compat.posix.randomBytes(&rnd);
         const path = std.fmt.bufPrintZ(&name_buf, "/tmp/zish_capture_{s}", .{std.fmt.bytesToHex(rnd, .lower)}) catch return error.NameTooLong;
         if (compat.posix.openZ(path.ptr, O{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true }, 0o600)) |fd| {
-            // Unlink now: the inode lives as long as this fd, leaves nothing on
-            // disk, and cannot be reached by name (so no symlink swap).
             std.Io.Dir.deleteFileAbsolute(compat.io(), path) catch {};
-            break fd;
+            return fd;
         } else |err| {
             attempt += 1;
             if (err == error.PathAlreadyExists and attempt < 8) continue;
             return err;
         }
-    };
+    }
+}
+
+fn captureInternal(sh: *Shell, command: []const u8) ![]const u8 {
+    const capfd = try createCaptureFile();
     defer compat.posix.close(capfd);
 
     // Park the backup at fd >= 10 with CLOEXEC (like the redirect backups in

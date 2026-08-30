@@ -139,7 +139,7 @@ inline fn fastParseI64(s: []const u8) ?i64 {
 /// harmless no-op (an arena only rewinds its own most recent allocation and
 /// ignores foreign ones). Nothing is leaked in practice because every caller
 /// exits the process shortly after.
-fn forkChildArena() std.heap.ArenaAllocator {
+pub fn forkChildArena() std.heap.ArenaAllocator {
     return std.heap.ArenaAllocator.init(std.heap.page_allocator);
 }
 

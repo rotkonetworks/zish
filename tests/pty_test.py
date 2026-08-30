@@ -1140,6 +1140,73 @@ def _(sh):
         shutil.rmtree(featroot, ignore_errors=True)
 
 
+TOOLWAIT_SCRIPT = """#!/bin/sh
+read hello_frame
+printf '%s\\n' '{"t":"run","cmd":"sleep 2; echo tool_finished_ok"}'
+read reply
+case "$reply" in
+  *tool_finished_ok*) printf '%s\\n' '{"t":"say","text":"tool-completed"}' ;;
+  *)                  printf '%s\\n' '{"t":"say","text":"tool-output-missing"}' ;;
+esac
+printf '%s\\n' '{"t":"done"}'
+"""
+
+
+@test("slow run frame does not freeze the prompt (pidfd tool child)")
+def _(sh):
+    # The tool child is a pollable pidfd in the input loop, so a slow `run`
+    # (sleep 2) must leave the prompt live: a command typed DURING the tool
+    # run must produce output BEFORE the tool's completion say. On the old
+    # synchronous-run binary the shell is frozen inside the frame handler for
+    # the whole sleep, so the typed command only runs afterwards — ordering
+    # flips and this test goes red.
+    featroot = make_session_featroot("toolwait", TOOLWAIT_SCRIPT)
+    small = Shell(env_extra={"ZISH_FEAT_PATH": featroot})
+    try:
+        small.read()
+        small.sendline("toolwait")
+        expect_soon(small, "started")
+        small.sendline("echo while_tool_$((5 + 6))")
+        expect_soon(small, "while_tool_11")
+        out = expect_soon(small, "ended")
+        assert "tool-completed" in clean(small.buf), \
+            f"tool result never reached the feat: {clean(small.buf)[-400:]!r}"
+        b = clean(small.buf)
+        assert b.index("while_tool_11") < b.index("tool-completed"), \
+            "prompt was frozen during the tool run (ordering flipped)"
+    finally:
+        small.close()
+        shutil.rmtree(featroot, ignore_errors=True)
+
+
+CODER_SCRIPT = """#!/bin/sh
+read hello_frame
+printf '%s\\n' '{"t":"run","cmd":"false"}'
+read reply
+case "$reply" in
+  *'"code":1'*) printf '%s\\n' '{"t":"say","text":"code-one-ok"}' ;;
+  *)            printf '%s\\n' '{"t":"say","text":"code-wrong"}' ;;
+esac
+printf '%s\\n' '{"t":"done"}'
+"""
+
+
+@test("run result carries the real exit code")
+def _(sh):
+    # `false` must come back as {"code":1}. The old binary hardcoded code 0.
+    featroot = make_session_featroot("coder", CODER_SCRIPT)
+    small = Shell(env_extra={"ZISH_FEAT_PATH": featroot})
+    try:
+        small.read()
+        small.sendline("coder")
+        out = expect_soon(small, "ended")
+        assert "code-one-ok" in clean(small.buf), \
+            f"exit code missing or wrong in result frame: {clean(small.buf)[-400:]!r}"
+    finally:
+        small.close()
+        shutil.rmtree(featroot, ignore_errors=True)
+
+
 @test("session feat with redirected stdout uses the sync host")
 def _(sh):
     # isatty(stdout) is the async/sync discriminator: redirected, the feat is

@@ -8,7 +8,7 @@
 //! uses), and writes result frames back. Single-threaded; a session feat's
 //! stdio is pipes, never the terminal.
 //!
-//! Frame protocol v0.2 (one JSON object per line):
+//! Frame protocol v0.3 (one JSON object per line):
 //!   zish → feat, once at session start
 //!     {"t":"hello","proto":0,"caps":["say","stream","done",...]}
 //!         the session's hostcall capability mask — the guest knows its world
@@ -23,9 +23,25 @@
 //!     {"t":"done"}                          end the session
 //!   zish → feat
 //!     {"t":"result","code":<int>,"out":"<captured stdout>"}   reply to "run"
+//!         `code` is the command's REAL exit status (128+sig if signaled;
+//!         255 if the status was reaped elsewhere, e.g. a user's bare `wait`)
 //!     {"t":"event","kind":"submitted","text":"<answer>"}      reply to "prompt"
 //!     {"t":"event","kind":"cancelled"}                        prompt not answerable
 //!     {"t":"error","call":"<name>","reason":"denied"}         masked-off hostcall
+//!     {"t":"error","call":"run","reason":"busy"}              a run is already in flight
+//!     {"t":"error","call":"run","reason":"failed"}            tool child could not spawn
+//!
+//! `run` semantics (v0.3): the command executes in a FORKED subshell child —
+//! same parser/evaluator/sandbox/fd-3 trace, but a snapshot: it sees the
+//! shell's live state (cwd, vars, functions) at call time and its mutations do
+//! not propagate back (plan #11's per-call snapshot, by construction). The
+//! child runs in its own process group with NO terminal claim, stdin from
+//! /dev/null, stdout captured to an unlinked temp file. In the async host the
+//! child's pidfd joins the input poll set, so the prompt stays live while a
+//! tool runs — Ctrl-C at the prompt edits the line and does NOT kill the
+//! agent's tool child (deliberate: background work must not die to a
+//! line-edit cancel; `session kill` is the kill switch). One run in flight
+//! per session (the protocol is lockstep); a second gets reason "busy".
 //!
 //! Hostcall capability mask: ONE vocabulary, per-session mask (never tiered
 //! tables). The mask bounds which CHANNELS the guest gets (execution, human
@@ -75,6 +91,8 @@ const std = @import("std");
 const Shell = @import("Shell.zig");
 const compat = @import("compat.zig");
 const expand = @import("expand.zig");
+const eval = @import("eval.zig");
+const jobs = @import("jobs.zig");
 const sanitize = @import("sanitize.zig");
 
 pub const MAX_SESSIONS = 8;
@@ -84,9 +102,12 @@ const MAX_FRAME = 1 << 20;
 /// How long a frame write to the feat may stall before the feat is presumed
 /// wedged/hostile and the session is ended.
 const WRITE_TIMEOUT_MS = 5000;
-/// Cap on captured `run` output copied into the transcript (the frame reply is
-/// not capped — the feat gets everything; the transcript is an audit log).
+/// Cap on captured `run` output copied into the transcript (the transcript is
+/// an audit log, not a data channel).
 const TRANSCRIPT_RUN_CAP = 64 * 1024;
+/// Cap on captured `run` output sent back in the result frame. A tool dumping
+/// more than this gets a truncation marker inside `out`.
+const RESULT_CAP = 8 * 1024 * 1024;
 
 /// Which hostcalls a session may use. say/stream/done are always granted — a
 /// guest that cannot even speak or exit cleanly has no useful failure mode.
@@ -103,6 +124,16 @@ pub const Caps = struct {
 
 const ERR_RUN_DENIED = "{\"t\":\"error\",\"call\":\"run\",\"reason\":\"denied\"}\n";
 const ERR_PROMPT_DENIED = "{\"t\":\"error\",\"call\":\"prompt\",\"reason\":\"denied\"}\n";
+const ERR_RUN_BUSY = "{\"t\":\"error\",\"call\":\"run\",\"reason\":\"busy\"}\n";
+const ERR_RUN_FAILED = "{\"t\":\"error\",\"call\":\"run\",\"reason\":\"failed\"}\n";
+
+/// One in-flight `run` command: a forked subshell child, awaited via its pidfd
+/// in the input poll set (async) or a blocking waitpid (sync host).
+pub const ToolChild = struct {
+    pid: compat.posix.pid_t,
+    pidfd: compat.posix.fd_t, // -1 if pidfd_open failed (completion still works via waitpid)
+    cap_fd: compat.posix.fd_t, // unlinked temp file holding the child's stdout
+};
 
 /// One live async session.
 pub const Session = struct {
@@ -117,6 +148,7 @@ pub const Session = struct {
     buf: std.ArrayListUnmanaged(u8) = .empty, // unparsed frame bytes
     echo: std.ArrayListUnmanaged(u8) = .empty, // sanitized text awaiting a full line
     pending_q: ?[]u8 = null, // sanitized question awaiting `session answer`
+    tool: ?ToolChild = null, // the in-flight run, if any
 };
 
 // ---------------------------------------------------------------------------
@@ -300,9 +332,13 @@ fn handleSyncFrame(shell: *Shell, line: []const u8, w: compat.posix.fd_t, caps: 
 
     if (std.mem.eql(u8, t, "run")) {
         if (!caps.run) return !writeFrame(w, ERR_RUN_DENIED);
-        const out = runCaptured(shell, frameStr(parsed.value, "cmd")) catch try alloc.dupe(u8, "");
-        defer alloc.free(out);
-        return !replyResult(shell, w, out);
+        // Same fork-isolated execution as the async host, waited for in place
+        // (blocking is the sync host's whole nature).
+        const tool = spawnToolChild(shell, frameStr(parsed.value, "cmd")) catch
+            return !writeFrame(w, ERR_RUN_FAILED);
+        const r = completeTool(shell, tool);
+        defer alloc.free(r.out);
+        return !replyResult(shell, w, r.code, r.out);
     }
 
     return false; // unknown frame type: ignore (forward-compat)
@@ -483,9 +519,15 @@ fn handleAsyncFrame(shell: *Shell, s: *Session, line: []const u8) !bool {
 
     if (std.mem.eql(u8, t, "run")) {
         if (!s.caps.run) return denyHostcall(shell, s, "run", ERR_RUN_DENIED);
+        if (s.tool != null) {
+            // lockstep protocol: one run in flight per session
+            writeAllFd(s.transcript_fd, "! run refused: tool already in flight\n");
+            return !writeFrame(s.w, ERR_RUN_BUSY);
+        }
         const cmd = frameStr(parsed.value, "cmd");
 
-        // audit trail: the command string is model-composed text — sanitize it
+        // Audit trail BEFORE execution, so a tool killed mid-run still left
+        // its line. The command string is model-composed text — sanitize it.
         writeAllFd(s.transcript_fd, "$ ");
         var cmdclean: std.ArrayListUnmanaged(u8) = .empty;
         defer cmdclean.deinit(alloc);
@@ -493,19 +535,11 @@ fn handleAsyncFrame(shell: *Shell, s: *Session, line: []const u8) !bool {
         writeAllFd(s.transcript_fd, cmdclean.items);
         writeAllFd(s.transcript_fd, "\n");
 
-        const out = runCaptured(shell, cmd) catch try alloc.dupe(u8, "");
-        defer alloc.free(out);
-
-        var outclean: std.ArrayListUnmanaged(u8) = .empty;
-        defer outclean.deinit(alloc);
-        const capped = out[0..@min(out.len, TRANSCRIPT_RUN_CAP)];
-        try sanitize.writeSanitized(listWriter(&outclean, alloc), capped);
-        writeAllFd(s.transcript_fd, outclean.items);
-        if (out.len > capped.len) writeAllFd(s.transcript_fd, "\n[transcript: output truncated]");
-        if (outclean.items.len == 0 or outclean.items[outclean.items.len - 1] != '\n')
-            writeAllFd(s.transcript_fd, "\n");
-
-        return !replyResult(shell, s.w, out);
+        // Spawn and park: the reply is sent by finishTool when the child's
+        // pidfd fires in the input poll — the prompt stays live meanwhile.
+        s.tool = spawnToolChild(shell, cmd) catch
+            return !writeFrame(s.w, ERR_RUN_FAILED);
+        return false;
     }
 
     return false; // unknown frame type: ignore (forward-compat)
@@ -524,31 +558,149 @@ fn denyHostcall(shell: *Shell, s: *Session, call: []const u8, err_frame: []const
     return !writeFrame(s.w, err_frame);
 }
 
-/// Run one command through zish's own executor with stdout captured and stdin
-/// redirected to /dev/null: same parse→eval→sandbox→trace path as everything
-/// else, but the child can never read the user's terminal.
-fn runCaptured(shell: *Shell, cmd: []const u8) ![]const u8 {
-    const devnull = compat.posix.openZ("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0) catch
-        return expand.executeCommandAndCapture(shell, cmd); // no /dev/null: degrade, don't fail
-    defer compat.posix.close(devnull);
-    const stdin_backup = compat.posix.dupHighCloexec(compat.posix.STDIN_FILENO) catch
-        return expand.executeCommandAndCapture(shell, cmd);
-    defer compat.posix.close(stdin_backup);
-    compat.posix.dup2(devnull, compat.posix.STDIN_FILENO) catch {};
-    defer compat.posix.dup2(stdin_backup, compat.posix.STDIN_FILENO) catch {};
-    return expand.executeCommandAndCapture(shell, cmd);
+/// Fork a subshell child that evaluates `cmd` through zish's own executor
+/// (plan #2's tool-call execution context: no terminal claim, captured stdout,
+/// stdin from /dev/null, own process group, state-isolated by the fork).
+/// The parent gets a ToolChild to await — pollable via pidfd or blocking.
+fn spawnToolChild(shell: *Shell, cmd: []const u8) !ToolChild {
+    const cap_fd = try expand.createCaptureFile();
+    errdefer compat.posix.close(cap_fd);
+
+    // The evaluator may reference `cmd`, which can point into the session's
+    // frame buffer — but the child's copy of that memory is stable (fork).
+    shell.stdout().flush() catch {};
+    const pid = try compat.posix.fork();
+    if (pid == 0) {
+        // === CHILD === (mirrors evaluateBackground's child, minus job table)
+        var child_arena = eval.forkChildArena();
+        shell.allocator = child_arena.allocator();
+        // own process group + default signals, NO terminal handover
+        jobs.launchProcess(0, 0, false, compat.posix.STDIN_FILENO);
+        // Close every session's fds: they are CLOEXEC, but a builtin-only
+        // command never execs, and a lingering copy of a pipe write end would
+        // keep a finished session's feat alive on a phantom stdin.
+        for (shell.sessions.items) |*os| {
+            compat.posix.close(os.r);
+            compat.posix.close(os.w);
+            if (os.transcript_fd >= 0) compat.posix.close(os.transcript_fd);
+            if (os.tool) |ot| {
+                if (ot.pidfd >= 0) compat.posix.close(ot.pidfd);
+                compat.posix.close(ot.cap_fd);
+            }
+        }
+        // stdio: /dev/null in (never the user's terminal), capture out
+        const devnull = compat.posix.openZ("/dev/null", .{ .ACCMODE = .RDONLY }, 0) catch compat.posix.exit(127);
+        compat.posix.dup2(devnull, compat.posix.STDIN_FILENO) catch compat.posix.exit(127);
+        compat.posix.close(devnull);
+        compat.posix.dup2(cap_fd, compat.posix.STDOUT_FILENO) catch compat.posix.exit(127);
+        compat.posix.close(cap_fd);
+        shell.forked_child = true;
+        const status = shell.executeCommandInternal(cmd) catch 127;
+        shell.stdout().flush() catch {};
+        compat.posix.exit(status);
+    }
+
+    // === PARENT ===
+    return .{ .pid = pid, .pidfd = pidfdOpen(pid), .cap_fd = cap_fd };
 }
 
-/// Reply a captured `run` result. Returns false if the write failed (stalled
-/// or dead feat) — caller ends the session.
-fn replyResult(shell: *Shell, w: compat.posix.fd_t, out: []const u8) bool {
+fn pidfdOpen(pid: compat.posix.pid_t) compat.posix.fd_t {
+    // pidfd_open fds are CLOEXEC by default. Verified: the seccomp denylist
+    // blocks only pidfd_getfd, not pidfd_open.
+    const rc = std.os.linux.pidfd_open(pid, 0);
+    const signed: isize = @bitCast(rc);
+    if (signed < 0) return -1; // completion degrades to blocking waitpid
+    return @intCast(rc);
+}
+
+const ToolResult = struct { code: u8, out: []u8 };
+
+/// Reap the tool child and read its captured output; closes the tool's fds.
+/// In the async path the pidfd has already signalled exit, so the waitpid
+/// returns immediately; the sync host blocks here on purpose.
+fn completeTool(shell: *Shell, t: ToolChild) ToolResult {
+    const alloc = shell.allocator;
+    const res = compat.posix.waitpid(t.pid, 0);
+    // res.pid == -1 (ECHILD): status was reaped elsewhere — e.g. the user ran
+    // bare `wait`, whose waitpid(-1) collects every child. The pidfd already
+    // told us it is dead; only the status is lost. Never block retrying.
+    const code: u8 = if (res.pid == t.pid) decodeWaitStatus(res.status) else 255;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    _ = compat.posix.lseek(t.cap_fd, 0, 0) catch {};
+    var tmp: [4096]u8 = undefined;
+    while (out.items.len < RESULT_CAP) {
+        const n = compat.posix.read(t.cap_fd, &tmp) catch break;
+        if (n == 0) break;
+        const room = RESULT_CAP - out.items.len;
+        out.appendSlice(alloc, tmp[0..@min(n, room)]) catch break;
+        if (n > room) {
+            out.appendSlice(alloc, "\n[output truncated]") catch {};
+            break;
+        }
+    }
+    compat.posix.close(t.cap_fd);
+    if (t.pidfd >= 0) compat.posix.close(t.pidfd);
+    return .{ .code = code, .out = out.toOwnedSlice(alloc) catch &.{} };
+}
+
+fn decodeWaitStatus(status: u32) u8 {
+    if ((status & 0x7f) == 0) return @truncate((status >> 8) & 0xff); // exited
+    return @truncate(128 + (status & 0x7f)); // killed by signal, shell convention
+}
+
+/// Reply a captured `run` result with the child's real exit code. Returns
+/// false if the write failed (stalled or dead feat) — caller ends the session.
+fn replyResult(shell: *Shell, w: compat.posix.fd_t, code: u8, out: []const u8) bool {
     const alloc = shell.allocator;
     var frame: std.ArrayListUnmanaged(u8) = .empty;
     defer frame.deinit(alloc);
-    frame.appendSlice(alloc, "{\"t\":\"result\",\"code\":0,\"out\":\"") catch return false;
+    var hdr: [48]u8 = undefined;
+    const h = std.fmt.bufPrint(&hdr, "{{\"t\":\"result\",\"code\":{d},\"out\":\"", .{code}) catch return false;
+    frame.appendSlice(alloc, h) catch return false;
     appendJsonEscaped(&frame, alloc, out) catch return false;
     frame.appendSlice(alloc, "\"}\n") catch return false;
     return writeFrame(w, frame.items);
+}
+
+/// A session's tool-child pidfd fired: reap it, audit the output, send the
+/// result frame the feat has been waiting on.
+fn finishTool(shell: *Shell, idx: usize) void {
+    const alloc = shell.allocator;
+    const s = &shell.sessions.items[idx];
+    const t = s.tool orelse return;
+    s.tool = null;
+
+    const r = completeTool(shell, t);
+    defer alloc.free(r.out);
+
+    // audit trail: sanitized, capped output + the real exit code
+    var outclean: std.ArrayListUnmanaged(u8) = .empty;
+    defer outclean.deinit(alloc);
+    const capped = r.out[0..@min(r.out.len, TRANSCRIPT_RUN_CAP)];
+    sanitize.writeSanitized(listWriter(&outclean, alloc), capped) catch {};
+    writeAllFd(s.transcript_fd, outclean.items);
+    if (r.out.len > capped.len) writeAllFd(s.transcript_fd, "\n[transcript: output truncated]");
+    if (outclean.items.len == 0 or outclean.items[outclean.items.len - 1] != '\n')
+        writeAllFd(s.transcript_fd, "\n");
+    if (r.code != 0) {
+        var cb: [24]u8 = undefined;
+        const cl = std.fmt.bufPrint(&cb, "[exit {d}]\n", .{r.code}) catch "";
+        writeAllFd(s.transcript_fd, cl);
+    }
+
+    if (!replyResult(shell, s.w, r.code, r.out)) finishSession(shell, idx);
+}
+
+/// Dispatch a ready fd from the input poll: a session's pipe or a tool
+/// child's pidfd.
+pub fn serviceFd(shell: *Shell, fd: compat.posix.fd_t) void {
+    if (findByFd(shell, fd) != null) return serviceByFd(shell, fd);
+    for (shell.sessions.items, 0..) |*s, i| {
+        if (s.tool) |t| {
+            if (t.pidfd == fd) return finishTool(shell, i);
+        }
+    }
 }
 
 /// Answer a session's pending question (the `session answer` builtin).
@@ -596,6 +748,16 @@ pub fn finishSession(shell: *Shell, idx: usize) void {
     if (s.echo.items.len > 0) {
         s.echo.append(alloc, '\n') catch {};
         echoCompleteLines(shell, &s);
+    }
+
+    // A tool still in flight dies with its session: the child leads its own
+    // process group, so the whole tree goes.
+    if (s.tool) |t| {
+        s.tool = null;
+        _ = compat.posix.kill(-t.pid, compat.posix.SIG.KILL) catch {};
+        const r = completeTool(shell, t); // reap + close fds
+        alloc.free(r.out);
+        writeAllFd(s.transcript_fd, "! tool killed with session\n");
     }
 
     compat.posix.close(s.w);

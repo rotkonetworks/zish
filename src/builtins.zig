@@ -1947,7 +1947,12 @@ fn sessionCmd(shell: *Shell, args: []const []const u8) !u8 {
             return 0;
         }
         for (shell.sessions.items) |*s| {
-            const state: []const u8 = if (s.pending_q != null) "awaiting answer" else "running";
+            const state: []const u8 = if (s.pending_q != null)
+                "awaiting answer"
+            else if (s.tool != null)
+                "tool running"
+            else
+                "running";
             const caps: []const u8 = if (s.caps.run and s.caps.prompt)
                 "say,stream,run,prompt"
             else if (s.caps.run)

@@ -952,13 +952,21 @@ fn readNextAction(self: *Shell) !Action {
     // serviced between keystrokes, so the prompt stays live while a session
     // feat runs (the agent-armor async substrate). Sessions are polled and
     // serviced first; stdin readiness then falls through to the key read.
-    var pfds: [1 + session_mod.MAX_SESSIONS]std.c.pollfd = undefined;
+    // one slot for stdin, then per session: its pipe fd and (if a tool run is
+    // in flight) the tool child's pidfd
+    var pfds: [1 + 2 * session_mod.MAX_SESSIONS]std.c.pollfd = undefined;
     pfds[0] = .{ .fd = std.posix.STDIN_FILENO, .events = std.c.POLL.IN, .revents = 0 };
     var nfds: usize = 1;
     for (self.sessions.items) |*s| {
         if (nfds >= pfds.len) break;
         pfds[nfds] = .{ .fd = s.r, .events = std.c.POLL.IN, .revents = 0 };
         nfds += 1;
+        if (s.tool) |t| {
+            if (t.pidfd >= 0 and nfds < pfds.len) {
+                pfds[nfds] = .{ .fd = t.pidfd, .events = std.c.POLL.IN, .revents = 0 };
+                nfds += 1;
+            }
+        }
     }
     const prc = std.c.poll(&pfds, @intCast(nfds), -1);
     if (prc <= 0) return .none; // EINTR (SIGWINCH) or spurious wake — loop again
@@ -966,7 +974,7 @@ fn readNextAction(self: *Shell) !Action {
     if (nfds > 1) {
         // Collect ready fds first: servicing can remove sessions (done/EOF),
         // which mutates the table the pfds were built from.
-        var ready: [session_mod.MAX_SESSIONS]posix.fd_t = undefined;
+        var ready: [2 * session_mod.MAX_SESSIONS]posix.fd_t = undefined;
         var nready: usize = 0;
         for (pfds[1..nfds]) |p| {
             if (p.revents != 0) { // IN, HUP or ERR all mean "go read it"
@@ -974,7 +982,7 @@ fn readNextAction(self: *Shell) !Action {
                 nready += 1;
             }
         }
-        for (ready[0..nready]) |fd| session_mod.serviceByFd(self, fd);
+        for (ready[0..nready]) |fd| session_mod.serviceFd(self, fd);
     }
     if ((pfds[0].revents & std.c.POLL.IN) == 0) return .none;
 

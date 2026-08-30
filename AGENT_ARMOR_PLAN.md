@@ -423,6 +423,169 @@ the provenance signal — distro-packaged (maintainer-vetted) feats could defaul
 standard tier, gf-fetched default extra; would need a feat search path (system
 dir → ~/.zish/feats) replacing the single featRoot. Revisit when gf exists.
 
+**Open idea, NOT locked (user pondering, same day): agent org + token
+treasury.** An organization of agents under a collective token budget, with a
+treasury/steward agent allocating by some metric. Anchors that already exist:
+plan #4's "usage accounting" internals; budget as one more dimension of the
+same execution context as the caps mask (caps bound WHICH hostcalls, budget
+bounds HOW MUCH — both delegate monotonically down the tree); transcripts +
+fd-3 trace as the ledger the steward reads (files again — no new machinery);
+zish as the enforcement chokepoint (budget exhaustion → the same loud `error`
+frame, reason "budget").
+**Mechanism VERIFIED (2026-08-31): OpenRouter provisioning keys.** A
+provisioning key manages other keys but cannot call completions (treasury
+allocates, never spends — the mask philosophy one layer up). Mint a per-agent
+key at session spawn via /api/v1/keys: `limit` = allocation (optional
+daily/weekly/monthly reset), `label` = session id, per-key usage readable for
+accounting, over-limit requests rejected at OpenRouter's edge BEFORE provider
+cost (mechanical enforcement, not self-reported; caveat: concurrent bursts can
+slightly overshoot). Disable key = revoke a misbehaving agent even if its
+process lingers. Composes with #3's secrets channel: per-session key on a
+per-session fd — a leaked child key burns only its own allowance.
+**Model routing (user direction, refined): pinned DeepSeek V4 pair via
+OpenRouter — `deepseek/deepseek-v4-flash-0731` (~$0.03/$0.16 per M) and
+`deepseek/deepseek-v4-pro-0813` (~$0.435/$0.87), both 1M context.** PINNED
+versions, never `-latest`: routing policy tuned against a pinned model stays
+valid; upgrades are deliberate steward decisions (same instinct as gf
+repo@sha). Division of labor is a PIPELINE split, not just an escalation
+ladder: Flash = input-heavy context work (explore, read, tool-loop, COMPACT);
+Pro = output-heavy synthesis consuming distilled context (~10x price step, and
+Pro's cost center is output tokens — feed it dense, ask for leverage).
+Compaction is thereby a first-class stage — pi's recipe from #6 (reserve
+tokens + keep-recent tail + summary + rebuild) is Flash's job description.
+Risk transfer to watch: lossy compaction moves failure upstream — bad Flash
+compaction makes Pro confidently synthesize convincing garbage; steward
+spot-checks compactions against source (cheap differential, same_as_bash
+spirit), not just spend. Routing is the THIRD dimension of
+the execution context (caps = which hostcalls, budget = how much, routing =
+which brain), delegated monotonically like the others. Trap to design around:
+cheap-per-token ≠ cheap-per-outcome — weak models flail (retries, loops,
+plausible-but-wrong output that costs verification); the steward's metric is
+spend-per-OUTCOME, learned from per-key usage + transcripts, not hand-designed.
+Agent feat reads key AND model name from outside (secrets fd / args) —
+routing is a spawn-time decision, never baked into the guest. Org-chart
+restraint: ONE steward role until multiple agents actually contend for budget
+(two-users rule applied to org design; roles are just session feats with a
+mask+budget+prompt, so structure can emerge later for free).
+**Self-editing org (user pondering): plasticity in the guests, invariants in
+the host.** Initial structure is a seed the org itself may edit — personas/
+prompts/roles/routing are DATA (files + spawn params), legitimately
+self-modifiable; the membrane (zish, masks, ledger, enforcement) stays outside
+the org's write jail per #3's propose-yes-enact-never. Constitution (human-
+amendable only) vs bylaws (org-amendable). Budget pressure is what makes
+plasticity into learning, not a limit on it (brains prune BECAUSE metabolically
+constrained — selection shapes the org better than upfront org-charts).
+Edges: the treasury METRIC is never self-editable (Goodhart with root access);
+persona edits carry provenance — personas as a repo, self-edits as proposed
+diffs through the staging gate, merge attested (git history = who rewrote
+whom). **Rate limits (user, from the first agent attempt's failure): be mindful.**
+The old Anthropic-direct agent died on rate limits immediately. OpenRouter
+helps structurally (multi-provider routing per model spreads 429s) but does
+not absolve the client: the model loop needs honor-429/Retry-After +
+exponential backoff with jitter + bounded in-flight concurrency from day one.
+And the org multiplies request rate — all agents' keys hang off ONE OpenRouter
+account, so account-level limits are shared: the steward is the natural rate
+governor (rate = a FOURTH allocation dimension alongside caps, budget,
+routing; requests/min per session, delegated monotonically like the rest).
+
+**Claude Code bridge (user direction, endorsed): command/advise the org from
+Claude Code.** The human prefers an interactive harness; the org is async
+files — so the bridge is a VIEW over the file surface, exactly the layering
+bet. Phase 1 needs NO new protocol: Claude Code already runs commands and
+reads files, so it drives the org via `session list/answer`, transcripts, and
+spawns — it is just another agent on the one seam. The real gap it exposes:
+the session table is IN-PROCESS state of the hosting interactive zish — a
+fresh `zish -c 'session list'` sees nothing. Fix = make org state file-based
+(session registry + pending questions + answers as files the hosting zish
+watches), which #10 persistence/resume wanted anyway; the filesystem is the
+message bus. Phase 2 (comfort): a thin `mcp` feat exposing those same
+files/commands as typed MCP tools for Claude Code; ACP stays the
+editor-drives-agent seam per #4, MCP is the agent-consumes-tools seam — for
+"command the org from Claude Code" MCP is the right protocol. Same principle
+generalizes (user): an `irc` feat bridging org events ↔ a channel gives a
+chat front-end for free — ANY front-end that reads files and sends commands
+is a valid org interface; a human is just another principal on the one seam.
+Cautions: metering must be mechanical (tokens counted
+at the API edge, reported in frames), never model-self-reported; peer-review
+allocation metrics are semantics — Goodhart bait — keep evaluation human-gated
+first. Design value to keep regardless (the karpathy lens applied to tokens):
+measure token spend per outcome; terse frames, capped results, written async
+transcripts are already the token-thin shape.
+
+**Open idea, FAR horizon (user pondering): open the org — external
+participants run their own agents, share profits; on-chain treasury
+(Polkadot pallet/rollup — full parachain slot likely unnecessary
+post-agile-coretime) + a token.** Why it's less crazy than the average agent
+DAO: the armor IS the missing trust story for foreign agents (sandboxed,
+masked, budgeted, attested), and the steward's allocation tree is structurally
+a treasury with spend approvals; Rotko already runs the validator infra.
+The two hard problems, named now so economics never gets ahead of them:
+(1) **local attestation does not survive federation** — a participant owns
+their kernel and can forge their own fd-3 trace; cross-host "what did your
+agent do" needs remote attestation (TEE / verify-by-redoing / reputation) —
+THE research gap between here and there; (2) **profit attribution is
+Goodhart with real stakes** — participants will run agents that game
+attribution; metric design becomes adversarial mechanism design. Plus the
+boring one: an investment/profit-share token is a security in most
+jurisdictions — lawyers before tokenomics. Sequencing: single-host org →
+file-based state → federation across OWN trusted hosts → economics. Nothing
+in the current design needs reversing to keep this door open.
+**REVISION (user, later same day): no remote attestation needed — pay for
+judged OUTPUT, not attested process.** The dictator model: participants
+submit artifacts; the org's steward evaluates them inside OUR trusted host
+(sandbox, staging gate — submitted work is hostile input) and decides payment.
+BDFL-as-payment-oracle; Linus never attested a contributor's machine, he read
+the diff. Costs, stated honestly: evaluation burden is the bottleneck (shape
+bounties toward cheaply-verifiable work — task specs ship with their own
+verification procedure, the zish differential-test ethos); trust moves from
+cryptography to the dictator (a managed fund with a transparent manager, not
+a trustless protocol — the live feed + attested payout record is the
+accountability). Governance layering: token holders sit at the CONSTITUTION
+layer (appoint/fire the dictator, treasury top-ups, challenge windows —
+optimistic pattern: dictator pays instantly, holders can claw back/slash off
+the public record); dictator owns the fast payout path. Never per-payout
+referenda (cadence mismatch: agents work in minutes, votes take days).
+**Identity = SSH key = wallet (user; see github.com/hitchho/swissh, "Simple
+Web3 Identity from SSH Handles").** One ed25519 keypair per agent/participant
+collapses transport auth + signing identity + Substrate payment address (+
+derived sub-addresses); submissions are SIGNED → output bound to payee (the
+non-repudiation the dictator model needs); composes with the existing
+"per-user zish trust levels via ssh users" idea. Custody sharpening: the
+agent NEVER holds its private key — `sign` is a masked hostcall (the
+ssh-agent precedent: custodian signs specific payloads on request, every
+request attested in the transcript; a compromised agent can request
+signatures while alive but never exfiltrate the key). Chain cost: agile
+coretime made parachains cheap (bulk/on-demand coretime, no slot auction);
+collators trivial on Rotko infra — the expensive part is mechanism design,
+not the chain. **Bootstrap (user): the org's first workload is ITSELF** —
+agents build/serve their own substrate (treasury pallet, bridge feats, gf
+packages, feed plumbing, collator monitoring): self-hosting, and infra work
+is exactly the cheaply-verifiable kind the dictator model wants. External
+value anchor against token circularity — REVISED (user): do NOT lean on
+Rotko revenue; seed budget is ~$100–200 total. The seed capital is Rotko's
+IDLE COMPUTE, not its P&L: first product = selling spare capacity, operated
+end-to-end by agents (provisioning/monitoring/support — cheaply verifiable
+infra ops, external customers = the real value anchor). Budget math: at
+Flash prices $100 ≈ ~1B input tokens — months of runway for terse agents,
+but ONE runaway loop can eat a month in an afternoon → per-key hard limits
+with daily resets are EXISTENTIAL from day one (before any model loop
+ships), and Pro calls are steward-rationed scarcity. Poverty is a good
+architect. **The frame (user): this is a 1-billion-token ORG-STRUCTURE
+experiment** — hold model intelligence deliberately cheap, scale structure
+(masks, delegation, budgets, judged-output gates, compaction) and measure how
+far organization compensates for mediocre minds. Instrumented by construction
+(metered keys + attested transcripts = the dataset; the feed = the running
+publication). Pinned hypothesis: cheap models + strong structure win where
+verification ≪ generation (tests, infra ops, differential checks) and lose
+elsewhere — where the output clusters relative to that line IS the finding,
+in any direction.
+Bonus riff (user): broadcast the org's flow on public append-only feeds
+(S2-style) so investors watch work live — nearly free by construction
+(sanitized append-only transcripts → stream appends; the attested trace makes
+the feed non-fake). Edges: "publishable" = a per-session mask capability
+(default private; secrets structurally never in transcripts), and observed
+agents perform — pay for outcomes, not for looking busy on stream.
+
 **Layering (user, same day):** a rendering front-end is NOT abandoned — it comes
 back later as a *view over the files*. The transcript + session state are the
 single source of truth; a live follow view / vim pager / full intent renderer
@@ -441,11 +604,20 @@ Consequences:
   poll multiplexes `{stdin} ∪ {session fds}`; frames are serviced between
   keystrokes. Non-interactive (`zish -c`) keeps the blocking host.
 - **Known v1 limitations (accepted, named):**
-  - Servicing a `run` frame executes the command synchronously inside the input
-    loop — prompt/rendering/Ctrl-C are dead until it returns. Fine for fast tool
-    calls; a slow command freezes the shell with no escape. The fix is plan #2's
-    real design — pidfd-pollable tool-children in the poll set — and is the
-    NEXT slice, not optional hardening.
+  - ~~Servicing a `run` frame executes synchronously inside the input loop~~
+    **FIXED (protocol v0.3, same day):** `run` is now a forked subshell child
+    (own pgroup, no terminal claim, stdin=/dev/null, stdout to an unlinked
+    capture file) awaited via pidfd in the input poll set — the prompt stays
+    live during slow tools; `result.code` carries the REAL exit status.
+    Side effects of the fork design: `run` is snapshot-isolated everywhere
+    (plan #11's per-call snapshot by construction — mutations don't propagate
+    back, sync host included); one run in flight per session (lockstep;
+    second gets error "busy"). **Ctrl-C at the prompt deliberately does NOT
+    kill the agent's tool child** — background work must not die to a
+    line-edit cancel; `session kill` is the kill switch (kills -pgid, whole
+    tool tree). Known edge: a user's bare `wait` (waitpid(-1)) can steal the
+    tool child's exit status → code reported 255, completion still fires via
+    pidfd.
   - `$(session-feat)` inside command substitution while interactive: forced back
     to the sync host when detectable, else documented wart.
   - A hostile feat that closes stdout without exiting is SIGKILLed (done/EOF is
