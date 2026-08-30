@@ -1886,7 +1886,7 @@ fn readNextAction(self: *Shell) !Action {
 // In vim normal mode the cursor rests ON a character, never past the end of
 // its line. After a delete at end-of-line it can land on the newline/end, so
 // pull it back onto the last character (no-op in insert mode or at line start).
-fn clampCursorNormal(self: *Shell) void {
+pub fn clampCursorNormal(self: *Shell) void {
     if (self.vim_mode != .normal) return;
     const b = &self.edit_buf;
     const at_line_end = b.cursor >= b.len or b.text[b.cursor] == '\n';

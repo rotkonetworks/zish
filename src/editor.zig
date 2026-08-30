@@ -604,7 +604,12 @@ pub const TermView = struct {
         }
 
         const w = self.term.width;
-        const cont_marker_len: u16 = 2; // "│ "
+        // Continuation lines of a multi-line command render flush-left with no
+        // gutter glyph. A decorative "│ " marker looked nice but a terminal has
+        // no way to mark it non-selectable, so it landed in every copy of the
+        // command and had to be hand-stripped. Flush-left keeps the on-screen
+        // text a faithful, round-trippable view of the buffer (micay/deidrec).
+        const cont_marker_len: u16 = 0;
 
         // When the prompt is wider than the terminal it is truncated on emit to
         // (w-4) visible chars + ".. " (see the prompt-emit branch below), so it
@@ -693,10 +698,6 @@ pub const TermView = struct {
                 _ = self.emit(Color.reset);
                 self.clearToEOL();
                 _ = self.emitByte('\n');
-                _ = self.emit(Color.gray);
-                _ = self.emit("│");
-                _ = self.emit(Color.reset);
-                _ = self.emitByte(' ');
                 hl.at_line_start = true;
                 hl.first_word = true;
                 render_row += 1;

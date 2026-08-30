@@ -1421,6 +1421,47 @@ test "vim motions" {
     try std.testing.expectEqual(@as(u16, 0), buf.cursor);
 }
 
+test "vim w/e/b stop on punctuation like real vi" {
+    var buf = editor.EditBuffer{};
+    var vim = Vim{ .mode = .normal };
+
+    // "foo.bar baz" : indices f0 o1 o2 .3 b4 a5 r6 _7 b8 a9 z10
+    buf.set("foo.bar baz");
+    buf.cursor = 0;
+
+    // w: foo -> . (punct is its own word)
+    _ = vim.handleKey(&buf, 'w');
+    try std.testing.expectEqual(@as(u16, 3), buf.cursor);
+    // w: . -> bar
+    _ = vim.handleKey(&buf, 'w');
+    try std.testing.expectEqual(@as(u16, 4), buf.cursor);
+    // w: bar -> baz
+    _ = vim.handleKey(&buf, 'w');
+    try std.testing.expectEqual(@as(u16, 8), buf.cursor);
+
+    // e from start: end of foo (index 2)
+    buf.cursor = 0;
+    _ = vim.handleKey(&buf, 'e');
+    try std.testing.expectEqual(@as(u16, 2), buf.cursor);
+    // e: end of . (index 3)
+    _ = vim.handleKey(&buf, 'e');
+    try std.testing.expectEqual(@as(u16, 3), buf.cursor);
+    // e: end of bar (index 6)
+    _ = vim.handleKey(&buf, 'e');
+    try std.testing.expectEqual(@as(u16, 6), buf.cursor);
+
+    // b from index 8 (b of baz): -> bar start (4)
+    buf.cursor = 8;
+    _ = vim.handleKey(&buf, 'b');
+    try std.testing.expectEqual(@as(u16, 4), buf.cursor);
+    // b: bar -> . (3)
+    _ = vim.handleKey(&buf, 'b');
+    try std.testing.expectEqual(@as(u16, 3), buf.cursor);
+    // b: . -> foo (0)
+    _ = vim.handleKey(&buf, 'b');
+    try std.testing.expectEqual(@as(u16, 0), buf.cursor);
+}
+
 test "vim delete word" {
     var buf = editor.EditBuffer{};
     var vim = Vim{ .mode = .normal };

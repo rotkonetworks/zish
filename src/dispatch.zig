@@ -92,6 +92,14 @@ fn viStateMachineKey(self: *Shell, char: u8) !Action {
         return .{ .vim_mode = .{ .set_mode = self.vim_mode } };
     }
     if (result == .unhandled) return .none;
+    // Normal-mode invariant: the cursor never sits past the last character.
+    // Word motions (w/e/W/E) and friends can legitimately walk buf.cursor to
+    // buf.len; without this clamp `e` on the final word overshoots to buf.len
+    // and the next press wraps, so you can never settle on end-of-line. This is
+    // the single choke point where a vi key result becomes final — enforce the
+    // invariant here rather than in each motion (operator-pending motions still
+    // need the transient past-end position, and they execute before returning).
+    self.clampCursorNormal();
     return .redraw_line;
 }
 

@@ -837,6 +837,20 @@ def _(sh):
     expect(out, "(x) tail")
 
 
+@test("e settles on the last char instead of overshooting past end")
+def _(sh):
+    # Regression: word-end motions could walk buf.cursor to buf.len (one past
+    # the last char) in normal mode, and nothing clamped it back — so spamming
+    # `e` overshot the end of "abc" and the cursor wrapped to column 0. An
+    # append there landed in the wrong place. Correct vi: `e` stops on the last
+    # char and stays; `a` then appends right after it. Five e's on "echo abc"
+    # must leave the cursor on the final 'c', so "END" appends to the tail.
+    vi_edit(sh, "echo abc", "0eeeeea", insert_text="END")
+    sh.send("\n")
+    out = expect_soon(sh, "abcEND")
+    assert "eENDcho" not in out and "ENDcho" not in out, f"cursor wrapped: {out!r}"
+
+
 @test("u undoes a change, Ctrl-R redoes it")
 def _(sh):
     # `w` first so dw deletes "aaa " (leaving "echo bbb"), not "echo " itself
@@ -940,6 +954,11 @@ def _(sh):
         order = ["AAA", "BBB", "CCC", "DDD", "EEE"]
         seen = [t for t in order if t in screen]
         assert seen, f"nothing rendered\n        screen: {screen!r}"
+
+        # Continuation lines must render flush-left with no decorative gutter
+        # glyph — a "│" marker used to prefix each wrapped line and landed in
+        # every copy of a multi-line command pasted out of the terminal.
+        assert "│" not in screen, f"continuation gutter leaked into render: {screen!r}"
 
         # Must end at the last line and be gap-free back from there.
         idx = [order.index(t) for t in seen]
