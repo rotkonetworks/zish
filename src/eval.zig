@@ -4,6 +4,7 @@ const compat = @import("compat.zig");
 const ast = @import("ast.zig");
 const glob = @import("glob.zig");
 const Shell = @import("Shell.zig");
+const brace = @import("brace.zig");
 const parser = @import("parser.zig");
 const builtins = @import("builtins.zig");
 const jobs = @import("jobs.zig");
@@ -955,7 +956,7 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
                 needs_full_expansion = true;
                 break;
             }
-            if (Shell.hasBracePattern(arg)) {
+            if (brace.hasBracePattern(arg)) {
                 needs_full_expansion = true;
                 break;
             }
@@ -2720,11 +2721,11 @@ fn expandUnquotedWordInto(shell: *Shell, raw: []const u8, out: *std.ArrayList([]
         std.mem.indexOfScalar(u8, raw, '$') != null;
 
     // Step 1: Brace expansion {a,b,c} or {1..5}
-    const brace_results = if (Shell.hasBracePattern(raw))
-        try Shell.expandBraces(shell.allocator, raw)
+    const brace_results = if (brace.hasBracePattern(raw))
+        try brace.expandBraces(shell.allocator, raw)
     else
         null;
-    defer if (brace_results) |br| Shell.freeBraceResults(shell.allocator, br);
+    defer if (brace_results) |br| brace.freeBraceResults(shell.allocator, br);
     const brace_items = if (brace_results) |br| br else &[_][]const u8{raw};
 
     for (brace_items) |item| {
