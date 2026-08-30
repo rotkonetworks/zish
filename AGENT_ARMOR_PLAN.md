@@ -432,6 +432,23 @@ bounds HOW MUCH — both delegate monotonically down the tree); transcripts +
 fd-3 trace as the ledger the steward reads (files again — no new machinery);
 zish as the enforcement chokepoint (budget exhaustion → the same loud `error`
 frame, reason "budget").
+**Polkadot layer = polkagent, NOT our own (user decision; github.com/wpank/
+polkagent).** Do NOT implement chain interaction (governance tracks, metadata,
+call encoding, finality, treasury/staking/identity) in zish — polkagent does
+it as first-class domain objects. Critical boundary: polkagent is ITSELF an
+agent framework (own multi-provider LLM loop) — adopt it as the **Polkadot
+CAPABILITY layer, not the org's agent** (we already built the loop; two brains
+fight). Integration: our agents reach the chain by calling polkagent as a TOOL
+— CLI subprocess via a `run` frame, or wrapped in an extra-tier session feat —
+contained by our sandbox/mask/staging like any feat. The overlap is a gift,
+not a conflict: its policy-gated effects + human approval ≡ our staging gate +
+human constitution (real chain writes stay human-gated); its ACP server ≡ the
+#4 acp-bridge third-party-ACP door, already anticipated; its CLI/REST ≡
+run-frame reachable with zero zish-side chain code; its durable conversations
++ evidence trails ≡ our transcripts + fd-3 attestation. Status caveat (theirs):
+real chain writes / shared identity / HA are incomplete — fine, our near-term
+need is read/propose, and writes are human-gated anyway.
+
 **Fiat bridge (user): Rotko as the provisioning oracle.** OpenRouter takes no
 crypto, so the on-chain treasury cannot pay it directly. Bridge: a chain
 contract lets an agent BUY OpenRouter allocation with the org token; Rotko
@@ -627,6 +644,28 @@ shape). Guard: advice is ADVISORY (returns words, not authority) — the agent
 still acts through the same attested executor; a smart model's suggestion is
 not a capability grant. Cheap first version: a distinct system prompt + Pro
 model on the same loop, invoked as a tool.
+
+**Transcript → JSONL event log (user: "look how Claude Code saves files").**
+Verified Claude Code's own format (its session data lives under
+~/.claude/projects/<proj>/<uuid>.jsonl): ONE append-only JSONL file per
+session, one TYPED event per line ({"type":"mode"...}, message/tool-call/
+result events, and a {"type":"file-history-snapshot"} checkpoint type —
+analogous to our staging/undo layer), grouped under a project dir, per-session
+subdir for aux data; resume = replay the JSONL. Adapt this: make our transcript
+an append-only JSONL event log (typed events: say/stream/run/result/prompt/
+answer/exit) instead of free-form sanitized text. Four wins at once: (1)
+resume-by-replay (#10) nearly free — re-render from the log; (2) front-ends
+(Claude Code / IRC) parse structured events, not scraped text; (3) `cat` stays
+terminal-safe FOR FREE — JSON escaping stores a control byte as literal
+``, so a raw ESC never lands in the file; sanitization moves to
+render-time only, dropping the need for a separate sanitized-text file; (4)
+the `.meta` registry (BUILT) is the lightweight index, like CC's project-dir
+listing. New org-state model: **JSONL event log per session (durable truth) +
+.meta index (discovery) + render-on-read (any front-end)** = Claude Code's
+architecture under our sandbox/provenance model. This SUPERSEDES the control-
+FIFO as the next slice (it delivers resume + front-end ingestion, not just
+cross-process discovery). Control channel (answer/kill from another process)
+comes after — likely a per-session control FIFO in the host's poll set.
 
 **Layering (user, same day):** a rendering front-end is NOT abandoned — it comes
 back later as a *view over the files*. The transcript + session state are the

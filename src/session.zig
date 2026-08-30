@@ -475,16 +475,65 @@ fn openTranscript(shell: *Shell, id: u32, name: []const u8) !Transcript {
         safe[i] = if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_') c else '_';
     }
 
-    const path = try std.fmt.allocPrint(alloc, "{s}/{d}-{d}-{s}.log", .{ dir, std.c.getpid(), id, safe[0..nlen] });
+    const path = try std.fmt.allocPrint(alloc, "{s}/{d}-{d}-{s}.jsonl", .{ dir, std.c.getpid(), id, safe[0..nlen] });
     errdefer alloc.free(path);
     var zbuf: [std.fs.max_path_bytes]u8 = undefined;
     const pathz = try std.fmt.bufPrintZ(&zbuf, "{s}", .{path});
     const fd = try compat.posix.openZ(pathz.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, 0o600);
 
-    var hdr: [160]u8 = undefined;
-    const h = std.fmt.bufPrint(&hdr, "# zish session {d} \xc2\xb7 feat {s} \xc2\xb7 t={d}\n", .{ id, safe[0..nlen], compat.timestamp() }) catch "";
+    var hdr: [200]u8 = undefined;
+    const h = std.fmt.bufPrint(&hdr, "{{\"t\":\"start\",\"id\":{d},\"name\":\"{s}\",\"ts\":{d}}}\n", .{ id, safe[0..nlen], compat.timestamp() }) catch "";
     writeAllFd(fd, h);
     return .{ .fd = fd, .path = path };
+}
+
+// ---------------------------------------------------------------------------
+// event log — the transcript is an append-only JSONL event log (Claude Code
+// shape): one typed event per line, all text JSON-escaped. Two properties
+// follow: `cat` is terminal-safe FOR FREE (a control byte is stored as the
+// literal 6-char escape (backslash u 001b), never a raw ESC — so no sanitize pass is needed
+// for the FILE; sanitize stays only on the terminal-echo path), and a session
+// re-renders by replaying the log (resume). Best-effort: a failed log write
+// never breaks the session.
+// ---------------------------------------------------------------------------
+
+/// Append `{"t":kind,"<key>":"<escaped val>"}`. The single-string-field event
+/// shape most events use (say/stream/prompt/answer/note/run/denied).
+fn logKV(shell: *Shell, fd: compat.posix.fd_t, kind: []const u8, key: []const u8, val: []const u8) void {
+    if (fd < 0) return;
+    const alloc = shell.allocator;
+    var b: std.ArrayListUnmanaged(u8) = .empty;
+    defer b.deinit(alloc);
+    b.appendSlice(alloc, "{\"t\":\"") catch return;
+    b.appendSlice(alloc, kind) catch return;
+    b.appendSlice(alloc, "\",\"") catch return;
+    b.appendSlice(alloc, key) catch return;
+    b.appendSlice(alloc, "\":\"") catch return;
+    appendJsonEscaped(&b, alloc, val) catch return;
+    b.appendSlice(alloc, "\"}\n") catch return;
+    writeAllFd(fd, b.items);
+}
+
+/// Append `{"t":"result","code":N,"out":"<escaped, capped>"}`.
+fn logResult(shell: *Shell, fd: compat.posix.fd_t, code: u8, out: []const u8) void {
+    if (fd < 0) return;
+    const alloc = shell.allocator;
+    var b: std.ArrayListUnmanaged(u8) = .empty;
+    defer b.deinit(alloc);
+    var hb: [40]u8 = undefined;
+    b.appendSlice(alloc, std.fmt.bufPrint(&hb, "{{\"t\":\"result\",\"code\":{d},\"out\":\"", .{code}) catch return) catch return;
+    const capped = out[0..@min(out.len, TRANSCRIPT_RUN_CAP)];
+    appendJsonEscaped(&b, alloc, capped) catch return;
+    if (out.len > capped.len) b.appendSlice(alloc, "\\n[output truncated]") catch return;
+    b.appendSlice(alloc, "\"}\n") catch return;
+    writeAllFd(fd, b.items);
+}
+
+fn logBare(fd: compat.posix.fd_t, kind: []const u8) void {
+    if (fd < 0) return;
+    writeAllFd(fd, "{\"t\":\"");
+    writeAllFd(fd, kind);
+    writeAllFd(fd, "\"}\n");
 }
 
 /// A session fd (or its HUP) came up readable in the input poll: drain it and
@@ -547,8 +596,10 @@ fn handleAsyncFrame(shell: *Shell, s: *Session, line: []const u8) !bool {
         var clean: std.ArrayListUnmanaged(u8) = .empty;
         defer clean.deinit(alloc);
         try sanitize.writeSanitized(listWriter(&clean, alloc), text);
+        // log the event (JSON-escaped, cat-safe) before appending the newline
+        // that only the terminal echo needs
+        logKV(shell, s.transcript_fd, t, "text", clean.items);
         if (t[1] == 'a') try clean.append(alloc, '\n'); // say implies newline
-        writeAllFd(s.transcript_fd, clean.items);
         try s.echo.appendSlice(alloc, clean.items);
         echoCompleteLines(shell, s);
         return false;
@@ -562,9 +613,7 @@ fn handleAsyncFrame(shell: *Shell, s: *Session, line: []const u8) !bool {
         // single line: a question that needs layout can use say first
         if (std.mem.indexOfScalar(u8, clean.items, '\n')) |p| clean.items.len = p;
 
-        writeAllFd(s.transcript_fd, "? ");
-        writeAllFd(s.transcript_fd, clean.items);
-        writeAllFd(s.transcript_fd, "\n");
+        logKV(shell, s.transcript_fd, "prompt", "text", clean.items);
 
         if (s.pending_q) |old| alloc.free(old);
         const q = try clean.toOwnedSlice(alloc);
@@ -581,19 +630,14 @@ fn handleAsyncFrame(shell: *Shell, s: *Session, line: []const u8) !bool {
         if (!s.caps.run) return denyHostcall(shell, s, "run", ERR_RUN_DENIED);
         if (s.tool != null) {
             // lockstep protocol: one run in flight per session
-            writeAllFd(s.transcript_fd, "! run refused: tool already in flight\n");
+            logKV(shell, s.transcript_fd, "note", "text", "run refused: tool already in flight");
             return !writeFrame(s.w, ERR_RUN_BUSY);
         }
         const cmd = frameStr(parsed.value, "cmd");
 
-        // Audit trail BEFORE execution, so a tool killed mid-run still left
-        // its line. The command string is model-composed text — sanitize it.
-        writeAllFd(s.transcript_fd, "$ ");
-        var cmdclean: std.ArrayListUnmanaged(u8) = .empty;
-        defer cmdclean.deinit(alloc);
-        try sanitize.writeSanitized(listWriter(&cmdclean, alloc), cmd);
-        writeAllFd(s.transcript_fd, cmdclean.items);
-        writeAllFd(s.transcript_fd, "\n");
+        // Audit the command BEFORE execution, so a tool killed mid-run still
+        // left its event. JSON escaping makes the raw command cat-safe.
+        logKV(shell, s.transcript_fd, "run", "cmd", cmd);
 
         // Spawn and park: the reply is sent by finishTool when the child's
         // pidfd fires in the input poll — the prompt stays live meanwhile.
@@ -610,9 +654,7 @@ fn handleAsyncFrame(shell: *Shell, s: *Session, line: []const u8) !bool {
 /// send the structured error frame back — never a silent drop. Returns true
 /// (end session) only if the error reply itself failed to write.
 fn denyHostcall(shell: *Shell, s: *Session, call: []const u8, err_frame: []const u8) bool {
-    writeAllFd(s.transcript_fd, "! hostcall denied: ");
-    writeAllFd(s.transcript_fd, call);
-    writeAllFd(s.transcript_fd, "\n");
+    logKV(shell, s.transcript_fd, "denied", "call", call);
     var note = beginAbovePrompt(shell);
     note.print("\x1b[2m[sess {d}:{s}] hostcall denied: {s}\x1b[0m\n", .{ s.id, s.name, call }) catch {};
     endAbovePrompt(shell);
@@ -735,20 +777,9 @@ fn finishTool(shell: *Shell, idx: usize) void {
     const r = completeTool(shell, t);
     defer alloc.free(r.out);
 
-    // audit trail: sanitized, capped output + the real exit code
-    var outclean: std.ArrayListUnmanaged(u8) = .empty;
-    defer outclean.deinit(alloc);
-    const capped = r.out[0..@min(r.out.len, TRANSCRIPT_RUN_CAP)];
-    sanitize.writeSanitized(listWriter(&outclean, alloc), capped) catch {};
-    writeAllFd(s.transcript_fd, outclean.items);
-    if (r.out.len > capped.len) writeAllFd(s.transcript_fd, "\n[transcript: output truncated]");
-    if (outclean.items.len == 0 or outclean.items[outclean.items.len - 1] != '\n')
-        writeAllFd(s.transcript_fd, "\n");
-    if (r.code != 0) {
-        var cb: [24]u8 = undefined;
-        const cl = std.fmt.bufPrint(&cb, "[exit {d}]\n", .{r.code}) catch "";
-        writeAllFd(s.transcript_fd, cl);
-    }
+    // audit event: real exit code + captured output (JSON-escaped, cat-safe,
+    // capped inside the event) — no separate sanitize pass needed for the file
+    logResult(shell, s.transcript_fd, r.code, r.out);
 
     if (!replyResult(shell, s.w, r.code, r.out)) {
         finishSession(shell, idx);
@@ -866,12 +897,7 @@ pub fn answerSession(shell: *Shell, id: u32, text: []const u8) !u8 {
     try appendJsonEscaped(&frame, alloc, text);
     try frame.appendSlice(alloc, "\"}\n");
 
-    writeAllFd(s.transcript_fd, "> ");
-    var clean: std.ArrayListUnmanaged(u8) = .empty;
-    defer clean.deinit(alloc);
-    try sanitize.writeSanitized(listWriter(&clean, alloc), text);
-    writeAllFd(s.transcript_fd, clean.items);
-    writeAllFd(s.transcript_fd, "\n");
+    logKV(shell, s.transcript_fd, "answer", "text", text);
 
     alloc.free(s.pending_q.?);
     s.pending_q = null;
@@ -904,14 +930,14 @@ pub fn finishSession(shell: *Shell, idx: usize) void {
         _ = compat.posix.kill(-t.pid, compat.posix.SIG.KILL) catch {};
         const r = completeTool(shell, t); // reap + close fds
         alloc.free(r.out);
-        writeAllFd(s.transcript_fd, "! tool killed with session\n");
+        logKV(shell, s.transcript_fd, "note", "text", "tool killed with session");
     }
 
     compat.posix.close(s.w);
     compat.posix.close(s.r);
     reapSessionChild(s.pid);
     if (s.transcript_fd >= 0) {
-        writeAllFd(s.transcript_fd, "# session ended\n");
+        logBare(s.transcript_fd, "end");
         compat.posix.close(s.transcript_fd);
     }
 

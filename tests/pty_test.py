@@ -1094,11 +1094,12 @@ def _(sh):
         # `ended` is last in the stream; the answered say precedes it in the burst
         out = expect_soon(small, "ended")
         assert "answered-ok" in out, f"post-answer say missing: {out[-400:]!r}"
-        # 4. the run hypercall was executed and audited: transcript has it,
-        #    sanitized (cat of a transcript is terminal-safe by construction)
-        small.sendline("cat ~/.zish/sessions/*.log")
+        # 4. the run hypercall was executed and audited: the JSONL event log
+        #    has the result event, and `cat` of it is terminal-safe by
+        #    construction (JSON escaping stores control bytes as \\u001b)
+        small.sendline("cat ~/.zish/sessions/*.jsonl")
         expect_soon(small, "tool_ran_ok")
-        assert "\x1b[31mred" not in small.buf, "raw SGR leaked into the transcript"
+        assert "\x1b[31mred" not in small.buf, "raw SGR leaked into the event log"
     finally:
         small.close()
         shutil.rmtree(featroot, ignore_errors=True)
@@ -1246,11 +1247,12 @@ def _(sh):
         assert "started" in buf, f"session never started: {buf[-400:]!r}"
         assert "ran it, got agentmark_22" in buf, \
             f"final say missing: {buf[-400:]!r}"
-        # transcript proves the run executed with real captured output
-        a.sendline("cat ~/.zish/sessions/*agent*.log")
+        # the JSONL event log proves the run executed with real output: a
+        # {"t":"run","cmd":"echo agentmark_..."} event and the result output
+        a.sendline("cat ~/.zish/sessions/*agent*.jsonl")
         out = expect_soon(a, "agentmark_22")
-        assert "$ echo agentmark_" in out, \
-            f"tool command not audited in transcript: {out[-400:]!r}"
+        assert '"t":"run","cmd":"echo agentmark_' in out, \
+            f"run event not in the event log: {out[-400:]!r}"
     finally:
         a.close()
         sh.vt = None
@@ -1271,6 +1273,40 @@ def _(sh):
         out = expect_soon(small, "answered-ok")
         assert "sync_rc_0" in out, f"sync host exit marker missing: {out[-400:]!r}"
         assert "started" not in out, "redirected session feat went async"
+    finally:
+        small.close()
+        shutil.rmtree(featroot, ignore_errors=True)
+
+
+@test("transcript is valid JSONL and cat-safe even with hostile feat output")
+def _(sh):
+    # The event log is append-only JSONL (Claude Code shape): every line a
+    # typed JSON event, all text JSON-escaped. Two guarantees: it parses as
+    # JSONL (the resume / front-end-ingestion unlock), and a raw ESC byte
+    # never lands in the file (cat-safety by construction) even though the
+    # pester feat emits a say containing an ESC/SGR sequence.
+    import json as _json
+    featroot = make_session_featroot("pester", PESTER_SCRIPT)
+    small = Shell(env_extra={"ZISH_FEAT_PATH": featroot})
+    try:
+        small.read()
+        small.sendline("pester")
+        expect_soon(small, "asks: proceed?")
+        small.sendline("session answer 1 yes")
+        expect_soon(small, "ended")
+        sess_dir = os.path.join(small.home, ".zish", "sessions")
+        logs = [f for f in os.listdir(sess_dir) if f.endswith(".jsonl")]
+        assert logs, "no .jsonl event log written"
+        raw = open(os.path.join(sess_dir, logs[0]), "rb").read()
+        assert b"\x1b" not in raw, "raw ESC byte leaked into the event log (not cat-safe)"
+        types = []
+        for line in raw.decode().splitlines():
+            if not line.strip():
+                continue
+            ev = _json.loads(line)  # raises if not valid JSON → test fails
+            types.append(ev["t"])
+        assert types[0] == "start" and types[-1] == "end", f"log framing wrong: {types}"
+        assert "run" in types and "say" in types, f"expected events missing: {types}"
     finally:
         small.close()
         shutil.rmtree(featroot, ignore_errors=True)
