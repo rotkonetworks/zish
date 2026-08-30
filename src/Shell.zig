@@ -1841,6 +1841,16 @@ fn logEscape(buf: *[4096]u8, start: usize, s: []const u8) usize {
 }
 
 fn readNextAction(self: *Shell) !Action {
+    // Wait for input with poll() before reading, and let EINTR surface: a
+    // SIGWINCH must return control to run()'s loop so it reflows the line at the
+    // new width immediately (zsh-parity), not sit blocked until the next
+    // keystroke. std.posix.poll and readStreaming both retry EINTR internally,
+    // so use the libc poll directly — it returns -1/EINTR, and run() then sees
+    // the terminal_resized flag on the next loop turn.
+    var pfd = [_]std.c.pollfd{.{ .fd = std.posix.STDIN_FILENO, .events = std.c.POLL.IN, .revents = 0 }};
+    const prc = std.c.poll(&pfd, 1, -1);
+    if (prc <= 0) return .none; // EINTR (SIGWINCH) or spurious wake — loop again
+
     var temp_buf: [1]u8 = undefined;
     const count = try compat.readAll(std.Io.File.stdin(), temp_buf[0..]);
     const char = temp_buf[0];

@@ -963,6 +963,33 @@ print("\nmultiline rendering")
 # ---------------------------------------------------------------------------
 
 
+@test("SIGWINCH reflows the current line immediately, no keystroke needed")
+def _(sh):
+    # zsh reflows the edit line the instant the window resizes. zish blocked in
+    # read() with the resize flag set but unchecked until the next keypress,
+    # because the libc read/poll wrappers retry EINTR — so a bare resize did
+    # nothing. poll-gating the read lets SIGWINCH's EINTR reach run()'s loop.
+    small = Shell(env_extra={"PS1": "READY> "}, cols=60, rows=20)
+    try:
+        small.read()
+        small.send("echo " + "x" * 90)   # 102 visible cols → 2 rows at width 60
+        small.read(quiet_for=0.2, timeout=2.0)
+        # Narrow the pty; the kernel sends SIGWINCH. Send NO keystroke.
+        fcntl.ioctl(small.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 20, 40, 0, 0))
+        out = small.read(quiet_for=0.4, timeout=2.0)
+        vt = VT(20, 40)
+        vt.feed(out)   # render the resize redraw at the new width
+        rows = [l for l in vt.visible_text().splitlines() if l.strip()]
+        assert len(rows) == 3, (
+            "line did not reflow on SIGWINCH without a keystroke "
+            f"(got {len(rows)} rows, expected 3 at width 40):\n"
+            + "\n".join("        | " + l for l in rows))
+        assert all(len(l) <= 40 for l in rows), f"row exceeds new width 40: {rows}"
+    finally:
+        small.close()
+        sh.vt = None
+
+
 @test("pasted multi-line content renders a contiguous window")
 def _(sh):
     # Regression: pasting a multi-line command into a terminal shorter than the
