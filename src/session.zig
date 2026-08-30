@@ -386,6 +386,7 @@ pub fn launchSession(shell: *Shell, name: []const u8, bin_path: []const u8, args
         .caps = caps,
     });
 
+    writeMeta(shell, &shell.sessions.items[shell.sessions.items.len - 1]);
     try shell.stdout().print("[sess {d}:{s}] started \xc2\xb7 transcript {s}\n", .{ id, name, tr.path });
     shell.stdout().flush() catch {};
     return 0;
@@ -393,22 +394,80 @@ pub fn launchSession(shell: *Shell, name: []const u8, bin_path: []const u8, args
 
 const Transcript = struct { fd: compat.posix.fd_t, path: []u8 };
 
+/// Fill `buf` with ~/.zish/sessions, creating ~/.zish and ~/.zish/sessions if
+/// absent (a fresh HOME has neither; EEXIST is fine). Returns the dir path.
+/// This directory is the file-based org registry: transcripts, per-session
+/// `.meta` records, and control FIFOs all live here.
+pub fn sessionsDir(alloc: std.mem.Allocator, buf: []u8) ![]const u8 {
+    const home = compat.getEnvVarOwned(alloc, "HOME") catch return error.NoHome;
+    defer alloc.free(home);
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const parent = try std.fmt.bufPrintZ(&pbuf, "{s}/.zish", .{home});
+    _ = std.c.mkdir(parent.ptr, 0o700);
+    const dir = try std.fmt.bufPrint(buf, "{s}/.zish/sessions", .{home});
+    var dz: [std.fs.max_path_bytes]u8 = undefined;
+    const dirz = try std.fmt.bufPrintZ(&dz, "{s}", .{dir});
+    _ = std.c.mkdir(dirz.ptr, 0o700);
+    return dir;
+}
+
+/// Session identity is namespaced by hosting-shell pid so concurrent shells
+/// never collide: the meta/ctl/transcript basename is <hostpid>-<id>.
+fn metaPath(alloc: std.mem.Allocator, id: u32) ?[]u8 {
+    var dbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = sessionsDir(alloc, &dbuf) catch return null;
+    return std.fmt.allocPrint(alloc, "{s}/{d}-{d}.meta", .{ dir, std.c.getpid(), id }) catch null;
+}
+
+/// The org registry record for one session: a single-line JSON file any
+/// process can read (`session list` scans the dir). Rewritten on every state
+/// change, removed on finish. State is derived from tool/pending fields.
+fn writeMeta(shell: *Shell, s: *const Session) void {
+    const alloc = shell.allocator;
+    const path = metaPath(alloc, s.id) orelse return;
+    defer alloc.free(path);
+    const state: []const u8 = if (s.pending_q != null) "awaiting" else if (s.tool != null) "tool" else "running";
+
+    var b: std.ArrayListUnmanaged(u8) = .empty;
+    defer b.deinit(alloc);
+    b.appendSlice(alloc, "{\"id\":") catch return;
+    var nb: [16]u8 = undefined;
+    b.appendSlice(alloc, std.fmt.bufPrint(&nb, "{d}", .{s.id}) catch return) catch return;
+    b.appendSlice(alloc, ",\"host\":") catch return;
+    b.appendSlice(alloc, std.fmt.bufPrint(&nb, "{d}", .{std.c.getpid()}) catch return) catch return;
+    b.appendSlice(alloc, ",\"name\":\"") catch return;
+    appendJsonEscaped(&b, alloc, s.name) catch return;
+    b.appendSlice(alloc, "\",\"state\":\"") catch return;
+    b.appendSlice(alloc, state) catch return;
+    b.appendSlice(alloc, "\",\"transcript\":\"") catch return;
+    appendJsonEscaped(&b, alloc, s.transcript_path) catch return;
+    b.appendSlice(alloc, "\",\"q\":\"") catch return;
+    if (s.pending_q) |q| appendJsonEscaped(&b, alloc, q) catch return;
+    b.appendSlice(alloc, "\"}\n") catch return;
+
+    var pz: [std.fs.max_path_bytes]u8 = undefined;
+    const pathz = std.fmt.bufPrintZ(&pz, "{s}", .{path}) catch return;
+    const fd = compat.posix.openZ(pathz.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o600) catch return;
+    defer compat.posix.close(fd);
+    writeAllFd(fd, b.items);
+}
+
+fn removeMeta(shell: *Shell, id: u32) void {
+    const alloc = shell.allocator;
+    const path = metaPath(alloc, id) orelse return;
+    defer alloc.free(path);
+    var pz: [std.fs.max_path_bytes]u8 = undefined;
+    const pathz = std.fmt.bufPrintZ(&pz, "{s}", .{path}) catch return;
+    std.Io.Dir.deleteFileAbsolute(compat.io(), pathz) catch {};
+}
+
 /// Transcripts live flat under ~/.zish/sessions/, named
 /// <shellpid>-<id>-<name>.log so concurrent shells never collide. Everything
 /// written to one is already sanitized: `cat transcript` is terminal-safe.
 fn openTranscript(shell: *Shell, id: u32, name: []const u8) !Transcript {
     const alloc = shell.allocator;
-    const home = compat.getEnvVarOwned(alloc, "HOME") catch return error.NoHome;
-    defer alloc.free(home);
-
-    // create ~/.zish then ~/.zish/sessions (a fresh HOME has neither);
-    // EEXIST is fine, any other failure makes the open below fail closed
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const parent = try std.fmt.bufPrintZ(&pbuf, "{s}/.zish", .{home});
-    _ = std.c.mkdir(parent.ptr, 0o700);
     var dbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const dir = try std.fmt.bufPrintZ(&dbuf, "{s}/.zish/sessions", .{home});
-    _ = std.c.mkdir(dir.ptr, 0o700);
+    const dir = try sessionsDir(alloc, &dbuf);
 
     var safe: [32]u8 = undefined;
     const nlen = @min(name.len, safe.len);
@@ -511,6 +570,7 @@ fn handleAsyncFrame(shell: *Shell, s: *Session, line: []const u8) !bool {
         const q = try clean.toOwnedSlice(alloc);
         s.pending_q = q;
 
+        writeMeta(shell, s); // state → awaiting; visible to `session list` cross-process
         var note = beginAbovePrompt(shell);
         note.print("\x1b[2m[sess {d}:{s}]\x1b[0m asks: {s}\n        \x1b[2mreply:\x1b[0m session answer {d} <text>\n", .{ s.id, s.name, q, s.id }) catch {};
         endAbovePrompt(shell);
@@ -539,6 +599,7 @@ fn handleAsyncFrame(shell: *Shell, s: *Session, line: []const u8) !bool {
         // pidfd fires in the input poll — the prompt stays live meanwhile.
         s.tool = spawnToolChild(shell, cmd) catch
             return !writeFrame(s.w, ERR_RUN_FAILED);
+        writeMeta(shell, s); // state → tool
         return false;
     }
 
@@ -689,7 +750,11 @@ fn finishTool(shell: *Shell, idx: usize) void {
         writeAllFd(s.transcript_fd, cl);
     }
 
-    if (!replyResult(shell, s.w, r.code, r.out)) finishSession(shell, idx);
+    if (!replyResult(shell, s.w, r.code, r.out)) {
+        finishSession(shell, idx);
+    } else {
+        writeMeta(shell, s); // state → running (tool cleared)
+    }
 }
 
 /// Dispatch a ready fd from the input poll: a session's pipe or a tool
@@ -701,6 +766,86 @@ pub fn serviceFd(shell: *Shell, fd: compat.posix.fd_t) void {
             if (t.pidfd == fd) return finishTool(shell, i);
         }
     }
+}
+
+/// Print the file-based org registry: every `.meta` under ~/.zish/sessions,
+/// across all hosting shells (this is what makes `session list` work from a
+/// separate process — a Claude Code / IRC front-end reads the same records).
+/// A record whose host process is gone is shown as `[stale]` and its file is
+/// swept, so a crashed shell leaves no permanent ghost.
+pub fn listRegistry(shell: *Shell) !void {
+    const alloc = shell.allocator;
+    const out = shell.stdout();
+    var dbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = sessionsDir(alloc, &dbuf) catch {
+        try out.writeAll("session: no registry\n");
+        return;
+    };
+    var dir = std.Io.Dir.cwd().openDir(compat.io(), dir_path, .{ .iterate = true }) catch {
+        try out.writeAll("session: none active\n");
+        return;
+    };
+    defer dir.close(compat.io());
+
+    var found = false;
+    var iter = dir.iterate();
+    while (try iter.next(compat.io())) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".meta")) continue;
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        const full = std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+        const content = std.Io.Dir.cwd().readFileAlloc(compat.io(), full, alloc, .limited(64 * 1024)) catch continue;
+        defer alloc.free(content);
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, content, .{}) catch continue;
+        defer parsed.deinit();
+
+        const host: i64 = objInt(parsed.value, "host") orelse 0;
+        const id: i64 = objInt(parsed.value, "id") orelse 0;
+        const name = objStr(parsed.value, "name") orelse "?";
+        const state = objStr(parsed.value, "state") orelse "?";
+        const transcript = objStr(parsed.value, "transcript") orelse "";
+        const q = objStr(parsed.value, "q") orelse "";
+
+        // liveness: kill(host, 0) — 0 or EPERM = exists, ESRCH = gone.
+        const alive = host > 0 and hostAlive(@intCast(host));
+        if (!alive) {
+            std.Io.Dir.deleteFileAbsolute(compat.io(), full) catch {};
+            try out.print("[{d}] {s}  [stale host {d}, swept]\n", .{ id, name, host });
+            found = true;
+            continue;
+        }
+        try out.print("[{d}] {s}  {s}  host={d}  {s}\n", .{ id, name, state, host, transcript });
+        if (q.len > 0) try out.print("    ? {s}\n", .{q});
+        found = true;
+    }
+    if (!found) try out.writeAll("session: none active\n");
+}
+
+fn objInt(v: std.json.Value, key: []const u8) ?i64 {
+    const o = switch (v) {
+        .object => |ob| ob,
+        else => return null,
+    };
+    return switch (o.get(key) orelse return null) {
+        .integer => |iv| iv,
+        else => null,
+    };
+}
+
+fn objStr(v: std.json.Value, key: []const u8) ?[]const u8 {
+    const o = switch (v) {
+        .object => |ob| ob,
+        else => return null,
+    };
+    return switch (o.get(key) orelse return null) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+fn hostAlive(host: compat.posix.pid_t) bool {
+    // signal 0 probes existence: ok/EPERM = alive, ESRCH = gone.
+    if (std.c.kill(host, @enumFromInt(0)) == 0) return true;
+    return std.c._errno().* == @intFromEnum(std.c.E.PERM); // exists, not ours
 }
 
 /// Answer a session's pending question (the `session answer` builtin).
@@ -735,6 +880,7 @@ pub fn answerSession(shell: *Shell, id: u32, text: []const u8) !u8 {
         finishSession(shell, idx);
         return 1;
     }
+    writeMeta(shell, s); // state → running (question answered)
     return 0;
 }
 
@@ -743,6 +889,7 @@ pub fn answerSession(shell: *Shell, id: u32, text: []const u8) !u8 {
 pub fn finishSession(shell: *Shell, idx: usize) void {
     const alloc = shell.allocator;
     var s = shell.sessions.orderedRemove(idx);
+    removeMeta(shell, s.id); // drop the registry record
 
     // flush any partial echoed line so the terminal isn't left mid-line
     if (s.echo.items.len > 0) {

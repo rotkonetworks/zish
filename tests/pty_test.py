@@ -1276,6 +1276,40 @@ def _(sh):
         shutil.rmtree(featroot, ignore_errors=True)
 
 
+@test("session registry is file-based: a separate process lists live sessions")
+def _(sh):
+    # The org registry (~/.zish/sessions/*.meta) is what makes `session list`
+    # work from ANY process — the unlock for external front-ends. Start a
+    # session that parks awaiting an answer in the interactive shell, then read
+    # it back from a separate `zish -c 'session list'` sharing the same HOME.
+    import subprocess as _sp
+    featroot = make_session_featroot("pester", PESTER_SCRIPT)
+    small = Shell(env_extra={"ZISH_FEAT_PATH": featroot})
+    try:
+        small.read()
+        small.sendline("pester")
+        expect_soon(small, "asks: proceed?")  # now parked, meta written
+        env = dict(os.environ)
+        env["HOME"] = small.home
+        env["ZISH_FEAT_PATH"] = featroot
+        env["ZISH_BYPASS_PASSWORD"] = "1"
+        r = _sp.run([ZISH, "-c", "session list"], env=env,
+                    capture_output=True, text=True, timeout=10)
+        out = clean(r.stdout)
+        assert "pester" in out, f"cross-process list missing the session: {out!r}"
+        assert "awaiting" in out, f"registry did not reflect the awaiting state: {out!r}"
+        # release the session; its meta must then be swept
+        small.sendline("session answer 1 yes")
+        expect_soon(small, "ended")
+        r2 = _sp.run([ZISH, "-c", "session list"], env=env,
+                     capture_output=True, text=True, timeout=10)
+        assert "pester" not in clean(r2.stdout), \
+            f"ended session's meta not swept: {clean(r2.stdout)!r}"
+    finally:
+        small.close()
+        shutil.rmtree(featroot, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 total = passed + failed
 print()
