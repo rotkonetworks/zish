@@ -95,7 +95,7 @@ pub const EntryData = struct {
         return buf;
     }
 
-    fn deserialize(data: []const u8, allocator: std.mem.Allocator) !EntryData {
+    pub fn deserialize(data: []const u8, allocator: std.mem.Allocator) !EntryData {
         if (data.len < 14) return error.InvalidEntryData; // min: 8+2+0+1+1+2
 
         var pos: usize = 0;

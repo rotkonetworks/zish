@@ -73,6 +73,7 @@ const compat = @import("compat.zig");
 const parser = @import("parser.zig");
 const glob = @import("glob.zig");
 const Shell = @import("Shell.zig");
+const history_log = @import("history_log.zig");
 
 /// Characters that make shell syntax interesting.
 ///
@@ -116,6 +117,19 @@ fn coreGlob(pattern: []const u8, text: []const u8) void {
     _ = glob.matchGlob(pattern, text);
 }
 
+/// History-record decode core. This is the highest-value memory-safety target:
+/// EntryData.deserialize parses UNTRUSTED bytes that come off disk — a history
+/// log written by another session (shared history) or a maliciously-crafted
+/// file. It reads little-endian lengths and slices by them, exactly the class
+/// where an out-of-bounds read or a length-vs-buffer mismatch lives (we already
+/// hardened the u16 length cast on the encode side). Feed it arbitrary bytes;
+/// it must error, never over-read or panic. Free the command on success so a
+/// leak is caught as a failure.
+fn coreHistoryDecode(data: []const u8) void {
+    const entry = history_log.EntryData.deserialize(data, std.testing.allocator) catch return;
+    std.testing.allocator.free(entry.command);
+}
+
 /// Arithmetic core. evaluateArithmetic is pure with respect to processes — it
 /// reads and writes shell variables and nothing else — so it is safe in-process.
 /// This is where INT_MIN/-1 and the 19-digit literal overflow lived.
@@ -138,6 +152,22 @@ fn smithShellish(smith: *Smith, out: []u8) []u8 {
     // 20:1 continue:stop biases toward longer inputs, where the nesting bugs are.
     while (n < out.len and !smith.eosWeightedSimple(20, 1)) : (n += 1) {
         out[n] = shell_alphabet[smith.value(u8) % shell_alphabet.len];
+    }
+    return out[0..n];
+}
+
+/// Full-range random bytes — for binary decoders (history records), where the
+/// interesting inputs are byte patterns, not shell syntax.
+fn randomBytes(rand: std.Random, out: []u8) []u8 {
+    const n = rand.uintLessThan(usize, out.len + 1);
+    rand.bytes(out[0..n]);
+    return out[0..n];
+}
+
+fn smithBytes(smith: *Smith, out: []u8) []u8 {
+    var n: usize = 0;
+    while (n < out.len and !smith.eosWeightedSimple(20, 1)) : (n += 1) {
+        out[n] = smith.value(u8);
     }
     return out[0..n];
 }
@@ -201,6 +231,13 @@ test "sweep: arithmetic" {
     for (0..iterations(sweep_iterations)) |_| coreArith(shell, randomShellish(rand, &buf));
 }
 
+test "sweep: history decode" {
+    var prng: std.Random.DefaultPrng = .init(std.testing.random_seed);
+    const rand = prng.random();
+    var buf: [512]u8 = undefined;
+    for (0..iterations(sweep_iterations)) |_| coreHistoryDecode(randomBytes(rand, &buf));
+}
+
 // ---------------------------------------------------------------------------
 // Driver 2: coverage-guided (std.testing.fuzz)
 // ---------------------------------------------------------------------------
@@ -239,6 +276,15 @@ test "fuzz: arithmetic" {
     const shell = try Shell.initNonInteractive(std.heap.page_allocator);
     defer shell.deinit();
     try std.testing.fuzz(shell, fuzzArith, .{});
+}
+
+test "fuzz: history decode" {
+    try std.testing.fuzz({}, fuzzHistoryDecode, .{});
+}
+
+fn fuzzHistoryDecode(_: void, smith: *Smith) !void {
+    var buf: [512]u8 = undefined;
+    coreHistoryDecode(smithBytes(smith, &buf));
 }
 
 fn fuzzArith(shell: *Shell, smith: *Smith) !void {
