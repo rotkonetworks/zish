@@ -8,7 +8,11 @@
 //! uses), and writes result frames back. Single-threaded; a session feat's
 //! stdio is pipes, never the terminal.
 //!
-//! Frame protocol v0.1 (one JSON object per line):
+//! Frame protocol v0.2 (one JSON object per line):
+//!   zish → feat, once at session start
+//!     {"t":"hello","proto":0,"caps":["say","stream","done",...]}
+//!         the session's hostcall capability mask — the guest knows its world
+//!         up front and degrades instead of probing by denial
 //!   feat → zish
 //!     {"t":"run","cmd":"<shell command>"}   execute via zish, capture stdout
 //!     {"t":"say","text":"<text>"}           display a line to the human
@@ -21,6 +25,17 @@
 //!     {"t":"result","code":<int>,"out":"<captured stdout>"}   reply to "run"
 //!     {"t":"event","kind":"submitted","text":"<answer>"}      reply to "prompt"
 //!     {"t":"event","kind":"cancelled"}                        prompt not answerable
+//!     {"t":"error","call":"<name>","reason":"denied"}         masked-off hostcall
+//!
+//! Hostcall capability mask: ONE vocabulary, per-session mask (never tiered
+//! tables). The mask bounds which CHANNELS the guest gets (execution, human
+//! attention); the sandbox bounds what a granted `run` may TOUCH. Denials are
+//! loud — a structured `error` frame plus a transcript line — and the mask is
+//! a POLICY gate, not containment: a guest denied `run` still sits inside its
+//! Landlock jail. v1 derivation: extra tier → {say,stream,done}; standard →
+//! everything. Endgame: a parent agent spawning a child session hands it a
+//! strictly narrower mask, so delegation narrows authority monotonically down
+//! an agent-to-agent tree.
 //!
 //! Two hosting modes, one protocol:
 //!   - **async** (interactive shell, stdout is the tty): `launchSession`
@@ -73,6 +88,22 @@ const WRITE_TIMEOUT_MS = 5000;
 /// not capped — the feat gets everything; the transcript is an audit log).
 const TRANSCRIPT_RUN_CAP = 64 * 1024;
 
+/// Which hostcalls a session may use. say/stream/done are always granted — a
+/// guest that cannot even speak or exit cleanly has no useful failure mode.
+/// A feat may effectively hold LESS by never emitting a call; it can never
+/// hold more than its tier grants (narrowing composes, fail-closed).
+pub const Caps = struct {
+    run: bool,
+    prompt: bool,
+
+    pub fn forTier(untrusted: bool) Caps {
+        return .{ .run = !untrusted, .prompt = !untrusted };
+    }
+};
+
+const ERR_RUN_DENIED = "{\"t\":\"error\",\"call\":\"run\",\"reason\":\"denied\"}\n";
+const ERR_PROMPT_DENIED = "{\"t\":\"error\",\"call\":\"prompt\",\"reason\":\"denied\"}\n";
+
 /// One live async session.
 pub const Session = struct {
     id: u32,
@@ -82,6 +113,7 @@ pub const Session = struct {
     w: compat.posix.fd_t, // zish → feat stdin (CLOEXEC)
     transcript_fd: compat.posix.fd_t,
     transcript_path: []u8, // owned
+    caps: Caps,
     buf: std.ArrayListUnmanaged(u8) = .empty, // unparsed frame bytes
     echo: std.ArrayListUnmanaged(u8) = .empty, // sanitized text awaiting a full line
     pending_q: ?[]u8 = null, // sanitized question awaiting `session answer`
@@ -93,7 +125,7 @@ pub const Session = struct {
 
 const Spawned = struct { pid: compat.posix.pid_t, r: compat.posix.fd_t, w: compat.posix.fd_t };
 
-fn spawn(shell: *Shell, bin_path: []const u8, args: []const []const u8) !Spawned {
+fn spawn(shell: *Shell, bin_path: []const u8, args: []const []const u8, untrusted: bool) !Spawned {
     const alloc = shell.allocator;
 
     // to_feat: zish writes → feat's stdin.  from_feat: feat's stdout → zish reads.
@@ -120,7 +152,12 @@ fn spawn(shell: *Shell, bin_path: []const u8, args: []const []const u8) !Spawned
     }
     argv[n] = null;
     const argv_ptr: [*:null]const ?[*:0]const u8 = argv[0..n :null];
-    const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+    // Untrusted (extra-tier) session feats cross a trust boundary: no shell
+    // environment leaks into them, same rule featExec applies to one-shots.
+    const envp: [*:null]const ?[*:0]const u8 = if (untrusted)
+        strippedEnv(alloc) orelse return error.ForkFailed
+    else
+        @ptrCast(std.c.environ);
 
     shell.stdout().flush() catch {};
 
@@ -149,6 +186,33 @@ fn spawn(shell: *Shell, bin_path: []const u8, args: []const []const u8) !Spawned
     return .{ .pid = pid, .r = from_feat[0], .w = to_feat[1] };
 }
 
+/// Minimal envp for untrusted `extra` session feats: HOME + a shrunk PATH,
+/// nothing else crosses the boundary. Allocations are process-lifetime — they
+/// must survive fork and stay valid until exec in the child.
+fn strippedEnv(alloc: std.mem.Allocator) ?[*:null]const ?[*:0]const u8 {
+    const home = compat.getEnvVarOwned(alloc, "HOME") catch return null;
+    const home_s = std.fmt.allocPrint(alloc, "HOME={s}", .{home}) catch return null;
+    const home_env = alloc.dupeZ(u8, home_s) catch return null;
+    const path_env = alloc.dupeZ(u8, "PATH=/usr/local/bin:/usr/bin:/bin") catch return null;
+    const envp = alloc.alloc(?[*:0]const u8, 3) catch return null;
+    envp[0] = home_env.ptr;
+    envp[1] = path_env.ptr;
+    envp[2] = null;
+    return @ptrCast(envp.ptr);
+}
+
+/// Announce the session's world to the guest: protocol version + granted
+/// hostcalls, first frame on its stdin. Returns false if the write failed.
+fn sendHello(w: compat.posix.fd_t, caps: Caps) bool {
+    var buf: [160]u8 = undefined;
+    var fbs: std.Io.Writer = .fixed(&buf);
+    fbs.writeAll("{\"t\":\"hello\",\"proto\":0,\"caps\":[\"say\",\"stream\",\"done\"") catch return false;
+    if (caps.run) fbs.writeAll(",\"run\"") catch return false;
+    if (caps.prompt) fbs.writeAll(",\"prompt\"") catch return false;
+    fbs.writeAll("]}\n") catch return false;
+    return writeFrame(w, fbs.buffered());
+}
+
 fn closePair(p: [2]compat.posix.fd_t) void {
     compat.posix.close(p[0]);
     compat.posix.close(p[1]);
@@ -172,14 +236,19 @@ fn setNonblock(fd: compat.posix.fd_t) void {
 
 /// Fork+exec `bin_path` and service its frames until {"t":"done"} or EOF.
 /// Blocks; used when there is no interactive input loop to poll from.
-pub fn hostSessionFeat(shell: *Shell, bin_path: []const u8, args: []const []const u8) !u8 {
+pub fn hostSessionFeat(shell: *Shell, bin_path: []const u8, args: []const []const u8, untrusted: bool) !u8 {
     const alloc = shell.allocator;
-    const sp = spawn(shell, bin_path, args) catch {
+    const caps = Caps.forTier(untrusted);
+    const sp = spawn(shell, bin_path, args, untrusted) catch {
         try shell.stdout().print("zish: session spawn failed\n", .{});
         return 1;
     };
     defer compat.posix.close(sp.w);
     defer compat.posix.close(sp.r);
+    if (!sendHello(sp.w, caps)) {
+        reapSessionChild(sp.pid);
+        return 1;
+    }
 
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(alloc);
@@ -194,7 +263,7 @@ pub fn hostSessionFeat(shell: *Shell, bin_path: []const u8, args: []const []cons
         }
         while (std.mem.indexOfScalar(u8, buf.items, '\n')) |nl| {
             const line = buf.items[0..nl];
-            const stop = handleSyncFrame(shell, line, sp.w) catch false;
+            const stop = handleSyncFrame(shell, line, sp.w, caps) catch false;
             const rest = buf.items[nl + 1 ..];
             std.mem.copyForwards(u8, buf.items, rest);
             buf.items.len = rest.len;
@@ -207,7 +276,7 @@ pub fn hostSessionFeat(shell: *Shell, bin_path: []const u8, args: []const []cons
 }
 
 /// Dispatch one frame in sync mode. Returns true when the session should end.
-fn handleSyncFrame(shell: *Shell, line: []const u8, w: compat.posix.fd_t) !bool {
+fn handleSyncFrame(shell: *Shell, line: []const u8, w: compat.posix.fd_t, caps: Caps) !bool {
     const alloc = shell.allocator;
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch return false;
     defer parsed.deinit();
@@ -224,11 +293,13 @@ fn handleSyncFrame(shell: *Shell, line: []const u8, w: compat.posix.fd_t) !bool 
     }
 
     if (std.mem.eql(u8, t, "prompt")) {
+        if (!caps.prompt) return !writeFrame(w, ERR_PROMPT_DENIED);
         // Nobody to ask in sync mode: refuse, don't hang the script.
         return !writeFrame(w, "{\"t\":\"event\",\"kind\":\"cancelled\"}\n");
     }
 
     if (std.mem.eql(u8, t, "run")) {
+        if (!caps.run) return !writeFrame(w, ERR_RUN_DENIED);
         const out = runCaptured(shell, frameStr(parsed.value, "cmd")) catch try alloc.dupe(u8, "");
         defer alloc.free(out);
         return !replyResult(shell, w, out);
@@ -243,17 +314,25 @@ fn handleSyncFrame(shell: *Shell, line: []const u8, w: compat.posix.fd_t) !bool 
 
 /// Start `bin_path` as a background session and return to the caller
 /// immediately; frames are serviced from Shell.readNextAction's poll.
-pub fn launchSession(shell: *Shell, name: []const u8, bin_path: []const u8, args: []const []const u8) !u8 {
+pub fn launchSession(shell: *Shell, name: []const u8, bin_path: []const u8, args: []const []const u8, untrusted: bool) !u8 {
     const alloc = shell.allocator;
     if (shell.sessions.items.len >= MAX_SESSIONS) {
         try shell.stdout().print("zish: session limit ({d}) reached\n", .{MAX_SESSIONS});
         return 1;
     }
-    const sp = spawn(shell, bin_path, args) catch {
+    const caps = Caps.forTier(untrusted);
+    const sp = spawn(shell, bin_path, args, untrusted) catch {
         try shell.stdout().print("zish: session spawn failed\n", .{});
         return 1;
     };
     setNonblock(sp.r);
+    if (!sendHello(sp.w, caps)) {
+        compat.posix.close(sp.w);
+        compat.posix.close(sp.r);
+        reapSessionChild(sp.pid);
+        try shell.stdout().print("zish: session hello failed\n", .{});
+        return 1;
+    }
 
     const id = shell.next_session_id;
     shell.next_session_id += 1;
@@ -268,6 +347,7 @@ pub fn launchSession(shell: *Shell, name: []const u8, bin_path: []const u8, args
         .w = sp.w,
         .transcript_fd = tr.fd,
         .transcript_path = tr.path,
+        .caps = caps,
     });
 
     try shell.stdout().print("[sess {d}:{s}] started \xc2\xb7 transcript {s}\n", .{ id, name, tr.path });
@@ -380,6 +460,7 @@ fn handleAsyncFrame(shell: *Shell, s: *Session, line: []const u8) !bool {
     }
 
     if (std.mem.eql(u8, t, "prompt")) {
+        if (!s.caps.prompt) return denyHostcall(shell, s, "prompt", ERR_PROMPT_DENIED);
         var clean: std.ArrayListUnmanaged(u8) = .empty;
         errdefer clean.deinit(alloc);
         try sanitize.writeSanitized(listWriter(&clean, alloc), frameStr(parsed.value, "text"));
@@ -401,6 +482,7 @@ fn handleAsyncFrame(shell: *Shell, s: *Session, line: []const u8) !bool {
     }
 
     if (std.mem.eql(u8, t, "run")) {
+        if (!s.caps.run) return denyHostcall(shell, s, "run", ERR_RUN_DENIED);
         const cmd = frameStr(parsed.value, "cmd");
 
         // audit trail: the command string is model-composed text — sanitize it
@@ -427,6 +509,19 @@ fn handleAsyncFrame(shell: *Shell, s: *Session, line: []const u8) !bool {
     }
 
     return false; // unknown frame type: ignore (forward-compat)
+}
+
+/// A masked-off hostcall: attest it in the transcript, show it to the human,
+/// send the structured error frame back — never a silent drop. Returns true
+/// (end session) only if the error reply itself failed to write.
+fn denyHostcall(shell: *Shell, s: *Session, call: []const u8, err_frame: []const u8) bool {
+    writeAllFd(s.transcript_fd, "! hostcall denied: ");
+    writeAllFd(s.transcript_fd, call);
+    writeAllFd(s.transcript_fd, "\n");
+    var note = beginAbovePrompt(shell);
+    note.print("\x1b[2m[sess {d}:{s}] hostcall denied: {s}\x1b[0m\n", .{ s.id, s.name, call }) catch {};
+    endAbovePrompt(shell);
+    return !writeFrame(s.w, err_frame);
 }
 
 /// Run one command through zish's own executor with stdout captured and stdin

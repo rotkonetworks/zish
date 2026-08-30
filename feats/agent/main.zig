@@ -13,6 +13,11 @@ const std = @import("std");
 const linux = std.os.linux;
 
 pub fn main() void {
+    // 0. consume the hello frame (protocol v0.2): zish announces proto + the
+    // hostcall capability mask before anything else.
+    var hbuf: [4096]u8 = undefined;
+    _ = readLine(&hbuf);
+
     // 1. ask zish to run a command; capture what it sent back.
     var buf: [1 << 16]u8 = undefined;
     const r1 = runCapture("echo hello from the agent feat", &buf);

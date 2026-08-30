@@ -1350,8 +1350,8 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
                 // frames swap stdout to a capture file, `zish -c` never enters
                 // run() — all of those need the blocking host.
                 if (shell.running and compat.posix.isatty(compat.posix.STDOUT_FILENO))
-                    return try session.launchSession(shell, cmd_name, f.bin, expanded_args.items[1..]);
-                return try session.hostSessionFeat(shell, f.bin, expanded_args.items[1..]);
+                    return try session.launchSession(shell, cmd_name, f.bin, expanded_args.items[1..], f.tier == .extra);
+                return try session.hostSessionFeat(shell, f.bin, expanded_args.items[1..], f.tier == .extra);
             }
             return try featExec(shell, f.tier, f.bin, expanded_args.items[1..]);
         }

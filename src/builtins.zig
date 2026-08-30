@@ -1948,7 +1948,15 @@ fn sessionCmd(shell: *Shell, args: []const []const u8) !u8 {
         }
         for (shell.sessions.items) |*s| {
             const state: []const u8 = if (s.pending_q != null) "awaiting answer" else "running";
-            try out.print("[{d}] {s}  {s}  {s}\n", .{ s.id, s.name, state, s.transcript_path });
+            const caps: []const u8 = if (s.caps.run and s.caps.prompt)
+                "say,stream,run,prompt"
+            else if (s.caps.run)
+                "say,stream,run"
+            else if (s.caps.prompt)
+                "say,stream,prompt"
+            else
+                "say,stream";
+            try out.print("[{d}] {s}  {s}  caps={s}  {s}\n", .{ s.id, s.name, state, caps, s.transcript_path });
             if (s.pending_q) |q| try out.print("    ? {s}\n", .{q});
         }
         return 0;

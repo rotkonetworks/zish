@@ -1043,6 +1043,7 @@ print("\nsession feats (agent armor async substrate)")
 # ---------------------------------------------------------------------------
 
 PESTER_SCRIPT = """#!/bin/sh
+read hello_frame
 printf '%s\\n' '{"t":"say","text":"hello-\\u001b[31mred"}'
 printf '%s\\n' '{"t":"run","cmd":"echo tool_ran_ok"}'
 read result_line
@@ -1054,13 +1055,13 @@ printf '%s\\n' '{"t":"done"}'
 """
 
 
-def make_session_featroot(name, script):
+def make_session_featroot(name, script, tier="standard"):
     """A temp feat root holding one session-feat backed by a shell script."""
     featroot = tempfile.mkdtemp(prefix="zish-featroot-")
-    d = os.path.join(featroot, "standard", name)
+    d = os.path.join(featroot, tier, name)
     os.makedirs(os.path.join(d, "bin"))
     with open(os.path.join(d, "feat.toml"), "w") as f:
-        f.write(f'name = "{name}"\ntier = "standard"\nkind = "session"\nbin = "{name}"\n')
+        f.write(f'name = "{name}"\ntier = "{tier}"\nkind = "session"\nbin = "{name}"\n')
     p = os.path.join(d, "bin", name)
     with open(p, "w") as f:
         f.write(script)
@@ -1098,6 +1099,42 @@ def _(sh):
         small.sendline("cat ~/.zish/sessions/*.log")
         expect_soon(small, "tool_ran_ok")
         assert "\x1b[31mred" not in small.buf, "raw SGR leaked into the transcript"
+    finally:
+        small.close()
+        shutil.rmtree(featroot, ignore_errors=True)
+
+
+SNEAK_SCRIPT = """#!/bin/sh
+read hello_frame
+case "$hello_frame" in
+  *'"run"'*) printf '%s\\n' '{"t":"say","text":"mask-listed-run"}' ;;
+  *)         printf '%s\\n' '{"t":"say","text":"mask-omits-run"}' ;;
+esac
+printf '%s\\n' '{"t":"run","cmd":"echo pwned_by_extra_feat"}'
+read reply
+case "$reply" in
+  *denied*) printf '%s\\n' '{"t":"say","text":"run-was-denied"}' ;;
+  *)        printf '%s\\n' '{"t":"say","text":"run-was-allowed"}' ;;
+esac
+printf '%s\\n' '{"t":"done"}'
+"""
+
+
+@test("extra-tier session feat: run hostcall masked off, denial is loud")
+def _(sh):
+    # The hostcall capability mask: an untrusted (extra-tier) guest gets
+    # {say,stream,done} only. Its hello must omit "run"; its run attempt must
+    # yield a structured error frame (not silence, not execution), and the
+    # denial must be attested on the terminal.
+    featroot = make_session_featroot("sneak", SNEAK_SCRIPT, tier="extra")
+    small = Shell(env_extra={"ZISH_FEAT_PATH": featroot})
+    try:
+        small.read()
+        small.sendline("sneak")
+        out = expect_soon(small, "ended")
+        assert "mask-omits-run" in out, f"hello advertised run to an extra-tier guest: {out[-400:]!r}"
+        assert "run-was-denied" in out, f"guest did not receive the error frame: {out[-400:]!r}"
+        assert "hostcall denied: run" in out, f"denial not attested to the human: {out[-400:]!r}"
     finally:
         small.close()
         shutil.rmtree(featroot, ignore_errors=True)
