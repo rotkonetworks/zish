@@ -2,6 +2,7 @@ const Shell = @This();
 
 const std = @import("std");
 const compat = @import("compat.zig");
+const paramexp = @import("paramexp.zig");
 const prompt_mod = @import("prompt.zig");
 const arith = @import("arith.zig");
 const posix = compat.posix;
@@ -3234,7 +3235,7 @@ fn expandVariablesAllocOpt(self: *Shell, input: []const u8, expand_tilde: bool) 
                     const pattern = pat_expanded orelse raw_pattern;
 
                     if (var_value) |v| {
-                        const stripped = stripPrefix(v, pattern, greedy);
+                        const stripped = paramexp.stripPrefix(v, pattern, greedy);
                         try result.appendSlice(self.allocator, stripped);
                     }
                 } else if (i < input.len and input[i] == '%') {
@@ -3257,7 +3258,7 @@ fn expandVariablesAllocOpt(self: *Shell, input: []const u8, expand_tilde: bool) 
                     const pattern = pat_expanded orelse raw_pattern;
 
                     if (var_value) |v| {
-                        const stripped = stripSuffix(v, pattern, greedy);
+                        const stripped = paramexp.stripSuffix(v, pattern, greedy);
                         try result.appendSlice(self.allocator, stripped);
                     }
                 } else if (i < input.len and input[i] == '/') {
@@ -3289,11 +3290,11 @@ fn expandVariablesAllocOpt(self: *Shell, input: []const u8, expand_tilde: bool) 
                     if (i < input.len and input[i] == '}') i += 1;
 
                     if (var_value) |v| {
-                        const replaced = try patternReplaceAnchored(self.allocator, v, pattern, replacement, replace_all, anchor);
+                        const replaced = try paramexp.patternReplaceAnchored(self.allocator, v, pattern, replacement, replace_all, anchor);
                         defer self.allocator.free(replaced);
                         try result.appendSlice(self.allocator, replaced);
                     }
-                } else if (i < input.len and input[i] == ':' and isSubstringOffset(input[i + 1 ..])) {
+                } else if (i < input.len and input[i] == ':' and paramexp.isSubstringOffset(input[i + 1 ..])) {
                     // ${VAR:offset} or ${VAR:offset:length} - substring.
                     // Note: ${VAR:-x}, ${VAR:=x}, ${VAR:+x}, ${VAR:?x} are default/alt/assign/error
                     // operators, NOT substring; a negative offset must be written as `${VAR: -n}`
@@ -3301,13 +3302,13 @@ fn expandVariablesAllocOpt(self: *Shell, input: []const u8, expand_tilde: bool) 
                     i += 1;
                     // Skip optional leading whitespace before the offset expression.
                     while (i < input.len and (input[i] == ' ' or input[i] == '\t')) i += 1;
-                    const offset = parseOffsetExpr(input, &i);
+                    const offset = paramexp.parseOffsetExpr(input, &i);
 
                     var length: ?i64 = null;
                     if (i < input.len and input[i] == ':') {
                         i += 1;
                         while (i < input.len and (input[i] == ' ' or input[i] == '\t')) i += 1;
-                        length = parseOffsetExpr(input, &i);
+                        length = paramexp.parseOffsetExpr(input, &i);
                     }
                     if (i < input.len and input[i] == '}') i += 1;
 
@@ -4196,154 +4197,6 @@ pub fn freeBraceResults(allocator: std.mem.Allocator, results: [][]const u8) voi
 /// rather than a default/alt/assign/error operator. `rest` is the text after the ':'.
 /// Substring: digit, '(' (arithmetic), or whitespace (e.g. `${VAR: -1}`). A bare
 /// leading '-'/'+'/'?'/'=' is an operator, not substring.
-fn isSubstringOffset(rest: []const u8) bool {
-    if (rest.len == 0) return false;
-    const c = rest[0];
-    if (std.ascii.isDigit(c)) return true;
-    if (c == '(') return true;
-    if (c == ' ' or c == '\t') return true;
-    return false;
-}
-
-/// Parse a substring offset/length expression starting at input[i.*], advancing i.
-/// Handles an optional '(' ... ')' arithmetic wrapper and a leading sign.
-fn parseOffsetExpr(input: []const u8, i: *usize) i64 {
-    var paren = false;
-    if (i.* < input.len and input[i.*] == '(') {
-        paren = true;
-        i.* += 1;
-        while (i.* < input.len and (input[i.*] == ' ' or input[i.*] == '\t')) i.* += 1;
-    }
-    const start = i.*;
-    if (i.* < input.len and (input[i.*] == '-' or input[i.*] == '+')) i.* += 1;
-    while (i.* < input.len and std.ascii.isDigit(input[i.*])) i.* += 1;
-    const num_str = input[start..i.*];
-    const val = std.fmt.parseInt(i64, num_str, 10) catch 0;
-    if (paren) {
-        while (i.* < input.len and input[i.*] != ')') i.* += 1;
-        if (i.* < input.len and input[i.*] == ')') i.* += 1;
-    }
-    return val;
-}
-
-fn stripPrefix(str: []const u8, pattern: []const u8, greedy: bool) []const u8 {
-    if (str.len == 0 or pattern.len == 0) return str;
-
-    // For greedy, try matching from longest to shortest
-    // For non-greedy, try matching from shortest to longest
-    if (greedy) {
-        var match_len = str.len;
-        while (match_len > 0) : (match_len -= 1) {
-            if (glob.matchGlob(pattern, str[0..match_len])) {
-                return str[match_len..];
-            }
-        }
-    } else {
-        var match_len: usize = 1;
-        while (match_len <= str.len) : (match_len += 1) {
-            if (glob.matchGlob(pattern, str[0..match_len])) {
-                return str[match_len..];
-            }
-        }
-    }
-    return str;
-}
-
-/// Strip suffix from string using glob pattern matching
-/// If greedy is true, removes longest match; otherwise removes shortest match
-fn stripSuffix(str: []const u8, pattern: []const u8, greedy: bool) []const u8 {
-    if (str.len == 0 or pattern.len == 0) return str;
-
-    // For greedy, try matching from longest to shortest
-    // For non-greedy, try matching from shortest to longest
-    if (greedy) {
-        var match_start: usize = 0;
-        while (match_start < str.len) : (match_start += 1) {
-            if (glob.matchGlob(pattern, str[match_start..])) {
-                return str[0..match_start];
-            }
-        }
-    } else {
-        var match_start = str.len;
-        while (match_start > 0) : (match_start -= 1) {
-            if (glob.matchGlob(pattern, str[match_start - 1 ..])) {
-                return str[0 .. match_start - 1];
-            }
-        }
-    }
-    return str;
-}
-
-/// Replace pattern in string with replacement
-/// If replace_all is true, replaces all occurrences; otherwise only first
-fn patternReplace(allocator: std.mem.Allocator, str: []const u8, pattern: []const u8, replacement: []const u8, replace_all: bool) ![]const u8 {
-    if (str.len == 0 or pattern.len == 0) return try allocator.dupe(u8, str);
-
-    var result: std.ArrayListUnmanaged(u8) = .empty;
-    defer result.deinit(allocator);
-
-    var i: usize = 0;
-    var replaced = false;
-
-    while (i < str.len) {
-        // Try to match pattern at this position
-        var matched = false;
-        if (!replaced or replace_all) {
-            // Try each possible match length at this position
-            var match_len = str.len - i;
-            while (match_len > 0) : (match_len -= 1) {
-                if (glob.matchGlob(pattern, str[i .. i + match_len])) {
-                    try result.appendSlice(allocator, replacement);
-                    i += match_len;
-                    matched = true;
-                    replaced = true;
-                    break;
-                }
-            }
-        }
-
-        if (!matched) {
-            try result.append(allocator, str[i]);
-            i += 1;
-        }
-    }
-
-    return try result.toOwnedSlice(allocator);
-}
-
-/// Pattern substitution with optional anchoring.
-/// anchor: 0 = unanchored (delegates to patternReplace), '#' = match only at
-/// the start of the string, '%' = match only at the end.
-fn patternReplaceAnchored(allocator: std.mem.Allocator, str: []const u8, pattern: []const u8, replacement: []const u8, replace_all: bool, anchor: u8) ![]const u8 {
-    if (anchor == 0) return patternReplace(allocator, str, pattern, replacement, replace_all);
-    if (pattern.len == 0) return allocator.dupe(u8, str);
-
-    var result: std.ArrayListUnmanaged(u8) = .empty;
-    defer result.deinit(allocator);
-
-    if (anchor == '#') {
-        // Longest match anchored at start.
-        var match_len = str.len;
-        while (true) : (match_len -= 1) {
-            if (glob.matchGlob(pattern, str[0..match_len])) {
-                try result.appendSlice(allocator, replacement);
-                try result.appendSlice(allocator, str[match_len..]);
-                return result.toOwnedSlice(allocator);
-            }
-            if (match_len == 0) break;
-        }
-    } else { // '%' - longest match anchored at end
-        var start: usize = 0;
-        while (start <= str.len) : (start += 1) {
-            if (glob.matchGlob(pattern, str[start..])) {
-                try result.appendSlice(allocator, str[0..start]);
-                try result.appendSlice(allocator, replacement);
-                return result.toOwnedSlice(allocator);
-            }
-        }
-    }
-    return allocator.dupe(u8, str);
-}
 
 /// Check if input contains brace expansion patterns.
 /// A `${...}` parameter expansion is NOT a brace group: its `{` is preceded by `$`,
