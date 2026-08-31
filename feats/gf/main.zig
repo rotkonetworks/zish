@@ -368,6 +368,169 @@ test "appendJsonStr escapes quotes and drops control bytes" {
 }
 
 // ===========================================================================
+// review-on-install — install, then have the agent feat judge the source and
+// append the verdict beside the install event. DECOUPLED from install
+// success: no agent feat / no key / model down / malformed output is a loud
+// note and NO verdict record, never a failed or partial install. Advisory in
+// the dictator era, by design. Binary packages are skipped (reviewing a
+// binary is worthless — this is why source packages exist).
+// ===========================================================================
+
+fn objStr2(v: std.json.Value, key: []const u8) ?[]const u8 {
+    const o = switch (v) {
+        .object => |ob| ob,
+        else => return null,
+    };
+    return switch (o.get(key) orelse return null) {
+        .string => |s| s,
+        else => null,
+    };
+}
+
+/// Resolve the installed agent feat's binary: standard tier first, then extra.
+fn resolveAgentBin(root: []const u8, buf: []u8) ?[]const u8 {
+    for ([_][]const u8{ "standard", "extra" }) |tier| {
+        const p = std.fmt.bufPrint(buf, "{s}/{s}/agent/bin/agent", .{ root, tier }) catch continue;
+        if (lstatMode(p) != null) return p;
+    }
+    return null;
+}
+
+/// The review rubric path: $ZISH_RUBRIC_DIR/feat-review-v1.toml, else
+/// $HOME/.zish/rubrics/feat-review-v1.toml.
+fn resolveRubric(buf: []u8) ?[]const u8 {
+    if (getEnv("ZISH_RUBRIC_DIR")) |d| {
+        const p = std.fmt.bufPrint(buf, "{s}/feat-review-v1.toml", .{d}) catch return null;
+        if (lstatMode(p) != null) return p;
+        return null;
+    }
+    const home = getEnv("HOME") orelse return null;
+    const p = std.fmt.bufPrint(buf, "{s}/.zish/rubrics/feat-review-v1.toml", .{home}) catch return null;
+    if (lstatMode(p) != null) return p;
+    return null;
+}
+
+/// Append a review verdict to the ledger, joined to the install by sha256.
+/// The bare pass/fail is lifted to top level for greppability; the full
+/// verdict object rides along as an escaped string under "result".
+fn reviewLedgerAppend(root: []const u8, sha: []const u8, verdict_word: []const u8, verdict_raw: []const u8) void {
+    const model = getEnv("ZISH_JUDGE_MODEL") orelse "deepseek/deepseek-v4-flash-0731";
+    var line: std.ArrayListUnmanaged(u8) = .empty;
+    defer line.deinit(alloc);
+    line.appendSlice(alloc, "{\"t\":\"review\",\"sha256\":\"") catch return;
+    appendJsonStr(&line, sha) catch return;
+    line.appendSlice(alloc, "\",\"rubric\":\"feat-review-v1\",\"reviewer\":\"") catch return;
+    appendJsonStr(&line, model) catch return;
+    line.appendSlice(alloc, "\",\"verdict\":\"") catch return;
+    appendJsonStr(&line, verdict_word) catch return;
+    line.appendSlice(alloc, "\",\"sig\":\"\",\"result\":\"") catch return;
+    appendJsonStr(&line, verdict_raw) catch return;
+    var tsbuf: [32]u8 = undefined;
+    const ts = std.fmt.bufPrint(&tsbuf, "\",\"ts\":{d}}}\n", .{nowSeconds()}) catch return;
+    line.appendSlice(alloc, ts) catch return;
+
+    var pbuf: [4096]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "{s}/ledger.jsonl", .{root}) catch return;
+    var z: [4096]u8 = undefined;
+    const p = toZ(&z, path) orelse return;
+    const fd_rc = linux.open(p, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o600);
+    const fd: isize = @bitCast(fd_rc);
+    if (fd < 0) return;
+    defer _ = linux.close(@intCast(fd));
+    var off: usize = 0;
+    while (off < line.items.len) {
+        const rc = linux.write(@intCast(fd), line.items.ptr + off, line.items.len - off);
+        const n: isize = @bitCast(rc);
+        if (n <= 0) break;
+        off += @intCast(n);
+    }
+}
+
+/// Exec `agent --judge` on the installed source and append the verdict. All
+/// failure paths are loud notes that leave the install intact and unreviewed.
+fn reviewInstalled(root: []const u8, dest: []const u8, name: []const u8, sha: []const u8) void {
+    var sbuf: [4096]u8 = undefined;
+    const src_dir = std.fmt.bufPrint(&sbuf, "{s}/src", .{dest}) catch return;
+    if (lstatMode(src_dir) == null) {
+        print("gf: {s} is a binary package; skipping source review\n", .{name});
+        return;
+    }
+    var abuf: [4096]u8 = undefined;
+    const agent_bin = resolveAgentBin(root, &abuf) orelse {
+        print("gf: no agent feat installed; install it to enable review-on-install\n", .{});
+        return;
+    };
+    var rbuf: [4096]u8 = undefined;
+    const rubric = resolveRubric(&rbuf) orelse {
+        print("gf: no review rubric found; skipping review\n", .{});
+        return;
+    };
+    var mfbuf: [4096]u8 = undefined;
+    const manifest = std.fmt.bufPrint(&mfbuf, "{s}/feat.toml", .{dest}) catch return;
+
+    // argv: env agent [--mock M] --judge rubric dest/feat.toml dest/src/<each>
+    var argv: [128]?[*:0]const u8 = undefined;
+    var held: [128][]u8 = undefined; // own the z-dupes until exec
+    var nheld: usize = 0;
+    var n: usize = 0;
+    const push = struct {
+        fn z(s: []const u8, held_: [][]u8, nheld_: *usize) ?[*:0]const u8 {
+            const dz = alloc.dupeZ(u8, s) catch return null;
+            held_[nheld_.*] = dz;
+            nheld_.* += 1;
+            return dz.ptr;
+        }
+    }.z;
+    argv[n] = push("env", &held, &nheld) orelse return;
+    n += 1;
+    argv[n] = push(agent_bin, &held, &nheld) orelse return;
+    n += 1;
+    if (getEnv("ZISH_JUDGE_MOCK")) |m| {
+        argv[n] = push("--mock", &held, &nheld) orelse return;
+        n += 1;
+        argv[n] = push(m, &held, &nheld) orelse return;
+        n += 1;
+    }
+    argv[n] = push("--judge", &held, &nheld) orelse return;
+    n += 1;
+    argv[n] = push(rubric, &held, &nheld) orelse return;
+    n += 1;
+    argv[n] = push(manifest, &held, &nheld) orelse return;
+    n += 1;
+    // each source file (bounded)
+    var names_buf: [64][]u8 = undefined;
+    if (listDir(src_dir, &names_buf)) |srcs| {
+        for (srcs) |sname| {
+            if (n >= argv.len - 1) break;
+            var fb: [4096]u8 = undefined;
+            const fp = std.fmt.bufPrint(&fb, "{s}/src/{s}", .{ dest, sname }) catch continue;
+            argv[n] = push(fp, &held, &nheld) orelse continue;
+            n += 1;
+        }
+    }
+    argv[n] = null;
+    const argv_z: [*:null]const ?[*:0]const u8 = argv[0..n :null];
+
+    const out = execCapture(argv_z) orelse {
+        print("gf: review produced no verdict; {s} stands installed but unreviewed\n", .{name});
+        return;
+    };
+    if (out.len == 0 or out[0] != '{') {
+        print("gf: review output was not a verdict; {s} stands unreviewed\n", .{name});
+        return;
+    }
+    // agent already validated shape; re-parse to lift the bare verdict word
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, out, .{}) catch {
+        print("gf: review verdict did not parse; {s} stands unreviewed\n", .{name});
+        return;
+    };
+    defer parsed.deinit();
+    const word = objStr2(parsed.value, "verdict") orelse "unknown";
+    reviewLedgerAppend(root, sha, word, out);
+    print("gf: reviewed {s}: verdict {s} (recorded in ledger)\n", .{ name, word });
+}
+
+// ===========================================================================
 // validation of the extracted tree
 // ===========================================================================
 
@@ -528,6 +691,174 @@ fn shadowsPath(name: []const u8) bool {
 }
 
 // ===========================================================================
+// gf status — the read-side fold over the ledger
+//
+// The write side appends install + review events; this projects them back
+// into "what is currently known about each feat", grouped by content hash.
+// TWO renderings over ONE fold: --json for agents (the ledger is
+// agent-drivable data), a pretty terminal card for humans. v1 is TRANSPARENCY
+// only — it surfaces verdicts, it does not GATE on them: weighting reviews by
+// reviewer reputation needs the calibration benchmark, and gating on an
+// uncalibrated signal would be shipping the illusion of trust. Promotion
+// gating (`gf promote`) is the next slice, after the benchmark supplies weights.
+// ===========================================================================
+
+const StInstall = struct { sha: []const u8, name: []const u8, url: []const u8, ts: i64 };
+const StReview = struct { sha: []const u8, verdict: []const u8, reviewer: []const u8, result: []const u8, ts: i64 };
+
+fn cmdStatus(root: []const u8, filter: ?[]const u8, json: bool) u8 {
+    var pbuf: [4096]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "{s}/ledger.jsonl", .{root}) catch return fail("path too long", .{});
+    const content = readFileAlloc(path, 16 * 1024 * 1024) orelse {
+        if (json) print("{{\"feats\":[]}}\n", .{}) else print("gf: no ledger yet (nothing installed through gf)\n", .{});
+        return 0;
+    };
+
+    var installs: std.ArrayListUnmanaged(StInstall) = .empty;
+    var reviews: std.ArrayListUnmanaged(StReview) = .empty;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |ln| {
+        const line = std.mem.trim(u8, ln, " \t\r");
+        if (line.len == 0) continue;
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch continue;
+        // NOTE: parsed is intentionally leaked into `alloc` (page_allocator,
+        // process-lifetime) so the extracted slices stay valid for rendering.
+        const t = objStr2(parsed.value, "t") orelse continue;
+        if (std.mem.eql(u8, t, "install")) {
+            installs.append(alloc, .{
+                .sha = objStr2(parsed.value, "sha256") orelse "",
+                .name = objStr2(parsed.value, "name") orelse "?",
+                .url = objStr2(parsed.value, "url") orelse "",
+                .ts = objInt2(parsed.value, "ts") orelse 0,
+            }) catch continue;
+        } else if (std.mem.eql(u8, t, "review")) {
+            reviews.append(alloc, .{
+                .sha = objStr2(parsed.value, "sha256") orelse "",
+                .verdict = objStr2(parsed.value, "verdict") orelse "unknown",
+                .reviewer = objStr2(parsed.value, "reviewer") orelse "?",
+                .result = objStr2(parsed.value, "result") orelse "",
+                .ts = objInt2(parsed.value, "ts") orelse 0,
+            }) catch continue;
+        }
+    }
+
+    if (json) return statusJson(installs.items, reviews.items, filter);
+    return statusHuman(installs.items, reviews.items, filter);
+}
+
+fn objInt2(v: std.json.Value, key: []const u8) ?i64 {
+    const o = switch (v) {
+        .object => |ob| ob,
+        else => return null,
+    };
+    return switch (o.get(key) orelse return null) {
+        .integer => |iv| iv,
+        else => null,
+    };
+}
+
+fn matches(name: []const u8, filter: ?[]const u8) bool {
+    return filter == null or std.mem.eql(u8, name, filter.?);
+}
+
+/// Agent rendering: the fold as one JSON object per install, reviews nested.
+/// Latest install per name wins the summary, but every record is present.
+fn statusJson(installs: []const StInstall, reviews: []const StReview, filter: ?[]const u8) u8 {
+    var b: std.ArrayListUnmanaged(u8) = .empty;
+    b.appendSlice(alloc, "{\"feats\":[") catch return 1;
+    var first = true;
+    for (installs) |in| {
+        if (!matches(in.name, filter)) continue;
+        if (!first) b.appendSlice(alloc, ",") catch return 1;
+        first = false;
+        b.appendSlice(alloc, "{\"name\":\"") catch return 1;
+        appendJsonStr(&b, in.name) catch return 1;
+        b.appendSlice(alloc, "\",\"sha256\":\"") catch return 1;
+        appendJsonStr(&b, in.sha) catch return 1;
+        b.appendSlice(alloc, "\",\"url\":\"") catch return 1;
+        appendJsonStr(&b, in.url) catch return 1;
+        var tb: [64]u8 = undefined;
+        b.appendSlice(alloc, std.fmt.bufPrint(&tb, "\",\"installed_at\":{d},\"reviews\":[", .{in.ts}) catch return 1) catch return 1;
+        var rfirst = true;
+        for (reviews) |rv| {
+            if (!std.mem.eql(u8, rv.sha, in.sha)) continue;
+            if (!rfirst) b.appendSlice(alloc, ",") catch return 1;
+            rfirst = false;
+            b.appendSlice(alloc, "{\"verdict\":\"") catch return 1;
+            appendJsonStr(&b, rv.verdict) catch return 1;
+            b.appendSlice(alloc, "\",\"reviewer\":\"") catch return 1;
+            appendJsonStr(&b, rv.reviewer) catch return 1;
+            b.appendSlice(alloc, "\",\"result\":\"") catch return 1;
+            appendJsonStr(&b, rv.result) catch return 1;
+            var rtb: [64]u8 = undefined;
+            b.appendSlice(alloc, std.fmt.bufPrint(&rtb, "\",\"ts\":{d}}}", .{rv.ts}) catch return 1) catch return 1;
+        }
+        b.appendSlice(alloc, "]}") catch return 1;
+    }
+    b.appendSlice(alloc, "]}\n") catch return 1;
+    writeAll1(b.items);
+    return 0;
+}
+
+/// Human rendering: a card per feat with a colored verdict badge. Reads as a
+/// glance: green pass, red fail, dim "unreviewed".
+fn statusHuman(installs: []const StInstall, reviews: []const StReview, filter: ?[]const u8) u8 {
+    var any = false;
+    for (installs) |in| {
+        if (!matches(in.name, filter)) continue;
+        any = true;
+
+        // find the latest review for this sha
+        var verdict: []const u8 = "";
+        var reviewer: []const u8 = "";
+        var latest_ts: i64 = -1;
+        var nrev: usize = 0;
+        for (reviews) |rv| {
+            if (!std.mem.eql(u8, rv.sha, in.sha)) continue;
+            nrev += 1;
+            if (rv.ts >= latest_ts) {
+                latest_ts = rv.ts;
+                verdict = rv.verdict;
+                reviewer = rv.reviewer;
+            }
+        }
+
+        // badge
+        const badge = if (verdict.len == 0)
+            "\x1b[2m ?  unreviewed\x1b[0m"
+        else if (std.mem.eql(u8, verdict, "pass"))
+            "\x1b[32m \xe2\x9c\x93  pass\x1b[0m"
+        else if (std.mem.eql(u8, verdict, "fail"))
+            "\x1b[31m \xe2\x9c\x97  fail\x1b[0m"
+        else
+            "\x1b[33m ?  " ++ "unknown\x1b[0m";
+
+        const short = if (in.sha.len >= 12) in.sha[0..12] else in.sha;
+        print("\x1b[1m{s}\x1b[0m  {s}\n", .{ in.name, badge });
+        print("    sha {s}  \x1b[2m{s}\x1b[0m\n", .{ short, in.url });
+        if (verdict.len > 0) {
+            print("    reviewed by {s}", .{reviewer});
+            if (nrev > 1) print("  (+{d} more)", .{nrev - 1});
+            print("\n", .{});
+        }
+    }
+    if (!any) {
+        if (filter) |f| print("gf: no record of {s}\n", .{f}) else print("gf: nothing installed through gf yet\n", .{});
+    }
+    return 0;
+}
+
+fn writeAll1(bytes: []const u8) void {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const rc = linux.write(1, bytes.ptr + off, bytes.len - off);
+        const n: isize = @bitCast(rc);
+        if (n <= 0) return;
+        off += @intCast(n);
+    }
+}
+
+// ===========================================================================
 // main
 // ===========================================================================
 
@@ -535,23 +866,40 @@ pub fn main(init: std.process.Init.Minimal) void {
     linux.exit(run(init));
 }
 
+/// Feat root: same resolution as zish (ZISH_FEAT_PATH overrides).
+fn featRootPath(buf: []u8) ?[]const u8 {
+    if (getEnv("ZISH_FEAT_PATH")) |p| return p;
+    const home = getEnv("HOME") orelse return null;
+    return std.fmt.bufPrint(buf, "{s}/.zish/feats", .{home}) catch null;
+}
+
 fn run(init: std.process.Init.Minimal) u8 {
     var args = std.process.Args.Iterator.init(init.args);
     _ = args.next(); // argv0
-    const url = args.next() orelse {
-        print("usage: gf <url>\nfetch a feat tarball and install it into the extra tier\n", .{});
+    const first = args.next() orelse {
+        print("usage: gf <url>              fetch a feat tarball, install into the extra tier\n" ++
+            "       gf status [feat] [--json]  show install + review history (the ledger fold)\n", .{});
         return 1;
     };
+
+    // `gf status [feat] [--json]` — the read-side fold over the ledger.
+    if (std.mem.eql(u8, first, "status")) {
+        var name: ?[]const u8 = null;
+        var json = false;
+        while (args.next()) |a| {
+            if (std.mem.eql(u8, a, "--json")) json = true else name = a;
+        }
+        var rb: [4096]u8 = undefined;
+        const root = featRootPath(&rb) orelse return fail("no HOME", .{});
+        return cmdStatus(root, name, json);
+    }
+
+    const url = first;
     if (args.next() != null) return fail("unexpected extra argument", .{});
 
     // feat root: same resolution as zish (ZISH_FEAT_PATH overrides)
     var root_buf: [4096]u8 = undefined;
-    const root = if (getEnv("ZISH_FEAT_PATH")) |p|
-        p
-    else blk: {
-        const home = getEnv("HOME") orelse return fail("no HOME", .{});
-        break :blk std.fmt.bufPrint(&root_buf, "{s}/.zish/feats", .{home}) catch return fail("HOME too long", .{});
-    };
+    const root = featRootPath(&root_buf) orelse return fail("no HOME", .{});
     mkdirP(root);
     var extra_buf: [4096]u8 = undefined;
     const extra_dir = std.fmt.bufPrint(&extra_buf, "{s}/extra", .{root}) catch return fail("path too long", .{});
@@ -661,6 +1009,11 @@ fn run(init: std.process.Init.Minimal) u8 {
     // attest the install in the append-only ledger (name, content hash,
     // origin, time) — the local end of the review/reputation pipeline
     ledgerAppend(root, name, url, sha);
+
+    // review-on-install: the agent judges the source and appends a verdict
+    // beside the install event. Decoupled — any failure leaves the install
+    // intact and simply unreviewed.
+    reviewInstalled(root, dest, name, sha);
 
     print(
         "gf: installed {s} into the extra tier: {s}\n" ++

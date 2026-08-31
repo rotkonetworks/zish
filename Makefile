@@ -73,6 +73,9 @@ feats:
 		cp -f feats/$$f/feat.toml $(ZISH_FEAT_DIR)/$$f/feat.toml; \
 		echo "staged feat: $$f"; \
 	done
+	@mkdir -p $(HOME)/.zish/rubrics
+	@cp -f rubrics/*.toml $(HOME)/.zish/rubrics/ 2>/dev/null && \
+		echo "staged rubrics" || true
 
 # ---- feat distribution ----
 # Pack one feat as the tarball gf installs (feat.toml + bin/<name> at top

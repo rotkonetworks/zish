@@ -473,6 +473,13 @@ const Config = struct {
 };
 
 pub fn main(init: std.process.Init.Minimal) void {
+    // Judge mode is a plain one-shot invocation (gf/steward/benchmark exec the
+    // binary directly): no session host, no hello frame, no session frames.
+    // Branch BEFORE the handshake the model loop needs.
+    if (hasJudgeFlag(init.args)) {
+        linux.exit(runJudge(init.args));
+    }
+
     // consume the hello frame (protocol v0.2+); we do not gate on caps here —
     // a run denial simply ends the loop via runCommand returning null.
     var hbuf: [4096]u8 = undefined;
@@ -670,6 +677,218 @@ fn parseArgs(args: std.process.Args) ?Config {
 }
 
 // ===========================================================================
+// judge mode — `agent --judge <rubric> <subject...>`
+//
+// The generalized "analyze-then-score-against-rubric" primitive (SmellBench's
+// stabilizing insight): a plain ONE-SHOT completion, no tool loop, no session
+// frames, no hello handshake. Reads a rubric file + subject files, asks the
+// model to analyze then score, validates the JSON verdict, prints it to
+// stdout. gf (and later the steward, the reviewer benchmark, dispute
+// adjudication) exec this directly and read the verdict off stdout. The
+// verdict schema is package-manager-agnostic — it knows nothing about feats.
+// ===========================================================================
+
+const JUDGE_RETRIES = 3;
+
+const JUDGE_SYSTEM =
+    "You are a meticulous code reviewer for a zish feat — a small standalone " ++
+    "command-line tool the user's shell may execute. You are given a scoring " ++
+    "rubric and the feat's manifest and source code. First analyze the code " ++
+    "against each rubric dimension, noting concrete issues (bugs, unsafe " ++
+    "operations, whether it does what its manifest claims). Then assign each " ++
+    "dimension an integer score from 0 to 10 following the rubric bands, and a " ++
+    "single overall verdict. Respond with ONLY a JSON object — no prose, no " ++
+    "markdown fences — of exactly this shape: {\"analysis\":\"<concise analysis>\"," ++
+    "\"scores\":{\"<dimension_key>\":<0-10>,...},\"verdict\":\"pass\" or \"fail\"}. " ++
+    "Use \"fail\" if any dimension scores below 5, or if the code is unsafe or " ++
+    "does not match what its manifest claims.";
+
+const JudgeCfg = struct {
+    model: []const u8 = DEFAULT_MODEL,
+    mock_path: ?[]const u8 = null,
+    rubric: []const u8 = "",
+    subjects: [][]const u8 = &.{},
+};
+
+fn warn(s: []const u8) void {
+    var off: usize = 0;
+    while (off < s.len) {
+        const rc = linux.write(2, s.ptr + off, s.len - off);
+        const sr: isize = @bitCast(rc);
+        if (sr <= 0) return;
+        off += @intCast(sr);
+    }
+}
+
+fn hasJudgeFlag(args: std.process.Args) bool {
+    var it = std.process.Args.Iterator.init(args);
+    _ = it.skip();
+    while (it.next()) |a| {
+        if (std.mem.eql(u8, a, "--judge")) return true;
+    }
+    return false;
+}
+
+fn parseJudgeArgs(args: std.process.Args) ?JudgeCfg {
+    var cfg = JudgeCfg{};
+    var subs: std.ArrayListUnmanaged([]const u8) = .empty;
+    var it = std.process.Args.Iterator.init(args);
+    _ = it.skip();
+    while (it.next()) |a| {
+        if (std.mem.eql(u8, a, "--judge")) {
+            continue;
+        } else if (std.mem.eql(u8, a, "-m")) {
+            cfg.model = dupe(it.next() orelse return null);
+        } else if (std.mem.eql(u8, a, "--mock")) {
+            cfg.mock_path = dupe(it.next() orelse return null);
+        } else if (cfg.rubric.len == 0) {
+            cfg.rubric = dupe(a);
+        } else {
+            subs.append(alloc, dupe(a)) catch return null;
+        }
+    }
+    cfg.subjects = subs.toOwnedSlice(alloc) catch return null;
+    if (cfg.rubric.len == 0 or cfg.subjects.len == 0) return null;
+    return cfg;
+}
+
+/// Build a plain chat-completions request (no tools) from an explicit system
+/// and user message.
+fn buildJudgeRequest(model: []const u8, system: []const u8, user: []const u8) ![]u8 {
+    var b: std.ArrayListUnmanaged(u8) = .empty;
+    try b.appendSlice(alloc, "{\"model\":\"");
+    try jsonEscape(&b, model);
+    try b.appendSlice(alloc, "\",\"stream\":false,\"messages\":[{\"role\":\"system\",\"content\":\"");
+    try jsonEscape(&b, system);
+    try b.appendSlice(alloc, "\"},{\"role\":\"user\",\"content\":\"");
+    try jsonEscape(&b, user);
+    try b.appendSlice(alloc, "\"}]}");
+    return b.toOwnedSlice(alloc);
+}
+
+/// Extract the first balanced {...} object from model output (tolerant of
+/// prose or ```json fences the model may wrap around it). String-aware so a
+/// brace inside a JSON string never miscounts.
+fn extractJsonObject(s: []const u8) ?[]const u8 {
+    const start = std.mem.indexOfScalar(u8, s, '{') orelse return null;
+    var depth: usize = 0;
+    var in_str = false;
+    var esc = false;
+    var i = start;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (in_str) {
+            if (esc) {
+                esc = false;
+            } else if (c == '\\') {
+                esc = true;
+            } else if (c == '"') {
+                in_str = false;
+            }
+        } else {
+            if (c == '"') {
+                in_str = true;
+            } else if (c == '{') {
+                depth += 1;
+            } else if (c == '}') {
+                depth -= 1;
+                if (depth == 0) return s[start .. i + 1];
+            }
+        }
+    }
+    return null;
+}
+
+/// A verdict is valid iff it parses and carries a pass|fail verdict plus a
+/// scores object. analysis is optional but expected.
+fn verdictValid(json_text: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, json_text, .{}) catch return false;
+    defer parsed.deinit();
+    const o = switch (parsed.value) {
+        .object => |ob| ob,
+        else => return false,
+    };
+    const v = o.get("verdict") orelse return false;
+    if (v != .string) return false;
+    if (!std.mem.eql(u8, v.string, "pass") and !std.mem.eql(u8, v.string, "fail")) return false;
+    const sc = o.get("scores") orelse return false;
+    return sc == .object;
+}
+
+/// Run one judge invocation end to end. Returns process exit code: 0 with the
+/// verdict JSON on stdout, non-zero with a diagnostic on stderr.
+fn runJudge(args: std.process.Args) u8 {
+    const cfg = parseJudgeArgs(args) orelse {
+        warn("agent: usage: agent --judge [-m model] [--mock file] <rubric> <subject...>\n");
+        return 2;
+    };
+
+    // rubric + subjects → one user message
+    const rubric = readFileAlloc(cfg.rubric) orelse {
+        warn("agent: cannot read rubric file\n");
+        return 2;
+    };
+    var user: std.ArrayListUnmanaged(u8) = .empty;
+    user.appendSlice(alloc, "## Scoring rubric\n") catch return 2;
+    user.appendSlice(alloc, rubric) catch return 2;
+    user.appendSlice(alloc, "\n\n## Feat under review\n") catch return 2;
+    for (cfg.subjects) |sp| {
+        const body = readFileAlloc(sp) orelse {
+            warn("agent: cannot read subject file\n");
+            return 2;
+        };
+        user.appendSlice(alloc, "\n### FILE: ") catch return 2;
+        user.appendSlice(alloc, sp) catch return 2;
+        user.appendSlice(alloc, "\n") catch return 2;
+        user.appendSlice(alloc, body) catch return 2;
+        user.appendSlice(alloc, "\n") catch return 2;
+    }
+
+    // transport: same seam as the model loop (mock file or curl + key)
+    var mock: ?Mock = null;
+    var home_buf: [4096]u8 = undefined;
+    var home: []const u8 = "";
+    var key: []const u8 = "";
+    if (cfg.mock_path) |mp| {
+        const contents = readFileAlloc(mp) orelse {
+            warn("agent: could not read mock file\n");
+            return 2;
+        };
+        mock = .{ .lines = std.mem.splitScalar(u8, contents, '\n') };
+    } else {
+        home = getHome(&home_buf) orelse {
+            warn("agent: HOME not set\n");
+            return 2;
+        };
+        var kbuf: [4096]u8 = undefined;
+        const kpath = std.fmt.bufPrint(&kbuf, "{s}/.zish/openrouter.key", .{home}) catch "";
+        key = readFileAlloc(kpath) orelse {
+            warn("agent: no API key at ~/.zish/openrouter.key\n");
+            return 2;
+        };
+    }
+
+    var attempt: usize = 0;
+    while (attempt < JUDGE_RETRIES) : (attempt += 1) {
+        const request = buildJudgeRequest(cfg.model, JUDGE_SYSTEM, user.items) catch return 2;
+        const reply = fetchWithBackoff(&mock, home, key, request) orelse continue;
+        if (reply.status < 200 or reply.status >= 300) continue;
+        switch (parseResponse(reply.body)) {
+            .text => |t| {
+                const obj = extractJsonObject(t) orelse continue;
+                if (!verdictValid(obj)) continue;
+                emit(obj); // plain JSON verdict to stdout — NOT a session frame
+                emit("\n");
+                return 0;
+            },
+            else => continue, // .err / .tools: malformed for a judge call, retry
+        }
+    }
+    warn("agent: judge produced no valid verdict after retries\n");
+    return 1;
+}
+
+// ===========================================================================
 // unit tests (run via `zig test feats/agent/main.zig`)
 // ===========================================================================
 
@@ -707,6 +926,34 @@ test "parseResponse surfaces an API error body" {
     const a = parseResponse(body);
     try std.testing.expect(a == .err);
     try std.testing.expect(std.mem.indexOf(u8, a.err, "rate limited") != null);
+}
+
+test "extractJsonObject pulls a balanced object out of fenced prose" {
+    const s = "Sure, here is the verdict:\n```json\n{\"verdict\":\"pass\",\"scores\":{\"a\":8}}\n```\ndone";
+    const o = extractJsonObject(s).?;
+    try std.testing.expectEqualStrings("{\"verdict\":\"pass\",\"scores\":{\"a\":8}}", o);
+}
+
+test "extractJsonObject ignores braces inside strings" {
+    const s = "{\"analysis\":\"has a } brace and { in text\",\"verdict\":\"fail\",\"scores\":{}}";
+    const o = extractJsonObject(s).?;
+    try std.testing.expectEqualStrings(s, o);
+}
+
+test "verdictValid requires pass|fail plus a scores object" {
+    try std.testing.expect(verdictValid("{\"verdict\":\"pass\",\"scores\":{\"cq\":9}}"));
+    try std.testing.expect(verdictValid("{\"analysis\":\"x\",\"verdict\":\"fail\",\"scores\":{}}"));
+    try std.testing.expect(!verdictValid("{\"verdict\":\"maybe\",\"scores\":{}}"));
+    try std.testing.expect(!verdictValid("{\"verdict\":\"pass\"}")); // no scores
+    try std.testing.expect(!verdictValid("not json"));
+}
+
+test "buildJudgeRequest has no tools and escapes content" {
+    const req = try buildJudgeRequest("m", "sys \"q\"", "review this");
+    defer alloc.free(req);
+    try std.testing.expect(std.mem.indexOf(u8, req, "run_command") == null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "\"role\":\"system\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, req, "sys \\\"q\\\"") != null);
 }
 
 test "buildRequest includes model, system, tool schema" {

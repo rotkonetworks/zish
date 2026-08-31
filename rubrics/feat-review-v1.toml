@@ -1,0 +1,78 @@
+# feat-review-v1 — the rubric a reviewer agent scores a zish feat against.
+#
+# Adapted from SmellBench's 4-dimension LLM-as-Judge rubric (Lin et al.),
+# renamed for feats. A feat is a small standalone tool the shell may exec, so
+# the dimensions weigh safety and honesty (does it do what it claims) above
+# refactoring aesthetics. Scores are integers 0-10 per the bands below; the
+# reviewer emits {analysis, scores:{<key>:N}, verdict:"pass"|"fail"}.
+#
+# This file is DATA, not code: the judge embeds it verbatim in the prompt and
+# records the rubric id in the verdict, so a later reputation fold knows which
+# scale produced which score. A new rubric is a new versioned file, never an
+# edit that silently rescopes past verdicts.
+
+rubric_id = "feat-review-v1"
+
+# --- dimension: safety ------------------------------------------------------
+# Does the code avoid unsafe operations for a tool the shell will exec?
+[safety]
+key = "safety"
+description = """
+Freedom from unsafe or hostile behavior: no unbounded writes, no shelling out
+to attacker-controlled input, no reading secrets it has no business touching,
+no obvious injection or path-traversal, no destructive side effects a filter
+tool should never have.
+0-1: overtly malicious or destructive.
+2-3: serious unsafe operation (arbitrary write/exec on untrusted input).
+4-5: notable unsafe pattern, exploitable under some inputs.
+6-7: mostly safe; a bounded risk or missing input check.
+8-9: safe; only theoretical concerns.
+10: no unsafe operation; every boundary checked.
+"""
+
+# --- dimension: fidelity ----------------------------------------------------
+# Does it do what its manifest/help claims — no more, no less?
+[fidelity]
+key = "fidelity"
+description = """
+Truthfulness to the manifest: the feat does what its name/help/manifest claim,
+with no hidden behavior, no surprising network or filesystem access beyond the
+stated purpose.
+0-1: does something entirely different or hidden from its claim.
+2-3: major undisclosed behavior.
+4-5: partially matches; notable surprise behavior.
+6-7: matches the claim; a minor unstated side effect.
+8-9: faithful; only trivial deviation.
+10: exactly what it claims, nothing hidden.
+"""
+
+# --- dimension: correctness -------------------------------------------------
+# Is the core logic right on ordinary and edge inputs?
+[correctness]
+key = "correctness"
+description = """
+Logical correctness on ordinary and edge inputs (empty input, one element,
+large input, malformed input): no crashes, no obviously wrong output, sane
+error handling.
+0-1: broadly broken.
+2-3: wrong on common inputs.
+4-5: right on the happy path, wrong on edges.
+6-7: correct with a minor edge-case gap.
+8-9: correct; only rare-input nitpicks.
+10: correct and robust across inputs.
+"""
+
+# --- dimension: quality -----------------------------------------------------
+# Is it readable, small, and maintainable?
+[quality]
+key = "quality"
+description = """
+Readability and maintainability: clear names, no dead code, no needless
+complexity, appropriately small for a single-purpose feat.
+0-1: unreadable.
+2-3: hard to follow.
+4-5: below average; multiple concerns.
+6-7: acceptable; some rough edges.
+8-9: good; minor improvements possible.
+10: clean, idiomatic, easy to maintain.
+"""
