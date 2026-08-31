@@ -1380,6 +1380,67 @@ def _(sh):
         shutil.rmtree(featroot, ignore_errors=True)
 
 
+ALICE_SCRIPT = """#!/bin/sh
+read hello_frame
+printf '%s\\n' '{"t":"prompt","text":"ping?"}'
+read answer_frame
+case "$answer_frame" in
+  *pong*) printf '%s\\n' '{"t":"say","text":"alice-got-pong"}' ;;
+  *) printf '%s\\n' '{"t":"say","text":"alice-got-garbage"}' ;;
+esac
+printf '%s\\n' '{"t":"done"}'
+"""
+
+BOB_SCRIPT = """#!/bin/sh
+read hello_frame
+i=0
+while [ $i -lt 50 ]; do
+  printf '%s\\n' '{"t":"run","cmd":"session list"}'
+  read result_frame
+  case "$result_frame" in *awaiting*) break ;; esac
+  sleep 0.2
+  i=$((i+1))
+done
+printf '%s\\n' '{"t":"run","cmd":"session answer 1 pong"}'
+read result_frame
+printf '%s\\n' '{"t":"done"}'
+"""
+
+
+@test("agent-to-agent: one session answers another session's prompt via run")
+def _(sh):
+    # The endgame arc in miniature: agent alice parks on a `prompt` hostcall;
+    # agent bob discovers the question through `run session list` (the registry
+    # is the org's shared bulletin board) and answers it through `run session
+    # answer` — no human in the loop. bob's run executes in a forked subshell
+    # child whose session-table copy has CLOSED pipe fds, so the answer must
+    # route via the registry + control FIFO back to the live host, not the
+    # dead in-process copy. Red on the old binary: the child's in-process
+    # lookup won the race and wrote to a closed fd.
+    featroot = make_session_featroot("alice", ALICE_SCRIPT)
+    # add bob next to alice in the same featroot
+    d = os.path.join(featroot, "standard", "bob")
+    os.makedirs(os.path.join(d, "bin"))
+    with open(os.path.join(d, "feat.toml"), "w") as f:
+        f.write('name = "bob"\ntier = "standard"\nkind = "session"\nbin = "bob"\n')
+    p = os.path.join(d, "bin", "bob")
+    with open(p, "w") as f:
+        f.write(BOB_SCRIPT)
+    os.chmod(p, 0o755)
+
+    small = Shell(env_extra={"ZISH_FEAT_PATH": featroot})
+    try:
+        small.read()
+        small.sendline("alice")
+        expect_soon(small, "asks: ping?")  # alice parked, meta says awaiting
+        small.sendline("bob")
+        # bob finds the question, answers it, alice confirms receipt
+        expect_soon(small, "alice-got-pong", timeout=20.0)
+    finally:
+        small.close()
+        shutil.rmtree(featroot, ignore_errors=True)
+
+
 @test("control channel: a separate process kills a session; host tears it down")
 def _(sh):
     # Remote kill goes through the same FIFO — the client never signals the

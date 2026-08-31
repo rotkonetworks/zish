@@ -741,6 +741,11 @@ fn spawnToolChild(shell: *Shell, cmd: []const u8) !ToolChild {
                 compat.posix.close(ot.cap_fd);
             }
         }
+        // ...then forget them: the copies now hold dead fds, and a `session
+        // answer`/`kill` run BY an agent must resolve its target through the
+        // registry + control FIFO back to the live host — this is what lets
+        // one session answer a sibling session's prompt (agent-to-agent).
+        shell.sessions.clearRetainingCapacity();
         // stdio: /dev/null in (never the user's terminal), capture out
         const devnull = compat.posix.openZ("/dev/null", .{ .ACCMODE = .RDONLY }, 0) catch compat.posix.exit(127);
         compat.posix.dup2(devnull, compat.posix.STDIN_FILENO) catch compat.posix.exit(127);
