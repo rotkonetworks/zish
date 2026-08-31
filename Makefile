@@ -50,6 +50,8 @@ test: build
 	./tests/regress.sh
 	zig build test
 	zig test feats/agent/main.zig
+	zig test -lc feats/gf/main.zig
+	./tests/gf_test.sh
 
 test-pty: build
 	python3 tests/pty_test.py
@@ -57,9 +59,9 @@ test-pty: build
 # ---- standard feats (python-replacement tier) ----
 # Compiles feats/<name>/main.zig and stages bin + feat.toml into the registry.
 ZISH_FEAT_DIR ?= $(HOME)/.zish/feats/standard
-FEAT_NAMES := cnt pk frq snf jls calc para agent
+FEAT_NAMES := cnt pk frq snf jls calc para agent gf
 # Feats needing libc (para uses execvp for PATH+env resolution).
-FEAT_LIBC := para agent
+FEAT_LIBC := para agent gf
 
 .PHONY: feats
 feats:
@@ -71,3 +73,18 @@ feats:
 		cp -f feats/$$f/feat.toml $(ZISH_FEAT_DIR)/$$f/feat.toml; \
 		echo "staged feat: $$f"; \
 	done
+
+# ---- feat distribution ----
+# Pack one feat as the tarball gf installs (feat.toml + bin/<name> at top
+# level). This is how the agent ships while its source stays in this repo:
+# the artifact is attached to releases; users run `gf <url>`.
+.PHONY: dist-agent
+dist-agent:
+	@mkdir -p dist/.pkg-agent/bin
+	@zig build-exe -O ReleaseFast -fstrip -lc feats/agent/main.zig \
+		-femit-bin=dist/.pkg-agent/bin/agent >/dev/null 2>&1
+	@cp -f feats/agent/feat.toml dist/.pkg-agent/feat.toml
+	@v=$$(sed -n 's/^version = "\(.*\)"/\1/p' feats/agent/feat.toml); \
+		tar -czf dist/agent-$${v:-0.0.0}.tar.gz -C dist/.pkg-agent feat.toml bin; \
+		rm -rf dist/.pkg-agent; \
+		echo "dist/agent-$${v:-0.0.0}.tar.gz"

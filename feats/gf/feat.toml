@@ -1,0 +1,5 @@
+name = "gf"
+version = "0.1.0"
+tier = "standard"
+bin = "gf"
+help = "fetch a feat tarball and install it into the extra tier: gf <url>"
