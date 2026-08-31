@@ -27,6 +27,16 @@
 //!     the final rename() into extra/<name> is atomic on one filesystem
 //!
 //! No upgrade in v1: an existing install is refused, remove it first.
+//!
+//! Source packages (format v2): a tarball may ship src/<file> instead of
+//! bin/<name>, plus declarative build fields in the manifest:
+//!     lang = "c" | "zig"      src = "main.c"      libc = "true" (zig only)
+//! gf then compiles it locally with a FIXED template (zig cc -O2 / zig
+//! build-exe -OReleaseFast) — the recipe is data, never code: a publisher
+//! gets no build-time execution (the AUR's PKGBUILD hole, closed by
+//! construction). Distributing source is what makes review-on-install
+//! meaningful: reviewers read what was actually shipped, and the binary
+//! trusted is the one built here from the hashed source.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -365,40 +375,45 @@ const S_IFMT: u32 = 0o170000;
 const S_IFREG: u32 = 0o100000;
 const S_IFDIR: u32 = 0o040000;
 
-/// Enforce the exact allowed shape: feat.toml (regular) + bin/ (dir) holding
-/// only regular files, one of which is `bin_name`. Anything else — symlinks
-/// above all — refuses the install. Returns null on pass, message on refusal.
-fn validateTree(tmp: []const u8, bin_name: []const u8) ?[]const u8 {
+/// Enforce the exact allowed shape. The archive is either a BINARY package
+/// (feat.toml + bin/<bin_name>) or a SOURCE package (feat.toml + src/<member>).
+/// Exactly one of bin/ or src/ may be present; the payload dir holds only
+/// regular files (lstat catches symlinks — the install-path attack); nothing
+/// else lives at top level. Returns null on pass, a message on refusal.
+/// `member` is the required file inside the payload dir (bin_name for binary,
+/// the manifest's src for source).
+fn validateTree(tmp: []const u8, payload_dir: []const u8, member: []const u8) ?[]const u8 {
     var pbuf: [4096]u8 = undefined;
 
     const mf = std.fmt.bufPrint(&pbuf, "{s}/feat.toml", .{tmp}) catch return "path too long";
     const mf_mode = lstatMode(mf) orelse return "archive has no feat.toml";
     if (mf_mode & S_IFMT != S_IFREG) return "feat.toml is not a regular file";
 
-    const bin_dir = std.fmt.bufPrint(&pbuf, "{s}/bin", .{tmp}) catch return "path too long";
-    const bd_mode = lstatMode(bin_dir) orelse return "archive has no bin/ directory";
-    if (bd_mode & S_IFMT != S_IFDIR) return "bin is not a directory";
+    var dbuf: [4096]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dbuf, "{s}/{s}", .{ tmp, payload_dir }) catch return "path too long";
+    const d_mode = lstatMode(dir) orelse return "archive is missing its payload directory";
+    if (d_mode & S_IFMT != S_IFDIR) return "payload path is not a directory";
 
-    // top level: nothing but feat.toml and bin
+    // top level: nothing but feat.toml and the one payload dir
     var names_buf: [64][]u8 = undefined;
     const top = listDir(tmp, &names_buf) orelse return "cannot open archive dir";
     for (top) |n| {
-        if (std.mem.eql(u8, n, "feat.toml") or std.mem.eql(u8, n, "bin")) continue;
-        return "archive contains files outside feat.toml + bin/";
+        if (std.mem.eql(u8, n, "feat.toml") or std.mem.eql(u8, n, payload_dir)) continue;
+        return "archive contains files outside feat.toml + payload dir";
     }
 
-    // bin/: regular files only (lstat: a symlink here is the install attack)
-    var found_bin = false;
-    var bnames_buf: [64][]u8 = undefined;
-    const bins = listDir(bin_dir, &bnames_buf) orelse return "cannot open bin dir";
-    for (bins) |n| {
+    // payload dir: regular files only (lstat: a symlink here is the attack)
+    var found = false;
+    var mnames_buf: [64][]u8 = undefined;
+    const members = listDir(dir, &mnames_buf) orelse return "cannot open payload dir";
+    for (members) |n| {
         var fbuf: [4096]u8 = undefined;
-        const fp = std.fmt.bufPrint(&fbuf, "{s}/{s}", .{ bin_dir, n }) catch return "path too long";
-        const m = lstatMode(fp) orelse return "unreadable file in bin/";
-        if (m & S_IFMT != S_IFREG) return "bin/ contains a non-regular file (symlink?)";
-        if (std.mem.eql(u8, n, bin_name)) found_bin = true;
+        const fp = std.fmt.bufPrint(&fbuf, "{s}/{s}", .{ dir, n }) catch return "path too long";
+        const m = lstatMode(fp) orelse return "unreadable payload file";
+        if (m & S_IFMT != S_IFREG) return "payload contains a non-regular file (symlink?)";
+        if (std.mem.eql(u8, n, member)) found = true;
     }
-    if (!found_bin) return "bin/ does not contain the manifest's bin";
+    if (!found) return "payload does not contain the required member";
     return null;
 }
 
@@ -419,6 +434,81 @@ fn listDir(path: []const u8, names: [][]u8) ?[][]u8 {
         n += 1;
     }
     return names[0..n];
+}
+
+/// A source filename gf will embed in a build command: like validName but
+/// allows one dot for the extension (main.c, agent.zig). Still no slashes, no
+/// "..", so it can never escape the src/ dir.
+fn validSrcName(s: []const u8) bool {
+    if (s.len == 0 or s.len > 64) return false;
+    if (!std.ascii.isAlphanumeric(s[0])) return false;
+    var dots: usize = 0;
+    for (s) |c| {
+        if (c == '.') {
+            dots += 1;
+        } else if (!(std.ascii.isLower(c) or std.ascii.isDigit(c) or c == '-' or c == '_')) {
+            return false;
+        }
+    }
+    return dots <= 1;
+}
+
+/// Compile src/<src_file> to bin/<bin_name> inside the temp tree with a FIXED
+/// template — the manifest chooses lang/libc, never the command. Returns null
+/// on success, a message on refusal or build failure. Everything here is data
+/// gf controls; the publisher's only inputs are the (charset-checked) filename
+/// and the source itself, which is what reviewers read.
+fn buildSource(tmp: []const u8, lang: []const u8, src_file: []const u8, bin_name: []const u8, want_libc: bool) ?[]const u8 {
+    var sbuf: [4096]u8 = undefined;
+    var obuf: [4096]u8 = undefined;
+    const src_path = std.fmt.bufPrint(&sbuf, "{s}/src/{s}", .{ tmp, src_file }) catch return "path too long";
+    const bin_dir = std.fmt.bufPrint(&obuf, "{s}/bin", .{tmp}) catch return "path too long";
+    mkdirP(bin_dir);
+    var pbuf: [4096]u8 = undefined;
+    const out_path = std.fmt.bufPrint(&pbuf, "{s}/bin/{s}", .{ tmp, bin_name }) catch return "path too long";
+
+    var sz: [4096]u8 = undefined;
+    var oz: [4096]u8 = undefined;
+    const sp = toZ(&sz, src_path) orelse return "path too long";
+    const op = toZ(&oz, out_path) orelse return "path too long";
+    var emit_buf: [4096]u8 = undefined;
+    const emit = std.fmt.bufPrintZ(&emit_buf, "-femit-bin={s}", .{out_path}) catch return "path too long";
+
+    var st: u8 = 255;
+    if (std.mem.eql(u8, lang, "c")) {
+        // zig cc: -O2, static-ish, output binary. libc flag is irrelevant (cc
+        // links libc anyway); we ignore it for C.
+        const argv = [_:null]?[*:0]const u8{ "env", "zig", "cc", "-O2", "-o", op, sp, null };
+        st = execStatus(&argv);
+    } else if (std.mem.eql(u8, lang, "zig")) {
+        if (want_libc) {
+            const argv = [_:null]?[*:0]const u8{ "env", "zig", "build-exe", "-OReleaseFast", "-fstrip", "-lc", sp, emit.ptr, null };
+            st = execStatus(&argv);
+        } else {
+            const argv = [_:null]?[*:0]const u8{ "env", "zig", "build-exe", "-OReleaseFast", "-fstrip", sp, emit.ptr, null };
+            st = execStatus(&argv);
+        }
+    } else {
+        return "unsupported lang (want \"c\" or \"zig\")";
+    }
+    if (st != 0) return "build failed";
+    if (lstatMode(out_path) == null) return "build produced no binary";
+    var bz: [4096]u8 = undefined;
+    if (toZ(&bz, out_path)) |p| _ = linux.chmod(p, 0o755);
+
+    // the built binary is trusted; the source dir has served its purpose but
+    // ships alongside so reviewers/audits can re-derive — leave src/ in place.
+    return null;
+}
+
+test "validSrcName allows one extension dot, rejects traversal" {
+    try std.testing.expect(validSrcName("main.c"));
+    try std.testing.expect(validSrcName("agent.zig"));
+    try std.testing.expect(validSrcName("x"));
+    try std.testing.expect(!validSrcName("../x.c"));
+    try std.testing.expect(!validSrcName("a/b.c"));
+    try std.testing.expect(!validSrcName("a.b.c"));
+    try std.testing.expect(!validSrcName(".hidden"));
 }
 
 /// Refuse names that collide with an executable on PATH. Dispatch-time
@@ -526,8 +616,23 @@ fn run(init: std.process.Init.Minimal) u8 {
     if (!validName(name)) return fail("invalid feat name {s}", .{name});
     if (!validName(bin_name)) return fail("invalid bin name {s}", .{bin_name});
 
-    if (validateTree(tmp, bin_name)) |why| return fail("{s}", .{why});
-    if (shadowsPath(name)) return fail("name {s} collides with an installed command — a feat never shadows a real binary", .{name});
+    // Source package? Presence of a `src` manifest field selects it. gf builds
+    // it locally from a fixed template; the recipe is declarative data, never
+    // an executable script the publisher supplies.
+    const is_source = manifestField(manifest, "src") != null;
+    if (is_source) {
+        const src_file = manifestField(manifest, "src").?;
+        const lang = manifestField(manifest, "lang") orelse return fail("source package needs a lang field", .{});
+        const want_libc = if (manifestField(manifest, "libc")) |l| std.mem.eql(u8, l, "true") else false;
+        if (!validSrcName(src_file)) return fail("invalid src filename {s}", .{src_file});
+        if (validateTree(tmp, "src", src_file)) |why| return fail("{s}", .{why});
+        if (shadowsPath(name)) return fail("name {s} collides with an installed command — a feat never shadows a real binary", .{name});
+        print("gf: building {s} from source ({s})...\n", .{ name, lang });
+        if (buildSource(tmp, lang, src_file, bin_name, want_libc)) |why| return fail("{s}", .{why});
+    } else {
+        if (validateTree(tmp, "bin", bin_name)) |why| return fail("{s}", .{why});
+        if (shadowsPath(name)) return fail("name {s} collides with an installed command — a feat never shadows a real binary", .{name});
+    }
 
     // force the quarantine tier in the manifest, mark the binary executable
     const rewritten = forceExtraTier(manifest) catch return fail("out of memory", .{});

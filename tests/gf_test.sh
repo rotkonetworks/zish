@@ -104,6 +104,40 @@ pack "$S" "$T/shadow.tar.gz"
 GF "file://$T/shadow.tar.gz" >/dev/null 2>&1 \
     && bad "shadowing name 'ls' was allowed" || ok "shadowing name refused"
 
+# ---- source package: gf builds it locally ---------------------------------
+S="$T/stage_src"; mkdir -p "$S/src"
+cat > "$S/feat.toml" <<'EOF'
+name = "srcdemo"
+tier = "standard"
+bin = "srcdemo"
+lang = "c"
+src = "main.c"
+EOF
+cat > "$S/src/main.c" <<'EOF'
+#include <stdio.h>
+int main(void){ printf("built-from-source\n"); return 0; }
+EOF
+pack "$S" "$T/srcdemo.tar.gz"
+
+if GF "file://$T/srcdemo.tar.gz" >"$T/outsrc" 2>&1; then
+    ok "source package installs (gf compiled it)"
+else
+    bad "source package failed: $(cat "$T/outsrc")"
+fi
+out=$(ZC srcdemo 2>&1)
+[ "$out" = "built-from-source" ] \
+    && ok "locally-built binary runs" || bad "built binary bad output: $out"
+[ -f "$T/feats/extra/srcdemo/src/main.c" ] \
+    && ok "source ships alongside for review/audit" || bad "source not retained"
+
+# refusal: source filename tries to escape src/
+S="$T/stage_srcesc"; mkdir -p "$S/src"
+printf 'name = "esc"\nbin = "esc"\nlang = "c"\nsrc = "../evil.c"\n' > "$S/feat.toml"
+echo 'int main(){return 0;}' > "$S/src/x.c"
+pack "$S" "$T/srcesc.tar.gz"
+GF "file://$T/srcesc.tar.gz" >/dev/null 2>&1 \
+    && bad "src path-escape allowed" || ok "src path-escape refused"
+
 # ---- install ledger --------------------------------------------------------
 L="$T/feats/ledger.jsonl"
 if [ -f "$L" ] && grep -q '"t":"install","name":"gfdemo","sha256":"[0-9a-f]\{64\}"' "$L"; then
@@ -111,9 +145,13 @@ if [ -f "$L" ] && grep -q '"t":"install","name":"gfdemo","sha256":"[0-9a-f]\{64\
 else
     bad "ledger missing or malformed: $(cat "$L" 2>/dev/null)"
 fi
+# two successful installs so far (gfdemo binary + srcdemo source); every
+# refusal between them must have written nothing
 n=$(wc -l < "$L" 2>/dev/null || echo 0)
-[ "$n" -eq 1 ] && ok "refused installs leave no ledger entries" \
-    || bad "expected 1 ledger line after refusals, got $n"
+[ "$n" -eq 2 ] && ok "refused installs leave no ledger entries" \
+    || bad "expected 2 ledger lines (gfdemo+srcdemo), got $n"
+grep -q '"name":"srcdemo"' "$L" && ok "source install also attested" \
+    || bad "source install missing from ledger"
 
 # ---- no temp debris left behind -------------------------------------------
 leftovers=$(find "$T/feats" -maxdepth 1 -name '.gf-tmp-*' | wc -l)
