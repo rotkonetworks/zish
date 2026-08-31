@@ -1978,15 +1978,16 @@ fn sessionCmd(shell: *Shell, args: []const []const u8) !u8 {
             try shell.stderr().writeAll("session: invalid session id\n");
             return 1;
         };
+        if (sub[0] == 'k') {
+            // Resolves locally first, then via the registry + control FIFO —
+            // killing another shell's session asks ITS host to tear it down.
+            return session_mod.killSessionById(shell, id);
+        }
         const idx = session_mod.findById(shell, id) orelse {
             try shell.stderr().print("session: no session {d}\n", .{id});
             return 1;
         };
-        if (sub[0] == 'k') {
-            session_mod.finishSession(shell, idx);
-        } else {
-            try out.print("{s}\n", .{shell.sessions.items[idx].transcript_path});
-        }
+        try out.print("{s}\n", .{shell.sessions.items[idx].transcript_path});
         return 0;
     }
 

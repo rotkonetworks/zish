@@ -145,8 +145,11 @@ pub const Session = struct {
     transcript_fd: compat.posix.fd_t,
     transcript_path: []u8, // owned
     caps: Caps,
+    ctl_fd: compat.posix.fd_t = -1, // control FIFO, host's O_RDWR end (see below)
+    ctl_path: ?[]u8 = null, // owned; unlinked on finish
     buf: std.ArrayListUnmanaged(u8) = .empty, // unparsed frame bytes
     echo: std.ArrayListUnmanaged(u8) = .empty, // sanitized text awaiting a full line
+    ctl_buf: std.ArrayListUnmanaged(u8) = .empty, // unparsed control-FIFO bytes
     pending_q: ?[]u8 = null, // sanitized question awaiting `session answer`
     tool: ?ToolChild = null, // the in-flight run, if any
 };
@@ -374,6 +377,7 @@ pub fn launchSession(shell: *Shell, name: []const u8, bin_path: []const u8, args
     shell.next_session_id += 1;
 
     const tr: Transcript = openTranscript(shell, id, name) catch .{ .fd = -1, .path = try alloc.dupe(u8, "(none)") };
+    const ctl = openCtlFifo(alloc, id);
 
     try shell.sessions.append(alloc, .{
         .id = id,
@@ -384,6 +388,8 @@ pub fn launchSession(shell: *Shell, name: []const u8, bin_path: []const u8, args
         .transcript_fd = tr.fd,
         .transcript_path = tr.path,
         .caps = caps,
+        .ctl_fd = ctl.fd,
+        .ctl_path = ctl.path,
     });
 
     writeMeta(shell, &shell.sessions.items[shell.sessions.items.len - 1]);
@@ -419,6 +425,47 @@ fn metaPath(alloc: std.mem.Allocator, id: u32) ?[]u8 {
     return std.fmt.allocPrint(alloc, "{s}/{d}-{d}.meta", .{ dir, std.c.getpid(), id }) catch null;
 }
 
+/// The control FIFO for one session: <dir>/<hostpid>-<id>.ctl, mode 0600.
+/// Any same-user process resolves it via the `.meta` record and writes one
+/// JSON line per command ({"t":"answer","text":...} | {"t":"kill"}); the host
+/// polls its end from the input loop. The host opens O_RDWR (Linux idiom) so
+/// the FIFO always has a writer — otherwise every client close would make
+/// poll report EOF/HUP forever and spin the input loop.
+fn ctlPathAlloc(alloc: std.mem.Allocator, id: u32) ?[]u8 {
+    var dbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = sessionsDir(alloc, &dbuf) catch return null;
+    return std.fmt.allocPrint(alloc, "{s}/{d}-{d}.ctl", .{ dir, std.c.getpid(), id }) catch null;
+}
+
+const Ctl = struct { fd: compat.posix.fd_t, path: ?[]u8 };
+
+/// Best-effort: a session without a control FIFO still works in-process
+/// (ctl_fd = -1 just means no cross-process control for it).
+fn openCtlFifo(alloc: std.mem.Allocator, id: u32) Ctl {
+    const path = ctlPathAlloc(alloc, id) orelse return .{ .fd = -1, .path = null };
+    var pz: [std.fs.max_path_bytes]u8 = undefined;
+    const pathz = std.fmt.bufPrintZ(&pz, "{s}", .{path}) catch {
+        alloc.free(path);
+        return .{ .fd = -1, .path = null };
+    };
+    // A stale FIFO from a crashed shell that recycled our pid: remove and
+    // recreate so the mode and ownership are ours by construction.
+    std.Io.Dir.deleteFileAbsolute(compat.io(), pathz) catch {};
+    // mkfifo(3) is mknod with S_IFIFO; go straight to the syscall.
+    const mkrc = std.os.linux.mknodat(std.os.linux.AT.FDCWD, pathz.ptr, std.os.linux.S.IFIFO | 0o600, 0);
+    const mkerr: isize = @bitCast(mkrc);
+    if (mkerr < 0) {
+        alloc.free(path);
+        return .{ .fd = -1, .path = null };
+    }
+    const fd = compat.posix.openZ(pathz.ptr, .{ .ACCMODE = .RDWR, .NONBLOCK = true, .CLOEXEC = true }, 0) catch {
+        std.Io.Dir.deleteFileAbsolute(compat.io(), pathz) catch {};
+        alloc.free(path);
+        return .{ .fd = -1, .path = null };
+    };
+    return .{ .fd = fd, .path = path };
+}
+
 /// The org registry record for one session: a single-line JSON file any
 /// process can read (`session list` scans the dir). Rewritten on every state
 /// change, removed on finish. State is derived from tool/pending fields.
@@ -441,6 +488,8 @@ fn writeMeta(shell: *Shell, s: *const Session) void {
     b.appendSlice(alloc, state) catch return;
     b.appendSlice(alloc, "\",\"transcript\":\"") catch return;
     appendJsonEscaped(&b, alloc, s.transcript_path) catch return;
+    b.appendSlice(alloc, "\",\"ctl\":\"") catch return;
+    if (s.ctl_path) |cp| appendJsonEscaped(&b, alloc, cp) catch return;
     b.appendSlice(alloc, "\",\"q\":\"") catch return;
     if (s.pending_q) |q| appendJsonEscaped(&b, alloc, q) catch return;
     b.appendSlice(alloc, "\"}\n") catch return;
@@ -686,6 +735,7 @@ fn spawnToolChild(shell: *Shell, cmd: []const u8) !ToolChild {
             compat.posix.close(os.r);
             compat.posix.close(os.w);
             if (os.transcript_fd >= 0) compat.posix.close(os.transcript_fd);
+            if (os.ctl_fd >= 0) compat.posix.close(os.ctl_fd);
             if (os.tool) |ot| {
                 if (ot.pidfd >= 0) compat.posix.close(ot.pidfd);
                 compat.posix.close(ot.cap_fd);
@@ -788,15 +838,94 @@ fn finishTool(shell: *Shell, idx: usize) void {
     }
 }
 
-/// Dispatch a ready fd from the input poll: a session's pipe or a tool
-/// child's pidfd.
+/// Dispatch a ready fd from the input poll: a session's pipe, its control
+/// FIFO, or a tool child's pidfd.
 pub fn serviceFd(shell: *Shell, fd: compat.posix.fd_t) void {
     if (findByFd(shell, fd) != null) return serviceByFd(shell, fd);
     for (shell.sessions.items, 0..) |*s, i| {
+        if (s.ctl_fd == fd) return serviceCtl(shell, i);
         if (s.tool) |t| {
             if (t.pidfd == fd) return finishTool(shell, i);
         }
     }
+}
+
+/// The control FIFO came up readable: drain it and act on complete JSON lines.
+/// Commands come from same-user processes (the FIFO is 0600 in a 0700 dir) —
+/// trusted enough to act on, still parsed defensively. Garbage lines are
+/// ignored; overflow clears the buffer (the FIFO is host-owned; a bad writer
+/// must not end the session).
+fn serviceCtl(shell: *Shell, idx: usize) void {
+    const alloc = shell.allocator;
+    var kill_requested = false;
+    {
+        const s = &shell.sessions.items[idx];
+        var tmp: [4096]u8 = undefined;
+        while (true) {
+            const got = compat.posix.read(s.ctl_fd, &tmp) catch break; // WouldBlock or error: drained
+            if (got == 0) break;
+            s.ctl_buf.appendSlice(alloc, tmp[0..got]) catch break;
+            if (s.ctl_buf.items.len > MAX_FRAME) s.ctl_buf.clearRetainingCapacity();
+        }
+        while (std.mem.indexOfScalar(u8, s.ctl_buf.items, '\n')) |nl| {
+            const line = s.ctl_buf.items[0..nl];
+            handleCtlLine(shell, s, line, &kill_requested);
+            const rest = s.ctl_buf.items[nl + 1 ..];
+            std.mem.copyForwards(u8, s.ctl_buf.items, rest);
+            s.ctl_buf.items.len = rest.len;
+            if (kill_requested) break;
+        }
+    }
+    if (kill_requested) {
+        const s = &shell.sessions.items[idx];
+        _ = compat.posix.kill(s.pid, compat.posix.SIG.KILL) catch {};
+        logKV(shell, s.transcript_fd, "note", "text", "ended via control channel");
+        finishSession(shell, idx);
+    }
+}
+
+fn handleCtlLine(shell: *Shell, s: *Session, line: []const u8, kill_requested: *bool) void {
+    const alloc = shell.allocator;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch return;
+    defer parsed.deinit();
+    const t = frameType(parsed.value) orelse return;
+
+    if (std.mem.eql(u8, t, "kill")) {
+        kill_requested.* = true;
+        return;
+    }
+    if (std.mem.eql(u8, t, "answer")) {
+        if (s.pending_q == null) {
+            // The remote client cannot see our stderr; attest in the transcript.
+            logKV(shell, s.transcript_fd, "note", "text", "ctl answer arrived with no pending question");
+            return;
+        }
+        // A failed write means the feat is wedged/dead: end it like any other
+        // stalled write (the kill path's cleanup is exactly right for this).
+        if (!deliverAnswer(shell, s, frameStr(parsed.value, "text"))) kill_requested.* = true;
+        return;
+    }
+}
+
+/// Send a pending question's answer to the feat: event frame + transcript +
+/// meta refresh. Caller has verified pending_q != null. Returns false when the
+/// write to the feat failed — the caller must end the session.
+fn deliverAnswer(shell: *Shell, s: *Session, text: []const u8) bool {
+    const alloc = shell.allocator;
+    var frame: std.ArrayListUnmanaged(u8) = .empty;
+    defer frame.deinit(alloc);
+    frame.appendSlice(alloc, "{\"t\":\"event\",\"kind\":\"submitted\",\"text\":\"") catch return false;
+    appendJsonEscaped(&frame, alloc, text) catch return false;
+    frame.appendSlice(alloc, "\"}\n") catch return false;
+
+    logKV(shell, s.transcript_fd, "answer", "text", text);
+
+    alloc.free(s.pending_q.?);
+    s.pending_q = null;
+
+    if (!writeFrame(s.w, frame.items)) return false;
+    writeMeta(shell, s); // state → running (question answered)
+    return true;
 }
 
 /// Print the file-based org registry: every `.meta` under ~/.zish/sessions,
@@ -840,6 +969,15 @@ pub fn listRegistry(shell: *Shell) !void {
         const alive = host > 0 and hostAlive(@intCast(host));
         if (!alive) {
             std.Io.Dir.deleteFileAbsolute(compat.io(), full) catch {};
+            // sweep the dead host's control FIFO too, or crashes accumulate them
+            if (objStr(parsed.value, "ctl")) |ctl| {
+                if (ctl.len > 0) {
+                    var cz: [std.fs.max_path_bytes]u8 = undefined;
+                    if (std.fmt.bufPrintZ(&cz, "{s}", .{ctl})) |ctlz| {
+                        std.Io.Dir.deleteFileAbsolute(compat.io(), ctlz) catch {};
+                    } else |_| {}
+                }
+            }
             try out.print("[{d}] {s}  [stale host {d}, swept]\n", .{ id, name, host });
             found = true;
             continue;
@@ -879,34 +1017,108 @@ fn hostAlive(host: compat.posix.pid_t) bool {
     return std.c._errno().* == @intFromEnum(std.c.E.PERM); // exists, not ours
 }
 
-/// Answer a session's pending question (the `session answer` builtin).
+/// Answer a session's pending question (the `session answer` builtin). If the
+/// id is not hosted by THIS shell, fall back to the control FIFO of whichever
+/// live shell hosts it (resolved via the registry) — this is what lets a
+/// Claude Code / IRC front-end drive an interactive shell's sessions.
 pub fn answerSession(shell: *Shell, id: u32, text: []const u8) !u8 {
     const idx = findById(shell, id) orelse {
-        try shell.stderr().print("session: no session {d}\n", .{id});
-        return 1;
+        const alloc = shell.allocator;
+        var line: std.ArrayListUnmanaged(u8) = .empty;
+        defer line.deinit(alloc);
+        try line.appendSlice(alloc, "{\"t\":\"answer\",\"text\":\"");
+        try appendJsonEscaped(&line, alloc, text);
+        try line.appendSlice(alloc, "\"}\n");
+        return sendRemoteCtl(shell, id, line.items);
     };
     const s = &shell.sessions.items[idx];
     if (s.pending_q == null) {
         try shell.stderr().print("session: {d} has no pending question\n", .{id});
         return 1;
     }
-    const alloc = shell.allocator;
-    var frame: std.ArrayListUnmanaged(u8) = .empty;
-    defer frame.deinit(alloc);
-    try frame.appendSlice(alloc, "{\"t\":\"event\",\"kind\":\"submitted\",\"text\":\"");
-    try appendJsonEscaped(&frame, alloc, text);
-    try frame.appendSlice(alloc, "\"}\n");
-
-    logKV(shell, s.transcript_fd, "answer", "text", text);
-
-    alloc.free(s.pending_q.?);
-    s.pending_q = null;
-
-    if (!writeFrame(s.w, frame.items)) {
+    if (!deliverAnswer(shell, s, text)) {
         finishSession(shell, idx);
         return 1;
     }
-    writeMeta(shell, s); // state → running (question answered)
+    return 0;
+}
+
+/// Kill a session by id (the `session kill` builtin), local or remote — same
+/// resolution rule as answerSession. Only the HOSTING shell tears down its
+/// session table / transcript / meta, so the remote path asks it to via the
+/// control FIFO rather than signalling the feat pid directly.
+pub fn killSessionById(shell: *Shell, id: u32) !u8 {
+    if (findById(shell, id)) |idx| {
+        finishSession(shell, idx);
+        return 0;
+    }
+    return sendRemoteCtl(shell, id, "{\"t\":\"kill\"}\n");
+}
+
+/// Resolve session `id` among OTHER live hosting shells via the registry and
+/// write one command line into its control FIFO. Ids are per-host, so a bare
+/// id can be ambiguous across shells — that is a loud error, never a guess.
+fn sendRemoteCtl(shell: *Shell, id: u32, line: []const u8) !u8 {
+    const alloc = shell.allocator;
+    const err = shell.stderr();
+
+    var ctl_path: ?[]u8 = null;
+    defer if (ctl_path) |cp| alloc.free(cp);
+    var matches: usize = 0;
+
+    var dbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_path = sessionsDir(alloc, &dbuf) catch {
+        try err.print("session: no session {d}\n", .{id});
+        return 1;
+    };
+    var dir = std.Io.Dir.cwd().openDir(compat.io(), dir_path, .{ .iterate = true }) catch {
+        try err.print("session: no session {d}\n", .{id});
+        return 1;
+    };
+    defer dir.close(compat.io());
+    var iter = dir.iterate();
+    while (iter.next(compat.io()) catch null) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".meta")) continue;
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        const full = std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+        const content = std.Io.Dir.cwd().readFileAlloc(compat.io(), full, alloc, .limited(64 * 1024)) catch continue;
+        defer alloc.free(content);
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, content, .{}) catch continue;
+        defer parsed.deinit();
+
+        const mid = objInt(parsed.value, "id") orelse continue;
+        if (mid != id) continue;
+        const host = objInt(parsed.value, "host") orelse continue;
+        if (host == std.c.getpid()) continue; // ours would have hit findById
+        if (!hostAlive(@intCast(host))) continue;
+        const ctl = objStr(parsed.value, "ctl") orelse continue;
+        if (ctl.len == 0) continue;
+        matches += 1;
+        if (ctl_path == null) ctl_path = alloc.dupe(u8, ctl) catch null;
+    }
+
+    if (matches == 0 or ctl_path == null) {
+        try err.print("session: no session {d}\n", .{id});
+        return 1;
+    }
+    if (matches > 1) {
+        try err.print("session: id {d} is ambiguous across {d} shells (see `session list` for hosts)\n", .{ id, matches });
+        return 1;
+    }
+
+    var pz: [std.fs.max_path_bytes]u8 = undefined;
+    const pathz = std.fmt.bufPrintZ(&pz, "{s}", .{ctl_path.?}) catch return 1;
+    // O_NONBLOCK write-open: ENXIO = no reader = the host died since the
+    // liveness probe. Loud, never hangs.
+    const fd = compat.posix.openZ(pathz.ptr, .{ .ACCMODE = .WRONLY, .NONBLOCK = true, .CLOEXEC = true }, 0) catch {
+        try err.print("session: host for session {d} is gone\n", .{id});
+        return 1;
+    };
+    defer compat.posix.close(fd);
+    if (!writeFrame(fd, line)) {
+        try err.print("session: control write to session {d} failed\n", .{id});
+        return 1;
+    }
     return 0;
 }
 
@@ -916,6 +1128,14 @@ pub fn finishSession(shell: *Shell, idx: usize) void {
     const alloc = shell.allocator;
     var s = shell.sessions.orderedRemove(idx);
     removeMeta(shell, s.id); // drop the registry record
+    if (s.ctl_fd >= 0) compat.posix.close(s.ctl_fd);
+    if (s.ctl_path) |cp| {
+        var pz: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.fmt.bufPrintZ(&pz, "{s}", .{cp})) |pathz| {
+            std.Io.Dir.deleteFileAbsolute(compat.io(), pathz) catch {};
+        } else |_| {}
+        alloc.free(cp);
+    }
 
     // flush any partial echoed line so the terminal isn't left mid-line
     if (s.echo.items.len > 0) {
@@ -951,6 +1171,7 @@ pub fn finishSession(shell: *Shell, idx: usize) void {
     alloc.free(s.transcript_path);
     s.buf.deinit(alloc);
     s.echo.deinit(alloc);
+    s.ctl_buf.deinit(alloc);
     if (s.pending_q) |q| alloc.free(q);
 }
 

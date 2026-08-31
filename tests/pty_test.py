@@ -1346,6 +1346,73 @@ def _(sh):
         shutil.rmtree(featroot, ignore_errors=True)
 
 
+@test("control channel: a separate process answers a session's question")
+def _(sh):
+    # The write half of the file-based org surface. The registry made sessions
+    # *visible* cross-process; the per-session control FIFO makes them
+    # *controllable*: `session answer` in an unrelated zish process resolves
+    # the id via ~/.zish/sessions/*.meta and writes into the hosting shell's
+    # <hostpid>-<id>.ctl, which sits in its input poll set. Red on the old
+    # binary: the separate process printed "session: no session 1".
+    import subprocess as _sp
+    featroot = make_session_featroot("pester", PESTER_SCRIPT)
+    small = Shell(env_extra={"ZISH_FEAT_PATH": featroot})
+    try:
+        small.read()
+        small.sendline("pester")
+        expect_soon(small, "asks: proceed?")  # parked; meta + ctl FIFO on disk
+        env = dict(os.environ)
+        env["HOME"] = small.home
+        env["ZISH_FEAT_PATH"] = featroot
+        env["ZISH_BYPASS_PASSWORD"] = "1"
+        r = _sp.run([ZISH, "-c", "session answer 1 yes"], env=env,
+                    capture_output=True, text=True, timeout=10)
+        assert r.returncode == 0, f"remote answer failed: rc={r.returncode} err={r.stderr!r}"
+        # the hosting shell must deliver the answer and see the session finish
+        out = expect_soon(small, "ended")
+        assert "answered-ok" in clean(small.buf), \
+            f"feat never received the remote answer: {out[-400:]!r}"
+        # the answer is attested in the hosting shell's event log
+        small.sendline("cat ~/.zish/sessions/*.jsonl")
+        expect_soon(small, '"t":"answer"')
+    finally:
+        small.close()
+        shutil.rmtree(featroot, ignore_errors=True)
+
+
+@test("control channel: a separate process kills a session; host tears it down")
+def _(sh):
+    # Remote kill goes through the same FIFO — the client never signals the
+    # feat pid itself, because only the HOSTING shell can consistently clean
+    # up its session table, meta record, and transcript.
+    import subprocess as _sp
+    featroot = make_session_featroot("pester", PESTER_SCRIPT)
+    small = Shell(env_extra={"ZISH_FEAT_PATH": featroot})
+    try:
+        small.read()
+        small.sendline("pester")
+        expect_soon(small, "asks: proceed?")
+        env = dict(os.environ)
+        env["HOME"] = small.home
+        env["ZISH_FEAT_PATH"] = featroot
+        env["ZISH_BYPASS_PASSWORD"] = "1"
+        r = _sp.run([ZISH, "-c", "session kill 1"], env=env,
+                    capture_output=True, text=True, timeout=10)
+        assert r.returncode == 0, f"remote kill failed: rc={r.returncode} err={r.stderr!r}"
+        expect_soon(small, "ended")
+        # meta and ctl FIFO are gone: nothing left for another process to see
+        r2 = _sp.run([ZISH, "-c", "session list"], env=env,
+                     capture_output=True, text=True, timeout=10)
+        assert "pester" not in clean(r2.stdout), \
+            f"killed session still in registry: {clean(r2.stdout)!r}"
+        left = [f for f in os.listdir(os.path.join(small.home, ".zish", "sessions"))
+                if f.endswith(".ctl") or f.endswith(".meta")]
+        assert not left, f"control/meta files not cleaned up: {left}"
+    finally:
+        small.close()
+        shutil.rmtree(featroot, ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 total = passed + failed
 print()

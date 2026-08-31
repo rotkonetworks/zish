@@ -952,15 +952,20 @@ fn readNextAction(self: *Shell) !Action {
     // serviced between keystrokes, so the prompt stays live while a session
     // feat runs (the agent-armor async substrate). Sessions are polled and
     // serviced first; stdin readiness then falls through to the key read.
-    // one slot for stdin, then per session: its pipe fd and (if a tool run is
-    // in flight) the tool child's pidfd
-    var pfds: [1 + 2 * session_mod.MAX_SESSIONS]std.c.pollfd = undefined;
+    // one slot for stdin, then per session: its pipe fd, its control FIFO
+    // (cross-process `session answer`/`kill`), and (if a tool run is in
+    // flight) the tool child's pidfd
+    var pfds: [1 + 3 * session_mod.MAX_SESSIONS]std.c.pollfd = undefined;
     pfds[0] = .{ .fd = std.posix.STDIN_FILENO, .events = std.c.POLL.IN, .revents = 0 };
     var nfds: usize = 1;
     for (self.sessions.items) |*s| {
         if (nfds >= pfds.len) break;
         pfds[nfds] = .{ .fd = s.r, .events = std.c.POLL.IN, .revents = 0 };
         nfds += 1;
+        if (s.ctl_fd >= 0 and nfds < pfds.len) {
+            pfds[nfds] = .{ .fd = s.ctl_fd, .events = std.c.POLL.IN, .revents = 0 };
+            nfds += 1;
+        }
         if (s.tool) |t| {
             if (t.pidfd >= 0 and nfds < pfds.len) {
                 pfds[nfds] = .{ .fd = t.pidfd, .events = std.c.POLL.IN, .revents = 0 };
@@ -974,7 +979,7 @@ fn readNextAction(self: *Shell) !Action {
     if (nfds > 1) {
         // Collect ready fds first: servicing can remove sessions (done/EOF),
         // which mutates the table the pfds were built from.
-        var ready: [2 * session_mod.MAX_SESSIONS]posix.fd_t = undefined;
+        var ready: [3 * session_mod.MAX_SESSIONS]posix.fd_t = undefined;
         var nready: usize = 0;
         for (pfds[1..nfds]) |p| {
             if (p.revents != 0) { // IN, HUP or ERR all mean "go read it"
