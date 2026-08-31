@@ -237,11 +237,124 @@ fn writeFile(path: []const u8, bytes: []const u8, mode: u32) bool {
     return true;
 }
 
+/// fork+exec via /usr/bin/env, capturing stdout (for sha256sum). Returns null
+/// on spawn failure or non-zero exit.
+fn execCapture(argv: [*:null]const ?[*:0]const u8) ?[]u8 {
+    var fds: [2]i32 = undefined;
+    if (@as(isize, @bitCast(linux.pipe2(&fds, .{}))) < 0) return null;
+    const pid_rc = linux.fork();
+    const pid: isize = @bitCast(pid_rc);
+    if (pid < 0) {
+        _ = linux.close(fds[0]);
+        _ = linux.close(fds[1]);
+        return null;
+    }
+    if (pid == 0) {
+        _ = linux.close(fds[0]);
+        _ = linux.dup2(fds[1], 1);
+        _ = linux.close(fds[1]);
+        _ = linux.execve("/usr/bin/env", argv, @ptrCast(std.c.environ));
+        linux.exit(127);
+    }
+    _ = linux.close(fds[1]);
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    var tmp: [4096]u8 = undefined;
+    while (true) {
+        const rc = linux.read(fds[0], &tmp, tmp.len);
+        const n: isize = @bitCast(rc);
+        if (n <= 0) break;
+        buf.appendSlice(alloc, tmp[0..@intCast(n)]) catch break;
+    }
+    _ = linux.close(fds[0]);
+    var status: u32 = 0;
+    _ = linux.waitpid(@intCast(pid), &status, 0);
+    if ((status & 0x7f) != 0 or ((status >> 8) & 0xff) != 0) return null;
+    return buf.toOwnedSlice(alloc) catch null;
+}
+
+/// sha256 of a file, as 64 hex chars, via sha256sum.
+fn sha256File(path: []const u8) ?[]const u8 {
+    var z: [4096]u8 = undefined;
+    const p = toZ(&z, path) orelse return null;
+    const argv = [_:null]?[*:0]const u8{ "env", "sha256sum", "--", p, null };
+    const out = execCapture(&argv) orelse return null;
+    if (out.len < 64) return null;
+    for (out[0..64]) |c| {
+        if (!std.ascii.isHex(c)) return null;
+    }
+    return out[0..64];
+}
+
 fn rmRf(path: []const u8) void {
     var z: [4096]u8 = undefined;
     const p = toZ(&z, path) orelse return;
     const argv = [_:null]?[*:0]const u8{ "env", "rm", "-rf", "--", p, null };
     _ = execStatus(&argv);
+}
+
+// ===========================================================================
+// install ledger — the seed of the distributed reputation system
+// ===========================================================================
+
+fn nowSeconds() i64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.REALTIME, &ts);
+    return @intCast(ts.sec);
+}
+
+/// Append a JSON string with minimal escaping (quotes, backslash; control
+/// bytes dropped — ledger lines must stay single-line valid JSON).
+fn appendJsonStr(out: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
+    for (s) |c| switch (c) {
+        '"' => try out.appendSlice(alloc, "\\\""),
+        '\\' => try out.appendSlice(alloc, "\\\\"),
+        else => if (c >= 0x20) try out.append(alloc, c),
+    };
+}
+
+/// Append one install event to <root>/ledger.jsonl: what was installed, from
+/// where, hashed as what, when. Append-only by contract — this is the local
+/// end of the broadcast/review/reputation pipeline (a review verdict for the
+/// same sha lands beside it later; a feed/chain replicates it later still).
+/// Best-effort: a failed ledger write never fails the install, but is noted.
+fn ledgerAppend(root: []const u8, name: []const u8, url: []const u8, sha: []const u8) void {
+    var line: std.ArrayListUnmanaged(u8) = .empty;
+    defer line.deinit(alloc);
+    line.appendSlice(alloc, "{\"t\":\"install\",\"name\":\"") catch return;
+    appendJsonStr(&line, name) catch return;
+    line.appendSlice(alloc, "\",\"sha256\":\"") catch return;
+    appendJsonStr(&line, sha) catch return;
+    line.appendSlice(alloc, "\",\"url\":\"") catch return;
+    appendJsonStr(&line, url) catch return;
+    var tsbuf: [32]u8 = undefined;
+    const ts = std.fmt.bufPrint(&tsbuf, "\",\"ts\":{d}}}\n", .{nowSeconds()}) catch return;
+    line.appendSlice(alloc, ts) catch return;
+
+    var pbuf: [4096]u8 = undefined;
+    const path = std.fmt.bufPrint(&pbuf, "{s}/ledger.jsonl", .{root}) catch return;
+    var z: [4096]u8 = undefined;
+    const p = toZ(&z, path) orelse return;
+    const fd_rc = linux.open(p, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o600);
+    const fd: isize = @bitCast(fd_rc);
+    if (fd < 0) {
+        print("gf: warning: could not write ledger\n", .{});
+        return;
+    }
+    defer _ = linux.close(@intCast(fd));
+    var off: usize = 0;
+    while (off < line.items.len) {
+        const rc = linux.write(@intCast(fd), line.items.ptr + off, line.items.len - off);
+        const n: isize = @bitCast(rc);
+        if (n <= 0) break;
+        off += @intCast(n);
+    }
+}
+
+test "appendJsonStr escapes quotes and drops control bytes" {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(alloc);
+    try appendJsonStr(&out, "a\"b\\c\x1bd");
+    try std.testing.expectEqualStrings("a\\\"b\\\\cd", out.items);
 }
 
 // ===========================================================================
@@ -398,6 +511,8 @@ fn run(init: std.process.Init.Minimal) u8 {
         const st = execStatus(&argv);
         if (st != 0) return fail("extract failed (tar exit {d})", .{st});
     }
+    // hash the exact bytes that were installed, then drop the archive
+    const sha = sha256File(archive) orelse "";
     var az2: [4096]u8 = undefined;
     if (toZ(&az2, archive)) |ap| _ = linux.unlink(ap);
 
@@ -437,6 +552,10 @@ fn run(init: std.process.Init.Minimal) u8 {
         if (@as(isize, @bitCast(linux.rename(tp, dp))) != 0) return fail("install rename failed", .{});
         cleanup_tmp = false;
     }
+
+    // attest the install in the append-only ledger (name, content hash,
+    // origin, time) — the local end of the review/reputation pipeline
+    ledgerAppend(root, name, url, sha);
 
     print(
         "gf: installed {s} into the extra tier: {s}\n" ++

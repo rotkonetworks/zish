@@ -104,6 +104,17 @@ pack "$S" "$T/shadow.tar.gz"
 GF "file://$T/shadow.tar.gz" >/dev/null 2>&1 \
     && bad "shadowing name 'ls' was allowed" || ok "shadowing name refused"
 
+# ---- install ledger --------------------------------------------------------
+L="$T/feats/ledger.jsonl"
+if [ -f "$L" ] && grep -q '"t":"install","name":"gfdemo","sha256":"[0-9a-f]\{64\}"' "$L"; then
+    ok "install attested in the ledger (name + content sha256)"
+else
+    bad "ledger missing or malformed: $(cat "$L" 2>/dev/null)"
+fi
+n=$(wc -l < "$L" 2>/dev/null || echo 0)
+[ "$n" -eq 1 ] && ok "refused installs leave no ledger entries" \
+    || bad "expected 1 ledger line after refusals, got $n"
+
 # ---- no temp debris left behind -------------------------------------------
 leftovers=$(find "$T/feats" -maxdepth 1 -name '.gf-tmp-*' | wc -l)
 [ "$leftovers" -eq 0 ] && ok "no temp dirs left after refusals" \
