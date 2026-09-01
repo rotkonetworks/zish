@@ -28,6 +28,14 @@ pipe pair. The model is **host / guest**:
 One frame is one JSON object on one line. `t` is the type. Unknown frame types
 are ignored (forward-compatible).
 
+**frame vs intent** — do not conflate them. A *frame* is the message unit (a
+JSON line, either direction). An *intent* is the semantic role of a
+**guest→host** frame: a hostcall request. Intents are the subset the guest
+*emits to ask for something* — `run`, `say`, `stream`, `prompt`, `done`. The
+host's frames — `hello`, `result`, `event`, `error` — are announcements and
+replies, **not** intents. And neither is a *feat*: a feat is the *program*
+(see [feat-spec.md](feat-spec.md)); frames are what a session feat *speaks*.
+
 ## 1. The vocabulary
 
 Nine wire frames, stable across v0.1 → v0.3. Direction is host↔guest.
