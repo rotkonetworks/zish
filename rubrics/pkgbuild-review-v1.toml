@@ -1,0 +1,82 @@
+# pkgbuild-review-v1 — the rubric aurev scores an AUR PKGBUILD (or its diff)
+# against, before `yay` builds it.
+#
+# The threat model is specific: a PKGBUILD is arbitrary shell that runs as you
+# at build time. The classic supply-chain move is a legitimate-looking version
+# bump that quietly adds a payload — a `curl | sh` in prepare(), a swapped
+# source= mirror, an obfuscated blob, a new network fetch. So this rubric is
+# SAFETY-WEIGHTED: correctness/style barely matter; "is this update trying to
+# run something it shouldn't" is the whole question. When reviewing a diff,
+# judge the CHANGE — does it match a plausible version bump, or does it sneak
+# in unrelated behavior?
+#
+# Advisory to the user on their own machine: aurev prints the verdict, the user
+# still sees the raw diff and decides. Data, never a gate.
+
+rubric_id = "pkgbuild-review-v1"
+
+# --- dimension: safety (dominant) -------------------------------------------
+[safety]
+key = "safety"
+description = """
+Freedom from build-time hostility. Look hard for: piping remote content to a
+shell (curl/wget ... | sh/bash), executing downloaded blobs, obfuscated or
+encoded commands, writing outside the build dir, sudo/privilege escalation,
+tampering with the user's environment, or exfiltration. A PKGBUILD runs as the
+user — treat any of these as disqualifying.
+0-1: overtly malicious (remote code execution, exfiltration, destructive).
+2-3: a serious unsafe operation with no legitimate reason.
+4-5: a suspicious pattern that could be exploited or hide intent.
+6-7: mostly safe; one questionable command worth a human glance.
+8-9: safe; standard build operations only.
+10: nothing unsafe; every fetch and command is ordinary and expected.
+"""
+
+# --- dimension: provenance --------------------------------------------------
+[provenance]
+key = "provenance"
+description = """
+Source integrity. Does source= point at the expected upstream (not a swapped
+mirror or a random host)? Are checksums (sha256sums/b2sums) present and
+consistent with a version bump rather than left as SKIP for a binary blob? Are
+new sources declared and checksummed, or slipped in unchecked?
+0-1: source or checksum clearly tampered to hide a payload.
+2-3: unverified binary source, or a source host that doesn't match upstream.
+4-5: weak integrity (SKIP checksums, or an unexplained new source).
+6-7: acceptable; a minor provenance gap.
+8-9: sources and checksums are consistent and expected.
+10: fully verifiable provenance; every source pinned and checksummed.
+"""
+
+# --- dimension: change_intent (for diffs) -----------------------------------
+[change_intent]
+key = "change_intent"
+description = """
+Does the change match its ostensible purpose? A version bump should touch
+pkgver, sources, and checksums — not add a prepare() that fetches a script, not
+introduce build steps unrelated to the version, not edit install scripts to run
+new commands. The supply-chain attack hides a payload inside a plausible bump.
+For a first install (no diff), judge whether the PKGBUILD as a whole does only
+what packaging this software requires.
+0-1: the change adds behavior clearly unrelated to the stated update.
+2-3: unexplained new execution paths alongside a version bump.
+4-5: some change beyond what the version bump should need.
+6-7: mostly a clean bump; one unexplained edit.
+8-9: the change is what the update should be, nothing extra.
+10: a textbook version bump — pkgver, sources, checksums, nothing else.
+"""
+
+# --- dimension: transparency ------------------------------------------------
+[transparency]
+key = "transparency"
+description = """
+Is intent legible, or hidden? Obfuscation — base64/hex blobs, eval of assembled
+strings, minified inline scripts, misleading variable names — is itself a red
+flag, because a benign PKGBUILD has no reason to hide.
+0-1: deliberately obfuscated to conceal what it does.
+2-3: significant obfuscation with no packaging reason.
+4-5: some hard-to-follow construction that obscures intent.
+6-7: readable; a little indirection.
+8-9: clear and conventional.
+10: completely transparent; every step obvious.
+"""

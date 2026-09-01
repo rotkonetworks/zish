@@ -1,0 +1,5 @@
+name = "aurev"
+version = "0.1.0"
+tier = "standard"
+bin = "aurev"
+help = "review a PKGBUILD diff on stdin (a pager for yay): set PAGER=aurev"

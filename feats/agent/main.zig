@@ -690,18 +690,19 @@ fn parseArgs(args: std.process.Args) ?Config {
 
 const JUDGE_RETRIES = 3;
 
+// Subject-agnostic: the RUBRIC carries the domain (a feat, a PKGBUILD, a diff);
+// this prompt only defines the analyze-then-score-against-the-rubric contract.
 const JUDGE_SYSTEM =
-    "You are a meticulous code reviewer for a zish feat — a small standalone " ++
-    "command-line tool the user's shell may execute. You are given a scoring " ++
-    "rubric and the feat's manifest and source code. First analyze the code " ++
-    "against each rubric dimension, noting concrete issues (bugs, unsafe " ++
-    "operations, whether it does what its manifest claims). Then assign each " ++
+    "You are a meticulous reviewer. You are given a scoring rubric and a subject " ++
+    "to review — source code, a package build script, or a diff. First analyze " ++
+    "the subject against each rubric dimension, noting concrete issues (bugs, " ++
+    "unsafe operations, whether it does what it claims). Then assign each " ++
     "dimension an integer score from 0 to 10 following the rubric bands, and a " ++
     "single overall verdict. Respond with ONLY a JSON object — no prose, no " ++
     "markdown fences — of exactly this shape: {\"analysis\":\"<concise analysis>\"," ++
     "\"scores\":{\"<dimension_key>\":<0-10>,...},\"verdict\":\"pass\" or \"fail\"}. " ++
-    "Use \"fail\" if any dimension scores below 5, or if the code is unsafe or " ++
-    "does not match what its manifest claims.";
+    "Use \"fail\" if any dimension scores below 5, or if the subject is unsafe " ++
+    "or does not do what it claims.";
 
 const JudgeCfg = struct {
     model: []const u8 = DEFAULT_MODEL,
