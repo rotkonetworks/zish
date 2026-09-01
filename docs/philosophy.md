@@ -1,11 +1,16 @@
 # zish philosophy — does this belong in a shell?
 
 Status: living doc
-Scope: the standing test every ambitious addition to zish must pass. zish grew
-an agent-armor layer — session hosting, a package manager (`gf`), agent
-review, a reputation ledger, and (eventually) an economic/chain layer. That is
-a lot for a *shell*. This doc is the discipline that keeps it from rotting into
-an everything-daemon.
+Scope: the standing test every ambitious addition to zish must pass. An
+agent-armor layer has grown *around* zish — but almost none of it is *in* the
+shell. The shell core added exactly one thing: a **session-hosting substrate**
+(a poll-multiplexed, newline-delimited frame protocol over pipes). Everything
+else — the package manager (`gf`), agent inference and review, the reputation
+ledger, the eventual economic/chain layer — are **feats** (separate programs
+the shell `exec`s) and **text files**. They are extensions, not parts of zish.
+That separation *is* the point; this doc is the discipline that preserves it.
+The day any of it leaks into the shell binary, it has rotted into an
+everything-daemon.
 
 ## 0. The question, asked forever
 
@@ -111,6 +116,14 @@ not drift:
    dozens of message types, stateful handshakes, ordering dependencies. Keep it
    one greppable object per line and minimal — a protocol that stops being
    line-oriented has started becoming a runtime.
+
+   Evidence it has held: the wire vocabulary is **nine frame types**
+   (`hello` / `run` / `say` / `stream` / `prompt` / `done` / `result` /
+   `event` / `error`), plus two control-FIFO commands (`answer` / `kill`),
+   stable across protocol v0.1 → v0.3. The package manager, agent review, and
+   the ledger added **zero** new frame types — `run` is universal, so new
+   capability arrives as feats and files, not protocol surface. The day a new
+   feature needs a tenth frame type is the day to be suspicious.
 2. **Session-hosting-with-capabilities.** "Run a command and wait" is pure
    shell. "Host a long-lived guest, mediate its hostcalls through a capability
    mask" is job control *extended* — the seam where "run and wait" grows into
