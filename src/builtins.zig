@@ -247,8 +247,9 @@ fn dash(shell: *Shell) !u8 {
         return 1;
     };
 
-    try setVar(shell, "OLDPWD", cwd);
+    // print before setVar: it frees the buffer oldpwd points into
     try shell.stdout().print("{s}\n", .{oldpwd});
+    try setVar(shell, "OLDPWD", cwd);
     return 0;
 }
 
