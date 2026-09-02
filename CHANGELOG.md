@@ -1,5 +1,26 @@
 # changelog
 
+## v0.20.1
+
+Correctness fix release over 0.20.0. Recommended for everyone: two of these
+are glob bugs that silently returned the wrong thing.
+
+### fixed
+- **glob with a wildcard before the last `/` never expanded.** `*/main.zig`,
+  `src/*/x.zig`, `*/`, `[ab]*/file` all came back as the literal pattern,
+  because expansion split at the last slash and tried to open the directory
+  half literally — there is no directory called `*`. Patterns now expand one
+  component at a time. A trailing `/` keeps directories only and a leading
+  `//` is preserved, as in bash.
+- **`**/name` never matched.** The recursive walker kept the `/` on its
+  suffix and compared `/name` against filenames.
+- **`-` builtin printed garbage.** It changed to `$OLDPWD` correctly but
+  printed the path after the buffer it pointed into had been freed
+  (use-after-free; the bytes were whatever the allocator did next).
+
+Regression cases for all three are in `tests/regress.sh`, differential
+against bash where bash pins the answer.
+
 ## v0.16.1
 
 Correctness fix release. Recommended for anyone on 0.16.0.
