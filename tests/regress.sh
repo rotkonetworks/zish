@@ -637,12 +637,31 @@ same_as_bash "echo -e octal + hex edges"  'echo -e "\0101Z \101Z \x4Z \xgZ \08Z 
 same_as_bash "for words expand up front"  'v=x; for w in $v ${v}2; do v=CHANGED; printf "%s " "$w"; done'
 same_as_bash "for brace expansion"        'for w in a{1,2} b; do printf "%s " "$w"; done'
 same_as_bash "for glob words"             'mkdir -p g && touch g/a.zz g/b.zz; for f in g/*.zz; do printf "%s " "$f"; done'
+
+# --- glob with a wildcard before the last '/' ---
+# expandSimpleGlob split the pattern at its last slash and opened the directory
+# half literally. `*/main.zig` looked for a directory named `*`, found nothing,
+# and the pattern came back unexpanded. Now expanded one component at a time.
+same_as_bash "glob middle component"      'mkdir -p gm/a gm/b && touch gm/a/x.t gm/b/x.t gm/b/y.t; echo gm/*/x.t'
+same_as_bash "glob two wild components"   'mkdir -p gm/a gm/b && touch gm/a/x.t gm/b/y.t; echo gm/*/*.t'
+same_as_bash "glob trailing slash = dirs" 'mkdir -p gt/d1 gt/d2 && touch gt/f; echo gt/*/'
+same_as_bash "glob literal tail missing"  'mkdir -p gm/a; echo gm/*/nosuch'
+same_as_bash "glob absolute middle wild"  'mkdir -p ga/a ga/b && touch ga/a/x ga/b/x; echo "$PWD"/ga/*/x'
+same_as_bash "glob leading // kept"       'mkdir -p ga/a && touch ga/a/x; echo /"$PWD"/ga/*/x'
+# `**` kept the '/' on its suffix, so `**/z.t` compared "/z.t" against
+# filenames and never matched. bash needs globstar for this, so pin it.
+expect "glob ** recursive"                'gr/a/b/z.t gr/z.t' 0 'mkdir -p gr/a/b && touch gr/a/b/z.t gr/z.t; echo gr/**/z.t'
 same_as_bash "for custom IFS split"       'IFS=:; for x in a:b:c; do printf "[%s]" "$x"; done'
 same_as_bash "for quoted word one field"  'for x in "a b" c; do printf "[%s]" "$x"; done'
 same_as_bash "for empty word list"        'for x in; do echo no; done'
 same_as_bash "for escaped dollar literal" 'for x in \$HOME; do echo "$x"; done'
 same_as_bash "for cmdsubst split + break" 'for x in $(echo a b) lit; do printf "[%s]" "$x"; done'
 same_as_bash "for continue N"             'for i in 1 2 3; do for j in a b; do continue 2; done; echo "$i"; done'
+
+# --- `-` builtin: use-after-free ---
+# It printed OLDPWD *after* setVar had freed the buffer the slice pointed into,
+# so the path came out as garbage bytes (the directory change itself was fine).
+expect "- builtin prints old dir"         "$(printf '/tmp\n/tmp')" 0 'cd /tmp; cd /usr; -; pwd'
 same_as_bash "for nested same variable"   'for x in 1 2; do for x in a b; do printf %s "$x"; done; printf "[%s]" "$x"; done'
 
 # Redirections applied to a COMPOUND command (while/for/if/brace/subshell).

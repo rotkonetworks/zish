@@ -36,46 +36,79 @@ pub inline fn hasGlobChars(pattern: []const u8) bool {
     return false;
 }
 
+fn joinPath(allocator: std.mem.Allocator, prefix: []const u8, name: []const u8) ![]const u8 {
+    if (prefix.len == 0 or prefix[prefix.len - 1] == '/')
+        return std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, name });
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, name });
+}
+
+fn isDirPath(path: []const u8) bool {
+    const st = std.Io.Dir.cwd().statFile(compat.io(), path, .{}) catch return false;
+    return st.kind == .directory;
+}
+
+fn freeList(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8)) void {
+    for (list.items) |item| allocator.free(item);
+    list.deinit(allocator);
+}
+
+// Expands one path component at a time. Splitting at the last '/' and opening
+// the directory half literally can't do `*/main.zig`: there is no directory
+// called `*`, so the pattern silently came back unexpanded.
 fn expandSimpleGlob(allocator: std.mem.Allocator, pattern: []const u8) ![][]const u8 {
-    var results = try std.ArrayList([]const u8).initCapacity(allocator, 16);
-    errdefer {
-        for (results.items) |item| allocator.free(item);
-        results.deinit(allocator);
-    }
+    // leading slashes are kept verbatim (`//x` stays `//x`, as in bash)
+    var lead: usize = 0;
+    while (lead < pattern.len and pattern[lead] == '/') lead += 1;
 
-    // split pattern into directory and filename parts
-    const last_slash = std.mem.lastIndexOf(u8, pattern, "/");
-    const dir_path = if (last_slash) |idx| pattern[0..idx] else ".";
-    const file_pattern = if (last_slash) |idx| pattern[idx + 1 ..] else pattern;
+    // candidate prefixes so far; "" joins as "name", "/" joins as "/name"
+    var prefixes = try std.ArrayList([]const u8).initCapacity(allocator, 8);
+    errdefer freeList(allocator, &prefixes);
+    try prefixes.append(allocator, try allocator.dupe(u8, pattern[0..lead]));
 
-    // open directory
-    var dir = std.Io.Dir.cwd().openDir(compat.io(), dir_path, .{ .iterate = true }) catch {
-        // if directory doesn't exist, return empty
-        return try results.toOwnedSlice(allocator);
-    };
-    defer dir.close(compat.io());
+    var it = std.mem.splitScalar(u8, pattern[lead..], '/');
+    while (it.next()) |comp| {
+        const is_last = it.peek() == null;
+        if (comp.len == 0 and !is_last) continue; // `a//b` is `a/b`
 
-    // A leading '.' in a filename is only matched when the pattern's first
-    // char is a literal '.' (POSIX: hidden files hidden from wildcards).
-    const pattern_matches_dot = file_pattern.len > 0 and file_pattern[0] == '.';
+        var next = try std.ArrayList([]const u8).initCapacity(allocator, 16);
+        errdefer freeList(allocator, &next);
 
-    // iterate and match
-    var iter = dir.iterate();
-    while (try iter.next(compat.io())) |entry| {
-        if (entry.name.len > 0 and entry.name[0] == '.' and !pattern_matches_dot) continue;
-        if (matchGlob(file_pattern, entry.name)) {
-            const full_path = if (std.mem.eql(u8, dir_path, "."))
-                try allocator.dupe(u8, entry.name)
-            else
-                try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name });
-            try results.append(allocator, full_path);
+        for (prefixes.items) |prefix| {
+            if (comp.len == 0) {
+                // trailing slash: directories only, keep the slash
+                if (isDirPath(prefix)) try next.append(allocator, try joinPath(allocator, prefix, ""));
+            } else if (!hasGlobChars(comp)) {
+                const joined = try joinPath(allocator, prefix, comp);
+                std.Io.Dir.cwd().access(compat.io(), joined, .{}) catch {
+                    allocator.free(joined);
+                    continue;
+                };
+                try next.append(allocator, joined);
+            } else {
+                const dir_path = if (prefix.len == 0) "." else prefix;
+                var dir = std.Io.Dir.cwd().openDir(compat.io(), dir_path, .{ .iterate = true }) catch continue;
+                defer dir.close(compat.io());
+
+                // A leading '.' is only matched by a literal '.' in the pattern
+                // (POSIX: hidden files hidden from wildcards).
+                const matches_dot = comp[0] == '.';
+                var iter = dir.iterate();
+                while (try iter.next(compat.io())) |entry| {
+                    if (entry.name.len > 0 and entry.name[0] == '.' and !matches_dot) continue;
+                    if (!matchGlob(comp, entry.name)) continue;
+                    // an intermediate component has to be enterable
+                    if (!is_last and entry.kind != .directory and entry.kind != .sym_link) continue;
+                    try next.append(allocator, try joinPath(allocator, prefix, entry.name));
+                }
+            }
         }
+
+        freeList(allocator, &prefixes);
+        prefixes = next;
     }
 
-    // sort results for consistent output
-    std.mem.sort([]const u8, results.items, {}, stringLessThan);
-
-    return try results.toOwnedSlice(allocator);
+    std.mem.sort([]const u8, prefixes.items, {}, stringLessThan);
+    return try prefixes.toOwnedSlice(allocator);
 }
 
 fn expandRecursiveGlob(allocator: std.mem.Allocator, pattern: []const u8) ![][]const u8 {
@@ -88,7 +121,8 @@ fn expandRecursiveGlob(allocator: std.mem.Allocator, pattern: []const u8) ![][]c
     // split on **
     const star_star_idx = std.mem.indexOf(u8, pattern, "**") orelse return error.InvalidPattern;
     const prefix = pattern[0..star_star_idx];
-    const suffix = if (star_star_idx + 2 < pattern.len) pattern[star_star_idx + 2 ..] else "";
+    // `**/x`: the suffix is a filename, so it must not keep the '/'
+    const suffix = std.mem.trimStart(u8, pattern[star_star_idx + 2 ..], "/");
 
     // start directory
     const start_dir = if (prefix.len > 0 and prefix[prefix.len - 1] == '/')
