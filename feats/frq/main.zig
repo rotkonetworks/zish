@@ -41,17 +41,18 @@ pub fn main(init: std.process.Init) void {
     }
 
     const data: []const u8 = if (path) |p|
-    // never block an agent on a terminal: no file + stdin is a tty
-    if (path == null and std.Io.File.stdin().isTty(init.io) catch false) {
-        var eb: [256]u8 = undefined;
-        var ew = std.Io.File.stderr().writer(init.io, &eb);
-        ew.interface.writeAll("frq: no input (stdin is a terminal)\n") catch {};
-        ew.flush() catch {};
-        std.process.exit(2);
-    }
         std.Io.Dir.cwd().readFileAlloc(init.io, p, alloc, .limited(1 << 30)) catch return
-    else
-        readAllStdin(alloc) catch return;
+    else blk: {
+        // never block an agent on a terminal: no file + stdin is a tty
+        if (std.Io.File.stdin().isTty(init.io) catch false) {
+            var eb: [256]u8 = undefined;
+            var ew = std.Io.File.stderr().writer(init.io, &eb);
+            ew.interface.writeAll("frq: no input (stdin is a terminal)\n") catch {};
+            ew.flush() catch {};
+            std.process.exit(2);
+        }
+        break :blk readAllStdin(alloc) catch return;
+    };
     defer if (path != null) alloc.free(data);
 
     // collect tokens (pointers into data)
