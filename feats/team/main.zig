@@ -60,10 +60,61 @@ fn emit(comptime fmt: []const u8, args: anytype) void {
     appendFile(tp, line);
 }
 
-/// A JSON-safe copy of `s` (drops quotes/backslashes/controls) — display text.
+/// A JSON-safe copy of `s` (drops quotes/backslashes/controls) — short labels.
 fn jclean(s: []const u8) []u8 {
     var o: std.ArrayListUnmanaged(u8) = .empty;
     for (s) |c| if (c >= 0x20 and c != '"' and c != '\\') (o.append(alloc, c) catch {});
+    return o.toOwnedSlice(alloc) catch (alloc.dupe(u8, "") catch unreachable);
+}
+
+/// Token usage an agent reported via its ZISH_ASK_META sidecar.
+const Meta = struct { pt: i64, ct: i64 };
+
+/// Read a `{pt,ct,think}` meta sidecar. Always sets `think_out.*` (owned; caller
+/// frees) — the reasoning the agent produced. Missing/invalid → 0 tokens, "".
+fn readMeta(path: []const u8, think_out: *[]u8) Meta {
+    think_out.* = alloc.dupe(u8, "") catch "";
+    const c = readFileAlloc(path, MAX_OUT) orelse return .{ .pt = 0, .ct = 0 };
+    defer alloc.free(c);
+    const p = std.json.parseFromSlice(std.json.Value, alloc, c, .{}) catch return .{ .pt = 0, .ct = 0 };
+    defer p.deinit();
+    var pt: i64 = 0;
+    var ct: i64 = 0;
+    if (p.value == .object) {
+        if (p.value.object.get("pt")) |v| if (v == .integer) {
+            pt = v.integer;
+        };
+        if (p.value.object.get("ct")) |v| if (v == .integer) {
+            ct = v.integer;
+        };
+        if (p.value.object.get("think")) |v| if (v == .string) {
+            alloc.free(think_out.*);
+            think_out.* = alloc.dupe(u8, v.string) catch (alloc.dupe(u8, "") catch unreachable);
+        };
+    }
+    return .{ .pt = pt, .ct = ct };
+}
+
+/// Proper JSON string escaping that KEEPS content readable (newlines→\n etc.),
+/// truncated to `max` bytes — for the actual generated text an agent produced.
+fn jesc(s: []const u8, max: usize) []u8 {
+    var o: std.ArrayListUnmanaged(u8) = .empty;
+    var i: usize = 0;
+    for (s) |c| {
+        if (i >= max) {
+            o.appendSlice(alloc, "\\u2026") catch {};
+            break;
+        }
+        switch (c) {
+            '"' => o.appendSlice(alloc, "\\\"") catch {},
+            '\\' => o.appendSlice(alloc, "\\\\") catch {},
+            '\n' => o.appendSlice(alloc, "\\n") catch {},
+            '\r' => {},
+            '\t' => o.appendSlice(alloc, "\\t") catch {},
+            else => if (c >= 0x20) (o.append(alloc, c) catch {}),
+        }
+        i += 1;
+    }
     return o.toOwnedSlice(alloc) catch (alloc.dupe(u8, "") catch unreachable);
 }
 
@@ -268,12 +319,33 @@ fn budgetBalance(bin: []const u8, id: []const u8) ?i64 {
 
 /// Invoke the agent with `prompt`; return its stdout (owned) or null on failure.
 /// Passes --mock through when ZISH_JUDGE_MOCK is set, so a test can stay offline.
-fn callAgent(bin: []const u8, prompt: []const u8) ?[]u8 {
-    const r = if (getEnv("ZISH_JUDGE_MOCK")) |m|
-        exec(&.{ bin, "--mock", m, "--ask", prompt })
+/// Call the agent one-shot. When `meta_path` is non-empty, the agent writes its
+/// token usage + thinking there (via ZISH_ASK_META, injected as an `env` NAME=VAL).
+fn callAgent(bin: []const u8, prompt: []const u8, meta_path: []const u8) ?[]u8 {
+    var masg_buf: [4096]u8 = undefined;
+    const masg: []const u8 = if (meta_path.len > 0)
+        (std.fmt.bufPrint(&masg_buf, "ZISH_ASK_META={s}", .{meta_path}) catch "")
     else
-        exec(&.{ bin, "--ask", prompt });
-    const rr = r orelse return null;
+        "";
+    var args: [8][]const u8 = undefined;
+    var n: usize = 0;
+    if (masg.len > 0) {
+        args[n] = masg;
+        n += 1;
+    }
+    args[n] = bin;
+    n += 1;
+    if (getEnv("ZISH_JUDGE_MOCK")) |m| {
+        args[n] = "--mock";
+        n += 1;
+        args[n] = m;
+        n += 1;
+    }
+    args[n] = "--ask";
+    n += 1;
+    args[n] = prompt;
+    n += 1;
+    const rr = exec(args[0..n]) orelse return null;
     if (rr.code != 0) {
         alloc.free(rr.out);
         return null;
@@ -330,6 +402,11 @@ fn spawnAgentToFile(bin: []const u8, prompt: []const u8, out_path: []const u8, w
         const asg = std.fmt.bufPrint(&bb, "ZISH_AGENT_BACKEND={s}", .{b}) catch return null;
         if (!push(asg, &held, &nh, &argv, &n)) return null; // `env` consumes NAME=VAL
     }
+    { // tokens + thinking sidecar the worker writes, next to its output file
+        var mb: [4096]u8 = undefined;
+        const masg = std.fmt.bufPrint(&mb, "ZISH_ASK_META={s}.meta", .{out_path}) catch return null;
+        if (!push(masg, &held, &nh, &argv, &n)) return null;
+    }
     if (!push(bin, &held, &nh, &argv, &n)) return null;
     if (wm.model) |m| {
         if (!push("-m", &held, &nh, &argv, &n)) return null;
@@ -359,6 +436,14 @@ fn spawnAgentToFile(bin: []const u8, prompt: []const u8, out_path: []const u8, w
         linux.exit(127);
     }
     return @intCast(cpid);
+}
+
+/// Reap ANY finished child, returning its pid (or -1) — so parallel workers get
+/// their true finish times as they complete, not clustered at collect.
+fn waitAny() i32 {
+    var status: u32 = 0;
+    const r: isize = @bitCast(linux.waitpid(-1, &status, 0));
+    return if (r < 0) -1 else @intCast(r);
 }
 
 fn reap(cpid: i32) void {
@@ -525,7 +610,9 @@ fn serviceBtwAsk(agent_bin: []const u8, budget_bin: []const u8, root_id: []const
         }
         const eprompt = std.fmt.allocPrint(alloc, "You are the org's {s} expert: {s}\n\nA teammate asks: {s}\nAnswer concisely and concretely.", .{ exp.name, exp.style, q }) catch return;
         defer alloc.free(eprompt);
-        const eout = callAgent(agent_bin, eprompt) orelse {
+        var emeta_buf: [4096]u8 = undefined;
+        const emp = std.fmt.bufPrint(&emeta_buf, "{s}.consult.meta", .{bb_path}) catch "";
+        const eout = callAgent(agent_bin, eprompt, emp) orelse {
             const e = std.fmt.allocPrint(alloc, "(expert {s} unavailable)\n", .{exp.name}) catch return;
             defer alloc.free(e);
             appendFile(bb_path, e);
@@ -537,7 +624,15 @@ fn serviceBtwAsk(agent_bin: []const u8, budget_bin: []const u8, root_id: []const
         appendFile(bb_path, entry);
         const ec = jclean(exp.name);
         defer alloc.free(ec);
-        emit("{{\"t\":{d},\"ev\":\"consult\",\"worker\":{d},\"expert\":\"{s}\"}}", .{ nowMs(), worker_idx, ec });
+        const qesc = jesc(q, 2000);
+        defer alloc.free(qesc);
+        const aesc = jesc(std.mem.trim(u8, eout, " \t\r\n"), 8000);
+        defer alloc.free(aesc);
+        var ethink: []u8 = undefined;
+        const etok = readMeta(emp, &ethink);
+        alloc.free(ethink);
+        unlinkPath(emp);
+        emit("{{\"t\":{d},\"ev\":\"consult\",\"worker\":{d},\"expert\":\"{s}\",\"pt\":{d},\"ct\":{d},\"q\":\"{s}\",\"a\":\"{s}\"}}", .{ nowMs(), worker_idx, ec, etok.pt, etok.ct, qesc, aesc });
         return; // one consult per worker
     }
 }
@@ -579,19 +674,22 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
     }
 
     const home = getEnv("HOME") orelse "";
-    var pathbuf: [4096]u8 = undefined;
-    const bb_path = std.fmt.bufPrint(&pathbuf, "{s}/.zish/.team-{d}.md", .{ home, pid }) catch return 2;
-    _ = writeFileTrunc(bb_path, "# team blackboard\n");
-    defer unlinkPath(bb_path);
-
-    // live trace for the realtime dashboard: ~/.zish/traces/<run>.jsonl (persists)
-    var trbuf: [4096]u8 = undefined;
+    // ~/.zish/traces holds the whole run: the event stream (.jsonl) AND the full
+    // transcript (.md). Both PERSIST — the point is to read what every agent
+    // generated, live and after. (No unlink.)
     if (home.len > 0) {
         var dbuf: [4096]u8 = undefined;
         if (std.fmt.bufPrint(&dbuf, "{s}/.zish/traces", .{home})) |dir| {
             var dz: [4096]u8 = undefined;
             if (toZ(&dz, dir)) |dp| _ = linux.mkdir(dp, 0o700);
         } else |_| {}
+    }
+    var pathbuf: [4096]u8 = undefined;
+    const bb_path = std.fmt.bufPrint(&pathbuf, "{s}/.zish/traces/{d}.md", .{ home, pid }) catch return 2;
+    _ = writeFileTrunc(bb_path, "# team transcript\n");
+
+    var trbuf: [4096]u8 = undefined;
+    if (home.len > 0) {
         if (std.fmt.bufPrint(&trbuf, "{s}/.zish/traces/{d}.jsonl", .{ home, pid })) |tp| g_trace = tp else |_| {}
     }
     const run_started = nowMs();
@@ -629,11 +727,17 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
 
     const dprompt = std.fmt.allocPrint(alloc, "{s}CAPTAIN: decompose the following task into 2-3 short independent sub-tasks, one per line. TASK: {s}", .{ cap_intro, task }) catch return 2;
     defer alloc.free(dprompt);
-    const decomp = callAgent(agent_bin, dprompt) orelse {
+    var dmeta_buf: [4096]u8 = undefined;
+    const dmp = std.fmt.bufPrint(&dmeta_buf, "{s}.dec.meta", .{bb_path}) catch "";
+    const decomp = callAgent(agent_bin, dprompt, dmp) orelse {
         warn("team: captain (decompose) call failed\n");
         return 1;
     };
     defer alloc.free(decomp);
+    var dthink: []u8 = undefined;
+    const dtok = readMeta(dmp, &dthink);
+    alloc.free(dthink);
+    unlinkPath(dmp);
 
     var subs: std.ArrayListUnmanaged([]const u8) = .empty;
     defer subs.deinit(alloc);
@@ -644,7 +748,7 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
         subs.append(alloc, t) catch {};
         if (subs.items.len >= MAX_WORKERS) break;
     }
-    emit("{{\"t\":{d},\"ev\":\"decompose\",\"n\":{d}}}", .{ nowMs(), subs.items.len });
+    emit("{{\"t\":{d},\"ev\":\"decompose\",\"n\":{d},\"pt\":{d},\"ct\":{d}}}", .{ nowMs(), subs.items.len, dtok.pt, dtok.ct });
 
     // 2. FAN-OUT workers, IN PARALLEL — the whole point of a team is horizontal
     //    bandwidth. Split each affordable slice and SPAWN its worker without
@@ -655,7 +759,7 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
     defer models.deinit(alloc);
     loadModels(&models); // ZISH_TEAM_MODELS → per-worker (hybrid local+hosted)
 
-    const Spawn = struct { cpid: i32, out_path: []u8, sub: []const u8, idx: usize, t0: i64 };
+    const Spawn = struct { cpid: i32, out_path: []u8, sub: []const u8, idx: usize, t0: i64, tf: i64 };
     var spawns: std.ArrayListUnmanaged(Spawn) = .empty;
     defer {
         for (spawns.items) |s| {
@@ -704,15 +808,26 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
             appendFile(bb_path, "(worker spawn failed)\n");
             continue;
         };
-        spawns.append(alloc, .{ .cpid = cpid, .out_path = out_path, .sub = sub, .idx = i, .t0 = nowMs() }) catch {
+        spawns.append(alloc, .{ .cpid = cpid, .out_path = out_path, .sub = sub, .idx = i, .t0 = nowMs(), .tf = 0 }) catch {
             reap(cpid);
             unlinkPath(out_path);
             alloc.free(out_path);
         };
     }
 
-    // Phase B: wait for all concurrently-running workers to finish
-    for (spawns.items) |s| reap(s.cpid);
+    // Phase B: reap workers AS THEY FINISH (waitpid -1), stamping each true
+    // finish time — so per-worker duration and the parallelism metric are real.
+    {
+        var reaped: usize = 0;
+        while (reaped < spawns.items.len) : (reaped += 1) {
+            const rpid = waitAny();
+            if (rpid < 0) break;
+            for (spawns.items) |*sp| if (sp.cpid == rpid) {
+                sp.tf = nowMs();
+                break;
+            };
+        }
+    }
 
     // Phase C: collect outputs in order → blackboard, then service any consults
     var spawned: usize = 0;
@@ -726,7 +841,22 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
         const entry = std.fmt.allocPrint(alloc, "## worker {d}\nsubtask: {s}\n{s}\n", .{ s.idx, s.sub, trimmed }) catch continue;
         defer alloc.free(entry);
         appendFile(bb_path, entry);
-        emit("{{\"t\":{d},\"ev\":\"worker_done\",\"i\":{d},\"dur\":{d},\"chars\":{d}}}", .{ nowMs(), s.idx, nowMs() - s.t0, trimmed.len });
+        const oesc = jesc(trimmed, 8000);
+        defer alloc.free(oesc);
+        var think: []u8 = undefined;
+        var meta = Meta{ .pt = 0, .ct = 0 };
+        var mpath: [4096]u8 = undefined;
+        if (std.fmt.bufPrint(&mpath, "{s}.meta", .{s.out_path})) |mp| {
+            meta = readMeta(mp, &think);
+            unlinkPath(mp);
+        } else |_| {
+            think = alloc.dupe(u8, "") catch "";
+        }
+        defer alloc.free(think);
+        const tesc = jesc(think, 6000);
+        defer alloc.free(tesc);
+        const wdur = if (s.tf > s.t0) s.tf - s.t0 else nowMs() - s.t0;
+        emit("{{\"t\":{d},\"ev\":\"worker_done\",\"i\":{d},\"t0\":{d},\"dur\":{d},\"chars\":{d},\"pt\":{d},\"ct\":{d},\"think\":\"{s}\",\"out\":\"{s}\"}}", .{ nowMs(), s.idx, s.t0, wdur, trimmed.len, meta.pt, meta.ct, tesc, oesc });
         // a worker may consult an org expert (lateral info edge, org-funded)
         serviceBtwAsk(agent_bin, budget_bin, root_id, bb_path, experts.items, wout, s.idx);
         spawned += 1;
@@ -744,12 +874,24 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
     defer alloc.free(crit_intro);
     const cprompt = std.fmt.allocPrint(alloc, "{s}CRITIC: refute and cross-check the worker outputs below; flag contradictions or errors. BLACKBOARD:\n{s}", .{ crit_intro, bb1 }) catch return 1;
     defer alloc.free(cprompt);
-    const crit = callAgent(agent_bin, cprompt) orelse alloc.dupe(u8, "(critic unavailable)") catch return 1;
+    var cmeta_buf: [4096]u8 = undefined;
+    const cmp = std.fmt.bufPrint(&cmeta_buf, "{s}.crit.meta", .{bb_path}) catch "";
+    const crit = callAgent(agent_bin, cprompt, cmp) orelse alloc.dupe(u8, "(critic unavailable)") catch return 1;
     defer alloc.free(crit);
     const centry = std.fmt.allocPrint(alloc, "## critic\n{s}\n", .{std.mem.trim(u8, crit, " \t\r\n")}) catch return 1;
     defer alloc.free(centry);
     appendFile(bb_path, centry);
-    emit("{{\"t\":{d},\"ev\":\"critic_done\"}}", .{nowMs()});
+    {
+        var cthink: []u8 = undefined;
+        const ctok = readMeta(cmp, &cthink);
+        defer alloc.free(cthink);
+        unlinkPath(cmp);
+        const cesc = jesc(std.mem.trim(u8, crit, " \t\r\n"), 8000);
+        defer alloc.free(cesc);
+        const ctesc = jesc(cthink, 6000);
+        defer alloc.free(ctesc);
+        emit("{{\"t\":{d},\"ev\":\"critic_done\",\"pt\":{d},\"ct\":{d},\"think\":\"{s}\",\"text\":\"{s}\"}}", .{ nowMs(), ctok.pt, ctok.ct, ctesc, cesc });
+    }
 
     // 4. SYNTHESIS — the Captain keeps only what survived the critic.
     _ = budgetSpend(budget_bin, root_id, COST);
@@ -758,13 +900,26 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
     defer alloc.free(bb2);
     const sprompt = std.fmt.allocPrint(alloc, "{s}CAPTAIN SYNTHESIZE: produce the final answer from the blackboard, keeping only claims that survive the critic. BLACKBOARD:\n{s}", .{ cap_intro, bb2 }) catch return 1;
     defer alloc.free(sprompt);
-    const final = callAgent(agent_bin, sprompt) orelse {
+    var smeta_buf: [4096]u8 = undefined;
+    const smp = std.fmt.bufPrint(&smeta_buf, "{s}.synth.meta", .{bb_path}) catch "";
+    const final = callAgent(agent_bin, sprompt, smp) orelse {
         warn("team: synthesis call failed\n");
         return 1;
     };
     defer alloc.free(final);
     out(std.mem.trim(u8, final, " \t\r\n"));
     out("\n");
+    {
+        var sthink: []u8 = undefined;
+        const stok = readMeta(smp, &sthink);
+        defer alloc.free(sthink);
+        unlinkPath(smp);
+        const fesc = jesc(std.mem.trim(u8, final, " \t\r\n"), 12000);
+        defer alloc.free(fesc);
+        const stesc = jesc(sthink, 6000);
+        defer alloc.free(stesc);
+        emit("{{\"t\":{d},\"ev\":\"synth_done\",\"pt\":{d},\"ct\":{d},\"think\":\"{s}\",\"text\":\"{s}\"}}", .{ nowMs(), stok.pt, stok.ct, stesc, fesc });
+    }
 
     // stderr summary: make the conservation visible — how the root grant was
     // spent across the org (captain + workers + critic + synth).

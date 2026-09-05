@@ -917,6 +917,62 @@ fn hasAskFlag(args: std.process.Args) bool {
 
 /// One-shot plain-text completion: `agent [-m model] [--mock f] --ask <prompt...>`
 /// → the model's text on stdout. No tools, no frames — the adapter `team` calls.
+// Inline reasoning tags models use. ONE list, not a function per tag.
+const REASON_TAGS = [_][]const u8{ "think", "thinking", "reason", "reasoning" };
+
+/// Split an inline reasoning block (<think>…</think>, <thinking>…</thinking>, …)
+/// out of `content`. Returns { think, answer }; if none present, think="" and
+/// answer=content. Handles every tag in REASON_TAGS — add a tag, not a function.
+fn splitReasoning(content: []const u8) struct { think: []const u8, answer: []const u8 } {
+    for (REASON_TAGS) |tag| {
+        var ob: [32]u8 = undefined;
+        var cb: [32]u8 = undefined;
+        const open = std.fmt.bufPrint(&ob, "<{s}>", .{tag}) catch continue;
+        const close = std.fmt.bufPrint(&cb, "</{s}>", .{tag}) catch continue;
+        if (std.mem.indexOf(u8, content, open)) |a| {
+            const start = a + open.len;
+            if (std.mem.indexOf(u8, content[start..], close)) |b| return .{
+                .think = std.mem.trim(u8, content[start .. start + b], " \t\r\n"),
+                .answer = std.mem.trim(u8, content[start + b + close.len ..], " \t\r\n"),
+            };
+        }
+    }
+    return .{ .think = "", .answer = content };
+}
+
+/// When ZISH_ASK_META is set, write `{"pt","ct","think"}` — token usage (from the
+/// response's `usage`) and the reasoning (a `reasoning` field, else the `<think>`
+/// block) — so a caller like `team` can surface real tokens/cost + thinking.
+fn writeAskMeta(body: []const u8, inline_think: []const u8) void {
+    const mp = getEnv("ZISH_ASK_META") orelse return;
+    var pt: i64 = 0;
+    var ct: i64 = 0;
+    var reasoning: []const u8 = "";
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch null;
+    defer if (parsed) |p| p.deinit();
+    if (parsed) |p| if (p.value == .object) {
+        if (p.value.object.get("usage")) |u| {
+            pt = objInt(u, "prompt_tokens") orelse 0;
+            ct = objInt(u, "completion_tokens") orelse 0;
+        }
+        if (p.value.object.get("choices")) |ch| if (ch == .array and ch.array.items.len > 0) {
+            if (ch.array.items[0] == .object) if (ch.array.items[0].object.get("message")) |m|
+                if (objStr(m, "reasoning")) |r| {
+                    reasoning = r;
+                };
+        };
+    };
+    // API `reasoning` field wins; else the inline block already split out upstream
+    const think = if (reasoning.len > 0) reasoning else inline_think;
+    var m: std.ArrayListUnmanaged(u8) = .empty;
+    defer m.deinit(alloc);
+    var nb: [64]u8 = undefined;
+    m.appendSlice(alloc, std.fmt.bufPrint(&nb, "{{\"pt\":{d},\"ct\":{d},\"think\":\"", .{ pt, ct }) catch return) catch return;
+    jsonEscape(&m, std.mem.trim(u8, think, " \t\r\n")) catch return;
+    m.appendSlice(alloc, "\"}") catch return;
+    _ = writeFile600(mp, m.items);
+}
+
 fn runAsk(args: std.process.Args) u8 {
     var model: []const u8 = getEnv("ZISH_AGENT_MODEL") orelse DEFAULT_MODEL;
     var mock_path: ?[]const u8 = null;
@@ -979,7 +1035,10 @@ fn runAsk(args: std.process.Args) u8 {
         if (reply.status < 200 or reply.status >= 300) continue;
         switch (parseResponse(reply.body)) {
             .text => |t| {
-                emit(std.mem.trim(u8, t, " \t\r\n"));
+                const trimmed = std.mem.trim(u8, t, " \t\r\n");
+                const sr = splitReasoning(trimmed); // one splitter, all tags
+                writeAskMeta(reply.body, sr.think); // tokens + thinking → sidecar
+                emit(sr.answer); // the answer, reasoning removed
                 emit("\n");
                 return 0;
             },
