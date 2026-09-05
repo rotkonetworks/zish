@@ -101,6 +101,33 @@ fn readMeta(path: []const u8, think_out: *[]u8) Meta {
     return .{ .pt = pt, .ct = ct };
 }
 
+/// Collect any `human_say` messages that were appended to the run's trace (by a
+/// person replying in the dashboard) into "- <from>: <text>" lines. Empty if
+/// none. This is how a mid-run human reply reaches the org — team folds it into
+/// the synthesis so the final answer honors the guidance.
+fn collectHumanSays() []u8 {
+    var o: std.ArrayListUnmanaged(u8) = .empty;
+    const tp = g_trace orelse return (o.toOwnedSlice(alloc) catch &.{});
+    const content = readFileAlloc(tp, MAX_OUT) orelse return (o.toOwnedSlice(alloc) catch &.{});
+    defer alloc.free(content);
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |line| {
+        if (std.mem.indexOf(u8, line, "\"ev\":\"human_say\"") == null) continue;
+        const p = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch continue;
+        defer p.deinit();
+        if (p.value != .object) continue;
+        const from = if (p.value.object.get("from")) |v| (if (v == .string) v.string else "human") else "human";
+        const text = if (p.value.object.get("text")) |v| (if (v == .string) v.string else "") else "";
+        if (text.len == 0) continue;
+        o.appendSlice(alloc, "- ") catch {};
+        o.appendSlice(alloc, from) catch {};
+        o.appendSlice(alloc, ": ") catch {};
+        o.appendSlice(alloc, text) catch {};
+        o.append(alloc, '\n') catch {};
+    }
+    return o.toOwnedSlice(alloc) catch (alloc.dupe(u8, "") catch unreachable);
+}
+
 /// Proper JSON string escaping that KEEPS content readable (newlines→\n etc.),
 /// truncated to `max` bytes — for the actual generated text an agent produced.
 fn jesc(s: []const u8, max: usize) []u8 {
@@ -1216,7 +1243,15 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
     emit("{{\"t\":{d},\"ev\":\"synth_start\"}}", .{nowMs()});
     const bb2 = readFileAlloc(bb_path, MAX_OUT) orelse alloc.dupe(u8, "") catch return 1;
     defer alloc.free(bb2);
-    const sprompt = std.fmt.allocPrint(alloc, "{s}CAPTAIN SYNTHESIZE: produce the final answer from the blackboard, keeping only claims that survive the critic.{s}{s} Put any code in a fenced block tagged with its language. BLACKBOARD:\n{s}", .{ cap_intro, capline, sbudgetline, bb2 }) catch return 1;
+    // fold in any human replies sent mid-run (from the dashboard) as guidance
+    const says = collectHumanSays();
+    defer alloc.free(says);
+    var human_block_buf: [8192]u8 = undefined;
+    const human_block = if (says.len > 0)
+        (std.fmt.bufPrint(&human_block_buf, " The human(s) sent guidance DURING the run — honor it over the workers where they conflict:\n{s}", .{says}) catch "")
+    else
+        "";
+    const sprompt = std.fmt.allocPrint(alloc, "{s}CAPTAIN SYNTHESIZE: produce the final answer from the blackboard, keeping only claims that survive the critic.{s}{s}{s} Put any code in a fenced block tagged with its language. BLACKBOARD:\n{s}", .{ cap_intro, capline, sbudgetline, human_block, bb2 }) catch return 1;
     defer alloc.free(sprompt);
     var smeta_buf: [4096]u8 = undefined;
     const smp = std.fmt.bufPrint(&smeta_buf, "{s}.synth.meta", .{bb_path}) catch "";
