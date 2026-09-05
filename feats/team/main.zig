@@ -327,10 +327,16 @@ fn callAgent(bin: []const u8, prompt: []const u8, meta_path: []const u8) ?[]u8 {
         (std.fmt.bufPrint(&masg_buf, "ZISH_ASK_META={s}", .{meta_path}) catch "")
     else
         "";
-    var args: [8][]const u8 = undefined;
+    var cap_buf: [64]u8 = undefined;
+    const cap = std.fmt.bufPrint(&cap_buf, "ZISH_AGENT_MAX_TOKENS={s}", .{maxTokCap()}) catch "";
+    var args: [10][]const u8 = undefined;
     var n: usize = 0;
     if (masg.len > 0) {
         args[n] = masg;
+        n += 1;
+    }
+    if (cap.len > 0) {
+        args[n] = cap;
         n += 1;
     }
     args[n] = bin;
@@ -378,6 +384,18 @@ fn modelFor(models: []const WorkerModel, idx: usize) WorkerModel {
     return models[idx % models.len];
 }
 
+/// Per-call COMPLETION cap in tokens — the hard cost bound the org hands every
+/// agent it spawns (via ZISH_AGENT_MAX_TOKENS → agent's max_tokens). Budget
+/// credits bound the NUMBER of calls; this bounds each call's SIZE, so the two
+/// together bound total cost, not merely call count. Override via
+/// ZISH_TEAM_MAX_TOKENS; default 2048, digit-validated (bad value → default).
+fn maxTokCap() []const u8 {
+    const v = getEnv("ZISH_TEAM_MAX_TOKENS") orelse return "2048";
+    if (v.len == 0 or v.len >= 8) return "2048";
+    for (v) |c| if (c < '0' or c > '9') return "2048";
+    return v;
+}
+
 /// fork+exec `env [ZISH_AGENT_BACKEND=..] agent [-m model] [--mock M] --ask
 /// <prompt>` with stdout → `out_path`; returns the child pid WITHOUT waiting.
 fn spawnAgentToFile(bin: []const u8, prompt: []const u8, out_path: []const u8, wm: WorkerModel) ?i32 {
@@ -406,6 +424,11 @@ fn spawnAgentToFile(bin: []const u8, prompt: []const u8, out_path: []const u8, w
         var mb: [4096]u8 = undefined;
         const masg = std.fmt.bufPrint(&mb, "ZISH_ASK_META={s}.meta", .{out_path}) catch return null;
         if (!push(masg, &held, &nh, &argv, &n)) return null;
+    }
+    { // completion cap — the hard per-call cost bound (agent's max_tokens)
+        var cb: [64]u8 = undefined;
+        const casg = std.fmt.bufPrint(&cb, "ZISH_AGENT_MAX_TOKENS={s}", .{maxTokCap()}) catch return null;
+        if (!push(casg, &held, &nh, &argv, &n)) return null;
     }
     if (!push(bin, &held, &nh, &argv, &n)) return null;
     if (wm.model) |m| {

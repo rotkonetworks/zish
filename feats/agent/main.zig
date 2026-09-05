@@ -847,7 +847,20 @@ fn buildJudgeRequest(model: []const u8, system: []const u8, user: []const u8) ![
     try jsonEscape(&b, system);
     try b.appendSlice(alloc, "\"},{\"role\":\"user\",\"content\":\"");
     try jsonEscape(&b, user);
-    try b.appendSlice(alloc, "\"}]}");
+    try b.appendSlice(alloc, "\"}]");
+    // ZISH_AGENT_MAX_TOKENS caps COMPLETION per call — the hard bound on cost, so
+    // no single call can run away (a 40k-token generation becomes impossible).
+    if (getEnv("ZISH_AGENT_MAX_TOKENS")) |mt| {
+        var ok = mt.len > 0 and mt.len < 8;
+        for (mt) |c| if (c < '0' or c > '9') {
+            ok = false;
+        };
+        if (ok) {
+            try b.appendSlice(alloc, ",\"max_tokens\":");
+            try b.appendSlice(alloc, mt);
+        }
+    }
+    try b.appendSlice(alloc, "}");
     return b.toOwnedSlice(alloc);
 }
 
