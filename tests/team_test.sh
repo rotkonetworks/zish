@@ -23,6 +23,7 @@ prompt=""
 for a in "$@"; do prompt="$a"; done   # prompt is the last arg
 role=captain
 case "$prompt" in
+  *"COMPILER ERROR"*) role=repair ;;  # verify repair round — match BEFORE the others
   *SYNTHESIZE*)  role=synth ;;
   *CRITIC*)      role=critic ;;
   *"org's"*)     role=expert ;;   # "You are the org's <name> expert:"
@@ -37,7 +38,18 @@ case "$role" in
            # FAKE_WORKER_BTW=<name> makes the worker consult that expert
            [ -n "${FAKE_WORKER_BTW:-}" ] && printf 'BTW-ASK %s: is this safe?\n' "$FAKE_WORKER_BTW" ;;
   critic)  printf 'no contradictions found\n' ;;
-  synth)   printf 'FINAL: synthesized answer\n' ;;
+  synth)   # FAKE_SYNTH_CODE=zig|rust emits BROKEN code of that lang (verifier gate)
+           case "${FAKE_SYNTH_CODE:-}" in
+             zig)  printf 'Final code:\n```zig\nfn f() void {\n    var idx: usize = 0;\n    idx -= ;\n}\n```\n' ;;
+             rust) printf 'Final code:\n```rust\npub fn f(mut idx: usize) -> usize {\n    idx -= ;\n    idx\n}\n```\n' ;;
+             *)    printf 'FINAL: synthesized answer\n' ;;
+           esac ;;
+  repair)  # the verifier fed us the real compiler error — return code that compiles.
+           # (match on "rust code" from the repair prompt; avoid backticks in the pattern)
+           case "$prompt" in
+             *"rust code"*) printf 'Fixed:\n```rust\npub fn f(mut idx: usize) -> usize {\n    idx -= 1;\n    idx\n}\n```\n' ;;
+             *)             printf 'Fixed:\n```zig\npub fn add(a: i32, b: i32) i32 {\n    return a + b;\n}\n```\n' ;;
+           esac ;;
   expert)  printf 'expert says: proceed, with care\n' ;;
 esac
 SH
@@ -94,6 +106,35 @@ grep -q '^worker$'  "$T/agent.log" && ok "WORKERS fanned out" || bad "no worker 
 grep -q '^critic$'  "$T/agent.log" && ok "CRITIC ran (mandatory)" || bad "no critic phase"
 grep -q '^synth$'   "$T/agent.log" && ok "SYNTHESIS ran" || bad "no synth phase"
 case "$o" in *"FINAL: synthesized answer"*) ok "prints the synthesized answer" ;; *) bad "no final answer: $o" ;; esac
+
+echo "== verifier: broken code is caught and repaired against a REAL compiler =="
+reset_logs
+# synth emits broken zig -> verifier runs `zig ast-check` (real) -> fails ->
+# ONE repair round against the true error -> repaired code compiles.
+o=$(FAKE_SYNTH_CODE=zig TEAM run 8 "write a zig add function"); rc=$?
+[ "$rc" -eq 0 ] && ok "run with a code answer exits 0" || bad "exit was $rc: $o"
+grep -q '^repair$' "$T/agent.log" && ok "broken code triggered a repair round" || bad "verifier did not repair broken code"
+case "$o" in *"repaired, now compiles"*) ok "repaired code passes real zig ast-check" ;; *) bad "no successful repair in output: $o" ;; esac
+# a prose (no-code) answer must NOT be gated — the verifier is a no-op there
+reset_logs
+o=$(TEAM run 6 "explain the latency")
+case "$o" in *"DOES NOT COMPILE"*|*"[verify]"*) bad "prose answer wrongly gated: $o" ;; *) ok "prose answer is not gated (verifier no-op)" ;; esac
+# generalization: the verifier is language-agnostic — same red→green with rustc,
+# the language that motivated this. Probe rustc UNDER THE TEST'S HOME first: a
+# rustup shim needs a resolvable toolchain (the "pinned environment" case), which
+# the isolated test HOME lacks — so skip cleanly there rather than flake.
+rust_ok=0
+if command -v rustc >/dev/null 2>&1; then
+  printf 'pub fn p() -> u8 { 0 }\n' > "$T/probe.rs"
+  HOME="$T/home" rustc --edition 2021 --crate-type lib --emit=metadata -o "$T/probe.rmeta" "$T/probe.rs" >/dev/null 2>&1 && rust_ok=1
+fi
+if [ "$rust_ok" -eq 1 ]; then
+  reset_logs
+  o=$(FAKE_SYNTH_CODE=rust TEAM run 8 "write a rust function"); rc=$?
+  case "$o" in *"repaired, now compiles"*) ok "rust: broken code repaired against real rustc" ;; *) bad "rust verify/repair failed: $o" ;; esac
+else
+  ok "rust check skipped (no usable rustc toolchain under the test HOME)"
+fi
 
 echo "== conservation: total spent never exceeds the root grant =="
 reset_logs

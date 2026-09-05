@@ -70,13 +70,17 @@ FEAT_LIBC := para agent gf aur budget team
 .PHONY: feats
 feats:
 	@mkdir -p $(ZISH_FEAT_DIR)
-	@for f in $(FEAT_NAMES); do \
+	@failed=""; \
+	for f in $(FEAT_NAMES); do \
 		mkdir -p $(ZISH_FEAT_DIR)/$$f/bin; \
 		lc=""; case " $(FEAT_LIBC) " in *" $$f "*) lc="-lc";; esac; \
-		zig build-exe -O ReleaseFast -fstrip $$lc feats/$$f/main.zig -femit-bin=$(ZISH_FEAT_DIR)/$$f/bin/$$f >/dev/null 2>&1; \
+		if ! zig build-exe -O ReleaseFast -fstrip $$lc feats/$$f/main.zig -femit-bin=$(ZISH_FEAT_DIR)/$$f/bin/$$f; then \
+			echo "FEAT BUILD FAILED: $$f (not staged)" >&2; failed="$$failed $$f"; continue; \
+		fi; \
 		cp -f feats/$$f/feat.toml $(ZISH_FEAT_DIR)/$$f/feat.toml; \
 		echo "staged feat: $$f"; \
-	done
+	done; \
+	if [ -n "$$failed" ]; then echo "FEATS FAILED TO BUILD:$$failed" >&2; exit 1; fi
 	@mkdir -p $(HOME)/.zish/rubrics
 	@cp -f rubrics/*.toml $(HOME)/.zish/rubrics/ 2>/dev/null && \
 		echo "staged rubrics" || true

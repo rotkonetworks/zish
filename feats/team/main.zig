@@ -14,6 +14,12 @@
 //!      outputs. Load-bearing — collaboration without an adversarial critic is an
 //!      echo chamber that amplifies errors. Never skipped.
 //!   4. SYNTHESIS: the Captain combines only what survived the critic.
+//!   5. VERIFY: the org member that actually RUNS A COMPILER. It extracts code
+//!      from the answer and compile-checks it for real (rustc/zig/gofmt/…, per
+//!      what's installed) — a model critic reviews text and can't catch a parse
+//!      error. On failure it makes one budget-gated repair against the true
+//!      compiler error. Never ships untested code silently. The org advertises
+//!      its available checkers to the agents up front (capability discovery).
 //!
 //! Conservation: every credit spent flows from the root grant. Splits move
 //! credits root->child and fail closed when the root is short, so the whole tree
@@ -210,9 +216,14 @@ fn exists(path: []const u8) bool {
 
 const ExecResult = struct { out: []u8, code: u8 };
 
+/// merge_err folds the child's stderr into the captured output (a compiler
+/// writes diagnostics there); timeout_s > 0 wraps the child in `timeout <n>` so
+/// model-generated code can't hang a build. Defaults reproduce plain stdout capture.
+const ExecOpts = struct { merge_err: bool = false, timeout_s: u32 = 0 };
+
 /// fork+exec via /usr/bin/env, capturing stdout and the exit code. Returns null
 /// only on a spawn/plumbing failure.
-fn exec(args: []const []const u8) ?ExecResult {
+fn exec(args: []const []const u8, opts: ExecOpts) ?ExecResult {
     var argv: [40]?[*:0]const u8 = undefined;
     var held: [40][]u8 = undefined;
     var nh: usize = 0;
@@ -230,6 +241,12 @@ fn exec(args: []const []const u8) ?ExecResult {
     defer for (held[0..nh]) |h| alloc.free(h);
 
     if (!push("env", &held, &nh, &argv, &n)) return null;
+    if (opts.timeout_s > 0) { // env timeout <n> <cmd…> — a build must not hang the org
+        if (!push("timeout", &held, &nh, &argv, &n)) return null;
+        var tb: [16]u8 = undefined;
+        const ts = std.fmt.bufPrint(&tb, "{d}", .{opts.timeout_s}) catch return null;
+        if (!push(ts, &held, &nh, &argv, &n)) return null;
+    }
     for (args) |a| if (n >= argv.len - 1 or !push(a, &held, &nh, &argv, &n)) return null;
     argv[n] = null;
     const argvz: [*:null]const ?[*:0]const u8 = argv[0..n :null];
@@ -246,6 +263,7 @@ fn exec(args: []const []const u8) ?ExecResult {
     if (pid == 0) {
         _ = linux.close(fds[0]);
         _ = linux.dup2(fds[1], 1);
+        if (opts.merge_err) _ = linux.dup2(fds[1], 2);
         _ = linux.close(fds[1]);
         _ = linux.execve("/usr/bin/env", argvz, @ptrCast(std.c.environ));
         linux.exit(127);
@@ -284,7 +302,7 @@ fn resolveBin(root: []const u8, name: []const u8, buf: []u8) ?[]const u8 {
 fn budgetNew(bin: []const u8, id: []const u8, credits: i64) bool {
     var cb: [32]u8 = undefined;
     const c = std.fmt.bufPrint(&cb, "{d}", .{credits}) catch return false;
-    const r = exec(&.{ bin, "new", id, c }) orelse return false;
+    const r = exec(&.{ bin, "new", id, c }, .{}) orelse return false;
     defer alloc.free(r.out);
     return r.code == 0;
 }
@@ -292,7 +310,7 @@ fn budgetNew(bin: []const u8, id: []const u8, credits: i64) bool {
 fn budgetSplit(bin: []const u8, parent: []const u8, child: []const u8, credits: i64) bool {
     var cb: [32]u8 = undefined;
     const c = std.fmt.bufPrint(&cb, "{d}", .{credits}) catch return false;
-    const r = exec(&.{ bin, "split", parent, child, c }) orelse return false;
+    const r = exec(&.{ bin, "split", parent, child, c }, .{}) orelse return false;
     defer alloc.free(r.out);
     return r.code == 0;
 }
@@ -300,13 +318,13 @@ fn budgetSplit(bin: []const u8, parent: []const u8, child: []const u8, credits: 
 fn budgetSpend(bin: []const u8, id: []const u8, credits: i64) bool {
     var cb: [32]u8 = undefined;
     const c = std.fmt.bufPrint(&cb, "{d}", .{credits}) catch return false;
-    const r = exec(&.{ bin, "spend", id, c }) orelse return false;
+    const r = exec(&.{ bin, "spend", id, c }, .{}) orelse return false;
     defer alloc.free(r.out);
     return r.code == 0;
 }
 
 fn budgetBalance(bin: []const u8, id: []const u8) ?i64 {
-    const r = exec(&.{ bin, "balance", id }) orelse return null;
+    const r = exec(&.{ bin, "balance", id }, .{}) orelse return null;
     defer alloc.free(r.out);
     if (r.code != 0) return null;
     const t = std.mem.trim(u8, r.out, " \t\r\n");
@@ -351,7 +369,7 @@ fn callAgent(bin: []const u8, prompt: []const u8, meta_path: []const u8) ?[]u8 {
     n += 1;
     args[n] = prompt;
     n += 1;
-    const rr = exec(args[0..n]) orelse return null;
+    const rr = exec(args[0..n], .{}) orelse return null;
     if (rr.code != 0) {
         alloc.free(rr.out);
         return null;
@@ -661,6 +679,216 @@ fn serviceBtwAsk(agent_bin: []const u8, budget_bin: []const u8, root_id: []const
 }
 
 // ---------------------------------------------------------------------------
+// verifier member — the org member that actually RUNS A COMPILER. A model critic
+// reviews TEXT and cannot catch `idx -= ;`; this writes the answer's code to disk
+// and compiles it for real (zig ast-check / bun build) — compile/check ONLY,
+// never executing untrusted model code. So the team stops shipping untested code.
+// ---------------------------------------------------------------------------
+/// Languages the verifier knows a compile/check command for. Which are actually
+/// USABLE depends on what's installed (probed at runtime) — the org advertises
+/// only the available set to its agents, so they pick a language it can verify
+/// (or say up front they need a toolchain/pinned environment outside that set).
+const Lang = enum { zig, rust, python, go, c, cpp, ts, js, bash };
+const ALL_LANGS = [_]Lang{ .zig, .rust, .python, .go, .c, .cpp, .ts, .js, .bash };
+
+const LangSpec = struct {
+    name: []const u8, // canonical name for advertising + messages
+    tags: []const []const u8, // fence tags that select this language
+    ext: []const u8, // temp-file extension the checker expects
+    bin: []const u8, // checker executable — also the PATH-probe key
+};
+
+fn langSpec(l: Lang) LangSpec {
+    return switch (l) {
+        .zig => .{ .name = "zig", .tags = &.{"zig"}, .ext = "zig", .bin = "zig" },
+        .rust => .{ .name = "rust", .tags = &.{ "rust", "rs" }, .ext = "rs", .bin = "rustc" },
+        .python => .{ .name = "python", .tags = &.{ "python", "py" }, .ext = "py", .bin = "python3" },
+        .go => .{ .name = "go", .tags = &.{ "go", "golang" }, .ext = "go", .bin = "gofmt" },
+        .c => .{ .name = "c", .tags = &.{"c"}, .ext = "c", .bin = "cc" },
+        .cpp => .{ .name = "c++", .tags = &.{ "cpp", "c++", "cxx" }, .ext = "cpp", .bin = "c++" },
+        .ts => .{ .name = "typescript", .tags = &.{ "ts", "typescript" }, .ext = "ts", .bin = "bun" },
+        .js => .{ .name = "javascript", .tags = &.{ "js", "javascript" }, .ext = "js", .bin = "node" },
+        .bash => .{ .name = "bash", .tags = &.{ "bash", "sh", "shell" }, .ext = "sh", .bin = "bash" },
+    };
+}
+
+fn detectLang(tag: []const u8) ?Lang {
+    for (ALL_LANGS) |l| for (langSpec(l).tags) |t| if (std.ascii.eqlIgnoreCase(tag, t)) return l;
+    return null;
+}
+
+/// Is `name` an executable on PATH? Cheap capability probe for advertising.
+fn onPath(name: []const u8) bool {
+    const path_env = getEnv("PATH") orelse "/usr/bin:/bin";
+    var it = std.mem.splitScalar(u8, path_env, ':');
+    while (it.next()) |dir| {
+        if (dir.len == 0) continue;
+        var buf: [4096]u8 = undefined;
+        const full = std.fmt.bufPrint(&buf, "{s}/{s}", .{ dir, name }) catch continue;
+        var zb: [4096]u8 = undefined;
+        const z = toZ(&zb, full) orelse continue;
+        if (@as(isize, @bitCast(linux.access(z, 1))) == 0) return true; // X_OK
+    }
+    return false;
+}
+
+/// Comma-join the names of every language whose checker is installed — the
+/// capability line the org shows its agents. Written into `buf`.
+fn availableLangs(buf: []u8) []const u8 {
+    var w: usize = 0;
+    for (ALL_LANGS) |l| {
+        const sp = langSpec(l);
+        if (!onPath(sp.bin)) continue;
+        const sep = if (w == 0) "" else ", ";
+        const s = std.fmt.bufPrint(buf[w..], "{s}{s}", .{ sep, sp.name }) catch break;
+        w += s.len;
+    }
+    return buf[0..w];
+}
+
+/// Concatenate every fenced ```<tag> … ``` block whose tag maps to `l` (models
+/// split imports/fns across blocks). Caller frees; empty slice if none.
+fn extractFenced(text: []const u8, l: Lang) []u8 {
+    var o: std.ArrayListUnmanaged(u8) = .empty;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, text, i, "```")) |open| {
+        const after = open + 3;
+        const nl = std.mem.indexOfScalarPos(u8, text, after, '\n') orelse break;
+        const tag = std.mem.trim(u8, text[after..nl], " \t\r");
+        const close = std.mem.indexOfPos(u8, text, nl + 1, "```") orelse break;
+        if (detectLang(tag) == l) {
+            o.appendSlice(alloc, text[nl + 1 .. close]) catch {};
+            o.append(alloc, '\n') catch {};
+        }
+        i = close + 3;
+    }
+    return o.toOwnedSlice(alloc) catch (alloc.dupe(u8, "") catch unreachable);
+}
+
+const VerifyResult = struct { ok: bool, err: []u8 }; // err owned; caller frees
+
+/// Write `code` to a temp file (0600) and run the language's real checker. This
+/// is COMPILE/CHECK ONLY — it never runs the code, and the child is
+/// `timeout`-wrapped so a pathological input can't hang the org. Diagnostics
+/// (stdout+stderr) are captured. The check is syntax/parse-level, not a full
+/// build or test run — a semantic/test gate under --profile is the v2.
+fn verifyLang(home: []const u8, pid: i32, l: Lang, code: []const u8) VerifyResult {
+    const sp = langSpec(l);
+    const path = std.fmt.allocPrint(alloc, "{s}/.zish/.team-{d}.verify.{s}", .{ home, pid, sp.ext }) catch
+        return .{ .ok = false, .err = alloc.dupe(u8, "(verify: alloc failed)") catch "" };
+    defer alloc.free(path);
+    if (!writeFileTrunc(path, code))
+        return .{ .ok = false, .err = alloc.dupe(u8, "(verify: temp write failed)") catch "" };
+    defer unlinkPath(path);
+    const od = std.fmt.allocPrint(alloc, "{s}/.zish/.team-{d}.verify.out", .{ home, pid }) catch (alloc.dupe(u8, "/tmp") catch "/tmp");
+    defer alloc.free(od);
+    // rustc --emit=metadata still writes a real file (and derives its temp dir
+    // from the -o path, so /dev/null fails) — give it one in ~/.zish, then reap it.
+    const rmeta = std.fmt.allocPrint(alloc, "{s}/.zish/.team-{d}.verify.rmeta", .{ home, pid }) catch (alloc.dupe(u8, "/tmp/zish.rmeta") catch "/tmp/zish.rmeta");
+    defer alloc.free(rmeta);
+    defer unlinkPath(rmeta);
+    const opt = ExecOpts{ .merge_err = true, .timeout_s = 60 };
+    const res: ?ExecResult = switch (l) {
+        .zig => exec(&.{ "zig", "ast-check", path }, opt),
+        .rust => exec(&.{ "rustc", "--edition", "2021", "--crate-type", "lib", "--emit=metadata", "-o", rmeta, path }, opt),
+        .python => exec(&.{ "python3", "-m", "py_compile", path }, opt),
+        .go => exec(&.{ "gofmt", "-e", path }, opt),
+        .c => exec(&.{ "cc", "-fsyntax-only", path }, opt),
+        .cpp => exec(&.{ "c++", "-fsyntax-only", path }, opt),
+        .ts => exec(&.{ "bun", "build", "--outdir", od, path }, opt),
+        .js => exec(&.{ "node", "--check", path }, opt),
+        .bash => exec(&.{ "bash", "-n", path }, opt),
+    };
+    const r = res orelse return .{ .ok = false, .err = alloc.dupe(u8, "(verify: compiler spawn failed)") catch "" };
+    defer alloc.free(r.out);
+    const trimmed = std.mem.trim(u8, r.out, " \t\r\n");
+    return .{ .ok = r.code == 0, .err = alloc.dupe(u8, trimmed) catch "" };
+}
+
+/// Surface a compile failure on stdout AND the blackboard — broken code is never
+/// presented as if it were done.
+fn printVerifyFail(bb_path: []const u8, lname: []const u8, err: []const u8) void {
+    const msg = std.fmt.allocPrint(alloc, "\n[verify] {s}: DOES NOT COMPILE:\n{s}\n", .{ lname, err }) catch return;
+    defer alloc.free(msg);
+    out(msg);
+    appendFile(bb_path, msg);
+}
+
+/// The verifier phase: for every language present in the synth answer, compile
+/// it if the org has that checker; on failure make ONE budget-gated repair
+/// attempt against the REAL compiler error, then re-verify. Always prints the
+/// compile status — this is what stops the org from committing untested code.
+fn verifyAndGate(agent_bin: []const u8, budget_bin: []const u8, root_id: []const u8, bb_path: []const u8, home: []const u8, pid: i32, cap_intro: []const u8, final_text: []const u8) void {
+    for (ALL_LANGS) |l| {
+        const sp = langSpec(l);
+        const code = extractFenced(final_text, l);
+        defer alloc.free(code);
+        if (std.mem.trim(u8, code, " \t\r\n").len == 0) continue; // no code of this lang → nothing to gate
+        if (!onPath(sp.bin)) { // code we can't check — say so, never claim it's verified
+            const msg = std.fmt.allocPrint(alloc, "\n[verify] {s}: SKIPPED — no `{s}` toolchain installed\n", .{ sp.name, sp.bin }) catch continue;
+            defer alloc.free(msg);
+            out(msg);
+            appendFile(bb_path, msg);
+            emit("{{\"t\":{d},\"ev\":\"verify\",\"lang\":\"{s}\",\"level\":\"syntax\",\"ok\":null,\"skipped\":true,\"repaired\":false,\"err\":\"no {s} toolchain\"}}", .{ nowMs(), sp.name, sp.bin });
+            continue;
+        }
+
+        const vr = verifyLang(home, pid, l, code);
+        defer alloc.free(vr.err);
+        {
+            const eesc = jesc(vr.err, 4000);
+            defer alloc.free(eesc);
+            emit("{{\"t\":{d},\"ev\":\"verify\",\"lang\":\"{s}\",\"level\":\"syntax\",\"ok\":{s},\"repaired\":false,\"err\":\"{s}\"}}", .{ nowMs(), sp.name, if (vr.ok) "true" else "false", eesc });
+        }
+        if (vr.ok) {
+            const msg = std.fmt.allocPrint(alloc, "\n[verify] {s}: OK — compiles (syntax)\n", .{sp.name}) catch continue;
+            defer alloc.free(msg);
+            out(msg);
+            appendFile(bb_path, msg);
+            continue;
+        }
+
+        // failed — ONE repair round, budget-gated (an agent call costs like any other)
+        if ((budgetBalance(budget_bin, root_id) orelse 0) < COST or !budgetSpend(budget_bin, root_id, COST)) {
+            printVerifyFail(bb_path, sp.name, vr.err); // can't afford a fix → surface honestly
+            continue;
+        }
+        const rprompt = std.fmt.allocPrint(alloc, "{s}The {s} code below FAILED to compile. Return ONLY the corrected COMPLETE code in a single ```{s} fenced block — no prose.\n\nCOMPILER ERROR:\n{s}\n\nCODE:\n{s}", .{ cap_intro, sp.name, sp.name, vr.err, code }) catch continue;
+        defer alloc.free(rprompt);
+        var rmeta_buf: [4096]u8 = undefined;
+        const rmp = std.fmt.bufPrint(&rmeta_buf, "{s}.repair.meta", .{bb_path}) catch "";
+        const fixed = callAgent(agent_bin, rprompt, rmp) orelse {
+            printVerifyFail(bb_path, sp.name, vr.err);
+            continue;
+        };
+        defer alloc.free(fixed);
+        var rthink: []u8 = undefined;
+        const rtok = readMeta(rmp, &rthink);
+        alloc.free(rthink);
+        unlinkPath(rmp);
+
+        const fixed_code = extractFenced(fixed, l);
+        defer alloc.free(fixed_code);
+        const code2 = if (std.mem.trim(u8, fixed_code, " \t\r\n").len > 0) fixed_code else fixed;
+        const vr2 = verifyLang(home, pid, l, code2);
+        defer alloc.free(vr2.err);
+        {
+            const e2 = jesc(vr2.err, 4000);
+            defer alloc.free(e2);
+            emit("{{\"t\":{d},\"ev\":\"verify\",\"lang\":\"{s}\",\"level\":\"syntax\",\"ok\":{s},\"repaired\":true,\"pt\":{d},\"ct\":{d},\"err\":\"{s}\"}}", .{ nowMs(), sp.name, if (vr2.ok) "true" else "false", rtok.pt, rtok.ct, e2 });
+        }
+        if (vr2.ok) {
+            const msg = std.fmt.allocPrint(alloc, "\n[verify] {s}: FAILED → repaired, now compiles. Corrected code:\n```{s}\n{s}\n```\n", .{ sp.name, sp.name, std.mem.trim(u8, code2, " \t\r\n") }) catch continue;
+            defer alloc.free(msg);
+            out(msg);
+            appendFile(bb_path, msg);
+        } else {
+            printVerifyFail(bb_path, sp.name, vr2.err);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // orchestration
 // ---------------------------------------------------------------------------
 
@@ -748,7 +976,18 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
         enames.appendSlice(alloc, e.name) catch {};
     }
 
-    const dprompt = std.fmt.allocPrint(alloc, "{s}CAPTAIN: decompose the following task into 2-3 short independent sub-tasks, one per line. TASK: {s}", .{ cap_intro, task }) catch return 2;
+    // Advertise what the verifier can actually compile-check, so agents pick a
+    // language the org can verify (or flag up front that they need a toolchain /
+    // pinned environment outside this set) — capability discovery, not restriction.
+    var capbuf: [256]u8 = undefined;
+    const caps = availableLangs(&capbuf);
+    var capline_buf: [384]u8 = undefined;
+    const capline = if (caps.len > 0)
+        (std.fmt.bufPrint(&capline_buf, " The org can compile-verify code in: {s} — prefer these and tag each code block with its language; if a solution needs a language or pinned toolchain outside that set, say so instead of emitting code that can't be checked.", .{caps}) catch "")
+    else
+        "";
+
+    const dprompt = std.fmt.allocPrint(alloc, "{s}CAPTAIN: decompose the following task into 2-3 short independent sub-tasks, one per line.{s} TASK: {s}", .{ cap_intro, capline, task }) catch return 2;
     defer alloc.free(dprompt);
     var dmeta_buf: [4096]u8 = undefined;
     const dmp = std.fmt.bufPrint(&dmeta_buf, "{s}.dec.meta", .{bb_path}) catch "";
@@ -816,7 +1055,7 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
         else
             (alloc.dupe(u8, "") catch unreachable);
         defer alloc.free(btw);
-        const wprompt = std.fmt.allocPrint(alloc, "{s}WORKER: complete this sub-task and report the result.{s} SUBTASK: {s}", .{ w_intro, btw, sub }) catch continue;
+        const wprompt = std.fmt.allocPrint(alloc, "{s}WORKER: complete this sub-task and report the result.{s}{s} Put any code in a fenced block tagged with its language. SUBTASK: {s}", .{ w_intro, btw, capline, sub }) catch continue;
         defer alloc.free(wprompt);
         const out_path = std.fmt.allocPrint(alloc, "{s}/.zish/.team-{d}-w{d}.out", .{ home, pid, i }) catch continue;
         {
@@ -921,7 +1160,7 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
     emit("{{\"t\":{d},\"ev\":\"synth_start\"}}", .{nowMs()});
     const bb2 = readFileAlloc(bb_path, MAX_OUT) orelse alloc.dupe(u8, "") catch return 1;
     defer alloc.free(bb2);
-    const sprompt = std.fmt.allocPrint(alloc, "{s}CAPTAIN SYNTHESIZE: produce the final answer from the blackboard, keeping only claims that survive the critic. BLACKBOARD:\n{s}", .{ cap_intro, bb2 }) catch return 1;
+    const sprompt = std.fmt.allocPrint(alloc, "{s}CAPTAIN SYNTHESIZE: produce the final answer from the blackboard, keeping only claims that survive the critic.{s} Put any code in a fenced block tagged with its language. BLACKBOARD:\n{s}", .{ cap_intro, capline, bb2 }) catch return 1;
     defer alloc.free(sprompt);
     var smeta_buf: [4096]u8 = undefined;
     const smp = std.fmt.bufPrint(&smeta_buf, "{s}.synth.meta", .{bb_path}) catch "";
@@ -943,6 +1182,11 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
         defer alloc.free(stesc);
         emit("{{\"t\":{d},\"ev\":\"synth_done\",\"pt\":{d},\"ct\":{d},\"think\":\"{s}\",\"text\":\"{s}\"}}", .{ nowMs(), stok.pt, stok.ct, stesc, fesc });
     }
+
+    // 5. VERIFY — the member that actually runs a compiler. Compile any code in
+    //    the answer for real; repair once against the true error. Never ship
+    //    untested code silently. No-op on a prose (no-code) answer.
+    verifyAndGate(agent_bin, budget_bin, root_id, bb_path, home, @intCast(pid), cap_intro, final);
 
     // stderr summary: make the conservation visible — how the root grant was
     // spent across the org (captain + workers + critic + synth).
