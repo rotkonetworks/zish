@@ -128,6 +128,95 @@ fn collectHumanSays() []u8 {
     return o.toOwnedSlice(alloc) catch (alloc.dupe(u8, "") catch unreachable);
 }
 
+// ---------------------------------------------------------------------------
+// Prompts are DATA, not baked-in strings. Each role's prompt is a template with
+// {placeholders}; the built-in default below ships the current behaviour, and a
+// file at ~/.zish/prompts/<name>.txt (editable from the dashboard) overrides it.
+// Placeholders per prompt are documented in the defaults; unknown ones pass through.
+// ---------------------------------------------------------------------------
+const DEFAULT_DECOMPOSE = "{lens}CAPTAIN: decompose the following task into 2-3 short independent sub-tasks, one per line.{caps}{budget} TASK: {task}";
+const DEFAULT_WORKER = "{lens}WORKER: complete this sub-task and report the result.{consult}{caps}{budget} Put any code in a fenced block tagged with its language. SUBTASK: {sub}";
+const DEFAULT_CRITIC = "{lens}CRITIC: refute and cross-check the worker outputs below; flag contradictions or errors.{budget} BLACKBOARD:\n{blackboard}";
+const DEFAULT_SYNTH = "{lens}CAPTAIN SYNTHESIZE: produce the final answer from the blackboard, keeping only claims that survive the critic.{caps}{budget}{human} Put any code in a fenced block tagged with its language. BLACKBOARD:\n{blackboard}";
+const DEFAULT_REPAIR = "{lens}The {lang} code below FAILED to compile. Return ONLY the corrected COMPLETE code in a single fenced {lang} block — no prose.{budget}\n\nCOMPILER ERROR:\n{error}\n\nCODE:\n{code}";
+
+/// The built-in default template for a prompt name (for loading + for the API to
+/// advertise). Unknown name → "".
+fn defaultPrompt(name: []const u8) []const u8 {
+    if (std.mem.eql(u8, name, "decompose")) return DEFAULT_DECOMPOSE;
+    if (std.mem.eql(u8, name, "worker")) return DEFAULT_WORKER;
+    if (std.mem.eql(u8, name, "critic")) return DEFAULT_CRITIC;
+    if (std.mem.eql(u8, name, "synth")) return DEFAULT_SYNTH;
+    if (std.mem.eql(u8, name, "repair")) return DEFAULT_REPAIR;
+    return "";
+}
+
+/// Load a prompt template: ~/.zish/prompts/<name>.txt if it exists and is
+/// non-empty, else the built-in default. Owned; caller frees.
+fn loadPrompt(name: []const u8) []u8 {
+    const def = defaultPrompt(name);
+    const home = getEnv("HOME") orelse return alloc.dupe(u8, def) catch (alloc.dupe(u8, "") catch unreachable);
+    var pb: [4096]u8 = undefined;
+    if (std.fmt.bufPrint(&pb, "{s}/.zish/prompts/{s}.txt", .{ home, name })) |path| {
+        if (readFileAlloc(path, MAX_OUT)) |c| {
+            defer alloc.free(c);
+            const t = std.mem.trim(u8, c, " \t\r\n");
+            if (t.len > 0) return alloc.dupe(u8, t) catch (alloc.dupe(u8, def) catch "");
+        }
+    } else |_| {}
+    return alloc.dupe(u8, def) catch (alloc.dupe(u8, "") catch unreachable);
+}
+
+/// Substitute {key} placeholders in `template` from `pairs`. Single pass, so a
+/// value that itself contains braces is never re-scanned; unknown keys pass through.
+fn renderTemplate(template: []const u8, pairs: []const [2][]const u8) []u8 {
+    var o: std.ArrayListUnmanaged(u8) = .empty;
+    var i: usize = 0;
+    while (i < template.len) {
+        if (template[i] == '{') {
+            if (std.mem.indexOfScalarPos(u8, template, i, '}')) |end| {
+                const key = template[i + 1 .. end];
+                var matched = false;
+                for (pairs) |p| {
+                    if (std.mem.eql(u8, p[0], key)) {
+                        o.appendSlice(alloc, p[1]) catch {};
+                        matched = true;
+                        break;
+                    }
+                }
+                if (matched) {
+                    i = end + 1;
+                    continue;
+                }
+                // unknown placeholder — leave it literal
+            }
+        }
+        o.append(alloc, template[i]) catch {};
+        i += 1;
+    }
+    return o.toOwnedSlice(alloc) catch (alloc.dupe(u8, "") catch unreachable);
+}
+
+const PROMPT_NAMES = [_][]const u8{ "decompose", "worker", "critic", "synth", "repair" };
+
+/// Print the editable prompts as a JSON array of {name, default, current}.
+fn printPrompts() void {
+    out("[");
+    for (PROMPT_NAMES, 0..) |name, i| {
+        if (i > 0) out(",");
+        const cur = loadPrompt(name);
+        defer alloc.free(cur);
+        const de = jesc(defaultPrompt(name), 100000);
+        defer alloc.free(de);
+        const ce = jesc(cur, 100000);
+        defer alloc.free(ce);
+        const line = std.fmt.allocPrint(alloc, "{{\"name\":\"{s}\",\"default\":\"{s}\",\"current\":\"{s}\"}}", .{ name, de, ce }) catch continue;
+        defer alloc.free(line);
+        out(line);
+    }
+    out("]\n");
+}
+
 /// Proper JSON string escaping that KEEPS content readable (newlines→\n etc.),
 /// truncated to `max` bytes — for the actual generated text an agent produced.
 fn jesc(s: []const u8, max: usize) []u8 {
@@ -883,7 +972,9 @@ fn verifyAndGate(agent_bin: []const u8, budget_bin: []const u8, verify_bin: []co
                 }
                 var rbud_buf: [160]u8 = undefined;
                 const rbud = std.fmt.bufPrint(&rbud_buf, " Keep within ~{d} output tokens (reasoning included, hard-cut) — return the code, minimal reasoning.", .{capSynth()}) catch "";
-                const rprompt = std.fmt.allocPrint(alloc, "{s}The {s} code below FAILED to compile. Return ONLY the corrected COMPLETE code in a single fenced {s} block — no prose.{s}\n\nCOMPILER ERROR:\n{s}\n\nCODE:\n{s}", .{ cap_intro, tc.tag, tc.tag, rbud, vr.err, tc.code }) catch continue;
+                const rtmpl = loadPrompt("repair");
+        defer alloc.free(rtmpl);
+        const rprompt = renderTemplate(rtmpl, &.{ .{ "lens", cap_intro }, .{ "lang", tc.tag }, .{ "budget", rbud }, .{ "error", vr.err }, .{ "code", tc.code } });
                 defer alloc.free(rprompt);
                 var rmeta_buf: [4096]u8 = undefined;
                 const rmp = std.fmt.bufPrint(&rmeta_buf, "{s}.repair.meta", .{bb_path}) catch "";
@@ -1039,7 +1130,9 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
     const scap_n = capSynth();
     const sbudgetline = std.fmt.bufPrint(&sbudget_buf, bmsg, .{ scap_n, scap_n * 3 / 4 }) catch "";
 
-    const dprompt = std.fmt.allocPrint(alloc, "{s}CAPTAIN: decompose the following task into 2-3 short independent sub-tasks, one per line.{s}{s} TASK: {s}", .{ cap_intro, capline, budgetline, task }) catch return 2;
+    const dtmpl = loadPrompt("decompose");
+    defer alloc.free(dtmpl);
+    const dprompt = renderTemplate(dtmpl, &.{ .{ "lens", cap_intro }, .{ "caps", capline }, .{ "budget", budgetline }, .{ "task", task } });
     defer alloc.free(dprompt);
     var dmeta_buf: [4096]u8 = undefined;
     const dmp = std.fmt.bufPrint(&dmeta_buf, "{s}.dec.meta", .{bb_path}) catch "";
@@ -1138,7 +1231,9 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
         else
             (alloc.dupe(u8, "") catch unreachable);
         defer alloc.free(btw);
-        const wprompt = std.fmt.allocPrint(alloc, "{s}WORKER: complete this sub-task and report the result.{s}{s}{s} Put any code in a fenced block tagged with its language. SUBTASK: {s}", .{ w_intro, btw, capline, budgetline, sub }) catch continue;
+        const wtmpl = loadPrompt("worker");
+        defer alloc.free(wtmpl);
+        const wprompt = renderTemplate(wtmpl, &.{ .{ "lens", w_intro }, .{ "consult", btw }, .{ "caps", capline }, .{ "budget", budgetline }, .{ "sub", sub } });
         defer alloc.free(wprompt);
         const out_path = std.fmt.allocPrint(alloc, "{s}/.zish/.team-{d}-w{d}.out", .{ home, pid, i }) catch continue;
         {
@@ -1217,7 +1312,9 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
     defer alloc.free(bb1);
     const crit_intro = lensIntro(lensFor(lenses.items, "critic", 0));
     defer alloc.free(crit_intro);
-    const cprompt = std.fmt.allocPrint(alloc, "{s}CRITIC: refute and cross-check the worker outputs below; flag contradictions or errors.{s} BLACKBOARD:\n{s}", .{ crit_intro, budgetline, bb1 }) catch return 1;
+    const ctmpl = loadPrompt("critic");
+    defer alloc.free(ctmpl);
+    const cprompt = renderTemplate(ctmpl, &.{ .{ "lens", crit_intro }, .{ "budget", budgetline }, .{ "blackboard", bb1 } });
     defer alloc.free(cprompt);
     var cmeta_buf: [4096]u8 = undefined;
     const cmp = std.fmt.bufPrint(&cmeta_buf, "{s}.crit.meta", .{bb_path}) catch "";
@@ -1251,7 +1348,9 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
         (std.fmt.bufPrint(&human_block_buf, " The human(s) sent guidance DURING the run — honor it over the workers where they conflict:\n{s}", .{says}) catch "")
     else
         "";
-    const sprompt = std.fmt.allocPrint(alloc, "{s}CAPTAIN SYNTHESIZE: produce the final answer from the blackboard, keeping only claims that survive the critic.{s}{s}{s} Put any code in a fenced block tagged with its language. BLACKBOARD:\n{s}", .{ cap_intro, capline, sbudgetline, human_block, bb2 }) catch return 1;
+    const stmpl = loadPrompt("synth");
+    defer alloc.free(stmpl);
+    const sprompt = renderTemplate(stmpl, &.{ .{ "lens", cap_intro }, .{ "caps", capline }, .{ "budget", sbudgetline }, .{ "human", human_block }, .{ "blackboard", bb2 } });
     defer alloc.free(sprompt);
     var smeta_buf: [4096]u8 = undefined;
     const smp = std.fmt.bufPrint(&smeta_buf, "{s}.synth.meta", .{bb_path}) catch "";
@@ -1308,8 +1407,14 @@ fn run(args: std.process.Args) u8 {
         printHelp();
         return 0;
     }
+    if (std.mem.eql(u8, verb, "prompts")) {
+        // print the editable prompts as JSON {name, default, current} — the
+        // single source of truth the dashboard reads (no duplicated defaults).
+        printPrompts();
+        return 0;
+    }
     if (!std.mem.eql(u8, verb, "run")) {
-        warn("team: unknown verb (expected 'run')\n");
+        warn("team: unknown verb (expected 'run' or 'prompts')\n");
         return 2;
     }
     const budget_arg = it.next() orelse {
