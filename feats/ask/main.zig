@@ -193,14 +193,18 @@ fn run(args: std.process.Args) u8 {
                 out(ans); // open question — free text
                 out("\n");
                 return 0;
-            } else if (std.fmt.parseInt(usize, ans, 10)) |idx| {
-                if (idx < options.items.len) {
-                    out(options.items[idx]); // MC — print the chosen option text
-                    out("\n");
-                    return 0;
-                }
-            } else |_| {
-                out(ans); // not an index — echo whatever came back
+            } else {
+                // MC: a plain in-range index prints that option; anything else
+                // (an "Other" custom answer, or an out-of-range number) is echoed
+                // verbatim — so a choice question always accepts a typed answer too.
+                if (std.fmt.parseInt(usize, ans, 10)) |idx| {
+                    if (idx < options.items.len) {
+                        out(options.items[idx]);
+                        out("\n");
+                        return 0;
+                    }
+                } else |_| {}
+                out(ans);
                 out("\n");
                 return 0;
             }
