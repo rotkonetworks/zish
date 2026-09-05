@@ -853,7 +853,10 @@ fn verifyAndGate(agent_bin: []const u8, budget_bin: []const u8, root_id: []const
             printVerifyFail(bb_path, sp.name, vr.err); // can't afford a fix → surface honestly
             continue;
         }
-        const rprompt = std.fmt.allocPrint(alloc, "{s}The {s} code below FAILED to compile. Return ONLY the corrected COMPLETE code in a single ```{s} fenced block — no prose.\n\nCOMPILER ERROR:\n{s}\n\nCODE:\n{s}", .{ cap_intro, sp.name, sp.name, vr.err, code }) catch continue;
+        var rbud_buf: [160]u8 = undefined;
+        const rcap = std.fmt.parseInt(usize, maxTokCap(), 10) catch 2048;
+        const rbud = std.fmt.bufPrint(&rbud_buf, " Keep within ~{d} output tokens (reasoning included, hard-cut) — return the code, minimal reasoning.", .{rcap}) catch "";
+        const rprompt = std.fmt.allocPrint(alloc, "{s}The {s} code below FAILED to compile. Return ONLY the corrected COMPLETE code in a single ```{s} fenced block — no prose.{s}\n\nCOMPILER ERROR:\n{s}\n\nCODE:\n{s}", .{ cap_intro, sp.name, sp.name, rbud, vr.err, code }) catch continue;
         defer alloc.free(rprompt);
         var rmeta_buf: [4096]u8 = undefined;
         const rmp = std.fmt.bufPrint(&rmeta_buf, "{s}.repair.meta", .{bb_path}) catch "";
@@ -987,7 +990,15 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
     else
         "";
 
-    const dprompt = std.fmt.allocPrint(alloc, "{s}CAPTAIN: decompose the following task into 2-3 short independent sub-tasks, one per line.{s} TASK: {s}", .{ cap_intro, capline, task }) catch return 2;
+    // Tell the agent its output budget UP FRONT. A hard max_tokens cutoff the
+    // model doesn't know about is a guillotine — a thinking model spends the
+    // whole budget reasoning and gets truncated before the answer. Communicating
+    // the number (and that reasoning counts toward it) lets the model allocate.
+    var budgetline_buf: [320]u8 = undefined;
+    const cap_n = std.fmt.parseInt(usize, maxTokCap(), 10) catch 2048;
+    const budgetline = std.fmt.bufPrint(&budgetline_buf, " OUTPUT BUDGET: keep your COMPLETE response within ~{d} tokens (~{d} words). Any reasoning/thinking counts toward this limit and it is HARD-CUT at the end — so reason briefly and make sure your final answer is fully written before you reach it.", .{ cap_n, cap_n * 3 / 4 }) catch "";
+
+    const dprompt = std.fmt.allocPrint(alloc, "{s}CAPTAIN: decompose the following task into 2-3 short independent sub-tasks, one per line.{s}{s} TASK: {s}", .{ cap_intro, capline, budgetline, task }) catch return 2;
     defer alloc.free(dprompt);
     var dmeta_buf: [4096]u8 = undefined;
     const dmp = std.fmt.bufPrint(&dmeta_buf, "{s}.dec.meta", .{bb_path}) catch "";
@@ -1055,7 +1066,7 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
         else
             (alloc.dupe(u8, "") catch unreachable);
         defer alloc.free(btw);
-        const wprompt = std.fmt.allocPrint(alloc, "{s}WORKER: complete this sub-task and report the result.{s}{s} Put any code in a fenced block tagged with its language. SUBTASK: {s}", .{ w_intro, btw, capline, sub }) catch continue;
+        const wprompt = std.fmt.allocPrint(alloc, "{s}WORKER: complete this sub-task and report the result.{s}{s}{s} Put any code in a fenced block tagged with its language. SUBTASK: {s}", .{ w_intro, btw, capline, budgetline, sub }) catch continue;
         defer alloc.free(wprompt);
         const out_path = std.fmt.allocPrint(alloc, "{s}/.zish/.team-{d}-w{d}.out", .{ home, pid, i }) catch continue;
         {
@@ -1134,7 +1145,7 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
     defer alloc.free(bb1);
     const crit_intro = lensIntro(lensFor(lenses.items, "critic", 0));
     defer alloc.free(crit_intro);
-    const cprompt = std.fmt.allocPrint(alloc, "{s}CRITIC: refute and cross-check the worker outputs below; flag contradictions or errors. BLACKBOARD:\n{s}", .{ crit_intro, bb1 }) catch return 1;
+    const cprompt = std.fmt.allocPrint(alloc, "{s}CRITIC: refute and cross-check the worker outputs below; flag contradictions or errors.{s} BLACKBOARD:\n{s}", .{ crit_intro, budgetline, bb1 }) catch return 1;
     defer alloc.free(cprompt);
     var cmeta_buf: [4096]u8 = undefined;
     const cmp = std.fmt.bufPrint(&cmeta_buf, "{s}.crit.meta", .{bb_path}) catch "";
@@ -1160,7 +1171,7 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
     emit("{{\"t\":{d},\"ev\":\"synth_start\"}}", .{nowMs()});
     const bb2 = readFileAlloc(bb_path, MAX_OUT) orelse alloc.dupe(u8, "") catch return 1;
     defer alloc.free(bb2);
-    const sprompt = std.fmt.allocPrint(alloc, "{s}CAPTAIN SYNTHESIZE: produce the final answer from the blackboard, keeping only claims that survive the critic.{s} Put any code in a fenced block tagged with its language. BLACKBOARD:\n{s}", .{ cap_intro, capline, bb2 }) catch return 1;
+    const sprompt = std.fmt.allocPrint(alloc, "{s}CAPTAIN SYNTHESIZE: produce the final answer from the blackboard, keeping only claims that survive the critic.{s}{s} Put any code in a fenced block tagged with its language. BLACKBOARD:\n{s}", .{ cap_intro, capline, budgetline, bb2 }) catch return 1;
     defer alloc.free(sprompt);
     var smeta_buf: [4096]u8 = undefined;
     const smp = std.fmt.bufPrint(&smeta_buf, "{s}.synth.meta", .{bb_path}) catch "";
