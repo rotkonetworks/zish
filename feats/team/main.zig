@@ -339,14 +339,14 @@ fn budgetBalance(bin: []const u8, id: []const u8) ?i64 {
 /// Passes --mock through when ZISH_JUDGE_MOCK is set, so a test can stay offline.
 /// Call the agent one-shot. When `meta_path` is non-empty, the agent writes its
 /// token usage + thinking there (via ZISH_ASK_META, injected as an `env` NAME=VAL).
-fn callAgent(bin: []const u8, prompt: []const u8, meta_path: []const u8) ?[]u8 {
+fn callAgent(bin: []const u8, prompt: []const u8, meta_path: []const u8, cap_n: usize) ?[]u8 {
     var masg_buf: [4096]u8 = undefined;
     const masg: []const u8 = if (meta_path.len > 0)
         (std.fmt.bufPrint(&masg_buf, "ZISH_ASK_META={s}", .{meta_path}) catch "")
     else
         "";
     var cap_buf: [64]u8 = undefined;
-    const cap = std.fmt.bufPrint(&cap_buf, "ZISH_AGENT_MAX_TOKENS={s}", .{maxTokCap()}) catch "";
+    const cap = std.fmt.bufPrint(&cap_buf, "ZISH_AGENT_MAX_TOKENS={d}", .{cap_n}) catch "";
     var args: [10][]const u8 = undefined;
     var n: usize = 0;
     if (masg.len > 0) {
@@ -402,16 +402,27 @@ fn modelFor(models: []const WorkerModel, idx: usize) WorkerModel {
     return models[idx % models.len];
 }
 
-/// Per-call COMPLETION cap in tokens — the hard cost bound the org hands every
-/// agent it spawns (via ZISH_AGENT_MAX_TOKENS → agent's max_tokens). Budget
-/// credits bound the NUMBER of calls; this bounds each call's SIZE, so the two
-/// together bound total cost, not merely call count. Override via
-/// ZISH_TEAM_MAX_TOKENS; default 2048, digit-validated (bad value → default).
-fn maxTokCap() []const u8 {
-    const v = getEnv("ZISH_TEAM_MAX_TOKENS") orelse return "2048";
-    if (v.len == 0 or v.len >= 8) return "2048";
-    for (v) |c| if (c < '0' or c > '9') return "2048";
-    return v;
+fn envUint(name: [:0]const u8) ?usize {
+    const v = getEnv(name) orelse return null;
+    if (v.len == 0 or v.len >= 8) return null;
+    for (v) |c| if (c < '0' or c > '9') return null;
+    return std.fmt.parseInt(usize, v, 10) catch null;
+}
+
+/// Base per-call COMPLETION cap in tokens — the hard cost bound the org hands the
+/// MANY fan-out calls (workers, decompose, critic, consults), where runaway cost
+/// lives. Budget credits bound the NUMBER of calls; this bounds each call's SIZE.
+/// Override ZISH_TEAM_MAX_TOKENS; default 2048.
+fn capBase() usize {
+    return envUint("ZISH_TEAM_MAX_TOKENS") orelse 2048;
+}
+
+/// Cap for the SYNTHESIS (and repair) — the final DELIVERABLE. Capping the one
+/// answer call to the same tight budget as fan-out truncates the product
+/// mid-output; it's a single call per run, so give it real room to finish.
+/// Override ZISH_TEAM_SYNTH_MAX_TOKENS; default 4× the base cap.
+fn capSynth() usize {
+    return envUint("ZISH_TEAM_SYNTH_MAX_TOKENS") orelse (capBase() * 4);
 }
 
 /// fork+exec `env [ZISH_AGENT_BACKEND=..] agent [-m model] [--mock M] --ask
@@ -445,7 +456,7 @@ fn spawnAgentToFile(bin: []const u8, prompt: []const u8, out_path: []const u8, w
     }
     { // completion cap — the hard per-call cost bound (agent's max_tokens)
         var cb: [64]u8 = undefined;
-        const casg = std.fmt.bufPrint(&cb, "ZISH_AGENT_MAX_TOKENS={s}", .{maxTokCap()}) catch return null;
+        const casg = std.fmt.bufPrint(&cb, "ZISH_AGENT_MAX_TOKENS={d}", .{capBase()}) catch return null;
         if (!push(casg, &held, &nh, &argv, &n)) return null;
     }
     if (!push(bin, &held, &nh, &argv, &n)) return null;
@@ -653,7 +664,7 @@ fn serviceBtwAsk(agent_bin: []const u8, budget_bin: []const u8, root_id: []const
         defer alloc.free(eprompt);
         var emeta_buf: [4096]u8 = undefined;
         const emp = std.fmt.bufPrint(&emeta_buf, "{s}.consult.meta", .{bb_path}) catch "";
-        const eout = callAgent(agent_bin, eprompt, emp) orelse {
+        const eout = callAgent(agent_bin, eprompt, emp, capBase()) orelse {
             const e = std.fmt.allocPrint(alloc, "(expert {s} unavailable)\n", .{exp.name}) catch return;
             defer alloc.free(e);
             appendFile(bb_path, e);
@@ -854,13 +865,13 @@ fn verifyAndGate(agent_bin: []const u8, budget_bin: []const u8, root_id: []const
             continue;
         }
         var rbud_buf: [160]u8 = undefined;
-        const rcap = std.fmt.parseInt(usize, maxTokCap(), 10) catch 2048;
+        const rcap = capSynth(); // repair must emit the WHOLE corrected file — give it room
         const rbud = std.fmt.bufPrint(&rbud_buf, " Keep within ~{d} output tokens (reasoning included, hard-cut) — return the code, minimal reasoning.", .{rcap}) catch "";
         const rprompt = std.fmt.allocPrint(alloc, "{s}The {s} code below FAILED to compile. Return ONLY the corrected COMPLETE code in a single ```{s} fenced block — no prose.{s}\n\nCOMPILER ERROR:\n{s}\n\nCODE:\n{s}", .{ cap_intro, sp.name, sp.name, rbud, vr.err, code }) catch continue;
         defer alloc.free(rprompt);
         var rmeta_buf: [4096]u8 = undefined;
         const rmp = std.fmt.bufPrint(&rmeta_buf, "{s}.repair.meta", .{bb_path}) catch "";
-        const fixed = callAgent(agent_bin, rprompt, rmp) orelse {
+        const fixed = callAgent(agent_bin, rprompt, rmp, capSynth()) orelse {
             printVerifyFail(bb_path, sp.name, vr.err);
             continue;
         };
@@ -994,15 +1005,19 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
     // model doesn't know about is a guillotine — a thinking model spends the
     // whole budget reasoning and gets truncated before the answer. Communicating
     // the number (and that reasoning counts toward it) lets the model allocate.
+    const bmsg = " OUTPUT BUDGET: keep your COMPLETE response within ~{d} tokens (~{d} words). Any reasoning/thinking counts toward this limit and it is HARD-CUT at the end — so reason briefly and make sure your final answer is fully written before you reach it.";
     var budgetline_buf: [320]u8 = undefined;
-    const cap_n = std.fmt.parseInt(usize, maxTokCap(), 10) catch 2048;
-    const budgetline = std.fmt.bufPrint(&budgetline_buf, " OUTPUT BUDGET: keep your COMPLETE response within ~{d} tokens (~{d} words). Any reasoning/thinking counts toward this limit and it is HARD-CUT at the end — so reason briefly and make sure your final answer is fully written before you reach it.", .{ cap_n, cap_n * 3 / 4 }) catch "";
+    const cap_n = capBase(); // workers / decompose / critic
+    const budgetline = std.fmt.bufPrint(&budgetline_buf, bmsg, .{ cap_n, cap_n * 3 / 4 }) catch "";
+    var sbudget_buf: [320]u8 = undefined; // synthesis gets its own, larger budget
+    const scap_n = capSynth();
+    const sbudgetline = std.fmt.bufPrint(&sbudget_buf, bmsg, .{ scap_n, scap_n * 3 / 4 }) catch "";
 
     const dprompt = std.fmt.allocPrint(alloc, "{s}CAPTAIN: decompose the following task into 2-3 short independent sub-tasks, one per line.{s}{s} TASK: {s}", .{ cap_intro, capline, budgetline, task }) catch return 2;
     defer alloc.free(dprompt);
     var dmeta_buf: [4096]u8 = undefined;
     const dmp = std.fmt.bufPrint(&dmeta_buf, "{s}.dec.meta", .{bb_path}) catch "";
-    const decomp = callAgent(agent_bin, dprompt, dmp) orelse {
+    const decomp = callAgent(agent_bin, dprompt, dmp, capBase()) orelse {
         warn("team: captain (decompose) call failed\n");
         return 1;
     };
@@ -1149,7 +1164,7 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
     defer alloc.free(cprompt);
     var cmeta_buf: [4096]u8 = undefined;
     const cmp = std.fmt.bufPrint(&cmeta_buf, "{s}.crit.meta", .{bb_path}) catch "";
-    const crit = callAgent(agent_bin, cprompt, cmp) orelse alloc.dupe(u8, "(critic unavailable)") catch return 1;
+    const crit = callAgent(agent_bin, cprompt, cmp, capBase()) orelse alloc.dupe(u8, "(critic unavailable)") catch return 1;
     defer alloc.free(crit);
     const centry = std.fmt.allocPrint(alloc, "## critic\n{s}\n", .{std.mem.trim(u8, crit, " \t\r\n")}) catch return 1;
     defer alloc.free(centry);
@@ -1171,11 +1186,11 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
     emit("{{\"t\":{d},\"ev\":\"synth_start\"}}", .{nowMs()});
     const bb2 = readFileAlloc(bb_path, MAX_OUT) orelse alloc.dupe(u8, "") catch return 1;
     defer alloc.free(bb2);
-    const sprompt = std.fmt.allocPrint(alloc, "{s}CAPTAIN SYNTHESIZE: produce the final answer from the blackboard, keeping only claims that survive the critic.{s}{s} Put any code in a fenced block tagged with its language. BLACKBOARD:\n{s}", .{ cap_intro, capline, budgetline, bb2 }) catch return 1;
+    const sprompt = std.fmt.allocPrint(alloc, "{s}CAPTAIN SYNTHESIZE: produce the final answer from the blackboard, keeping only claims that survive the critic.{s}{s} Put any code in a fenced block tagged with its language. BLACKBOARD:\n{s}", .{ cap_intro, capline, sbudgetline, bb2 }) catch return 1;
     defer alloc.free(sprompt);
     var smeta_buf: [4096]u8 = undefined;
     const smp = std.fmt.bufPrint(&smeta_buf, "{s}.synth.meta", .{bb_path}) catch "";
-    const final = callAgent(agent_bin, sprompt, smp) orelse {
+    const final = callAgent(agent_bin, sprompt, smp, capSynth()) orelse {
         warn("team: synthesis call failed\n");
         return 1;
     };
