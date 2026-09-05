@@ -1,0 +1,5 @@
+name = "verify"
+version = "0.1.0"
+tier = "standard"
+bin = "verify"
+help = "compile-check code in the language its fence names (zig/rust/python/go/c/c++/ts/js/bash); `verify caps` lists installed checkers"
