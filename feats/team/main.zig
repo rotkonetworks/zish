@@ -40,6 +40,34 @@ const COST: i64 = 1; // credits per agent call
 const RESERVE: i64 = COST * 2; // critic + synth, always kept back
 
 // ---------------------------------------------------------------------------
+// live trace emission — one JSON event per line to ~/.zish/traces/<run>.jsonl,
+// appended AS THINGS HAPPEN. A separate viewer (Deno SSE server + Solid/UnoCSS
+// dashboard) tails this to follow the org in real time. team only writes the
+// file; it knows nothing about HTTP. Fire-and-forget; no trace file = no-op.
+// ---------------------------------------------------------------------------
+var g_trace: ?[]const u8 = null;
+
+fn nowMs() i64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+}
+
+fn emit(comptime fmt: []const u8, args: anytype) void {
+    const tp = g_trace orelse return;
+    const line = std.fmt.allocPrint(alloc, fmt ++ "\n", args) catch return;
+    defer alloc.free(line);
+    appendFile(tp, line);
+}
+
+/// A JSON-safe copy of `s` (drops quotes/backslashes/controls) — display text.
+fn jclean(s: []const u8) []u8 {
+    var o: std.ArrayListUnmanaged(u8) = .empty;
+    for (s) |c| if (c >= 0x20 and c != '"' and c != '\\') (o.append(alloc, c) catch {});
+    return o.toOwnedSlice(alloc) catch (alloc.dupe(u8, "") catch unreachable);
+}
+
+// ---------------------------------------------------------------------------
 // small helpers (syscall-shaped, matching feats/aur & feats/gf)
 // ---------------------------------------------------------------------------
 
@@ -507,6 +535,9 @@ fn serviceBtwAsk(agent_bin: []const u8, budget_bin: []const u8, root_id: []const
         const entry = std.fmt.allocPrint(alloc, "## expert {s} (consulted by worker {d})\nQ: {s}\n{s}\n", .{ exp.name, worker_idx, q, std.mem.trim(u8, eout, " \t\r\n") }) catch return;
         defer alloc.free(entry);
         appendFile(bb_path, entry);
+        const ec = jclean(exp.name);
+        defer alloc.free(ec);
+        emit("{{\"t\":{d},\"ev\":\"consult\",\"worker\":{d},\"expert\":\"{s}\"}}", .{ nowMs(), worker_idx, ec });
         return; // one consult per worker
     }
 }
@@ -553,6 +584,23 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
     _ = writeFileTrunc(bb_path, "# team blackboard\n");
     defer unlinkPath(bb_path);
 
+    // live trace for the realtime dashboard: ~/.zish/traces/<run>.jsonl (persists)
+    var trbuf: [4096]u8 = undefined;
+    if (home.len > 0) {
+        var dbuf: [4096]u8 = undefined;
+        if (std.fmt.bufPrint(&dbuf, "{s}/.zish/traces", .{home})) |dir| {
+            var dz: [4096]u8 = undefined;
+            if (toZ(&dz, dir)) |dp| _ = linux.mkdir(dp, 0o700);
+        } else |_| {}
+        if (std.fmt.bufPrint(&trbuf, "{s}/.zish/traces/{d}.jsonl", .{ home, pid })) |tp| g_trace = tp else |_| {}
+    }
+    const run_started = nowMs();
+    {
+        const tc = jclean(task);
+        defer alloc.free(tc);
+        emit("{{\"t\":{d},\"ev\":\"run_start\",\"run\":{d},\"task\":\"{s}\",\"budget\":{d}}}", .{ nowMs(), pid, tc, root_budget });
+    }
+
     // 1. CAPTAIN decompose (charged to root)
     if (!budgetSpend(budget_bin, root_id, COST)) {
         warn("team: cannot afford captain\n");
@@ -596,6 +644,7 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
         subs.append(alloc, t) catch {};
         if (subs.items.len >= MAX_WORKERS) break;
     }
+    emit("{{\"t\":{d},\"ev\":\"decompose\",\"n\":{d}}}", .{ nowMs(), subs.items.len });
 
     // 2. FAN-OUT workers, IN PARALLEL — the whole point of a team is horizontal
     //    bandwidth. Split each affordable slice and SPAWN its worker without
@@ -606,7 +655,7 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
     defer models.deinit(alloc);
     loadModels(&models); // ZISH_TEAM_MODELS → per-worker (hybrid local+hosted)
 
-    const Spawn = struct { cpid: i32, out_path: []u8, sub: []const u8, idx: usize };
+    const Spawn = struct { cpid: i32, out_path: []u8, sub: []const u8, idx: usize, t0: i64 };
     var spawns: std.ArrayListUnmanaged(Spawn) = .empty;
     defer {
         for (spawns.items) |s| {
@@ -643,12 +692,19 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
         const wprompt = std.fmt.allocPrint(alloc, "{s}WORKER: complete this sub-task and report the result.{s} SUBTASK: {s}", .{ w_intro, btw, sub }) catch continue;
         defer alloc.free(wprompt);
         const out_path = std.fmt.allocPrint(alloc, "{s}/.zish/.team-{d}-w{d}.out", .{ home, pid, i }) catch continue;
+        {
+            const mc = jclean(modelFor(models.items, i).model orelse "local");
+            defer alloc.free(mc);
+            const sc = jclean(sub);
+            defer alloc.free(sc);
+            emit("{{\"t\":{d},\"ev\":\"worker_start\",\"i\":{d},\"model\":\"{s}\",\"sub\":\"{s}\"}}", .{ nowMs(), i, mc, sc });
+        }
         const cpid = spawnAgentToFile(agent_bin, wprompt, out_path, modelFor(models.items, i)) orelse {
             alloc.free(out_path);
             appendFile(bb_path, "(worker spawn failed)\n");
             continue;
         };
-        spawns.append(alloc, .{ .cpid = cpid, .out_path = out_path, .sub = sub, .idx = i }) catch {
+        spawns.append(alloc, .{ .cpid = cpid, .out_path = out_path, .sub = sub, .idx = i, .t0 = nowMs() }) catch {
             reap(cpid);
             unlinkPath(out_path);
             alloc.free(out_path);
@@ -670,6 +726,7 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
         const entry = std.fmt.allocPrint(alloc, "## worker {d}\nsubtask: {s}\n{s}\n", .{ s.idx, s.sub, trimmed }) catch continue;
         defer alloc.free(entry);
         appendFile(bb_path, entry);
+        emit("{{\"t\":{d},\"ev\":\"worker_done\",\"i\":{d},\"dur\":{d},\"chars\":{d}}}", .{ nowMs(), s.idx, nowMs() - s.t0, trimmed.len });
         // a worker may consult an org expert (lateral info edge, org-funded)
         serviceBtwAsk(agent_bin, budget_bin, root_id, bb_path, experts.items, wout, s.idx);
         spawned += 1;
@@ -680,6 +737,7 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
     //    still run the critic (fail-open on the safety check), and the ledger
     //    can never go negative because `budget spend` fails closed.
     _ = budgetSpend(budget_bin, root_id, COST);
+    emit("{{\"t\":{d},\"ev\":\"critic_start\"}}", .{nowMs()});
     const bb1 = readFileAlloc(bb_path, MAX_OUT) orelse alloc.dupe(u8, "") catch return 1;
     defer alloc.free(bb1);
     const crit_intro = lensIntro(lensFor(lenses.items, "critic", 0));
@@ -691,9 +749,11 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
     const centry = std.fmt.allocPrint(alloc, "## critic\n{s}\n", .{std.mem.trim(u8, crit, " \t\r\n")}) catch return 1;
     defer alloc.free(centry);
     appendFile(bb_path, centry);
+    emit("{{\"t\":{d},\"ev\":\"critic_done\"}}", .{nowMs()});
 
     // 4. SYNTHESIS — the Captain keeps only what survived the critic.
     _ = budgetSpend(budget_bin, root_id, COST);
+    emit("{{\"t\":{d},\"ev\":\"synth_start\"}}", .{nowMs()});
     const bb2 = readFileAlloc(bb_path, MAX_OUT) orelse alloc.dupe(u8, "") catch return 1;
     defer alloc.free(bb2);
     const sprompt = std.fmt.allocPrint(alloc, "{s}CAPTAIN SYNTHESIZE: produce the final answer from the blackboard, keeping only claims that survive the critic. BLACKBOARD:\n{s}", .{ cap_intro, bb2 }) catch return 1;
@@ -711,6 +771,7 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
     const final_bal = budgetBalance(budget_bin, root_id) orelse 0;
     var sb: [256]u8 = undefined;
     warn(std.fmt.bufPrint(&sb, "team: root {s} — budget {d}, spent {d}, remaining {d} ({d} workers)\n", .{ root_id, root_budget, root_budget - final_bal, final_bal, spawned }) catch "");
+    emit("{{\"t\":{d},\"ev\":\"run_done\",\"spent\":{d},\"remaining\":{d},\"workers\":{d},\"dur\":{d}}}", .{ nowMs(), root_budget - final_bal, final_bal, spawned, nowMs() - run_started });
     return 0;
 }
 
