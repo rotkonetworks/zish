@@ -422,6 +422,155 @@ meta-packages (minimal/agent/full). The interesting part: the channel becomes
 the provenance signal — distro-packaged (maintainer-vetted) feats could default
 standard tier, gf-fetched default extra; would need a feat search path (system
 dir → ~/.zish/feats) replacing the single featRoot. Revisit when gf exists.
+UPDATE: gf v1 EXISTS (commit 1698d7c) — install-only, forces extra tier,
+hostile-tarball validation, `make dist-agent` produces the artifact.
+
+**Open idea, NOT locked (user, 2026-08-31 evening): the agentic package
+manager.** Beyond gf-as-installer: a full package channel that is (a) as easy
+to publish to as the AUR — push a repo, done — and (b) trust-scored not by
+maintainer fiat but by REVIEW WORK: every new version's diff gets reviewed by
+agents (and/or network participants) as long as the diff is a reasonable
+size; reviews accumulate into a per-feat / per-publisher reputation. The
+BUILDER/REVIEWER duet (which built `median` end-to-end on 2026-08-31) is the
+proof-of-concept of the review cell; the package manager is that cell run
+routinely against incoming diffs. Sketch of layers on what exists today:
+  - publish = a git repo or tarball URL (AUR-easy); gf fetches, extra tier
+  - `gf upgrade <name>` = fetch new version, DIFF against installed, spawn a
+    reviewer agent session on the diff (size-capped; oversized diff → human
+    review required, never silently skipped)
+  - verdicts are JSONL events (same transcript machinery) → an append-only
+    review ledger per feat; reputation = a fold over that ledger
+  - promotion policy reads reputation: N clean agent reviews + M distinct
+    reviewers before standard-tier eligibility; the HUMAN still runs the mv
+  - ties into the token org: review work is exactly the kind of task the
+    treasury pays for, and reviewer diversity (distinct keys) is the sybil
+    knob. User: "we want something as easy as AUR repositories but have kinda
+    reputation system that's reviewed by commits reviewed by agents/network
+    participants."
+Possible tool integration: user mentioned combining "githem" (to clarify:
+gitea? a specific tool?) as the hosting/review substrate rather than building
+repo hosting ourselves.
+
+**Locked direction (user, same evening): review-on-install + broadcast.**
+Every agent that installs a feat also reviews it and broadcasts the verdict —
+installers ARE the reviewer network, so reputation accumulates from usage.
+Consequences:
+  - package format v2 must ship SOURCE + build recipe (AUR model, gf builds
+    locally with zig cc): reviewing a binary is near-worthless. v1 binary
+    tarballs stay for bootstrap.
+  - BUILT (f4be2bc): gf install ledger — <featroot>/ledger.jsonl, append-only,
+    {"t":"install",name,sha256-of-archive,url,ts}. Review verdicts for the
+    same sha land beside it; feed/chain replication later; reputation = fold.
+  - sybil answer (user raised it): sybils can only win where review CONSENSUS
+    is truth — here truth is RE-DERIVABLE (any review can be redone on the
+    same source; one honest re-review refutes a thousand fake LGTMs).
+    Defense stack, in rollout order: (1) benevolent-dictator era — community
+    reviews advisory, steward's own review gates standard-tier, payouts
+    reputation-first; (2) random audit + slashing — steward re-reviews a
+    sample; slash > reward/audit-rate makes coordinated lying negative-EV
+    regardless of identity count; (3) weight by stake x key-age x slash-free
+    history, never headcount — fresh keys near-zero until they survive
+    audits; (4) permissioned key set (rotko-vetted) first, widen as audit
+    machinery proves out. Cryptoeconomic layer (staking/slashing on-chain)
+    is the settlement bolt-on via polkagent, not new zish machinery.
+
+**Bigger vision (user, 2026-08-31 night): review-as-a-network-service.** The
+package manager is the demo; the PRODUCT is reproducible, staked agent
+code-review offered as a service to OTHER package managers (npm, PyPI, crates,
+AUR, extension/model registries) — all of which drown in unreviewed diffs and
+supply-chain attacks and cannot human-review at volume. What is actually being
+sold is NOT the LLM review (commodity, a weekend to clone) but the
+ACCOUNTABILITY: a ledger of reviewers with provable track records + a slashing
+game that makes verdicts trustworthy + re-checkable reasoning. Moat = the
+trust substrate, not the model. Strategic constraint captured NOW so we don't
+paint into a zish corner: keep the review protocol (ledger schema, verdict
+format, reputation fold) package-manager-AGNOSTIC and open from day one; zish
+is reviewer #1 and the reference implementation, the protocol is the product
+(same instinct as ssh-key-as-wallet — open format, not walled service). Honest
+risks to respect: adjudication cost doesn't scale to millions of pkgs until
+audit automation is strong (start high-value/low-volume, not "all of npm");
+paid "clean" verdict shifts liability (frame as staked SIGNAL, never
+guarantee); false-positive fatigue (slashing must punish false alarms too, not
+only missed threats). Substrate it needs = exactly the bottom-up bricks already
+being built (source packages 8db7269, ledger f4be2bc, review-on-install next).
+
+**Sequencing (user, same night): self-host first, decentralize only what earns
+it.** Not a compromise — the correct order. Rotko already has infra + compute,
+so self-hosting the registry + feeds + review network costs ~nothing and keeps
+total control while the design moves; SaaS/chain to VALIDATE an idea is
+backwards. Centralized-but-open IS the honest v1 of the decentralized system:
+ledger = append-only file on our server, reviewers = agents we run, registry =
+a directory we serve, adjudication = benevolent dictator. Each has a
+decentralized successor LATER (ledger→chain, our-reviewers→network, dictator→
+token-jury) but only after the protocol earns it. THE RULE that stops this
+being a trap: self-host the DEPLOYMENT, keep the PROTOCOL open + portable from
+day one (file formats, verdict schema, ssh-key sigs) so "self-hosted now" and
+"federated later" are one system at different scales, never a rewrite — avoid
+baking rotko-specific assumptions into the data model. Matches the earlier
+"stream the files ourselves, no S2 dependency" call.
+
+**SmellBench adaptation (user, 2026-09-01), meditated through the karpathy
+(measurement) + hdevalence (architecture) lenses.** Source: Lin et al.,
+"SmellBench: Fine-Grained Evaluation of Code Agents on Refactoring Tasks"
+(arXiv 2606.05574; NOTE a DIFFERENT same-named paper exists, Dinu et al.
+2605.07001 — this is the injection-based one). It is an EVALUATION paper, so
+it maps onto exactly the two lenses that govern a review network.
+
+  KARPATHY (measurement) — the paper's spine is one karpathy sentence:
+  test-pass-rate is an easy metric that does NOT measure the thing you care
+  about (>80% pass tests, ~0.50 smell elimination). Consequences for us:
+  - REPUTATION MUST BE MEASURED, NOT ASSERTED. A reviewer's "PASS" is our
+    test-pass-rate: gameable, decoupled from discernment. Steal their case-
+    GENERATION pipeline (inject known defects into clean feats) as a reviewer
+    BENCHMARK: reputation = measured catch-rate vs planted ground truth
+    ("validate against bash" applied to trust). This is also the bootstrap
+    answer for a new reviewer key — it reviews planted defects first.
+  - MEASURE BOTH AXES: recall (catches planted defects) AND precision (does
+    NOT flag clean feats). A single score hides the false-alarm failure the
+    paper warns about (false-positive fatigue). Localization (found it) is
+    tracked SEPARATELY from judgment (rated severity right) — they fail apart.
+  - CALIBRATE: their Oracle clean code scores 0.96 not 1.0 (judge
+    conservatism). Reputation is RELATIVE to a baseline + noise floor, never
+    absolute. Keep easy/medium/hard stratification — reputation is a CURVE
+    over difficulty, and a promotion-gating review matches feat complexity to
+    the reviewer's proven-difficulty band.
+
+  HDEVALENCE (architecture) — right altitude, one owner per concern:
+  - The review protocol is NOT a gf feature (they integrated with HARBOR =
+    eval framework separated from eval content). Altitude = a standalone
+    package-manager-AGNOSTIC verdict protocol; gf is merely its first caller.
+    Verdict schema must not know it is about a feat (an npm diff rides the
+    same envelope later — the review-as-a-service vision needs this now).
+  - One owner each: reviewer agent = pure fn (diff, rubric) -> (analysis,
+    verdict), stateless/re-runnable (that is what makes it re-checkable);
+    LEDGER owns durable truth (append-only, no scoring logic); BENCHMARK
+    HARNESS is the only thing that mints a reputation number; STEWARD owns
+    policy (thresholds, difficulty-matching), reads the other three.
+  - GENERALIZE THE MECHANISM: their "Smell Analysis before judgment" (which
+    stabilized their judge) is not a code-review trick — it is the shape of
+    ALL scored agent judgment. Build ONE primitive: judge = analyze-then-
+    score-against-rubric, separating analysis (reusable, re-checkable artifact)
+    from verdict (scored decision). Reuse for package review, steward
+    allocation, dispute adjudication. Do NOT build a code-review-specific judge.
+
+  DIRECT BORROWS into review-on-install (next slice), so build it this shape:
+  - reviewer emits ANALYSIS then VERDICT, both to the ledger (never bare
+    PASS/FAIL); the analysis is the re-checkable artifact underpinning sybil
+    defense.
+  - RUBRIC: adopt their 4 dims (Code Quality / Structural Soundness / Cross-
+    file Coordination / Smell Elimination), renamed for feats, 10-pt bands.
+  - HAND THE REVIEWER THE DIFF, never "go review the repo": their guided LA
+    0.65 vs targeted 0.92 — the delegator localizes. gf already has the diff.
+  - SINGLE-FILE feats validated: cross-file coordination is the cliff (Shotgun
+    Surgery 5.7 files, models touch 2.7). Our source packages are one src file
+    — keep them small ON PURPOSE; review reliability falls off this cliff as
+    feats sprawl.
+  - TURN CAP + watchdog: runaway reasoning timeouts (DeepSeek 77%) is the
+    empirical case for MAX_TURNS + steward-as-rate-governor + compaction loop.
+  - THESIS VALIDATED: "OpenHands beats Qwen Code with weaker LLMs — stronger
+    exploration better utilizes limited model capacity." The harness matters
+    MOST when the model is weak = our "cheap models + strong structure" bet,
+    stated as someone else's experimental result. The armor is the lever.
 
 **Open idea, NOT locked (user pondering, same day): agent org + token
 treasury.** An organization of agents under a collective token budget, with a
@@ -611,11 +760,28 @@ verification ≪ generation (tests, infra ops, differential checks) and lose
 elsewhere — where the output clusters relative to that line IS the finding,
 in any direction.
 Bonus riff (user): broadcast the org's flow on public append-only feeds
-(S2-style) so investors watch work live — nearly free by construction
-(sanitized append-only transcripts → stream appends; the attested trace makes
-the feed non-fake). Edges: "publishable" = a per-session mask capability
-(default private; secrets structurally never in transcripts), and observed
-agents perform — pay for outcomes, not for looking busy on stream.
+(S2.dev) so investors/spectators watch work live. **Now concrete (the JSONL
+event log is BUILT):** the transcript is append-only JSON events → a feed
+pusher tails each `.jsonl` and appends new lines to an S2 stream keyed by
+session id; a website tails the S2 stream and renders each event live. Nearly
+free & clean by construction: append-only file ↔ append-only S2 stream is 1:1
+(pure fan-out, just read-past-offset); cat-safety = feed-safety (JSON escaping
+already stripped raw control bytes, so nothing hostile reaches the site); the
+mask gates publication ("publishable" per-session capability; secrets never
+enter the log so can't leak). Division of labor stays honest: zish writes the
+local truth, a SEPARATE feat does the outbound push (network = a contained
+capability, not in the shell core), the website is just a reader.
+**CORRECTION (user): self-host it — no S2 dependency.** We already own the
+hard part (append-only, offset-addressable event log); serving it live is a
+small feed feat that tails the .jsonl and pushes new lines over SSE/WebSocket
+— no external bucket, no vendor, no egress, data stays on Rotko infra. Keep
+the S2 *design*, drop the *dependency*. Two S2 principles worth matching: (1)
+OFFSET is the only cursor — a reader reconnects with "past line/byte N", so
+reconnect and replay are the same seek+tail operation (design the feed
+protocol around a monotonic offset, never timestamps or "latest"); (2)
+reader/writer separation — serving from the FILE (not an in-memory queue)
+means a slow/dead reader can never back-pressure the org's writers.
+Edges: observed agents perform — pay for outcomes, not for looking busy on stream.
 
 **Agent salary / personal budget (user): each agent holds a PERSONAL token
 budget it allocates itself; the org tops it up by merit — "capitalism babe".**
