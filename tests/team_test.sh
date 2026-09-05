@@ -10,11 +10,15 @@ trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/home/.zish" \
          "$T/feats/standard/agent/bin" \
          "$T/feats/standard/budget/bin" \
+         "$T/feats/standard/verify/bin" \
          "$T/state"
 
 echo "building team..."
 zig build-exe -lc feats/team/main.zig -femit-bin="$T/team" >/dev/null 2>&1 || {
     echo "FAIL: team does not compile"; exit 1; }
+# the REAL verify feat (team execs it as the compiler gate)
+zig build-exe -lc feats/verify/main.zig -femit-bin="$T/feats/standard/verify/bin/verify" >/dev/null 2>&1 || {
+    echo "FAIL: verify does not compile"; exit 1; }
 
 # ---- fake agent: detects its role from the prompt (last arg) and logs it -----
 cat > "$T/feats/standard/agent/bin/agent" <<'SH'
@@ -84,6 +88,14 @@ esac
 SH
 chmod +x "$T/feats/standard/budget/bin/budget"
 
+# ---- fake ask: echoes $FAKE_ASK_ANSWER (the chosen option text) -------------
+mkdir -p "$T/feats/standard/ask/bin"
+cat > "$T/feats/standard/ask/bin/ask" <<'SH'
+#!/bin/sh
+printf '%s\n' "${FAKE_ASK_ANSWER:-Proceed}"
+SH
+chmod +x "$T/feats/standard/ask/bin/ask"
+
 pass=0; fail=0
 ok()  { pass=$((pass+1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
@@ -135,6 +147,18 @@ if [ "$rust_ok" -eq 1 ]; then
 else
   ok "rust check skipped (no usable rustc toolchain under the test HOME)"
 fi
+
+echo "== human checkpoint (opt-in): Abort stops before fan-out; Proceed continues =="
+reset_logs
+o=$(ZISH_TEAM_CONFIRM=1 FAKE_ASK_ANSWER=Abort TEAM run 8 "a task"); rc=$?
+[ "$rc" -eq 0 ] && ok "aborted run exits 0" || bad "abort exit $rc"
+grep -q '^worker$' "$T/agent.log" && bad "workers ran despite Abort" || ok "Abort stopped before fan-out (no workers spawned)"
+reset_logs
+o=$(ZISH_TEAM_CONFIRM=1 FAKE_ASK_ANSWER=Proceed TEAM run 8 "a task")
+grep -q '^worker$' "$T/agent.log" && ok "Proceed continues to fan-out" || bad "Proceed did not run workers"
+reset_logs
+o=$(TEAM run 8 "a task")   # no ZISH_TEAM_CONFIRM -> never asks
+grep -q '^worker$' "$T/agent.log" && ok "no checkpoint by default (opt-in only)" || bad "default run regressed"
 
 echo "== conservation: total spent never exceeds the root grant =="
 reset_logs

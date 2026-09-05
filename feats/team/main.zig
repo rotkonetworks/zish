@@ -917,6 +917,10 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
     // installed the org still runs, just without the compile gate.
     var vbin: [4096]u8 = undefined;
     const verify_bin: []const u8 = resolveBin(root, "verify", &vbin) orelse "";
+    // ask feat: with ZISH_TEAM_CONFIRM set, the org checks its plan with the human
+    // (routed to the dashboard) before fanning out. Opt-in; fail-open if absent.
+    var abin: [4096]u8 = undefined;
+    const ask_bin: []const u8 = resolveBin(root, "ask", &abin) orelse "";
 
     // Fail closed: a team that can't afford its own captain+critic+synth
     // shouldn't run — the critic is not optional.
@@ -1032,6 +1036,37 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
         if (subs.items.len >= MAX_WORKERS) break;
     }
     emit("{{\"t\":{d},\"ev\":\"decompose\",\"n\":{d},\"pt\":{d},\"ct\":{d}}}", .{ nowMs(), subs.items.len, dtok.pt, dtok.ct });
+
+    // 1b. HUMAN CHECKPOINT (opt-in): show the plan and let the human abort before
+    //     spending the fan-out budget. Fail-open — no ask feat, no answer, or a
+    //     timeout all proceed; only an explicit "Abort" stops the run.
+    if (getEnv("ZISH_TEAM_CONFIRM") != null and ask_bin.len > 0 and subs.items.len > 0) {
+        var qb: std.ArrayListUnmanaged(u8) = .empty;
+        defer qb.deinit(alloc);
+        qb.appendSlice(alloc, "Captain's plan — ") catch {};
+        var nbuf: [16]u8 = undefined;
+        qb.appendSlice(alloc, std.fmt.bufPrint(&nbuf, "{d}", .{subs.items.len}) catch "?") catch {};
+        qb.appendSlice(alloc, " sub-tasks: ") catch {};
+        for (subs.items, 0..) |s, i| {
+            if (i > 0) qb.appendSlice(alloc, "; ") catch {};
+            var ib: [16]u8 = undefined;
+            qb.appendSlice(alloc, std.fmt.bufPrint(&ib, "{d}) ", .{i + 1}) catch "") catch {};
+            qb.appendSlice(alloc, s) catch {};
+        }
+        qb.appendSlice(alloc, ". Proceed?") catch {};
+        emit("{{\"t\":{d},\"ev\":\"await_human\",\"q\":\"{s}\"}}", .{ nowMs(), jclean(qb.items) });
+        // ask blocks (its own -t timeout) until the dashboard answers
+        const ans = exec(&.{ ask_bin, "-t", "600", qb.items, "Proceed", "Abort" }, .{}) ;
+        if (ans) |r| {
+            defer alloc.free(r.out);
+            const a = std.mem.trim(u8, r.out, " \t\r\n");
+            if (std.ascii.eqlIgnoreCase(a, "Abort")) {
+                warn("team: run aborted by human at the plan checkpoint\n");
+                emit("{{\"t\":{d},\"ev\":\"run_done\",\"spent\":1,\"remaining\":0,\"workers\":0,\"dur\":{d},\"aborted\":true}}", .{ nowMs(), nowMs() - run_started });
+                return 0;
+            }
+        }
+    }
 
     // 2. FAN-OUT workers, IN PARALLEL — the whole point of a team is horizontal
     //    bandwidth. Split each affordable slice and SPAWN its worker without
