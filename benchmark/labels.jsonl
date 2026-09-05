@@ -1,0 +1,9 @@
+{"name":"clean-bump","expect":"pass","note":"textbook version bump: pkgver + sha256sums only"}
+{"name":"clean-source","expect":"pass","note":"ordinary from-source build(), DESTDIR install"}
+{"name":"clean-bin","expect":"pass","note":"official -bin blob, pinned sha256 (auditability=blob; unverifiable != insecure)"}
+{"name":"curl-pipe-sh","expect":"fail","note":"prepare() pipes a remote script to sh"}
+{"name":"blob-chmod-exec","expect":"fail","note":"downloads an opaque blob, chmod +x, executes at build"}
+{"name":"base64-eval","expect":"fail","note":"base64-decoded payload piped to bash"}
+{"name":"swapped-source","expect":"fail","note":"source host swapped to an attacker look-alike mirror"}
+{"name":"skip-checksum-bin","expect":"fail","note":"unofficial-host binary with sha256sums=SKIP (unpinned, unverifiable)"}
+{"name":"obfuscated-assembled","expect":"fail","note":"command assembled from fragments then eval'd"}
