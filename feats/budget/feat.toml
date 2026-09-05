@@ -1,0 +1,5 @@
+name = "budget"
+version = "0.1.0"
+tier = "standard"
+bin = "budget"
+help = "conservation ledger for agent spawn trees (spawn = subdivide): budget new/split/spend/balance"
