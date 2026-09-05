@@ -1,4 +1,4 @@
-# pkgbuild-review-v1 — the rubric aurev scores an AUR PKGBUILD (or its diff)
+# pkgbuild-review-v1 — the rubric `aur` scores an AUR PKGBUILD (or its diff)
 # against, before `yay` builds it.
 #
 # The threat model is specific: a PKGBUILD is arbitrary shell that runs as you
@@ -10,10 +10,28 @@
 # judge the CHANGE — does it match a plausible version bump, or does it sneak
 # in unrelated behavior?
 #
-# Advisory to the user on their own machine: aurev prints the verdict, the user
-# still sees the raw diff and decides. Data, never a gate.
+# The same rubric drives both `aur` verbs: `aur review` (advisory pager — prints
+# the verdict, still shows the raw diff, you decide) and `aur check` (the gate
+# that blocks an upgrade on a failed verdict). The rubric is data; the posture
+# lives in the caller.
 
 rubric_id = "pkgbuild-review-v1"
+
+# --- output: auditability (a fact, not a score) -----------------------------
+# Also emit an "auditability" field in the verdict: "source" if the package
+# builds the software from reviewable source, or "blob" if it installs a
+# prebuilt binary/opaque payload (a `-bin` package, a downloaded tarball of
+# compiled artifacts, minified bundles). This is derived from the PKGBUILD
+# alone, so it is stable per content hash and safe to cache/share.
+#
+# IMPORTANT: a "blob" is UNVERIFIABLE, not unsafe. Do NOT fail a package merely
+# for being a blob — you cannot audit the payload, and most real installs are
+# blobs (chrome, zoom, claude-code). Judge only what the PKGBUILD lets you:
+# packaging safety, pinned provenance (official host + present checksum), and
+# change-shape. A clean, pinned blob PASSES; the caller renders it as
+# "trusting the vendor", not as a red flag. Reserve FAIL for a hostile
+# PKGBUILD, an unpinned/SKIP'd source, or a source host that doesn't match
+# upstream — the things that are actually reviewable.
 
 # --- dimension: safety (dominant) -------------------------------------------
 [safety]

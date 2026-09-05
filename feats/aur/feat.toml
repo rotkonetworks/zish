@@ -1,0 +1,5 @@
+name = "aur"
+version = "0.1.0"
+tier = "standard"
+bin = "aur"
+help = "reviewed-AUR-upgrade gate: 'aur check && yay -Syu' blocks the build on a failed PKGBUILD review"
