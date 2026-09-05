@@ -1,0 +1,6 @@
+name = "team"
+version = "0.1.0"
+tier = "standard"
+bin = "team"
+help = "budget-bounded agent swarm: Captain decomposes, workers fan out, a mandatory critic refutes, then synthesis — the tree never exceeds its root budget"
+usage = "team run <root-budget> <task...>   # needs the agent + budget feats"
