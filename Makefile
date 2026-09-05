@@ -55,6 +55,7 @@ test: build
 	./tests/aur_test.sh
 	./tests/budget_test.sh
 	./tests/verify_test.sh
+	./tests/ask_test.sh
 	./tests/team_test.sh
 	./benchmark/run.sh --selftest
 
@@ -64,9 +65,9 @@ test-pty: build
 # ---- standard feats (python-replacement tier) ----
 # Compiles feats/<name>/main.zig and stages bin + feat.toml into the registry.
 ZISH_FEAT_DIR ?= $(HOME)/.zish/feats/standard
-FEAT_NAMES := cnt pk frq snf jls calc para agent gf aur budget verify team
+FEAT_NAMES := cnt pk frq snf jls calc para agent gf aur budget verify ask team
 # Feats needing libc (para uses execvp for PATH+env resolution).
-FEAT_LIBC := para agent gf aur budget verify team
+FEAT_LIBC := para agent gf aur budget verify ask team
 
 .PHONY: feats
 feats:

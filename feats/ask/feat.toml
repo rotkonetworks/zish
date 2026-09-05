@@ -1,0 +1,5 @@
+name = "ask"
+version = "0.1.0"
+tier = "standard"
+bin = "ask"
+help = "pose a question to the human (up to 4 options, or open-ended) and block until they answer in the dashboard"
