@@ -258,6 +258,167 @@ else
     bad "make dist-agent produced no tarball"
 fi
 
+# ---- install-by-name: the feat index (crates.io-for-feats, minimal) --------
+# A static JSONL index maps name -> {url, sha256}. `gf install <name>` resolves
+# against it and PINS the sha: the index is the trust root, gf refuses any bytes
+# that don't match. No server — just a file:// URL here.
+IS="$T/stage-idx"; mkdir -p "$IS/bin"
+cat > "$IS/feat.toml" <<'EOF'
+name = "idxdemo"
+tier = "standard"
+bin = "idxdemo"
+EOF
+printf '#!/bin/sh\necho idxdemo-ran\n' > "$IS/bin/idxdemo"
+pack "$IS" "$T/idxdemo.tar.gz"
+IDX_SHA=$(sha256sum "$T/idxdemo.tar.gz" | cut -d' ' -f1)
+
+# a good index (correct sha) and a tampered one (wrong sha)
+printf '{"name":"idxdemo","url":"file://%s/idxdemo.tar.gz","sha256":"%s","version":"0.1.0"}\n' "$T" "$IDX_SHA" > "$T/index.jsonl"
+printf '{"name":"idxdemo","url":"file://%s/idxdemo.tar.gz","sha256":"%s","version":"0.1.0"}\n' "$T" "0000000000000000000000000000000000000000000000000000000000000000" > "$T/index-bad.jsonl"
+
+IGF() { HOME="$T/home" ZISH_FEAT_PATH="$T/feats" ZISH_FEAT_INDEX="file://$1" "$T/gf" "${@:2}"; }
+
+if IGF "$T/index.jsonl" install idxdemo >"$T/oi1" 2>&1 && [ -x "$T/feats/extra/idxdemo/bin/idxdemo" ]; then
+    ok "gf install <name> resolves the index and installs"
+else
+    bad "install-by-name failed: $(cat "$T/oi1")"
+fi
+
+# the ledger records it under the same content hash the index pinned
+if grep -q "\"sha256\":\"$IDX_SHA\"" "$T/feats/ledger.jsonl" 2>/dev/null; then
+    ok "install-by-name attested under the index's sha256"
+else
+    bad "ledger missing the pinned sha: $(cat "$T/feats/ledger.jsonl" 2>/dev/null)"
+fi
+
+# tampered index (wrong sha) must be refused, nothing staged
+rm -rf "$T/feats/extra/idxdemo"
+if IGF "$T/index-bad.jsonl" install idxdemo >"$T/oi2" 2>&1; then
+    bad "sha mismatch was NOT refused"
+else
+    grep -q "mismatch" "$T/oi2" && ok "sha mismatch refused (index is the trust root)" || bad "wrong error: $(cat "$T/oi2")"
+    [ ! -e "$T/feats/extra/idxdemo" ] && ok "nothing staged on a mismatch" || bad "feat staged despite mismatch"
+fi
+
+# unknown name -> a clear miss, not a crash
+if IGF "$T/index.jsonl" install nope >"$T/oi3" 2>&1; then
+    bad "unknown name unexpectedly succeeded"
+else
+    grep -q "not found in the feat index" "$T/oi3" && ok "unknown name reports an index miss" || bad "wrong miss error: $(cat "$T/oi3")"
+fi
+
+# no index configured -> honest error (no fake default)
+if HOME="$T/home" ZISH_FEAT_PATH="$T/feats" "$T/gf" install idxdemo >"$T/oi4" 2>&1; then
+    bad "install with no index configured unexpectedly succeeded"
+else
+    grep -q "no feat index configured" "$T/oi4" && ok "missing index URL is a clear error" || bad "wrong no-index error: $(cat "$T/oi4")"
+fi
+
+# ---- install from a git user-repo (the publish model: git + a pinned ref) --
+# A user publishes a feat as a git repo (feat.toml + src/); the index maps the
+# name to {git, ref}. gf clones at the ref, builds via the source-package path
+# (no publisher script is ever run), and installs. The ref is the trust root.
+G="$T/repo-hello"; mkdir -p "$G/src"
+cat > "$G/feat.toml" <<'EOF'
+name = "hellofeat"
+tier = "standard"
+bin = "hellofeat"
+src = "main.zig"
+lang = "zig"
+EOF
+printf 'pub fn main() void {}\n' > "$G/src/main.zig"
+git -C "$G" init -q
+git -C "$G" add -A
+git -C "$G" -c user.name=t -c user.email=t@t commit -qm init
+git -C "$G" tag v0.1.0
+
+printf '{"name":"hellofeat","git":"file://%s","ref":"v0.1.0"}\n' "$G" > "$T/index-git.jsonl"
+printf '{"name":"hellofeat","git":"file://%s","ref":"v9.9.9"}\n' "$G" > "$T/index-git-bad.jsonl"
+
+if IGF "$T/index-git.jsonl" install hellofeat >"$T/og1" 2>&1 && [ -x "$T/feats/extra/hellofeat/bin/hellofeat" ]; then
+    ok "gf install <name> clones a git user-repo at its ref and builds it"
+else
+    bad "git-install failed: $(cat "$T/og1")"
+fi
+
+[ ! -e "$T/feats/extra/hellofeat/.git" ] && ok "git install does not stage .git into the tier" || bad ".git leaked into the installed feat"
+grep -q '"name":"hellofeat"' "$T/feats/ledger.jsonl" 2>/dev/null && ok "git install attested in the ledger" || bad "git install not in ledger"
+
+# a ref that doesn't exist -> refused, nothing staged
+rm -rf "$T/feats/extra/hellofeat"
+if IGF "$T/index-git-bad.jsonl" install hellofeat >"$T/og2" 2>&1; then
+    bad "bad git ref was NOT refused"
+else
+    grep -q "checkout" "$T/og2" && ok "unknown git ref refused (ref is the pin)" || bad "wrong error: $(cat "$T/og2")"
+    [ ! -e "$T/feats/extra/hellofeat" ] && ok "nothing staged on a bad ref" || bad "feat staged despite bad ref"
+fi
+
+# ---- gf publish (cargo-style) + signed-tag verification on install ---------
+# A publisher signs a release tag with their ssh key; the index line carries the
+# publisher pubkey; gf install verifies the tag against it before building. This
+# binds the ref to the publisher cryptographically (not just immutability).
+if ! command -v ssh-keygen >/dev/null 2>&1; then
+    printf '  \033[33mSKIP\033[0m ssh-keygen not available — publish/verify tests skipped\n'
+else
+    ssh-keygen -q -t ed25519 -N '' -C 'pub@zish' -f "$T/pubkey" </dev/null
+    ssh-keygen -q -t ed25519 -N '' -f "$T/otherkey" </dev/null
+    git init -q --bare "$T/origin.git"
+    mkdir -p "$T/wf/src"
+    cat > "$T/wf/feat.toml" <<'EOF'
+name = "signedfeat"
+tier = "standard"
+bin = "signedfeat"
+src = "main.zig"
+lang = "zig"
+version = "v0.1.0"
+EOF
+    printf 'pub fn main() void {}\n' > "$T/wf/src/main.zig"
+    git -C "$T/wf" init -q
+    git -C "$T/wf" config user.email d@e
+    git -C "$T/wf" config user.name d
+    git -C "$T/wf" add -A
+    git -C "$T/wf" commit -qm init
+    git -C "$T/wf" remote add origin "file://$T/origin.git"
+    git -C "$T/wf" push -q -u origin HEAD
+
+    # publish: sign+push the tag, append the index line to a local index file
+    HOME="$T/home" ZISH_FEAT_PATH="$T/feats" ZISH_SIGN_KEY="$T/pubkey" \
+        ZISH_FEAT_INDEX="$T/pubindex.jsonl" "$T/gf" publish "$T/wf" >"$T/pub.out" 2>&1
+    if grep -q '"publisher":"' "$T/pubindex.jsonl" 2>/dev/null && grep -q '"ref":"v0.1.0"' "$T/pubindex.jsonl" 2>/dev/null; then
+        ok "gf publish signs a tag and emits an index line with the publisher key"
+    else
+        bad "publish did not index: $(cat "$T/pub.out" "$T/pubindex.jsonl" 2>/dev/null)"
+    fi
+
+    if IGF "$T/pubindex.jsonl" install signedfeat >"$T/ins.out" 2>&1 && [ -x "$T/feats/extra/signedfeat/bin/signedfeat" ]; then
+        ok "gf install verifies the publisher signature and installs"
+    else
+        bad "signed install failed: $(cat "$T/ins.out")"
+    fi
+    grep -q "signature verified" "$T/ins.out" && ok "install reports the verified signature" || bad "no verify message: $(cat "$T/ins.out")"
+
+    # tamper: swap the publisher key to a different one -> install must refuse
+    rm -rf "$T/feats/extra/signedfeat"
+    otherpub=$(cut -d' ' -f1,2 "$T/otherkey.pub")
+    python3 - "$T/pubindex.jsonl" "$T/badpub.jsonl" "$otherpub" <<'PY'
+import json, sys
+out = open(sys.argv[2], "w")
+for l in open(sys.argv[1]):
+    if not l.strip(): continue
+    d = json.loads(l); d["publisher"] = sys.argv[3]
+    out.write(json.dumps(d) + "\n")
+PY
+    if IGF "$T/badpub.jsonl" install signedfeat >"$T/bad.out" 2>&1; then
+        bad "install accepted a wrong publisher key!"
+    else
+        grep -q "signature check failed" "$T/bad.out" && ok "wrong publisher key refused (fail-closed)" || bad "wrong error: $(cat "$T/bad.out")"
+        [ ! -e "$T/feats/extra/signedfeat" ] && ok "nothing staged when the signature fails" || bad "feat staged despite bad signature"
+    fi
+
+    so=$(IGF "$T/pubindex.jsonl" search signed 2>&1)
+    case "$so" in *"signedfeat"*"[signed]"*) ok "gf search finds the feat and flags it signed" ;; *) bad "search: $so" ;; esac
+fi
+
 echo
 total=$((pass+fail))
 if [ "$fail" -eq 0 ]; then

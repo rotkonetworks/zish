@@ -873,14 +873,253 @@ fn featRootPath(buf: []u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s}/.zish/feats", .{home}) catch null;
 }
 
+/// A feat index entry, resolved by name. The index is the "crates.io for feats"
+/// piece — but minimal: a single static JSONL file (one object per line,
+/// `{"name":..,"url":..,"sha256":..,"version":..}`) hosted anywhere. No server,
+/// no accounts. The index is the trust root; the sha is the join key that
+/// `gf install <name>` pins against.
+// An index entry resolves to one of two delivery shapes:
+//   git entry:     {"name","git","ref",...}      -> clone the user-repo at ref
+//   tarball entry: {"name","url","sha256",...}    -> fetch prebuilt bytes, sha-pin
+// git is the user-repository path (publish = git push + one index line); tarball
+// is for prebuilt/bootstrap artifacts (e.g. gf installing itself). The trust
+// root is the ref (immutable commit/tag) for git, the sha for tarballs.
+const ResolvedKind = enum { git, tarball };
+const Resolved = struct { kind: ResolvedKind, loc: []const u8, pin: []const u8, publisher: ?[]const u8 };
+
+/// Fetch the index body (curl, protocol-restricted, size-capped). Caller frees.
+fn fetchIndex(idx_url: []const u8) ?[]u8 {
+    var uz: [4096]u8 = undefined;
+    const up = toZ(&uz, idx_url) orelse return null;
+    const argv = [_:null]?[*:0]const u8{
+        "env",            "curl", "-fsSL",     "--max-time", "60", "--proto", "=http,https,file",
+        "--max-filesize", "4194304",           up,           null,
+    };
+    return execCapture(&argv);
+}
+
+fn resolveIndex(idx_url: []const u8, name: []const u8) ?Resolved {
+    const data = fetchIndex(idx_url) orelse return null;
+    defer alloc.free(data);
+    // last match wins: republishing appends a newer line for the same name, so
+    // the newest entry (later in the file) supersedes — cargo-like versioning.
+    var found: ?Resolved = null;
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |ln| {
+        const line = std.mem.trim(u8, ln, " \t\r");
+        if (line.len == 0) continue;
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch continue;
+        defer parsed.deinit();
+        const nm = objStr2(parsed.value, "name") orelse continue;
+        if (!std.mem.eql(u8, nm, name)) continue;
+        // build the candidate; on success, free any prior match and keep this one
+        const cand: ?Resolved = blk: {
+            // git entry (user-repo) takes precedence; it MUST pin a ref.
+            if (objStr2(parsed.value, "git")) |g| {
+                const ref = objStr2(parsed.value, "ref") orelse break :blk null;
+                const pubkey = objStr2(parsed.value, "publisher");
+                break :blk Resolved{
+                    .kind = .git,
+                    .loc = alloc.dupe(u8, g) catch break :blk null,
+                    .pin = alloc.dupe(u8, ref) catch break :blk null,
+                    .publisher = if (pubkey) |p| (alloc.dupe(u8, p) catch null) else null,
+                };
+            }
+            if (objStr2(parsed.value, "url")) |u| {
+                const sha = objStr2(parsed.value, "sha256") orelse break :blk null;
+                break :blk Resolved{
+                    .kind = .tarball,
+                    .loc = alloc.dupe(u8, u) catch break :blk null,
+                    .pin = alloc.dupe(u8, sha) catch break :blk null,
+                    .publisher = null,
+                };
+            }
+            break :blk null;
+        };
+        if (cand) |c| {
+            if (found) |old| {
+                alloc.free(old.loc);
+                alloc.free(old.pin);
+                if (old.publisher) |p| alloc.free(p);
+            }
+            found = c;
+        }
+    }
+    return found;
+}
+
+/// The first two whitespace fields of an ssh .pub line ("ssh-ed25519 AAAA…"),
+/// dropping any trailing comment.
+fn pubField2(raw: []const u8) []const u8 {
+    const t = std.mem.trim(u8, raw, " \t\r\n");
+    var it = std.mem.tokenizeAny(u8, t, " \t");
+    _ = it.next() orelse return t;
+    const b = it.next() orelse return t;
+    return t[0 .. (@intFromPtr(b.ptr) - @intFromPtr(t.ptr)) + b.len];
+}
+
+/// Append `s` to a JSON string, dropping quotes/backslashes/control chars.
+/// The fields here are structured tokens (name, ref, url, base64 key) that
+/// never legitimately contain those, so this is a sanitizer, not an escaper.
+fn appendClean(o: *std.ArrayListUnmanaged(u8), s: []const u8) void {
+    for (s) |c| if (c >= 0x20 and c != '"' and c != '\\') o.append(alloc, c) catch {};
+}
+
+/// Append a line to a local index file (O_APPEND|O_CREAT). Returns false on error.
+fn appendLine(path: []const u8, line: []const u8) bool {
+    var z: [4096]u8 = undefined;
+    const p = toZ(&z, path) orelse return false;
+    const fd_rc = linux.open(p, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o644);
+    const fd: isize = @bitCast(fd_rc);
+    if (fd < 0) return false;
+    defer _ = linux.close(@intCast(fd));
+    return @as(isize, @bitCast(linux.write(@intCast(fd), line.ptr, line.len))) == @as(isize, @intCast(line.len));
+}
+
+/// `gf publish [dir]` — the cargo-easy write side. In a feat repo it cuts a
+/// signed tag from feat.toml's version, pushes it, and emits (or appends) the
+/// index line binding name → repo → ref → publisher key. One key signs both
+/// your published tags and your review verdicts.
+fn cmdPublish(dir_arg: ?[]const u8) u8 {
+    const dir = dir_arg orelse ".";
+    const key = getEnv("ZISH_SIGN_KEY") orelse
+        return fail("set ZISH_SIGN_KEY to your ssh signing key (the same key that signs your reviews)", .{});
+
+    var mb: [4096]u8 = undefined;
+    const mfp = std.fmt.bufPrint(&mb, "{s}/feat.toml", .{dir}) catch return fail("path too long", .{});
+    const content = readFileAlloc(mfp, 1 << 20) orelse
+        return fail("no feat.toml in {s} — run publish inside a feat repo", .{dir});
+    defer alloc.free(content);
+    const name = manifestField(content, "name") orelse return fail("feat.toml has no name", .{});
+    if (!validName(name)) return fail("invalid feat name in feat.toml", .{});
+    const ver = manifestField(content, "version") orelse
+        return fail("feat.toml needs a version = \"vX.Y.Z\" line to publish", .{});
+
+    var dz: [4096]u8 = undefined;
+    const dp = toZ(&dz, dir) orelse return 1;
+    {
+        const argv = [_:null]?[*:0]const u8{ "env", "git", "-C", dp, "rev-parse", "--is-inside-work-tree", null };
+        if (execStatus(&argv) != 0) return fail("{s} is not a git repository", .{dir});
+    }
+    const origin_raw = blk: {
+        const argv = [_:null]?[*:0]const u8{ "env", "git", "-C", dp, "remote", "get-url", "origin", null };
+        break :blk execCapture(&argv) orelse
+            return fail("no 'origin' remote — add one: git -C {s} remote add origin <url>", .{dir});
+    };
+    defer alloc.free(origin_raw);
+    const origin = std.mem.trim(u8, origin_raw, " \t\r\n");
+    if (origin.len == 0) return fail("origin remote is empty", .{});
+
+    var rz: [512]u8 = undefined;
+    const rp = toZ(&rz, ver) orelse return fail("version too long", .{});
+    var skb: [4096]u8 = undefined;
+    const skcfg = std.fmt.bufPrint(&skb, "user.signingkey={s}", .{key}) catch return 1;
+    var skz: [4096]u8 = undefined;
+    const skp = toZ(&skz, skcfg) orelse return 1;
+    var msgb: [600]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msgb, "release {s}", .{ver}) catch return 1;
+    var msgz: [600]u8 = undefined;
+    const mp = toZ(&msgz, msg) orelse return 1;
+    {
+        // signed annotated tag: ssh format, key from ZISH_SIGN_KEY
+        const argv = [_:null]?[*:0]const u8{ "env", "git", "-C", dp, "-c", "gpg.format=ssh", "-c", skp, "tag", "-s", rp, "-m", mp, null };
+        if (execStatus(&argv) != 0)
+            return fail("could not create signed tag {s} (already exists, or key {s} unreadable?)", .{ ver, key });
+    }
+    {
+        const argv = [_:null]?[*:0]const u8{ "env", "git", "-C", dp, "push", "origin", rp, null };
+        if (execStatus(&argv) != 0) return fail("git push origin {s} failed", .{ver});
+    }
+
+    var pkb: [4096]u8 = undefined;
+    const pkp = std.fmt.bufPrint(&pkb, "{s}.pub", .{key}) catch return 1;
+    const pubraw = readFileAlloc(pkp, 8192) orelse return fail("could not read the public key {s}.pub", .{key});
+    defer alloc.free(pubraw);
+    const pubkey = pubField2(pubraw);
+
+    var line: std.ArrayListUnmanaged(u8) = .empty;
+    defer line.deinit(alloc);
+    line.appendSlice(alloc, "{\"name\":\"") catch return 1;
+    appendClean(&line, name);
+    line.appendSlice(alloc, "\",\"git\":\"") catch return 1;
+    appendClean(&line, origin);
+    line.appendSlice(alloc, "\",\"ref\":\"") catch return 1;
+    appendClean(&line, ver);
+    line.appendSlice(alloc, "\",\"publisher\":\"") catch return 1;
+    appendClean(&line, pubkey);
+    line.appendSlice(alloc, "\"}\n") catch return 1;
+
+    // If the index is a local file we control, append the line automatically
+    // (cargo-to-crates.io ease). Otherwise print it for the user to add.
+    if (getEnv("ZISH_FEAT_INDEX")) |idx| {
+        const local: ?[]const u8 = if (std.mem.startsWith(u8, idx, "file://"))
+            idx[7..]
+        else if (std.mem.indexOf(u8, idx, "://") == null)
+            idx
+        else
+            null;
+        if (local) |p| {
+            if (appendLine(p, line.items)) {
+                print("published {s} {s} → {s}\nindexed in {s} (newest line wins)\n", .{ name, ver, origin, p });
+                return 0;
+            }
+            print("published {s} {s}, but could not write the index at {s}; add this line yourself:\n", .{ name, ver, p });
+        }
+    }
+    print("published {s} {s} → {s}\nadd this line to your feat index:\n", .{ name, ver, origin });
+    print("{s}", .{line.items});
+    return 0;
+}
+
+/// `gf search [query]` — AUR-style discovery over the index (substring on name;
+/// empty query lists everything).
+fn cmdSearch(query: []const u8) u8 {
+    const idx = getEnv("ZISH_FEAT_INDEX") orelse
+        return fail("no feat index configured — set ZISH_FEAT_INDEX to an index URL", .{});
+    const data = fetchIndex(idx) orelse return fail("could not fetch the index ({s})", .{idx});
+    defer alloc.free(data);
+    var n: usize = 0;
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |ln| {
+        const line = std.mem.trim(u8, ln, " \t\r");
+        if (line.len == 0) continue;
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch continue;
+        defer parsed.deinit();
+        const nm = objStr2(parsed.value, "name") orelse continue;
+        if (query.len != 0 and std.mem.indexOf(u8, nm, query) == null) continue;
+        const ref = objStr2(parsed.value, "ref") orelse objStr2(parsed.value, "sha256") orelse "";
+        const loc = objStr2(parsed.value, "git") orelse objStr2(parsed.value, "url") orelse "";
+        const signed = if (objStr2(parsed.value, "publisher") != null) " [signed]" else "";
+        print("{s}  {s}  {s}{s}\n", .{ nm, ref, loc, signed });
+        n += 1;
+    }
+    if (n == 0) print("no feats match \"{s}\"\n", .{query});
+    return 0;
+}
+
 fn run(init: std.process.Init.Minimal) u8 {
     var args = std.process.Args.Iterator.init(init.args);
     _ = args.next(); // argv0
     const first = args.next() orelse {
-        print("usage: gf <url>              fetch a feat tarball, install into the extra tier\n" ++
+        print("usage: gf <url>                 fetch a feat tarball, install into the extra tier\n" ++
+            "       gf install <name>          install a feat by name from the feat index (pinned + verified)\n" ++
+            "       gf search [query]          find feats in the index (AUR-style)\n" ++
+            "       gf publish [dir]           sign + push a release tag, emit the index line (cargo-style)\n" ++
             "       gf status [feat] [--json]  show install + review history (the ledger fold)\n", .{});
         return 1;
     };
+
+    if (std.mem.eql(u8, first, "search")) {
+        const q = args.next() orelse "";
+        if (args.next() != null) return fail("usage: gf search [query]", .{});
+        return cmdSearch(q);
+    }
+
+    if (std.mem.eql(u8, first, "publish")) {
+        const dir = args.next();
+        if (args.next() != null) return fail("usage: gf publish [dir]", .{});
+        return cmdPublish(dir);
+    }
 
     // `gf status [feat] [--json]` — the read-side fold over the ledger.
     if (std.mem.eql(u8, first, "status")) {
@@ -894,8 +1133,32 @@ fn run(init: std.process.Init.Minimal) u8 {
         return cmdStatus(root, name, json);
     }
 
-    const url = first;
-    if (args.next() != null) return fail("unexpected extra argument", .{});
+    // Resolve the target: a bare URL, or `install <name>` against the feat
+    // index. Install-by-name PINS the sha — the index is the trust root, so gf
+    // refuses any downloaded bytes that don't match what the index declares.
+    var expected_sha: ?[]const u8 = null; // tarball pin (index sha256)
+    var git_ref: ?[]const u8 = null; // git pin (index ref: commit/tag)
+    var publisher: ?[]const u8 = null; // git: index-declared signing pubkey
+    const url = blk: {
+        if (std.mem.eql(u8, first, "install")) {
+            const name_arg = args.next() orelse return fail("usage: gf install <name>", .{});
+            if (args.next() != null) return fail("unexpected extra argument", .{});
+            const idx_url = getEnv("ZISH_FEAT_INDEX") orelse
+                return fail("no feat index configured — set ZISH_FEAT_INDEX to an index URL", .{});
+            const r = resolveIndex(idx_url, name_arg) orelse
+                return fail("{s} not found in the feat index ({s})", .{ name_arg, idx_url });
+            switch (r.kind) {
+                .tarball => expected_sha = r.pin,
+                .git => {
+                    git_ref = r.pin;
+                    publisher = r.publisher;
+                },
+            }
+            break :blk r.loc;
+        }
+        if (args.next() != null) return fail("unexpected extra argument", .{});
+        break :blk first;
+    };
 
     // feat root: same resolution as zish (ZISH_FEAT_PATH overrides)
     var root_buf: [4096]u8 = undefined;
@@ -913,46 +1176,114 @@ fn run(init: std.process.Init.Minimal) u8 {
     var cleanup_tmp = true;
     defer if (cleanup_tmp) rmRf(tmp);
 
-    // download (protocol-restricted; file:// is what the test suite uses)
-    var ar_buf: [4096]u8 = undefined;
-    const archive = std.fmt.bufPrint(&ar_buf, "{s}/archive.tar.gz", .{tmp}) catch return fail("path too long", .{});
-    {
-        var az: [4096]u8 = undefined;
+    // Fetch the payload into `tmp` (feat.toml at the top, bin/ or src/ beside
+    // it) by one of two paths: clone a git user-repo at its pinned ref, or
+    // download + extract a tarball.
+    var sha: []const u8 = ""; // ledger content hash; set per path
+    if (git_ref) |ref| {
+        // git user-repo install: clone the publisher's repo and check out the
+        // PINNED ref (an immutable commit/tag — the trust root). We never run a
+        // publisher-supplied build script: the source-package path below builds
+        // the declared source via gf's own fixed template. GIT_ALLOW_PROTOCOL
+        // fences off ext::/other transports on the clone.
         var uz: [4096]u8 = undefined;
-        const ap = toZ(&az, archive) orelse return fail("path too long", .{});
-        const up = toZ(&uz, url) orelse return fail("url too long", .{});
-        var szbuf: [24]u8 = undefined;
-        var szz: [24]u8 = undefined;
-        const szs = std.fmt.bufPrint(&szbuf, "{d}", .{MAX_ARCHIVE}) catch return 1;
-        const szp = toZ(&szz, szs) orelse return 1;
-        const argv = [_:null]?[*:0]const u8{
-            "env",            "curl", "-fsSL", "--max-time", "300", "--proto", "=http,https,file",
-            "--max-filesize", szp,
-            "-o",             ap,
-            up,
-            null,
-        };
-        const st = execStatus(&argv);
-        if (st != 0) return fail("download failed (curl exit {d}): {s}", .{ st, url });
-    }
-    // curl's --max-filesize misses some servers; verify the landed size too
-    const sz = fileSize(archive) orelse return fail("download produced no file", .{});
-    if (sz > MAX_ARCHIVE) return fail("archive exceeds {d} bytes", .{MAX_ARCHIVE});
-
-    // extract into the temp dir
-    {
-        var az: [4096]u8 = undefined;
         var tz: [4096]u8 = undefined;
-        const ap = toZ(&az, archive) orelse return 1;
+        var rz: [4096]u8 = undefined;
+        const up = toZ(&uz, url) orelse return fail("url too long", .{});
         const tp = toZ(&tz, tmp) orelse return 1;
-        const argv = [_:null]?[*:0]const u8{ "env", "tar", "-xzf", ap, "-C", tp, null };
-        const st = execStatus(&argv);
-        if (st != 0) return fail("extract failed (tar exit {d})", .{st});
+        const rp = toZ(&rz, ref) orelse return fail("ref too long", .{});
+        {
+            const argv = [_:null]?[*:0]const u8{
+                "env", "GIT_ALLOW_PROTOCOL=file:git:http:https:ssh", "GIT_TERMINAL_PROMPT=0",
+                "git", "clone", "--quiet", up, tp, null,
+            };
+            if (execStatus(&argv) != 0) return fail("git clone failed: {s}", .{url});
+        }
+        {
+            const argv = [_:null]?[*:0]const u8{
+                "env", "git", "-C", tp, "-c", "advice.detachedHead=false", "checkout", "--quiet", rp, null,
+            };
+            if (execStatus(&argv) != 0) return fail("git checkout {s} failed (ref not found in {s}?)", .{ ref, url });
+        }
+        // When the index declares a publisher key, the ref MUST be a tag signed
+        // by that key. We verify with a wildcard-principal allowed_signers (the
+        // tagger's email is irrelevant — only "signed by THIS key" matters), so
+        // the ref becomes cryptographically bound to the publisher, not just
+        // immutable. Fail-closed: a missing/unsigned/wrong-key tag refuses.
+        if (publisher) |pk| {
+            // allowed_signers lives OUTSIDE the clone tree (a sibling of tmp) so
+            // it is never renamed into the installed feat.
+            var af_buf: [4096]u8 = undefined;
+            const af = std.fmt.bufPrint(&af_buf, "{s}.allowed", .{tmp}) catch return 1;
+            var al_buf: [4096]u8 = undefined;
+            const al = std.fmt.bufPrint(&al_buf, "* namespaces=\"git\" {s}\n", .{pk}) catch return fail("publisher key too long", .{});
+            if (!writeFile(af, al, 0o600)) return fail("could not stage the publisher key", .{});
+            var cfg: [4096]u8 = undefined;
+            const cfgval = std.fmt.bufPrint(&cfg, "gpg.ssh.allowedSignersFile={s}", .{af}) catch return 1;
+            var cfgz: [4096]u8 = undefined;
+            const cfgp = toZ(&cfgz, cfgval) orelse return 1;
+            const argv = [_:null]?[*:0]const u8{
+                "env", "git", "-C", tp, "-c", "gpg.format=ssh", "-c", cfgp, "tag", "-v", rp, null,
+            };
+            const vrc = execStatus(&argv);
+            rmRf(af);
+            if (vrc != 0)
+                return fail("publisher signature check failed for {s} — refusing (tag not signed by the index's publisher key)", .{ref});
+            print("gf: publisher signature verified ({s})\n", .{ref});
+        }
+        // drop .git so it is never staged into the tier
+        var gd_buf: [4096]u8 = undefined;
+        const gd = std.fmt.bufPrint(&gd_buf, "{s}/.git", .{tmp}) catch return 1;
+        rmRf(gd);
+        // The PIN is enforced above by checking out the immutable ref — not by a
+        // byte hash. The ledger sha256 for a git install is the hash of the
+        // installed artifact, computed after staging (below).
+    } else {
+        // download (protocol-restricted; file:// is what the test suite uses)
+        var ar_buf: [4096]u8 = undefined;
+        const archive = std.fmt.bufPrint(&ar_buf, "{s}/archive.tar.gz", .{tmp}) catch return fail("path too long", .{});
+        {
+            var az: [4096]u8 = undefined;
+            var uz: [4096]u8 = undefined;
+            const ap = toZ(&az, archive) orelse return fail("path too long", .{});
+            const up = toZ(&uz, url) orelse return fail("url too long", .{});
+            var szbuf: [24]u8 = undefined;
+            var szz: [24]u8 = undefined;
+            const szs = std.fmt.bufPrint(&szbuf, "{d}", .{MAX_ARCHIVE}) catch return 1;
+            const szp = toZ(&szz, szs) orelse return 1;
+            const argv = [_:null]?[*:0]const u8{
+                "env",            "curl", "-fsSL", "--max-time", "300", "--proto", "=http,https,file",
+                "--max-filesize", szp,
+                "-o",             ap,
+                up,
+                null,
+            };
+            const st = execStatus(&argv);
+            if (st != 0) return fail("download failed (curl exit {d}): {s}", .{ st, url });
+        }
+        // curl's --max-filesize misses some servers; verify the landed size too
+        const sz = fileSize(archive) orelse return fail("download produced no file", .{});
+        if (sz > MAX_ARCHIVE) return fail("archive exceeds {d} bytes", .{MAX_ARCHIVE});
+
+        // extract into the temp dir
+        {
+            var az: [4096]u8 = undefined;
+            var tz: [4096]u8 = undefined;
+            const ap = toZ(&az, archive) orelse return 1;
+            const tp = toZ(&tz, tmp) orelse return 1;
+            const argv = [_:null]?[*:0]const u8{ "env", "tar", "-xzf", ap, "-C", tp, null };
+            const st = execStatus(&argv);
+            if (st != 0) return fail("extract failed (tar exit {d})", .{st});
+        }
+        // hash the exact bytes; sha-pin to the index; then drop the archive
+        sha = sha256File(archive) orelse "";
+        if (expected_sha) |want| {
+            if (want.len != sha.len or !std.ascii.eqlIgnoreCase(want, sha))
+                return fail("sha256 mismatch: index expected {s}, downloaded {s} — refusing", .{ want, sha });
+        }
+        var az2: [4096]u8 = undefined;
+        if (toZ(&az2, archive)) |ap| _ = linux.unlink(ap);
     }
-    // hash the exact bytes that were installed, then drop the archive
-    const sha = sha256File(archive) orelse "";
-    var az2: [4096]u8 = undefined;
-    if (toZ(&az2, archive)) |ap| _ = linux.unlink(ap);
 
     // manifest: name + bin, charset-checked before they join any path
     var mf_buf: [4096]u8 = undefined;
@@ -1004,6 +1335,14 @@ fn run(init: std.process.Init.Minimal) u8 {
         const dp = toZ(&dz, dest) orelse return 1;
         if (@as(isize, @bitCast(linux.rename(tp, dp))) != 0) return fail("install rename failed", .{});
         cleanup_tmp = false;
+    }
+
+    // For a git install the content hash is the installed artifact (the ref
+    // enforced the pin, not a byte hash); compute it now that it's staged.
+    if (git_ref != null and sha.len == 0) {
+        var bz: [4096]u8 = undefined;
+        const bp = std.fmt.bufPrint(&bz, "{s}/bin/{s}", .{ dest, bin_name }) catch return 1;
+        sha = sha256File(bp) orelse "";
     }
 
     // attest the install in the append-only ledger (name, content hash,
