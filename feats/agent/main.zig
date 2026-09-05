@@ -1,6 +1,14 @@
-//! agent — the model loop (session feat). Drives an OpenRouter chat-completions
-//! model over the v0.3 frame protocol: the model's tool calls become `run`
-//! frames executed by zish, results feed back, final text becomes a `say`.
+//! agent — the model loop (session feat). Drives a chat-completions model over
+//! the v0.3 frame protocol: the model's tool calls become `run` frames executed
+//! by zish, results feed back, final text becomes a `say`.
+//!
+//! Backend (both the loop and `--judge`): default is OpenRouter. Set
+//!   ZISH_AGENT_BACKEND=ollama   [OLLAMA_HOST=host:port]   — local Ollama, no key
+//!   ZISH_AGENT_ENDPOINT=<url>                             — any OpenAI-compatible API
+//! Ollama uses its OpenAI-compatible /v1/chat/completions and needs no key; pass
+//! the locally-pulled model name with -m (e.g. -m qwen3:1.7b, -m qwen3.8:27b-mtp-q4_K_M).
+//! ZISH_AGENT_TIMEOUT=<seconds> (default 120) raises the per-request curl timeout —
+//! a big local model on CPU can take minutes per generation (27B ≈ 6 min here).
 //!
 //! Grammar (one-shot, the old `agent exec -p` shape):
 //!   agent [-m <model>] [--mock <file>] <query...>
@@ -368,7 +376,7 @@ fn writeFile600(path: []const u8, bytes: []const u8) bool {
 /// (auth header) lives in a 0600 --config file and the body in a --data @file,
 /// so the secret is never a process argument. Returns null on spawn/read
 /// failure (caller treats as retryable).
-fn fetchCurl(home: []const u8, key: []const u8, request: []const u8) ?HttpReply {
+fn fetchCurl(home: []const u8, endpoint: []const u8, key: []const u8, request: []const u8) ?HttpReply {
     // pid-suffixed so concurrent agent sessions never clobber each other's
     // request files; all three are unlinked before returning.
     const pid = linux.getpid();
@@ -384,11 +392,16 @@ fn fetchCurl(home: []const u8, key: []const u8, request: []const u8) ?HttpReply 
         unlinkPath(out_path);
     }
 
+    // Auth header only when a key is present (Ollama/local endpoints take none).
+    // The cfg file is written either way; an empty --config is valid.
     var cfg: std.ArrayListUnmanaged(u8) = .empty;
     defer cfg.deinit(alloc);
-    cfg.appendSlice(alloc, "header = \"Authorization: Bearer ") catch return null;
-    cfg.appendSlice(alloc, std.mem.trim(u8, key, " \t\r\n")) catch return null;
-    cfg.appendSlice(alloc, "\"\n") catch return null;
+    const kt = std.mem.trim(u8, key, " \t\r\n");
+    if (kt.len > 0) {
+        cfg.appendSlice(alloc, "header = \"Authorization: Bearer ") catch return null;
+        cfg.appendSlice(alloc, kt) catch return null;
+        cfg.appendSlice(alloc, "\"\n") catch return null;
+    }
     if (!writeFile600(cfg_path, cfg.items)) return null;
     if (!writeFile600(body_path, request)) return null;
 
@@ -400,16 +413,20 @@ fn fetchCurl(home: []const u8, key: []const u8, request: []const u8) ?HttpReply 
     const cfgz = std.fmt.bufPrintZ(&cfg_argz, "{s}", .{cfg_path}) catch return null;
     var out_argz: [4096]u8 = undefined;
     const outz = std.fmt.bufPrintZ(&out_argz, "{s}", .{out_path}) catch return null;
+    var ep_argz: [4096]u8 = undefined;
+    const epz = std.fmt.bufPrintZ(&ep_argz, "{s}", .{endpoint}) catch return null;
+    var to_argz: [8]u8 = undefined;
+    const toz = std.fmt.bufPrintZ(&to_argz, "{s}", .{timeoutStr()}) catch return null;
 
     const argv = [_:null]?[*:0]const u8{
-        "env", "curl", "-sS", "--max-time", "120",
+        "env", "curl", "-sS", "--max-time", toz.ptr,
         "--config", cfgz.ptr,
         "-H",       "Content-Type: application/json",
         "-X",       "POST",
         "--data",   data.ptr,
         "-o",       outz.ptr,
         "-w",       "%{http_code}",
-        ENDPOINT,
+        epz.ptr,
         null,
     };
 
@@ -479,6 +496,12 @@ pub fn main(init: std.process.Init.Minimal) void {
     if (hasJudgeFlag(init.args)) {
         linux.exit(runJudge(init.args));
     }
+    // --ask: one-shot plain-text completion (no tools, no session frames). This
+    // is the seam a plain caller like `team` drives — `agent --ask <prompt>` →
+    // the model's text on stdout — without speaking the session frame protocol.
+    if (hasAskFlag(init.args)) {
+        linux.exit(runAsk(init.args));
+    }
 
     // consume the hello frame (protocol v0.2+); we do not gate on caps here —
     // a run denial simply ends the loop via runCommand returning null.
@@ -514,14 +537,22 @@ pub fn main(init: std.process.Init.Minimal) void {
             emit("{\"t\":\"done\"}\n");
             return;
         };
-        var kbuf: [4096]u8 = undefined;
-        const kpath = std.fmt.bufPrint(&kbuf, "{s}/.zish/openrouter.key", .{home}) catch "";
-        key = readFileAlloc(kpath) orelse {
-            say("agent: no API key at ~/.zish/openrouter.key (create it, chmod 600)");
-            emit("{\"t\":\"done\"}\n");
-            return;
-        };
+        // OpenRouter needs the key file; Ollama/custom endpoints send it only if
+        // present (Ollama takes no auth at all).
+        if (agentNeedsKey() or getEnv("ZISH_AGENT_ENDPOINT") != null) {
+            var kbuf: [4096]u8 = undefined;
+            const kpath = std.fmt.bufPrint(&kbuf, "{s}/.zish/openrouter.key", .{home}) catch "";
+            if (readFileAlloc(kpath)) |k| {
+                key = k;
+            } else if (agentNeedsKey()) {
+                say("agent: no API key at ~/.zish/openrouter.key (create it, chmod 600)");
+                emit("{\"t\":\"done\"}\n");
+                return;
+            }
+        }
     }
+    var ep_buf: [512]u8 = undefined;
+    const endpoint = agentEndpoint(&ep_buf);
 
     // history seeds with the system prompt and the user's query
     var history: std.ArrayListUnmanaged(Message) = .empty;
@@ -534,7 +565,7 @@ pub fn main(init: std.process.Init.Minimal) void {
             say("agent: failed to build request");
             break;
         };
-        const reply = fetchWithBackoff(&mock, home, key, request) orelse {
+        const reply = fetchWithBackoff(&mock, home, endpoint, key, request) orelse {
             say("agent: request failed after retries");
             break;
         };
@@ -619,10 +650,10 @@ fn appendToolResult(history: *std.ArrayListUnmanaged(Message), id: []const u8, r
 
 /// One request with bounded exponential backoff on 429/5xx. Deterministic
 /// jitter (no clock in a feat): jitter derived from the attempt number.
-fn fetchWithBackoff(mock: *?Mock, home: []const u8, key: []const u8, request: []const u8) ?HttpReply {
+fn fetchWithBackoff(mock: *?Mock, home: []const u8, endpoint: []const u8, key: []const u8, request: []const u8) ?HttpReply {
     var attempt: usize = 0;
     while (attempt < MAX_RETRIES) : (attempt += 1) {
-        const reply = if (mock.*) |*m| m.next() else fetchCurl(home, key, request);
+        const reply = if (mock.*) |*m| m.next() else fetchCurl(home, endpoint, key, request);
         const r = reply orelse return null;
         if (r.status != 429 and r.status < 500) return r;
         // retryable: back off. base 200ms * 2^attempt + attempt*37ms jitter.
@@ -632,7 +663,7 @@ fn fetchWithBackoff(mock: *?Mock, home: []const u8, key: []const u8, request: []
         sleepMs(base_ms + @as(u64, attempt) * 37);
     }
     // last try, whatever it is
-    return if (mock.*) |*m| m.next() else fetchCurl(home, key, request);
+    return if (mock.*) |*m| m.next() else fetchCurl(home, endpoint, key, request);
 }
 
 fn sleepMs(ms: u64) void {
@@ -655,8 +686,58 @@ fn getHome(buf: []u8) ?[]const u8 {
     return null;
 }
 
+/// Look up an environment variable, returning a slice into `environ` (stable for
+/// the process lifetime), or null if unset.
+fn getEnv(name: []const u8) ?[]const u8 {
+    const envp = std.c.environ;
+    var i: usize = 0;
+    while (envp[i]) |line| : (i += 1) {
+        const s = std.mem.sliceTo(line, 0);
+        if (s.len > name.len and s[name.len] == '=' and std.mem.startsWith(u8, s, name))
+            return s[name.len + 1 ..];
+    }
+    return null;
+}
+
+/// Backend selection. Default is OpenRouter (key from ~/.zish/openrouter.key).
+/// `ZISH_AGENT_BACKEND=ollama` targets a local Ollama over its OpenAI-compatible
+/// API (no key), honoring `OLLAMA_HOST` (host:port or full base URL). A raw
+/// `ZISH_AGENT_ENDPOINT` overrides the URL outright.
+fn backendIsOllama() bool {
+    const b = getEnv("ZISH_AGENT_BACKEND") orelse return false;
+    return std.mem.eql(u8, b, "ollama");
+}
+
+fn agentEndpoint(buf: []u8) []const u8 {
+    if (getEnv("ZISH_AGENT_ENDPOINT")) |e| return e;
+    if (backendIsOllama()) {
+        const host = getEnv("OLLAMA_HOST") orelse "127.0.0.1:11434";
+        if (std.mem.startsWith(u8, host, "http"))
+            return std.fmt.bufPrint(buf, "{s}/v1/chat/completions", .{host}) catch ENDPOINT;
+        return std.fmt.bufPrint(buf, "http://{s}/v1/chat/completions", .{host}) catch ENDPOINT;
+    }
+    return ENDPOINT;
+}
+
+/// Only default OpenRouter requires a key file; Ollama needs none.
+fn agentNeedsKey() bool {
+    if (getEnv("ZISH_AGENT_ENDPOINT")) |_| return false;
+    return !backendIsOllama();
+}
+
+/// Per-request curl timeout in seconds. Default 120; `ZISH_AGENT_TIMEOUT` raises
+/// it for slow local models (a big Ollama model can take minutes to load+generate).
+/// Validated to digits so it stays a clean curl argument.
+fn timeoutStr() []const u8 {
+    const v = getEnv("ZISH_AGENT_TIMEOUT") orelse return "120";
+    if (v.len == 0 or v.len > 6) return "120";
+    for (v) |c| if (c < '0' or c > '9') return "120";
+    return v;
+}
+
 fn parseArgs(args: std.process.Args) ?Config {
     var cfg = Config{};
+    cfg.model = getEnv("ZISH_AGENT_MODEL") orelse DEFAULT_MODEL; // -m overrides
     var it = std.process.Args.Iterator.init(args);
     _ = it.skip(); // argv[0]
     var query: std.ArrayListUnmanaged(u8) = .empty;
@@ -732,6 +813,9 @@ fn hasJudgeFlag(args: std.process.Args) bool {
 
 fn parseJudgeArgs(args: std.process.Args) ?JudgeCfg {
     var cfg = JudgeCfg{};
+    // model default from env (so a caller like `aur`, which doesn't take -m,
+    // still selects the model); an explicit -m overrides.
+    cfg.model = getEnv("ZISH_AGENT_MODEL") orelse DEFAULT_MODEL;
     var subs: std.ArrayListUnmanaged([]const u8) = .empty;
     var it = std.process.Args.Iterator.init(args);
     _ = it.skip();
@@ -818,6 +902,94 @@ fn verdictValid(json_text: []const u8) bool {
 
 /// Run one judge invocation end to end. Returns process exit code: 0 with the
 /// verdict JSON on stdout, non-zero with a diagnostic on stderr.
+const ASK_SYSTEM =
+    \\You are one member of a small agent team working a shared task. Answer the
+    \\instruction directly and concisely in plain text — no preamble, no restating
+    \\the question, no markdown headers. If asked to decompose a task, output one
+    \\short sub-task per line and nothing else.
+;
+
+fn hasAskFlag(args: std.process.Args) bool {
+    var it = std.process.Args.Iterator.init(args);
+    while (it.next()) |a| if (std.mem.eql(u8, a, "--ask")) return true;
+    return false;
+}
+
+/// One-shot plain-text completion: `agent [-m model] [--mock f] --ask <prompt...>`
+/// → the model's text on stdout. No tools, no frames — the adapter `team` calls.
+fn runAsk(args: std.process.Args) u8 {
+    var model: []const u8 = getEnv("ZISH_AGENT_MODEL") orelse DEFAULT_MODEL;
+    var mock_path: ?[]const u8 = null;
+    var prompt: std.ArrayListUnmanaged(u8) = .empty;
+    defer prompt.deinit(alloc);
+    var it = std.process.Args.Iterator.init(args);
+    _ = it.next(); // argv0
+    while (it.next()) |a| {
+        if (std.mem.eql(u8, a, "--ask")) continue;
+        if (std.mem.eql(u8, a, "-m")) {
+            model = dupe(it.next() orelse return 2);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--mock")) {
+            mock_path = dupe(it.next() orelse return 2);
+            continue;
+        }
+        if (prompt.items.len > 0) prompt.append(alloc, ' ') catch return 2;
+        prompt.appendSlice(alloc, a) catch return 2;
+    }
+    if (prompt.items.len == 0) {
+        warn("agent: --ask needs a prompt\n");
+        return 2;
+    }
+
+    // transport: same seam as the judge (mock file or curl + key + backend)
+    var mock: ?Mock = null;
+    var home_buf: [4096]u8 = undefined;
+    var home: []const u8 = "";
+    var key: []const u8 = "";
+    if (mock_path) |mp| {
+        const contents = readFileAlloc(mp) orelse {
+            warn("agent: could not read mock file\n");
+            return 2;
+        };
+        mock = .{ .lines = std.mem.splitScalar(u8, contents, '\n') };
+    } else {
+        home = getHome(&home_buf) orelse {
+            warn("agent: HOME not set\n");
+            return 2;
+        };
+        if (agentNeedsKey() or getEnv("ZISH_AGENT_ENDPOINT") != null) {
+            var kbuf: [4096]u8 = undefined;
+            const kpath = std.fmt.bufPrint(&kbuf, "{s}/.zish/openrouter.key", .{home}) catch "";
+            if (readFileAlloc(kpath)) |k| {
+                key = k;
+            } else if (agentNeedsKey()) {
+                warn("agent: no API key at ~/.zish/openrouter.key\n");
+                return 2;
+            }
+        }
+    }
+    var ep_buf: [512]u8 = undefined;
+    const endpoint = agentEndpoint(&ep_buf);
+
+    var attempt: usize = 0;
+    while (attempt < JUDGE_RETRIES) : (attempt += 1) {
+        const request = buildJudgeRequest(model, ASK_SYSTEM, prompt.items) catch return 2;
+        const reply = fetchWithBackoff(&mock, home, endpoint, key, request) orelse continue;
+        if (reply.status < 200 or reply.status >= 300) continue;
+        switch (parseResponse(reply.body)) {
+            .text => |t| {
+                emit(std.mem.trim(u8, t, " \t\r\n"));
+                emit("\n");
+                return 0;
+            },
+            else => continue, // .tools shouldn't happen (no tools sent); retry
+        }
+    }
+    warn("agent: --ask produced no response after retries\n");
+    return 1;
+}
+
 fn runJudge(args: std.process.Args) u8 {
     const cfg = parseJudgeArgs(args) orelse {
         warn("agent: usage: agent --judge [-m model] [--mock file] <rubric> <subject...>\n");
@@ -861,18 +1033,24 @@ fn runJudge(args: std.process.Args) u8 {
             warn("agent: HOME not set\n");
             return 2;
         };
-        var kbuf: [4096]u8 = undefined;
-        const kpath = std.fmt.bufPrint(&kbuf, "{s}/.zish/openrouter.key", .{home}) catch "";
-        key = readFileAlloc(kpath) orelse {
-            warn("agent: no API key at ~/.zish/openrouter.key\n");
-            return 2;
-        };
+        if (agentNeedsKey() or getEnv("ZISH_AGENT_ENDPOINT") != null) {
+            var kbuf: [4096]u8 = undefined;
+            const kpath = std.fmt.bufPrint(&kbuf, "{s}/.zish/openrouter.key", .{home}) catch "";
+            if (readFileAlloc(kpath)) |k| {
+                key = k;
+            } else if (agentNeedsKey()) {
+                warn("agent: no API key at ~/.zish/openrouter.key\n");
+                return 2;
+            }
+        }
     }
+    var ep_buf: [512]u8 = undefined;
+    const endpoint = agentEndpoint(&ep_buf);
 
     var attempt: usize = 0;
     while (attempt < JUDGE_RETRIES) : (attempt += 1) {
         const request = buildJudgeRequest(cfg.model, JUDGE_SYSTEM, user.items) catch return 2;
-        const reply = fetchWithBackoff(&mock, home, key, request) orelse continue;
+        const reply = fetchWithBackoff(&mock, home, endpoint, key, request) orelse continue;
         if (reply.status < 200 or reply.status >= 300) continue;
         switch (parseResponse(reply.body)) {
             .text => |t| {
