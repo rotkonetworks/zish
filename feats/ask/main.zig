@@ -103,18 +103,23 @@ fn run(args: std.process.Args) u8 {
     _ = it.next(); // argv[0]
 
     var timeout_s: u64 = DEFAULT_TIMEOUT_S;
+    var multi = false; // allow choosing several options (answer = comma-sep indices)
     var question: ?[]const u8 = null;
     var options: std.ArrayListUnmanaged([]const u8) = .empty;
     defer options.deinit(alloc);
 
     while (it.next()) |a| {
         if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
-            warn("usage: ask [-t <seconds>] \"<question>\" [\"opt1\" ... \"opt4\"]\n");
+            warn("usage: ask [-t <seconds>] [-m] \"<question>\" [\"opt1\" ... \"opt4\"]\n");
             return 0;
         }
         if (std.mem.eql(u8, a, "-t")) {
             const v = it.next() orelse return usageErr();
             timeout_s = std.fmt.parseInt(u64, v, 10) catch return usageErr();
+            continue;
+        }
+        if (std.mem.eql(u8, a, "-m") or std.mem.eql(u8, a, "--multi")) {
+            multi = true;
             continue;
         }
         if (question == null) {
@@ -172,7 +177,7 @@ fn run(args: std.process.Args) u8 {
             jsonEsc(&j, opt);
             j.append(alloc, '"') catch {};
         }
-        j.appendSlice(alloc, "]}") catch {};
+        j.appendSlice(alloc, if (multi) "],\"multi\":true}" else "],\"multi\":false}") catch {};
         if (!writeFileTrunc(qpath, j.items)) {
             warn("ask: cannot write question\n");
             return 2;
