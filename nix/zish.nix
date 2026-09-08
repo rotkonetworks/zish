@@ -4,6 +4,11 @@
   zig,
   callPackage,
   installShellFiles,
+  makeWrapper,
+  curl,
+  git,
+  gnutar,
+  coreutils,
 }:
 let
   src = lib.cleanSource ../.;
@@ -44,6 +49,7 @@ stdenv.mkDerivation {
   nativeBuildInputs = [
     zig
     installShellFiles
+    makeWrapper
   ];
 
   dontConfigure = true;
@@ -70,6 +76,20 @@ stdenv.mkDerivation {
 
   postInstall = ''
     installManPage zish.1
+
+    # Runtime tools the feats shell out to: gf execs curl/git/tar/sha256sum to
+    # fetch, verify and unpack feats; web execs curl. Suffix them onto PATH so
+    # they are a fallback on a minimal system without shadowing the user's own.
+    # Feats inherit this PATH because zish execs them.
+    wrapProgram $out/bin/zish \
+      --suffix PATH : ${
+        lib.makeBinPath [
+          curl
+          git
+          gnutar
+          coreutils
+        ]
+      }
   '';
 
   meta = {
