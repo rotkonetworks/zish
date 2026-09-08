@@ -1,5 +1,5 @@
-//! web — the grounding tool. Give an agent (or you) web search + readable page
-//! fetch from the shell, so "check, don't guess" is one command away.
+//! web — web search + readable page fetch from the shell, so an agent (or you)
+//! can check instead of guess.
 //!
 //!   web search <query...>     # top results: title / url / snippet
 //!   web fetch <url>           # the page as clean, bounded text (tags stripped)
@@ -9,8 +9,8 @@
 //! Override the search backend with a URL template holding {q}:
 //!   ZISH_WEB_SEARCH="https://searx.example/search?q={q}&format=json"   (or any engine)
 //! Network is curl (execed), so it inherits the shell's proxy/DNS. Output is
-//! bounded (ZISH_WEB_MAX bytes, default 20000) — an agent gets the gist, not a
-//! multi-megabyte token dump.
+//! bounded (ZISH_WEB_MAX bytes, default 20000), so the caller gets the gist, not
+//! a multi-megabyte dump.
 
 const std = @import("std");
 const linux = std.os.linux;
