@@ -49,6 +49,46 @@ printf 'const std = @import("std");\npub fn main() void { _ = std; }\n' | "$V" z
 # a compile-check must not run main; a side-effecting file must be absent
 [ ! -e "$mark" ] && ok "checking code did not execute it" || bad "code was executed!"
 
+echo "== lake: whole-project mode fails closed on holes in OWN sources, not .lake/ =="
+# Toolchain-independent: an empty PATH makes onPath("lake") false, so a project that
+# passes the hole gate deterministically reaches exit 4 instead of a real build
+# (`verify` execs /usr/bin/env by absolute path, so nothing else needs PATH).
+mkdir -p "$T/emptybin"
+P="$T/lakeproj"; mkdir -p "$P/Foo" "$P/.lake/packages/mathlib/Mathlib"
+printf 'name = "foo"\n' > "$P/lakefile.toml"
+printf 'theorem t : 1 = 1 := by rfl\n' > "$P/Foo/Ok.lean"
+printf 'theorem s : 1 = 1 := by sorry\n' > "$P/.lake/packages/mathlib/Mathlib/Dep.lean"
+o=$(PATH="$T/emptybin" "$V" lake "$P" 2>&1); rc=$?
+[ "$rc" -eq 4 ] && ok "sorry only under .lake/ -> not a hole (exit 4, toolchain gate)" || bad "sorry under .lake/ misjudged: exit $rc: $o"
+case "$o" in *"proof hole"*) bad ".lake/ dependency sorry was flagged as ours" ;; *) ok ".lake/ excluded from the hole scan" ;; esac
+printf 'theorem s : 1 = 1 := by sorry\n' > "$P/Foo/Hole.lean"
+o=$(PATH="$T/emptybin" "$V" lake "$P" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && ok "sorry in own source -> exit 1 before toolchain check" || bad "own-source sorry exit $rc: $o"
+case "$o" in *"proof hole"*Foo/Hole.lean*'`sorry`'*) ok "hole report names the file and token" ;; *) bad "bad hole report: $o" ;; esac
+rm "$P/Foo/Hole.lean"
+printf 'example := sorryAx\n' > "$P/Foo/Id.lean"   # identifier, not the `sorry` word
+o=$(PATH="$T/emptybin" "$V" lake "$P" 2>&1); rc=$?
+[ "$rc" -eq 4 ] && ok "sorryAx identifier is not a hole (word boundary)" || bad "sorryAx misflagged: exit $rc: $o"
+rm "$P/Foo/Id.lean"
+printf 'ok\n' > "$P/Foo/Priv.lean"; chmod 000 "$P/Foo/Priv.lean"
+if [ "$(id -u)" -ne 0 ]; then
+    o=$(PATH="$T/emptybin" "$V" lake "$P" 2>&1); rc=$?
+    [ "$rc" -eq 1 ] && ok "unreadable own source -> exit 1 (inconclusive, fail closed)" || bad "unreadable source exit $rc: $o"
+    case "$o" in *inconclusive*) ok "inconclusive is reported distinctly from a hole" ;; *) bad "no inconclusive report: $o" ;; esac
+fi
+chmod 644 "$P/Foo/Priv.lean"; rm "$P/Foo/Priv.lean"
+# a FIFO named *.lean must not hang the scan (open would block) nor pass as clean
+mkfifo "$P/Foo/Pipe.lean"
+o=$(timeout 10 env PATH="$T/emptybin" "$V" lake "$P" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && ok "FIFO named .lean -> exit 1 without hanging" || bad "FIFO source exit $rc: $o"
+case "$o" in *"not a regular file"*) ok "FIFO reported as inconclusive (not scanned as clean)" ;; *) bad "FIFO not reported: $o" ;; esac
+rm "$P/Foo/Pipe.lean"
+mkdir -p "$T/nolake"
+PATH="$T/emptybin" "$V" lake "$T/nolake" >/dev/null 2>&1
+[ $? -eq 2 ] && ok "dir without lakefile -> exit 2 (usage)" || bad "no-lakefile wrong exit"
+PATH="$T/emptybin" "$V" lake >/dev/null 2>&1
+[ $? -eq 2 ] && ok "lake without <dir> -> exit 2 (usage)" || bad "lake no-arg wrong exit"
+
 echo
 if [ "$fail" -eq 0 ]; then printf '\033[32mALL GREEN\033[0m — %d passed\n' "$pass"; exit 0
 else printf '\033[31m%d FAILED\033[0m, %d passed\n' "$fail" "$pass"; exit 1; fi
