@@ -73,11 +73,12 @@ fn jclean(s: []const u8) []u8 {
     return o.toOwnedSlice(alloc) catch (alloc.dupe(u8, "") catch unreachable);
 }
 
-/// Token usage an agent reported via its ZISH_ASK_META sidecar.
-const Meta = struct { pt: i64, ct: i64 };
+/// Token usage + the model that actually ran, reported via the ZISH_ASK_META
+/// sidecar. `model` is the agent's authoritative record of what it called.
+const Meta = struct { pt: i64, ct: i64, model: []const u8 = "" };
 
-/// Read a `{pt,ct,think}` meta sidecar. Always sets `think_out.*` (owned; caller
-/// frees) — the reasoning the agent produced. Missing/invalid → 0 tokens, "".
+/// Read a `{pt,ct,model,think}` meta sidecar. Always sets `think_out.*` (owned;
+/// caller frees). Missing/invalid → 0 tokens, "", "".
 fn readMeta(path: []const u8, think_out: *[]u8) Meta {
     think_out.* = alloc.dupe(u8, "") catch "";
     const c = readFileAlloc(path, MAX_OUT) orelse return .{ .pt = 0, .ct = 0 };
@@ -86,6 +87,7 @@ fn readMeta(path: []const u8, think_out: *[]u8) Meta {
     defer p.deinit();
     var pt: i64 = 0;
     var ct: i64 = 0;
+    var model: []const u8 = "";
     if (p.value == .object) {
         if (p.value.object.get("pt")) |v| if (v == .integer) {
             pt = v.integer;
@@ -93,12 +95,15 @@ fn readMeta(path: []const u8, think_out: *[]u8) Meta {
         if (p.value.object.get("ct")) |v| if (v == .integer) {
             ct = v.integer;
         };
+        if (p.value.object.get("model")) |v| if (v == .string) {
+            model = alloc.dupe(u8, v.string) catch "";
+        };
         if (p.value.object.get("think")) |v| if (v == .string) {
             alloc.free(think_out.*);
             think_out.* = alloc.dupe(u8, v.string) catch (alloc.dupe(u8, "") catch unreachable);
         };
     }
-    return .{ .pt = pt, .ct = ct };
+    return .{ .pt = pt, .ct = ct, .model = model };
 }
 
 /// Collect any `human_say` messages that were appended to the run's trace (by a
@@ -134,10 +139,10 @@ fn collectHumanSays() []u8 {
 // file at ~/.zish/prompts/<name>.txt (editable from the dashboard) overrides it.
 // Placeholders per prompt are documented in the defaults; unknown ones pass through.
 // ---------------------------------------------------------------------------
-const DEFAULT_DECOMPOSE = "{lens}CAPTAIN: decompose the following task into 2-3 short independent sub-tasks, one per line.{caps}{budget} TASK: {task}";
-const DEFAULT_WORKER = "{lens}WORKER: complete this sub-task and report the result.{consult}{caps}{budget} Put any code in a fenced block tagged with its language. SUBTASK: {sub}";
+const DEFAULT_DECOMPOSE = "{lens}CAPTAIN: decompose the following task into 2-3 short independent sub-tasks, one per line.{caps}{budget} {context}TASK: {task}";
+const DEFAULT_WORKER = "{lens}WORKER: complete this sub-task and report the result.{consult}{caps}{budget} {context}Put any code in a fenced block tagged with its language. SUBTASK: {sub}";
 const DEFAULT_CRITIC = "{lens}CRITIC: refute and cross-check the worker outputs below; flag contradictions or errors.{budget} BLACKBOARD:\n{blackboard}";
-const DEFAULT_SYNTH = "{lens}CAPTAIN SYNTHESIZE: produce the final answer from the blackboard, keeping only claims that survive the critic.{caps}{budget}{human} Put any code in a fenced block tagged with its language. BLACKBOARD:\n{blackboard}";
+const DEFAULT_SYNTH = "{lens}CAPTAIN SYNTHESIZE: produce the final answer from the blackboard, keeping only claims that survive the critic.{caps}{budget}{human} {context}Put any code in a fenced block tagged with its language. BLACKBOARD:\n{blackboard}";
 const DEFAULT_REPAIR = "{lens}The {lang} code below FAILED to compile. Return ONLY the corrected COMPLETE code in a single fenced {lang} block — no prose.{budget}\n\nCOMPILER ERROR:\n{error}\n\nCODE:\n{code}";
 
 /// The built-in default template for a prompt name (for loading + for the API to
@@ -541,6 +546,21 @@ fn modelFor(models: []const WorkerModel, idx: usize) WorkerModel {
     return models[idx % models.len];
 }
 
+// agent's own DEFAULT_MODEL — mirrored so `worker_start` can name the model a
+// worker will ACTUALLY use when no roster/-m is given, instead of the old lie
+// "local". Keep in sync with feats/agent DEFAULT_MODEL. The agent still reports
+// the authoritative model back via its meta sidecar (worker_done), so a drift
+// here only affects the pre-call label, never the recorded truth.
+const AGENT_DEFAULT_MODEL = "deepseek/deepseek-v4-flash-0731";
+
+/// The model a worker will actually run with: explicit roster model → the
+/// process-wide ZISH_AGENT_MODEL → the agent default. Never "local".
+fn intendedModel(wm: WorkerModel) []const u8 {
+    if (wm.model) |m| return m;
+    if (getEnv("ZISH_AGENT_MODEL")) |m| return m;
+    return AGENT_DEFAULT_MODEL;
+}
+
 fn envUint(name: [:0]const u8) ?usize {
     const v = getEnv(name) orelse return null;
     if (v.len == 0 or v.len >= 8) return null;
@@ -554,6 +574,14 @@ fn envUint(name: [:0]const u8) ?usize {
 /// Override ZISH_TEAM_MAX_TOKENS; default 2048.
 fn capBase() usize {
     return envUint("ZISH_TEAM_MAX_TOKENS") orelse 2048;
+}
+
+/// Workers run the tool-using `agent solo` loop (real shell/web/checker access)
+/// instead of tool-less `--ask` when ZISH_TEAM_TOOLS=1. This is what a long-form,
+/// evidence-gathering run (e.g. formal-verification research) needs.
+fn teamToolsMode() bool {
+    const v = getEnv("ZISH_TEAM_TOOLS") orelse return false;
+    return std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
 }
 
 /// Cap for the SYNTHESIS (and repair) — the final DELIVERABLE. Capping the one
@@ -599,6 +627,13 @@ fn spawnAgentToFile(bin: []const u8, prompt: []const u8, out_path: []const u8, w
         if (!push(casg, &held, &nh, &argv, &n)) return null;
     }
     if (!push(bin, &held, &nh, &argv, &n)) return null;
+    // ZISH_TEAM_TOOLS=1 → workers run the TOOL-USING `solo` loop (read files, web,
+    // run checkers) instead of tool-less `--ask`. Costs more (multiple calls per
+    // worker) but does real work. The verb goes right after the bin.
+    const tools = teamToolsMode();
+    if (tools) {
+        if (!push("solo", &held, &nh, &argv, &n)) return null;
+    }
     if (wm.model) |m| {
         if (!push("-m", &held, &nh, &argv, &n)) return null;
         if (!push(m, &held, &nh, &argv, &n)) return null;
@@ -607,7 +642,9 @@ fn spawnAgentToFile(bin: []const u8, prompt: []const u8, out_path: []const u8, w
         if (!push("--mock", &held, &nh, &argv, &n)) return null;
         if (!push(mock, &held, &nh, &argv, &n)) return null;
     }
-    if (!push("--ask", &held, &nh, &argv, &n)) return null;
+    if (!tools) {
+        if (!push("--ask", &held, &nh, &argv, &n)) return null;
+    }
     if (!push(prompt, &held, &nh, &argv, &n)) return null;
     argv[n] = null;
     const argvz: [*:null]const ?[*:0]const u8 = argv[0..n :null];
@@ -1015,7 +1052,15 @@ fn verifyAndGate(agent_bin: []const u8, budget_bin: []const u8, verify_bin: []co
 // orchestration
 // ---------------------------------------------------------------------------
 
-fn teamRun(root_budget: i64, task: []const u8) u8 {
+fn teamRun(root_budget: i64, task: []const u8, context: []const u8) u8 {
+    // A dispatched run can carry the topic's prior conversation for continuity.
+    // It is prepended to the decompose + synth prompts (workers get only their
+    // subtask). Rendered into the {context} slot; empty = no preamble.
+    const ctx_block: []const u8 = if (context.len > 0)
+        std.fmt.allocPrint(alloc, "PRIOR CONVERSATION (context for continuity; the NEW request is last, act on it):\n{s}\n\n", .{context}) catch ""
+    else
+        "";
+    defer if (ctx_block.len > 0) alloc.free(ctx_block);
     var rb: [4096]u8 = undefined;
     const root = featRootPath(&rb) orelse {
         warn("team: no feat root (HOME unset)\n");
@@ -1132,7 +1177,7 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
 
     const dtmpl = loadPrompt("decompose");
     defer alloc.free(dtmpl);
-    const dprompt = renderTemplate(dtmpl, &.{ .{ "lens", cap_intro }, .{ "caps", capline }, .{ "budget", budgetline }, .{ "task", task } });
+    const dprompt = renderTemplate(dtmpl, &.{ .{ "lens", cap_intro }, .{ "caps", capline }, .{ "budget", budgetline }, .{ "context", ctx_block }, .{ "task", task } });
     defer alloc.free(dprompt);
     var dmeta_buf: [4096]u8 = undefined;
     const dmp = std.fmt.bufPrint(&dmeta_buf, "{s}.dec.meta", .{bb_path}) catch "";
@@ -1233,11 +1278,11 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
         defer alloc.free(btw);
         const wtmpl = loadPrompt("worker");
         defer alloc.free(wtmpl);
-        const wprompt = renderTemplate(wtmpl, &.{ .{ "lens", w_intro }, .{ "consult", btw }, .{ "caps", capline }, .{ "budget", budgetline }, .{ "sub", sub } });
+        const wprompt = renderTemplate(wtmpl, &.{ .{ "lens", w_intro }, .{ "consult", btw }, .{ "caps", capline }, .{ "budget", budgetline }, .{ "context", ctx_block }, .{ "sub", sub } });
         defer alloc.free(wprompt);
         const out_path = std.fmt.allocPrint(alloc, "{s}/.zish/.team-{d}-w{d}.out", .{ home, pid, i }) catch continue;
         {
-            const mc = jclean(modelFor(models.items, i).model orelse "local");
+            const mc = jclean(intendedModel(modelFor(models.items, i)));
             defer alloc.free(mc);
             const sc = jclean(sub);
             defer alloc.free(sc);
@@ -1296,7 +1341,12 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
         const tesc = jesc(think, 6000);
         defer alloc.free(tesc);
         const wdur = if (s.tf > s.t0) s.tf - s.t0 else nowMs() - s.t0;
-        emit("{{\"t\":{d},\"ev\":\"worker_done\",\"i\":{d},\"t0\":{d},\"dur\":{d},\"chars\":{d},\"pt\":{d},\"ct\":{d},\"think\":\"{s}\",\"out\":\"{s}\"}}", .{ nowMs(), s.idx, s.t0, wdur, trimmed.len, meta.pt, meta.ct, tesc, oesc });
+        // the model the agent ACTUALLY ran (from its meta) — authoritative; falls
+        // back to the intended model if the sidecar didn't report one.
+        const amodel = if (meta.model.len > 0) meta.model else intendedModel(modelFor(models.items, s.idx));
+        const mesc = jclean(amodel);
+        defer alloc.free(mesc);
+        emit("{{\"t\":{d},\"ev\":\"worker_done\",\"i\":{d},\"t0\":{d},\"dur\":{d},\"chars\":{d},\"pt\":{d},\"ct\":{d},\"model\":\"{s}\",\"think\":\"{s}\",\"out\":\"{s}\"}}", .{ nowMs(), s.idx, s.t0, wdur, trimmed.len, meta.pt, meta.ct, mesc, tesc, oesc });
         // a worker may consult an org expert (lateral info edge, org-funded)
         serviceBtwAsk(agent_bin, budget_bin, root_id, bb_path, experts.items, wout, s.idx);
         spawned += 1;
@@ -1350,7 +1400,7 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
         "";
     const stmpl = loadPrompt("synth");
     defer alloc.free(stmpl);
-    const sprompt = renderTemplate(stmpl, &.{ .{ "lens", cap_intro }, .{ "caps", capline }, .{ "budget", sbudgetline }, .{ "human", human_block }, .{ "blackboard", bb2 } });
+    const sprompt = renderTemplate(stmpl, &.{ .{ "lens", cap_intro }, .{ "caps", capline }, .{ "budget", sbudgetline }, .{ "human", human_block }, .{ "context", ctx_block }, .{ "blackboard", bb2 } });
     defer alloc.free(sprompt);
     var smeta_buf: [4096]u8 = undefined;
     const smp = std.fmt.bufPrint(&smeta_buf, "{s}.synth.meta", .{bb_path}) catch "";
@@ -1370,7 +1420,10 @@ fn teamRun(root_budget: i64, task: []const u8) u8 {
         defer alloc.free(fesc);
         const stesc = jesc(sthink, 6000);
         defer alloc.free(stesc);
-        emit("{{\"t\":{d},\"ev\":\"synth_done\",\"pt\":{d},\"ct\":{d},\"think\":\"{s}\",\"text\":\"{s}\"}}", .{ nowMs(), stok.pt, stok.ct, stesc, fesc });
+        const smodel = if (stok.model.len > 0) stok.model else intendedModel(modelFor(models.items, 0));
+        const smesc = jclean(smodel);
+        defer alloc.free(smesc);
+        emit("{{\"t\":{d},\"ev\":\"synth_done\",\"pt\":{d},\"ct\":{d},\"model\":\"{s}\",\"think\":\"{s}\",\"text\":\"{s}\"}}", .{ nowMs(), stok.pt, stok.ct, smesc, stesc, fesc });
     }
 
     // 5. VERIFY — the member that actually runs a compiler. Compile any code in
@@ -1430,11 +1483,20 @@ fn run(args: std.process.Args) u8 {
         return 2;
     }
 
-    // remaining args = the task (joined with spaces)
+    // remaining args = the task (joined with spaces); `-c <file>` supplies a
+    // conversation-context file (thread continuity), also via $ZISH_TEAM_CONTEXT.
+    var ctx_path: ?[]const u8 = getEnv("ZISH_TEAM_CONTEXT");
     var task: std.ArrayListUnmanaged(u8) = .empty;
     defer task.deinit(alloc);
     var first = true;
     while (it.next()) |w| {
+        if (std.mem.eql(u8, w, "-c")) {
+            ctx_path = it.next() orelse {
+                warn("team: -c needs a file path\n");
+                return 2;
+            };
+            continue;
+        }
         if (!first) task.append(alloc, ' ') catch {};
         first = false;
         task.appendSlice(alloc, w) catch {};
@@ -1443,7 +1505,8 @@ fn run(args: std.process.Args) u8 {
         warn("team: no task given\n");
         return 2;
     }
-    return teamRun(root_budget, task.items);
+    const context: []const u8 = if (ctx_path) |p| (readFileAlloc(p, MAX_OUT) orelse "") else "";
+    return teamRun(root_budget, task.items, context);
 }
 
 fn printHelp() void {
