@@ -74,6 +74,45 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // Stage the standard feat set beside the binary so it ships WITH zish:
+    // <prefix>/share/zish/feats/standard/<name>/{bin/<name>, feat.toml}. The
+    // resolver searches this system tier in addition to the writable
+    // ~/.zish/feats, so gf and the standard feats are present out of the box
+    // (like curl on $PATH) while user installs still land in $HOME. `zig build
+    // --prefix $out` ships them for nix; `make feats` stays the local-dev path
+    // into ~/.zish.
+    const feat_names = [_][]const u8{
+        "cnt",  "pk",    "frq",    "snf",    "jls", "calc", "para", "agent",
+        "gf",   "aur",   "budget", "verify", "ask", "team", "web",
+    };
+    const feat_libc = [_][]const u8{ "para", "agent", "gf", "aur", "budget", "verify", "ask", "team", "web" };
+    for (feat_names) |name| {
+        var needs_libc = false;
+        for (feat_libc) |l| {
+            if (std.mem.eql(u8, l, name)) needs_libc = true;
+        }
+        const feat_exe = b.addExecutable(.{
+            .name = name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(b.fmt("feats/{s}/main.zig", .{name})),
+                .target = target,
+                .optimize = optimize,
+                .strip = strip_symbols,
+                .link_libc = needs_libc,
+            }),
+        });
+        const bin_inst = b.addInstallArtifact(feat_exe, .{
+            .dest_dir = .{ .override = .{ .custom = b.fmt("share/zish/feats/standard/{s}/bin", .{name}) } },
+        });
+        b.getInstallStep().dependOn(&bin_inst.step);
+        const toml_inst = b.addInstallFileWithDir(
+            b.path(b.fmt("feats/{s}/feat.toml", .{name})),
+            .{ .custom = b.fmt("share/zish/feats/standard/{s}", .{name}) },
+            "feat.toml",
+        );
+        b.getInstallStep().dependOn(&toml_inst.step);
+    }
+
     const run_step = b.step("run", "Run the app");
 
     const run_cmd = b.addRunArtifact(exe);

@@ -3227,49 +3227,79 @@ pub fn acceptGhostWord(self: *Shell) bool {
 }
 
 // -------- feat builtin completion (subcommands + feat names) --------
-fn featRegRoot(self: *Shell, buf: []u8) ?[]const u8 {
+// The shipped feat set beside the binary (<prefix>/share/zish/feats), mirroring
+// eval.zig's systemFeatDir so completion offers system-tier feats too.
+fn featSystemDir(buf: []u8) ?[]const u8 {
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rc: isize = @bitCast(std.os.linux.readlink("/proc/self/exe", &exe_buf, exe_buf.len));
+    if (rc <= 0) return null;
+    const exe = exe_buf[0..@intCast(rc)];
+    const bindir = std.fs.path.dirname(exe) orelse return null;
+    const prefix = std.fs.path.dirname(bindir) orelse return null;
+    return std.fmt.bufPrint(buf, "{s}/share/zish/feats", .{prefix}) catch null;
+}
+
+// Ordered feat roots: ZISH_FEAT_PATH overrides to a single root, else the user
+// root (~/.zish/feats) then the shipped system root. Matches eval.featRoots.
+fn featRegRoots(self: *Shell, bufs: *[2][std.fs.max_path_bytes]u8, out: *[2][]const u8) usize {
     if (compat.getEnvVarOwned(self.allocator, "ZISH_FEAT_PATH")) |p| {
         defer self.allocator.free(p);
-        if (p.len < buf.len) {
-            @memcpy(buf[0..p.len], p);
-            return buf[0..p.len];
+        if (p.len < bufs[0].len) {
+            @memcpy(bufs[0][0..p.len], p);
+            out[0] = bufs[0][0..p.len];
+            return 1;
         }
-        return null;
+        return 0;
     } else |_| {}
-    const home = compat.getEnvVarOwned(self.allocator, "HOME") catch return null;
-    defer self.allocator.free(home);
-    return std.fmt.bufPrint(buf, "{s}/.zish/feats", .{home}) catch null;
+    var n: usize = 0;
+    if (compat.getEnvVarOwned(self.allocator, "HOME")) |home| {
+        defer self.allocator.free(home);
+        if (std.fmt.bufPrint(&bufs[n], "{s}/.zish/feats", .{home})) |p| {
+            out[n] = p;
+            n += 1;
+        } else |_| {}
+    } else |_| {}
+    if (featSystemDir(&bufs[n])) |p| {
+        out[n] = p;
+        n += 1;
+    }
+    return n;
 }
 
 fn featCollectNames(self: *Shell, matches: *std.ArrayList([]const u8), pattern: []const u8) !void {
     var seen = std.StringHashMap(void).init(self.allocator);
     defer seen.deinit();
 
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = featRegRoot(self, &root_buf) orelse return;
+    var root_bufs: [2][std.fs.max_path_bytes]u8 = undefined;
+    var roots: [2][]const u8 = undefined;
+    const nroots = featRegRoots(self, &root_bufs, &roots);
 
     const tiers = [_][]const u8{ "standard", "extra" };
-    for (tiers) |tier| {
-        var tb: [std.fs.max_path_bytes]u8 = undefined;
-        const td = std.fmt.bufPrint(&tb, "{s}/{s}", .{ root, tier }) catch continue;
-        var dir = std.Io.Dir.cwd().openDir(compat.io(), td, .{ .iterate = true }) catch continue;
-        defer dir.close(compat.io());
-        var iter = dir.iterate();
-        while (iter.next(compat.io()) catch null) |entry| {
-            if (entry.kind != .directory) continue;
-            const name = entry.name;
-            if (name.len == 0 or name[0] == '.') continue;
-            if (!std.mem.startsWith(u8, name, pattern)) continue;
-            if (seen.contains(name)) continue;
-            const dup = self.allocator.dupe(u8, name) catch continue;
-            seen.put(dup, {}) catch {
-                self.allocator.free(dup);
-                continue;
-            };
-            matches.append(self.allocator, dup) catch {
-                self.allocator.free(dup);
-                continue;
-            };
+    var ri: usize = 0;
+    while (ri < nroots) : (ri += 1) {
+        const root = roots[ri];
+        for (tiers) |tier| {
+            var tb: [std.fs.max_path_bytes]u8 = undefined;
+            const td = std.fmt.bufPrint(&tb, "{s}/{s}", .{ root, tier }) catch continue;
+            var dir = std.Io.Dir.cwd().openDir(compat.io(), td, .{ .iterate = true }) catch continue;
+            defer dir.close(compat.io());
+            var iter = dir.iterate();
+            while (iter.next(compat.io()) catch null) |entry| {
+                if (entry.kind != .directory) continue;
+                const name = entry.name;
+                if (name.len == 0 or name[0] == '.') continue;
+                if (!std.mem.startsWith(u8, name, pattern)) continue;
+                if (seen.contains(name)) continue;
+                const dup = self.allocator.dupe(u8, name) catch continue;
+                seen.put(dup, {}) catch {
+                    self.allocator.free(dup);
+                    continue;
+                };
+                matches.append(self.allocator, dup) catch {
+                    self.allocator.free(dup);
+                    continue;
+                };
+            }
         }
     }
 }

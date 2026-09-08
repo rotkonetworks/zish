@@ -3824,18 +3824,49 @@ const FEAT_TIER_NAMES = [_][]const u8{ "standard", "extra" };
 // session.zig. Default is oneshot — the manifest opts in to session.
 const FeatKind = enum { oneshot, session };
 
-fn featRoot(alloc: std.mem.Allocator, buf: []u8) ?[]const u8 {
+/// The read-only feat set shipped beside the binary: `<prefix>/share/zish/feats`,
+/// derived from `/proc/self/exe` (so `<prefix>/bin/zish` → `<prefix>/share/zish/
+/// feats`). This is how the standard set — `gf` included — ships with zish and is
+/// found without anything under $HOME, the way `curl` is just on $PATH. Returns
+/// null if the layout doesn't resolve (e.g. running from a build dir).
+fn systemFeatDir(buf: []u8) ?[]const u8 {
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rc: isize = @bitCast(std.os.linux.readlink("/proc/self/exe", &exe_buf, exe_buf.len));
+    if (rc <= 0) return null;
+    const exe = exe_buf[0..@intCast(rc)];
+    const bindir = std.fs.path.dirname(exe) orelse return null; // <prefix>/bin
+    const prefix = std.fs.path.dirname(bindir) orelse return null; // <prefix>
+    return std.fmt.bufPrint(buf, "{s}/share/zish/feats", .{prefix}) catch null;
+}
+
+/// Ordered feat roots to search. `ZISH_FEAT_PATH`, if set, is the ONLY root (an
+/// explicit override — tests, packaging). Otherwise the writable user root
+/// (`~/.zish/feats`) comes first, so a user install shadows a shipped feat, then
+/// the read-only system root shipped beside the binary. `bufs` backs the
+/// returned slices and must outlive them; returns how many roots were filled (0-2).
+fn featRoots(alloc: std.mem.Allocator, bufs: *[2][std.fs.max_path_bytes]u8, out: *[2][]const u8) usize {
     if (compat.getEnvVarOwned(alloc, "ZISH_FEAT_PATH")) |p| {
         defer alloc.free(p);
-        if (p.len < buf.len) {
-            @memcpy(buf[0..p.len], p);
-            return buf[0..p.len];
+        if (p.len < bufs[0].len) {
+            @memcpy(bufs[0][0..p.len], p);
+            out[0] = bufs[0][0..p.len];
+            return 1;
         }
-        return null;
+        return 0;
     } else |_| {}
-    const home = compat.getEnvVarOwned(alloc, "HOME") catch return null;
-    defer alloc.free(home);
-    return std.fmt.bufPrint(buf, "{s}/.zish/feats", .{home}) catch null;
+    var n: usize = 0;
+    if (compat.getEnvVarOwned(alloc, "HOME")) |home| {
+        defer alloc.free(home);
+        if (std.fmt.bufPrint(&bufs[n], "{s}/.zish/feats", .{home})) |p| {
+            out[n] = p;
+            n += 1;
+        } else |_| {}
+    } else |_| {}
+    if (systemFeatDir(&bufs[n])) |p| {
+        out[n] = p;
+        n += 1;
+    }
+    return n;
 }
 
 /// Terse, hostile-input manifest field: returns the value of `key = "value"`
@@ -3882,8 +3913,9 @@ fn featParseRef(raw: []const u8) ?struct { tier: ?FeatTier, name: []const u8 } {
 fn featResolve(alloc: std.mem.Allocator, raw: []const u8) ?struct { tier: FeatTier, bin: []u8, kind: FeatKind } {
     const parsed = featParseRef(raw) orelse return null;
 
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = featRoot(alloc, &root_buf) orelse return null;
+    var root_bufs: [2][std.fs.max_path_bytes]u8 = undefined;
+    var roots: [2][]const u8 = undefined;
+    const nroots = featRoots(alloc, &root_bufs, &roots);
 
     var candidates: [2]FeatTier = undefined;
     var ncand: usize = 0;
@@ -3896,37 +3928,44 @@ fn featResolve(alloc: std.mem.Allocator, raw: []const u8) ?struct { tier: FeatTi
         ncand = 2;
     }
 
-    var k: usize = 0;
-    while (k < ncand) : (k += 1) {
-        const tier = candidates[k];
-        const tier_name = if (tier == .standard) "standard" else "extra";
+    // Search each root in order (user root before the shipped system root, so a
+    // user install shadows a shipped feat), and within a root standard before
+    // extra. First hit wins.
+    var ri: usize = 0;
+    while (ri < nroots) : (ri += 1) {
+        const root = roots[ri];
+        var k: usize = 0;
+        while (k < ncand) : (k += 1) {
+            const tier = candidates[k];
+            const tier_name = if (tier == .standard) "standard" else "extra";
 
-        var tier_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const tier_dir = std.fmt.bufPrint(&tier_buf, "{s}/{s}", .{ root, tier_name }) catch continue;
+            var tier_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const tier_dir = std.fmt.bufPrint(&tier_buf, "{s}/{s}", .{ root, tier_name }) catch continue;
 
-        var bin_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const bin_path = std.fmt.bufPrint(&bin_buf, "{s}/{s}/bin/{s}", .{ tier_dir, parsed.name, parsed.name }) catch continue;
-        // default bin name == feat name; honor an opt-in `bin` manifest field.
-        var mf_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const mf_path = std.fmt.bufPrint(&mf_path_buf, "{s}/{s}/feat.toml", .{ tier_dir, parsed.name }) catch continue;
-        var kind: FeatKind = .oneshot;
-        if (std.Io.Dir.cwd().readFileAlloc(compat.io(), mf_path, alloc, .limited(16 * 1024))) |content| {
-            defer alloc.free(content);
-            if (featManifestField(content, "bin")) |b| {
-                if (b.len > 0 and std.mem.indexOfScalar(u8, b, '/') == null and std.mem.indexOf(u8, b, "..") == null) {
-                    const w = std.fmt.bufPrint(&bin_buf, "{s}/{s}/bin/{s}", .{ tier_dir, parsed.name, b }) catch bin_path;
-                    _ = w;
+            var bin_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const bin_path = std.fmt.bufPrint(&bin_buf, "{s}/{s}/bin/{s}", .{ tier_dir, parsed.name, parsed.name }) catch continue;
+            // default bin name == feat name; honor an opt-in `bin` manifest field.
+            var mf_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const mf_path = std.fmt.bufPrint(&mf_path_buf, "{s}/{s}/feat.toml", .{ tier_dir, parsed.name }) catch continue;
+            var kind: FeatKind = .oneshot;
+            if (std.Io.Dir.cwd().readFileAlloc(compat.io(), mf_path, alloc, .limited(16 * 1024))) |content| {
+                defer alloc.free(content);
+                if (featManifestField(content, "bin")) |b| {
+                    if (b.len > 0 and std.mem.indexOfScalar(u8, b, '/') == null and std.mem.indexOf(u8, b, "..") == null) {
+                        const w = std.fmt.bufPrint(&bin_buf, "{s}/{s}/bin/{s}", .{ tier_dir, parsed.name, b }) catch bin_path;
+                        _ = w;
+                    }
                 }
-            }
-            if (featManifestField(content, "kind")) |kv| {
-                if (std.mem.eql(u8, kv, "session")) kind = .session;
-            }
-        } else |_| {}
+                if (featManifestField(content, "kind")) |kv| {
+                    if (std.mem.eql(u8, kv, "session")) kind = .session;
+                }
+            } else |_| {}
 
-        // must exist and be a regular file
-        const f = std.Io.Dir.cwd().openFile(compat.io(), bin_path, .{}) catch continue;
-        f.close(compat.io());
-        return .{ .tier = tier, .bin = alloc.dupe(u8, bin_path) catch return null, .kind = kind };
+            // must exist and be a regular file
+            const f = std.Io.Dir.cwd().openFile(compat.io(), bin_path, .{}) catch continue;
+            f.close(compat.io());
+            return .{ .tier = tier, .bin = alloc.dupe(u8, bin_path) catch return null, .kind = kind };
+        }
     }
     return null;
 }
@@ -4005,26 +4044,49 @@ fn featExec(shell: *Shell, tier: FeatTier, bin_path: []const u8, sub_args: []con
 }
 
 fn featList(shell: *Shell, alloc: std.mem.Allocator) !u8 {
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = featRoot(alloc, &root_buf) orelse return 1;
+    var root_bufs: [2][std.fs.max_path_bytes]u8 = undefined;
+    var roots: [2][]const u8 = undefined;
+    const nroots = featRoots(alloc, &root_bufs, &roots);
 
-    for (FEAT_TIER_NAMES) |tier_name| {
-        var tier_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const tier_dir = std.fmt.bufPrint(&tier_buf, "{s}/{s}", .{ root, tier_name }) catch continue;
-        var dir = std.Io.Dir.cwd().openDir(compat.io(), tier_dir, .{ .iterate = true }) catch continue;
-        defer dir.close(compat.io());
+    // dedup by "tier/name": a feat in an earlier (user) root shadows the shipped
+    // system one, so it lists once — matching what featResolve would dispatch.
+    var seen: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (seen.items) |s| alloc.free(s);
+        seen.deinit(alloc);
+    }
 
-        var iter = dir.iterate();
-        while (try iter.next(compat.io())) |entry| {
-            if (entry.kind != .directory) continue;
-            if (entry.name.len == 0 or entry.name[0] == '.') continue;
+    var ri: usize = 0;
+    while (ri < nroots) : (ri += 1) {
+        const root = roots[ri];
+        for (FEAT_TIER_NAMES) |tier_name| {
+            var tier_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const tier_dir = std.fmt.bufPrint(&tier_buf, "{s}/{s}", .{ root, tier_name }) catch continue;
+            var dir = std.Io.Dir.cwd().openDir(compat.io(), tier_dir, .{ .iterate = true }) catch continue;
+            defer dir.close(compat.io());
 
-            var mf_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const mf_path = std.fmt.bufPrint(&mf_path_buf, "{s}/{s}/feat.toml", .{ tier_dir, entry.name }) catch continue;
-            const content = std.Io.Dir.cwd().readFileAlloc(compat.io(), mf_path, alloc, .limited(16 * 1024)) catch continue;
-            defer alloc.free(content);
-            const help = featManifestField(content, "help") orelse "";
-            try shell.stdout().print("{s}\t{s}\t{s}\n", .{ tier_name, entry.name, help });
+            var iter = dir.iterate();
+            while (try iter.next(compat.io())) |entry| {
+                if (entry.kind != .directory) continue;
+                if (entry.name.len == 0 or entry.name[0] == '.') continue;
+
+                var key_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const key = std.fmt.bufPrint(&key_buf, "{s}/{s}", .{ tier_name, entry.name }) catch continue;
+                var dup = false;
+                for (seen.items) |s| if (std.mem.eql(u8, s, key)) {
+                    dup = true;
+                    break;
+                };
+                if (dup) continue;
+
+                var mf_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const mf_path = std.fmt.bufPrint(&mf_path_buf, "{s}/{s}/feat.toml", .{ tier_dir, entry.name }) catch continue;
+                const content = std.Io.Dir.cwd().readFileAlloc(compat.io(), mf_path, alloc, .limited(16 * 1024)) catch continue;
+                defer alloc.free(content);
+                const help = featManifestField(content, "help") orelse "";
+                try shell.stdout().print("{s}\t{s}\t{s}\n", .{ tier_name, entry.name, help });
+                seen.append(alloc, alloc.dupe(u8, key) catch continue) catch {};
+            }
         }
     }
     return 0;
@@ -4037,12 +4099,14 @@ fn featHelp(shell: *Shell, alloc: std.mem.Allocator, raw: []const u8) !u8 {
     };
     defer alloc.free(resolved.bin);
 
-    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = featRoot(alloc, &root_buf) orelse return 1;
     const parsed = featParseRef(raw) orelse return 1;
-    const tier_name = if (resolved.tier == .standard) "standard" else "extra";
+    // The manifest sits beside the resolved binary, in whichever root it came
+    // from: resolved.bin is `<featdir>/bin/<binname>`, so feat.toml is two levels
+    // up. This reads from the same root featResolve dispatched, user or system.
+    const bindir = std.fs.path.dirname(resolved.bin) orelse return 1; // <featdir>/bin
+    const featdir = std.fs.path.dirname(bindir) orelse return 1; // <featdir>
     var mf_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const mf_path = std.fmt.bufPrint(&mf_path_buf, "{s}/{s}/{s}/feat.toml", .{ root, tier_name, parsed.name }) catch return 1;
+    const mf_path = std.fmt.bufPrint(&mf_path_buf, "{s}/feat.toml", .{featdir}) catch return 1;
     const content = std.Io.Dir.cwd().readFileAlloc(compat.io(), mf_path, alloc, .limited(16 * 1024)) catch return 1;
     defer alloc.free(content);
     const help = featManifestField(content, "help") orelse "";
