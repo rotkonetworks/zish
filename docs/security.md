@@ -24,7 +24,7 @@ and — more usefully — what it does not.
   can still open sockets.
 - A malicious binary you install and run. zish executes what you ask it to;
   a restriction profile bounds what that binary may write, nothing more.
-- Anything that runs *after* the restricted session ends. A profile grants
+- Anything that runs after the restricted session ends. A profile grants
   write access to directories that hold executable configuration — `.git/hooks`,
   `Makefile`, `package.json`, `.envrc`, an agent's own hook settings — and all
   of those run unrestricted the next time you invoke git, make or the harness.
@@ -63,7 +63,7 @@ zish --profile workdir  -c 'make build'
 Implemented with [Landlock](https://docs.kernel.org/userspace-api/landlock.html),
 which needs no root, no container and no `LD_PRELOAD`. Applied once at startup;
 Landlock restrictions are inherited and cannot be lifted, so the limit binds
-every descendant process **and zish itself**.
+every descendant process and zish itself.
 
 That last part is the reason it is session-scoped rather than per-command. A
 per-command sandbox would be more flexible, but it would leave zish's own

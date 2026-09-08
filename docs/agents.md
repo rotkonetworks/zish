@@ -23,8 +23,7 @@ So a shell-level sandbox that only covers commands typed at zish would have a
 hole in it the size of the harness.
 
 Landlock closes that by construction. The restriction is a property of the
-**process**, it is inherited across `fork` and `exec`, and it cannot be
-relaxed. Restrict the process that starts the agent and you have restricted the
+process, inherited across `fork` and `exec`, and it cannot be relaxed. Restrict the process that starts the agent and you have restricted the
 agent, every tool it calls, and everything those spawn — without the harness
 knowing or cooperating.
 
@@ -150,10 +149,10 @@ Write a `SessionStart` hook into `settings.json` and it executes the next time
 the harness starts — outside any sandbox, because *you* launched that one.
 Same for a git hook, a Makefile target, `package.json` scripts, `.envrc`.
 
-So state the guarantee accurately: **the sandbox protects everything outside
-the roots you granted. It cannot protect the roots themselves, and those
-contain executable configuration.** Granting write access to a directory is
-granting deferred code execution in it.
+So the guarantee is this: the sandbox protects everything outside the roots
+you granted. It cannot protect the roots themselves, and those contain
+executable configuration. Granting write access to a directory is granting
+deferred code execution in it.
 
 Two things follow.
 

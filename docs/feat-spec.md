@@ -132,8 +132,8 @@ request, but that is out of this contract and must not be relied upon.
 - **ML / numeric.** numpy/scipy/torch are not replaceable in Zig. The project's
   model training + HF→GGUF export pipeline remains an **external Python stage**
   whose `.gguf` output zish's pure-Zig `src/inference/` engine consumes. feats
-  replace Python *for shell and harness scripting*; they do not replace it,
-  period. This carve-out is part of this spec.
+  replace Python for shell and harness scripting; they do not replace it.
+  This carve-out is part of this spec.
 - **Dynamic loading**, **IPC**, **in-process hooks**: deliberately absent, §0.
 - **A general-purpose scripting language inside zish**: absent. The "language"
   is the shell pipeline; feats are the leaf atoms.
