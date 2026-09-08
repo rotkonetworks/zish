@@ -82,6 +82,33 @@ jobs:
             zig-out/bin/SHA256SUMS-${{ matrix.target }}
           fail_on_unmatched_files: true
 
+  # ── Build the feat catalog (static-musl tarballs + index) that gf resolves ─
+  # gf's default index is <release>/latest/download/index.jsonl, with each entry
+  # pinning an immutable <release>/download/<tag>/<file> tarball. `make dist-all`
+  # cross-compiles every feat to static musl for both arches and emits the index.
+  feats:
+    needs: build   # the release exists by now (build creates it); this attaches
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: setup zig 0.16.0
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      - name: build feat tarballs + index.jsonl
+        run: make dist-all REL_TAG=${{ github.ref_name }}
+
+      - name: attach to release
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/index.jsonl
+          fail_on_unmatched_files: true
+
   # ── Publish to the AUR from the canonical in-repo PKGBUILD ─────────────────
   aur:
     needs: build

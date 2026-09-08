@@ -22,7 +22,7 @@ let
   # lib.fakeHash, run the build, and copy the hash nix reports.
   deps = stdenv.mkDerivation {
     pname = "zish-deps";
-    version = "0.16.0";
+    version = "0.21.1";
     inherit src;
 
     nativeBuildInputs = [ zig ];
