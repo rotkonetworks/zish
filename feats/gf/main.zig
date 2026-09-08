@@ -1,42 +1,39 @@
-//! gf — the feat fetcher: `gf <url>` downloads a feat tarball and installs it
-//! into the EXTRA tier, quarantined by construction.
+//! gf — the feat fetcher. `gf install <name>` resolves a feat from the index and
+//! installs it; `gf <url>` installs a tarball from a URL. Both do fetch →
+//! validate → stage.
 //!
-//! This is the bottom layer of the feat distribution story (and of the later
-//! agentic package manager): fetch → validate → stage. Trust decisions stay
-//! with the human (or, later, a reviewer agent): everything gf installs lands
-//! in `extra/`, where zish runs it with a stripped environment, refuses it as
-//! root, and (for session feats) masks off the run/prompt hostcalls.
-//! Promotion to `standard/` is a deliberate `mv` by someone with authority,
-//! never gf's call.
+//! Trust stays with the human (or a reviewer agent). A tarball from a
+//! user-pointed index or a bare URL lands in `extra/`, where zish runs it with a
+//! stripped environment, refuses it as root, and masks the run/prompt hostcalls
+//! for session feats. A sha-verified tarball from the built-in default index
+//! installs to `standard/` and is callable at once; promoting anything else is a
+//! deliberate `mv`.
 //!
-//! Tarball format: feat.toml and bin/<name> at the TOP level (what
-//! `make dist-agent` produces). The archive is adversarial input:
-//!   - the extracted tree is validated by lstat walk — regular files only,
-//!     no symlinks anywhere (a symlinked bin/ member is the classic
-//!     install-path attack), nothing outside feat.toml + bin/
-//!   - manifest name/bin fields are charset-checked before they ever join a
-//!     path (gf builds install paths itself; `../standard/x` in a name would
-//!     otherwise be a tier escape)
-//!   - the manifest's tier line is rewritten to "extra" so file and location
-//!     never disagree (the directory is authoritative, but a lying manifest
-//!     must not linger for a future reader)
-//!   - a name that collides with anything on PATH is refused (dispatch-time
-//!     no-shadowing already makes such a feat inert; refusing at install is
-//!     the honest UX)
-//!   - download and extraction happen in a temp dir INSIDE the feat root, so
-//!     the final rename() into extra/<name> is atomic on one filesystem
+//! Tarball format: feat.toml and bin/<name> at the top level (what `make
+//! dist-all` produces). The archive is adversarial input:
+//!   - the extracted tree is validated by lstat walk: regular files only, no
+//!     symlinks (a symlinked bin/ member is the classic install-path attack),
+//!     nothing outside feat.toml + bin/.
+//!   - manifest name/bin fields are charset-checked before they join a path (gf
+//!     builds install paths itself; `../standard/x` in a name would be a tier
+//!     escape).
+//!   - the manifest's tier line is rewritten to match the install location, so a
+//!     lying manifest can't mislead a later reader; the directory is authoritative.
+//!   - a name that collides with a command on PATH is refused (dispatch already
+//!     makes such a feat inert; refusing at install is the honest UX).
+//!   - download and extraction happen in a temp dir inside the feat root, so the
+//!     final rename() into the tier is atomic on one filesystem.
 //!
-//! No upgrade in v1: an existing install is refused, remove it first.
+//! No upgrade in v1: an existing install at the target tier is refused; remove it first.
 //!
 //! Source packages (format v2): a tarball may ship src/<file> instead of
-//! bin/<name>, plus declarative build fields in the manifest:
+//! bin/<name>, plus declarative build fields:
 //!     lang = "c" | "zig"      src = "main.c"      libc = "true" (zig only)
-//! gf then compiles it locally with a FIXED template (zig cc -O2 / zig
-//! build-exe -OReleaseFast) — the recipe is data, never code: a publisher
-//! gets no build-time execution (the AUR's PKGBUILD hole, closed by
-//! construction). Distributing source is what makes review-on-install
-//! meaningful: reviewers read what was actually shipped, and the binary
-//! trusted is the one built here from the hashed source.
+//! gf compiles it locally with a fixed template (zig cc -O2 / zig build-exe
+//! -OReleaseFast). The recipe is data, not code: the publisher gets no
+//! build-time execution (the AUR PKGBUILD hole, closed here). Distributing
+//! source is what makes review-on-install meaningful: reviewers read what
+//! shipped, and the binary trusted is the one built here from the hashed source.
 
 const std = @import("std");
 const builtin = @import("builtin");
