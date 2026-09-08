@@ -47,7 +47,7 @@ let
 in
 stdenv.mkDerivation {
   pname = "zish";
-  version = "0.16.0";
+  version = "0.21.1";
   inherit src;
 
   nativeBuildInputs = [

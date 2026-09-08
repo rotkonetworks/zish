@@ -24,15 +24,18 @@
         default = zish;
       });
 
-      # nix run github:rotkonetworks/zish  (or #zish-full for everything)
+      # nix run github:rotkonetworks/zish  (or #zish-full for everything).
+      # Both run the `zish` binary — getExe resolves it via meta.mainProgram, so
+      # there's no hard-coded /bin/zish; zish-full is the same binary with the
+      # full feat set staged beside it.
       apps = forAllSystems (pkgs: rec {
         zish = {
           type = "app";
-          program = "${self.packages.${pkgs.system}.zish}/bin/zish";
+          program = pkgs.lib.getExe self.packages.${pkgs.system}.zish;
         };
         zish-full = {
           type = "app";
-          program = "${self.packages.${pkgs.system}.zish-full}/bin/zish";
+          program = pkgs.lib.getExe self.packages.${pkgs.system}.zish-full;
         };
         default = zish;
       });
