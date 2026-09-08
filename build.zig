@@ -84,8 +84,18 @@ pub fn build(b: *std.Build) void {
     // system tier plus the writable ~/.zish/feats (where gf installs), so core is
     // present out of the box like curl on $PATH. `zig build --prefix $out` ships
     // core for nix; `make feats` stays the local-dev path into ~/.zish.
-    const feat_names = [_][]const u8{ "cnt", "pk", "frq", "snf", "jls", "calc", "para", "gf" };
-    const feat_libc = [_][]const u8{ "para", "gf" }; // the core feats that need libc
+    // -Dfeats selects which set ships beside the binary: "core" (default — the
+    // zero-dep utils + gf, the lean base) or "all" (also the heavy/situational
+    // feats, for a batteries-included build). Nix exposes both as separate flake
+    // packages (zish / zish-full), so `nix run …#zish-full` gets everything.
+    const feat_set = b.option([]const u8, "feats", "feat set to ship: 'core' (default) or 'all'") orelse "core";
+    const core_feats = [_][]const u8{ "cnt", "pk", "frq", "snf", "jls", "calc", "para", "gf" };
+    const all_feats = [_][]const u8{
+        "cnt", "pk",  "frq",    "snf",    "jls", "calc", "para", "agent",
+        "gf",  "aur", "budget", "verify", "ask", "team", "web",
+    };
+    const feat_names: []const []const u8 = if (std.mem.eql(u8, feat_set, "all")) &all_feats else &core_feats;
+    const feat_libc = [_][]const u8{ "para", "agent", "gf", "aur", "budget", "verify", "ask", "team", "web" };
     for (feat_names) |name| {
         var needs_libc = false;
         for (feat_libc) |l| {

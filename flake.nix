@@ -16,15 +16,23 @@
     in
     {
       packages = forAllSystems (pkgs: rec {
+        # zish: the lean base — core feats (utils + gf) staged beside the binary.
         zish = pkgs.callPackage ./nix/zish.nix { };
+        # zish-full: batteries included — the whole feat set staged, no gf needed.
+        #   nix run github:rotkonetworks/zish#zish-full
+        zish-full = pkgs.callPackage ./nix/zish.nix { featSet = "all"; };
         default = zish;
       });
 
-      # nix run github:rotkonetworks/zish
+      # nix run github:rotkonetworks/zish  (or #zish-full for everything)
       apps = forAllSystems (pkgs: rec {
         zish = {
           type = "app";
           program = "${self.packages.${pkgs.system}.zish}/bin/zish";
+        };
+        zish-full = {
+          type = "app";
+          program = "${self.packages.${pkgs.system}.zish-full}/bin/zish";
         };
         default = zish;
       });

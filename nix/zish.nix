@@ -9,6 +9,10 @@
   git,
   gnutar,
   coreutils,
+  # Which feat set to stage beside the binary: "core" (default — utils + gf, the
+  # lean base) or "all" (also agent/team/web/… for a batteries-included build).
+  # flake.nix exposes both as packages.zish and packages.zish-full.
+  featSet ? "core",
 }:
 let
   src = lib.cleanSource ../.;
@@ -58,7 +62,7 @@ stdenv.mkDerivation {
     runHook preBuild
     export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache
     cp -r --no-preserve=mode,ownership ${deps} $ZIG_GLOBAL_CACHE_DIR
-    zig build --release=fast --prefix $out
+    zig build --release=fast --prefix $out -Dfeats=${featSet}
     runHook postBuild
   '';
 
