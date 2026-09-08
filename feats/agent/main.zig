@@ -1171,8 +1171,10 @@ fn hasEditFlag(args: std.process.Args) bool {
     return false;
 }
 
-/// Read all of stdin (the region to transform). EINTR-safe; caps at 8 MiB so a
-/// runaway pipe can't exhaust memory.
+extern "c" fn isatty(fd: c_int) c_int;
+
+/// Read all of stdin (the region to transform, or a piped captain message).
+/// EINTR-safe; caps at 8 MiB so a runaway pipe can't exhaust memory.
 fn readAllStdin() []u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     var tmp: [65536]u8 = undefined;
@@ -1652,8 +1654,17 @@ fn runCaptain(args: std.process.Args) u8 {
         }
     }
     const tpath = thread_path orelse return usageCaptain();
+    // message: from argv, or piped on stdin so the captain composes as a filter
+    // (`git log -1 --format=%s | agent captain --thread f`). Only read stdin when
+    // it isn't a tty — an interactive shell with no message is the real error,
+    // and we must not block waiting for keyboard input.
+    if (msg.items.len == 0 and isatty(0) == 0) {
+        const piped = readAllStdin();
+        const trimmed = std.mem.trim(u8, piped, " \t\r\n");
+        if (trimmed.len > 0) msg.appendSlice(alloc, trimmed) catch {};
+    }
     if (msg.items.len == 0) {
-        warn("agent captain: no message given\n");
+        warn("agent captain: no message (pass it as an argument or pipe it on stdin)\n");
         return 2;
     }
 
@@ -1742,7 +1753,8 @@ fn runCaptain(args: std.process.Args) u8 {
 }
 
 fn usageCaptain() u8 {
-    warn("usage: agent captain --thread <file> [-m model] [--from name] [--budget n] <message...>\n");
+    warn("usage: agent captain --thread <file> [-m model] [--from name] [--budget n] <message...>\n" ++
+        "       (or pipe the message on stdin: `printf '%s' \"$msg\" | agent captain --thread <file>`)\n");
     return 2;
 }
 
