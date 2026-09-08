@@ -101,3 +101,47 @@ dist-agent:
 		tar -czf dist/agent-$${v:-0.0.0}.tar.gz -C dist/.pkg-agent feat.toml bin; \
 		rm -rf dist/.pkg-agent; \
 		echo "dist/agent-$${v:-0.0.0}.tar.gz"
+
+# ---- the whole feat catalog: `make dist-all` ------------------------------
+# Cross-compiles EVERY feat to static musl for each DIST_ARCH and packs it as
+# the tarball `gf install` fetches (feat.toml + bin/<name> at top level), then
+# emits dist/index.jsonl — the crates.io-for-feats index gf resolves by name.
+#
+# URL discipline (matters for smoothness): the index is published at the ROLLING
+# releases/latest/download/index.jsonl, but every ENTRY pins an IMMUTABLE
+# releases/download/<tag>/<file> tarball URL + sha256, so a release cut between a
+# user's index fetch and tarball fetch can never 404 a pinned artifact.
+# Static musl means no host-glibc symbol pinning and no "Exec format error" on
+# another arch — the `arch` field + gf's host-arch filter hand out the right one.
+# Entries are tier "standard": gf trusts its OWN default index (rotko's release
+# channel) enough to install callable, and quarantines everything else.
+REL_REPO ?= rotkonetworks/zish
+REL_TAG  ?= $(shell git describe --tags --abbrev=0 2>/dev/null || echo v0.0.0)
+REL_BASE  = https://github.com/$(REL_REPO)/releases/download/$(REL_TAG)
+DIST_ARCHES ?= x86_64 aarch64
+
+.PHONY: dist-all
+dist-all:
+	@rm -rf dist && mkdir -p dist
+	@: > dist/index.jsonl
+	@for f in $(FEAT_NAMES); do \
+		v=$$(sed -n 's/^version = "\(.*\)"/\1/p' feats/$$f/feat.toml); v=$${v:-0.0.0}; \
+		help=$$(sed -n 's/^help = "\(.*\)"/\1/p' feats/$$f/feat.toml | tr -d '"\\'); \
+		lc=""; case " $(FEAT_LIBC) " in *" $$f "*) lc="-lc";; esac; \
+		for a in $(DIST_ARCHES); do \
+			pkg=dist/.pkg-$$f-$$a; mkdir -p $$pkg/bin; \
+			if ! zig build-exe -O ReleaseFast -fstrip $$lc -target $$a-linux-musl \
+				feats/$$f/main.zig -femit-bin=$$pkg/bin/$$f 2>/dev/null; then \
+				echo "dist: SKIP $$f/$$a (musl build failed)" >&2; rm -rf $$pkg; continue; \
+			fi; \
+			cp -f feats/$$f/feat.toml $$pkg/feat.toml; \
+			file=$$f-$$v-$$a-linux-musl.tar.gz; \
+			tar -czf dist/$$file -C $$pkg feat.toml bin; rm -rf $$pkg; \
+			sha=$$(sha256sum dist/$$file | cut -d' ' -f1); \
+			printf '{"name":"%s","version":"%s","arch":"%s","tier":"standard","url":"%s/%s","sha256":"%s","desc":"%s"}\n' \
+				"$$f" "$$v" "$$a" "$(REL_BASE)" "$$file" "$$sha" "$$help" >> dist/index.jsonl; \
+			echo "dist: $$file"; \
+		done; \
+	done
+	@echo "wrote dist/index.jsonl ($$(grep -c . dist/index.jsonl) entries) → publish with:"
+	@echo "  gh release create $(REL_TAG) dist/*.tar.gz dist/index.jsonl --repo $(REL_REPO)"

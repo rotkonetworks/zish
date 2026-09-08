@@ -307,11 +307,41 @@ else
     grep -q "not found in the feat index" "$T/oi3" && ok "unknown name reports an index miss" || bad "wrong miss error: $(cat "$T/oi3")"
 fi
 
-# no index configured -> honest error (no fake default)
+# no ZISH_FEAT_INDEX set -> fall back to the built-in default index (zero-config,
+# the smooth path), not an error. The test fixture name is not in the default
+# index (and with no release the default URL 404s), so this misses against the
+# DEFAULT url whether the fetch fails offline or returns and misses online — the
+# miss message names the default index either way.
 if HOME="$T/home" ZISH_FEAT_PATH="$T/feats" "$T/gf" install idxdemo >"$T/oi4" 2>&1; then
-    bad "install with no index configured unexpectedly succeeded"
+    bad "test fixture unexpectedly resolved against the default index"
 else
-    grep -q "no feat index configured" "$T/oi4" && ok "missing index URL is a clear error" || bad "wrong no-index error: $(cat "$T/oi4")"
+    grep -q "github.com/rotkonetworks/zish" "$T/oi4" && ok "no index set -> uses the built-in default index (zero-config)" || bad "default index not used: $(cat "$T/oi4")"
+fi
+
+# ---- arch gate: an index entry naming an arch must match this host ----------
+HARCH=$(uname -m)  # x86_64 / aarch64 — the strings gf's HOST_ARCH uses
+case "$HARCH" in aarch64) WARCH=x86_64;; *) WARCH=aarch64;; esac
+rm -rf "$T/feats/extra/idxdemo"
+# a wrong-arch-only entry is filtered out -> install misses
+printf '{"name":"idxdemo","arch":"%s","url":"file://%s/idxdemo.tar.gz","sha256":"%s","version":"0.1.0"}\n' "$WARCH" "$T" "$IDX_SHA" > "$T/index-wrongarch.jsonl"
+if IGF "$T/index-wrongarch.jsonl" install idxdemo >"$T/oa1" 2>&1; then
+    bad "wrong-arch entry was installed"
+else
+    grep -q "not found in the feat index" "$T/oa1" && ok "wrong-arch entry is filtered (arch gate)" || bad "wrong-arch wrong error: $(cat "$T/oa1")"
+fi
+# a matching-arch entry installs
+printf '{"name":"idxdemo","arch":"%s","url":"file://%s/idxdemo.tar.gz","sha256":"%s","version":"0.1.0"}\n' "$HARCH" "$T" "$IDX_SHA" > "$T/index-arch.jsonl"
+if IGF "$T/index-arch.jsonl" install idxdemo >"$T/oa2" 2>&1 && [ -x "$T/feats/extra/idxdemo/bin/idxdemo" ]; then
+    ok "matching-arch entry installs (arch gate)"
+else
+    bad "matching-arch install failed: $(cat "$T/oa2")"
+fi
+
+# ---- gf list folds the index into a readable catalog -----------------------
+if IGF "$T/index.jsonl" list >"$T/ol1" 2>&1 && grep -q "idxdemo" "$T/ol1"; then
+    ok "gf list shows feats from the index"
+else
+    bad "gf list failed: $(cat "$T/ol1")"
 fi
 
 # ---- install from a git user-repo (the publish model: git + a pinned ref) --

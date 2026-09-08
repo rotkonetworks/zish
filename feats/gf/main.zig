@@ -39,6 +39,7 @@
 //! trusted is the one built here from the hashed source.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 
 const alloc = std.heap.page_allocator;
@@ -46,6 +47,31 @@ const alloc = std.heap.page_allocator;
 const MAX_ARCHIVE = 64 * 1024 * 1024; // download size cap
 const MAX_MANIFEST = 64 * 1024;
 const MAX_NAME = 32;
+
+// The built-in feat index: rotko's release channel. `gf install/list/search`
+// resolve against this with zero config; `ZISH_FEAT_INDEX` overrides it. The
+// index URL is the rolling `latest/download` pointer, but each entry inside it
+// pins an IMMUTABLE `releases/download/<tag>/…` tarball URL + sha256 (see
+// `make dist-all`), so a release cut mid-fetch can never 404 a pinned artifact.
+const DEFAULT_FEAT_INDEX = "https://github.com/rotkonetworks/zish/releases/latest/download/index.jsonl";
+
+// This host's arch, matched against an index entry's optional `arch` field so a
+// multi-arch index hands out the right binary (an entry with no `arch` is
+// arch-independent — e.g. a source package built locally).
+const HOST_ARCH: []const u8 = switch (builtin.target.cpu.arch) {
+    .x86_64 => "x86_64",
+    .aarch64 => "aarch64",
+    else => "unknown",
+};
+
+/// The feat index to use: the caller's `ZISH_FEAT_INDEX` if set, else the
+/// built-in default. `is_default` is the trust signal — only the built-in
+/// default (rotko's own release channel) earns a standard-tier install; a
+/// user-pointed index or a bare URL stays quarantined in extra/.
+fn indexUrl() struct { url: []const u8, is_default: bool } {
+    if (getEnv("ZISH_FEAT_INDEX")) |u| return .{ .url = u, .is_default = false };
+    return .{ .url = DEFAULT_FEAT_INDEX, .is_default = true };
+}
 
 // ===========================================================================
 // pure helpers (unit-tested)
@@ -82,9 +108,12 @@ fn manifestField(content: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Rewrite the manifest so its tier line reads "extra" — replacing an existing
-/// tier line, or appending one if the manifest had none.
-fn forceExtraTier(content: []const u8) ![]u8 {
+/// Rewrite the manifest so its tier line reads `tier` ("extra" or "standard") —
+/// replacing an existing tier line, or appending one if the manifest had none.
+/// gf, not the publisher, decides the tier: the installed directory is
+/// authoritative, and the manifest is made to agree so a future reader is never
+/// misled by a lying `tier =` line shipped in the tarball.
+fn forceTier(content: []const u8, tier: []const u8) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     var wrote_tier = false;
     var lines = std.mem.splitScalar(u8, content, '\n');
@@ -99,7 +128,9 @@ fn forceExtraTier(content: []const u8) ![]u8 {
             break :blk std.mem.trim(u8, after[0..eq], " \t").len == 0;
         };
         if (is_tier) {
-            try out.appendSlice(alloc, "tier = \"extra\"");
+            try out.appendSlice(alloc, "tier = \"");
+            try out.appendSlice(alloc, tier);
+            try out.append(alloc, '"');
             wrote_tier = true;
         } else {
             try out.appendSlice(alloc, raw);
@@ -107,7 +138,9 @@ fn forceExtraTier(content: []const u8) ![]u8 {
     }
     if (!wrote_tier) {
         if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') try out.append(alloc, '\n');
-        try out.appendSlice(alloc, "tier = \"extra\"\n");
+        try out.appendSlice(alloc, "tier = \"");
+        try out.appendSlice(alloc, tier);
+        try out.appendSlice(alloc, "\"\n");
     }
     return out.toOwnedSlice(alloc);
 }
@@ -131,12 +164,16 @@ test "manifestField extracts quoted values only" {
     try std.testing.expect(manifestField("name = unquoted\n", "name") == null);
 }
 
-test "forceExtraTier rewrites or appends the tier line" {
-    const a = try forceExtraTier("name = \"x\"\ntier = \"standard\"\nbin = \"x\"\n");
+test "forceTier rewrites or appends the tier line" {
+    const a = try forceTier("name = \"x\"\ntier = \"standard\"\nbin = \"x\"\n", "extra");
     try std.testing.expect(std.mem.indexOf(u8, a, "tier = \"extra\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, a, "standard") == null);
-    const b = try forceExtraTier("name = \"x\"\nbin = \"x\"\n");
+    const b = try forceTier("name = \"x\"\nbin = \"x\"\n", "extra");
     try std.testing.expect(std.mem.indexOf(u8, b, "tier = \"extra\"") != null);
+    // a trusted (default-index) install writes the standard tier instead
+    const c = try forceTier("name = \"x\"\ntier = \"extra\"\nbin = \"x\"\n", "standard");
+    try std.testing.expect(std.mem.indexOf(u8, c, "tier = \"standard\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "\"extra\"") == null);
 }
 
 // ===========================================================================
@@ -912,6 +949,12 @@ fn resolveIndex(idx_url: []const u8, name: []const u8) ?Resolved {
         defer parsed.deinit();
         const nm = objStr2(parsed.value, "name") orelse continue;
         if (!std.mem.eql(u8, nm, name)) continue;
+        // arch gate: an entry that names an `arch` must match this host (a
+        // multi-arch index carries one tarball line per arch); an entry with no
+        // `arch` is arch-independent (e.g. a source package built locally).
+        if (objStr2(parsed.value, "arch")) |a| {
+            if (!std.mem.eql(u8, a, HOST_ARCH)) continue;
+        }
         // build the candidate; on success, free any prior match and keep this one
         const cand: ?Resolved = blk: {
             // git entry (user-repo) takes precedence; it MUST pin a ref.
@@ -1071,13 +1114,19 @@ fn cmdPublish(dir_arg: ?[]const u8) u8 {
     return 0;
 }
 
-/// `gf search [query]` — AUR-style discovery over the index (substring on name;
-/// empty query lists everything).
+/// `gf search [query]` / `gf list` — AUR-style discovery over the index. Both
+/// fold the index into one readable line per feat (name · version · what it
+/// does), deduped and arch-filtered so a multi-arch index reads as one feat per
+/// name; search narrows by a substring on the name, list shows everything.
+/// Zero-config: resolves the built-in default index unless ZISH_FEAT_INDEX is set.
 fn cmdSearch(query: []const u8) u8 {
-    const idx = getEnv("ZISH_FEAT_INDEX") orelse
-        return fail("no feat index configured — set ZISH_FEAT_INDEX to an index URL", .{});
-    const data = fetchIndex(idx) orelse return fail("could not fetch the index ({s})", .{idx});
+    const ix = indexUrl();
+    const data = fetchIndex(ix.url) orelse return fail("could not fetch the feat index ({s})", .{ix.url});
     defer alloc.free(data);
+    // Dedup by name: a multi-arch index has one line per (name, arch); collapse
+    // to the entries that apply to THIS host so each feat prints once.
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(alloc);
     var n: usize = 0;
     var lines = std.mem.splitScalar(u8, data, '\n');
     while (lines.next()) |ln| {
@@ -1087,13 +1136,26 @@ fn cmdSearch(query: []const u8) u8 {
         defer parsed.deinit();
         const nm = objStr2(parsed.value, "name") orelse continue;
         if (query.len != 0 and std.mem.indexOf(u8, nm, query) == null) continue;
-        const ref = objStr2(parsed.value, "ref") orelse objStr2(parsed.value, "sha256") orelse "";
-        const loc = objStr2(parsed.value, "git") orelse objStr2(parsed.value, "url") orelse "";
+        if (objStr2(parsed.value, "arch")) |a| {
+            if (!std.mem.eql(u8, a, HOST_ARCH)) continue;
+        }
+        if (seen.contains(nm)) continue;
+        seen.put(alloc, alloc.dupe(u8, nm) catch nm, {}) catch {};
+        const ver = objStr2(parsed.value, "version") orelse objStr2(parsed.value, "ref") orelse "";
+        const desc = objStr2(parsed.value, "desc") orelse "";
         const signed = if (objStr2(parsed.value, "publisher") != null) " [signed]" else "";
-        print("{s}  {s}  {s}{s}\n", .{ nm, ref, loc, signed });
+        if (desc.len != 0) {
+            print("{s}  {s}  — {s}{s}\n", .{ nm, ver, desc, signed });
+        } else {
+            print("{s}  {s}{s}\n", .{ nm, ver, signed });
+        }
         n += 1;
     }
-    if (n == 0) print("no feats match \"{s}\"\n", .{query});
+    if (n == 0) {
+        if (query.len != 0) print("no feats match \"{s}\"\n", .{query}) else print("the feat index is empty ({s})\n", .{ix.url});
+    } else if (query.len == 0) {
+        print("\ninstall one:  gf install <name>\n", .{});
+    }
     return 0;
 }
 
@@ -1101,13 +1163,19 @@ fn run(init: std.process.Init.Minimal) u8 {
     var args = std.process.Args.Iterator.init(init.args);
     _ = args.next(); // argv0
     const first = args.next() orelse {
-        print("usage: gf <url>                 fetch a feat tarball, install into the extra tier\n" ++
+        print("usage: gf list                  list every feat in the index (name · version · what it does)\n" ++
             "       gf install <name>          install a feat by name from the feat index (pinned + verified)\n" ++
-            "       gf search [query]          find feats in the index (AUR-style)\n" ++
+            "       gf search <query>          find feats in the index (AUR-style)\n" ++
+            "       gf <url>                   fetch a feat tarball from a URL, install into the extra tier\n" ++
             "       gf publish [dir]           sign + push a release tag, emit the index line (cargo-style)\n" ++
             "       gf status [feat] [--json]  show install + review history (the ledger fold)\n", .{});
         return 1;
     };
+
+    if (std.mem.eql(u8, first, "list")) {
+        if (args.next() != null) return fail("usage: gf list", .{});
+        return cmdSearch("");
+    }
 
     if (std.mem.eql(u8, first, "search")) {
         const q = args.next() orelse "";
@@ -1139,16 +1207,25 @@ fn run(init: std.process.Init.Minimal) u8 {
     var expected_sha: ?[]const u8 = null; // tarball pin (index sha256)
     var git_ref: ?[]const u8 = null; // git pin (index ref: commit/tag)
     var publisher: ?[]const u8 = null; // git: index-declared signing pubkey
+    var to_standard = false; // trusted default-index tarball → standard tier
     const url = blk: {
         if (std.mem.eql(u8, first, "install")) {
             const name_arg = args.next() orelse return fail("usage: gf install <name>", .{});
             if (args.next() != null) return fail("unexpected extra argument", .{});
-            const idx_url = getEnv("ZISH_FEAT_INDEX") orelse
-                return fail("no feat index configured — set ZISH_FEAT_INDEX to an index URL", .{});
-            const r = resolveIndex(idx_url, name_arg) orelse
-                return fail("{s} not found in the feat index ({s})", .{ name_arg, idx_url });
+            const ix = indexUrl();
+            const r = resolveIndex(ix.url, name_arg) orelse
+                return fail("{s} not found in the feat index ({s})", .{ name_arg, ix.url });
             switch (r.kind) {
-                .tarball => expected_sha = r.pin,
+                .tarball => {
+                    expected_sha = r.pin;
+                    // A sha-verified tarball from gf's OWN default index (rotko's
+                    // release channel) installs to standard/, callable at once.
+                    // A user-pointed ZISH_FEAT_INDEX or a bare `gf <url>` stays
+                    // quarantined in extra/ — quarantine protects against
+                    // third-party publishers, not against the same release
+                    // channel that ships zish itself.
+                    if (ix.is_default) to_standard = true;
+                },
                 .git => {
                     git_ref = r.pin;
                     publisher = r.publisher;
@@ -1160,13 +1237,17 @@ fn run(init: std.process.Init.Minimal) u8 {
         break :blk first;
     };
 
-    // feat root: same resolution as zish (ZISH_FEAT_PATH overrides)
+    // feat root: same resolution as zish (ZISH_FEAT_PATH overrides). The
+    // destination tier is decided above (to_standard): a trusted default-index
+    // tarball lands in standard/ (instantly callable), everything else in
+    // extra/ (quarantined).
+    const tier_name: []const u8 = if (to_standard) "standard" else "extra";
     var root_buf: [4096]u8 = undefined;
     const root = featRootPath(&root_buf) orelse return fail("no HOME", .{});
     mkdirP(root);
-    var extra_buf: [4096]u8 = undefined;
-    const extra_dir = std.fmt.bufPrint(&extra_buf, "{s}/extra", .{root}) catch return fail("path too long", .{});
-    mkdirP(extra_dir);
+    var tierdir_buf: [4096]u8 = undefined;
+    const tier_dir = std.fmt.bufPrint(&tierdir_buf, "{s}/{s}", .{ root, tier_name }) catch return fail("path too long", .{});
+    mkdirP(tier_dir);
 
     // temp dir inside the feat root: rename() into extra/ stays one filesystem
     const pid = linux.getpid();
@@ -1314,7 +1395,7 @@ fn run(init: std.process.Init.Minimal) u8 {
     }
 
     // force the quarantine tier in the manifest, mark the binary executable
-    const rewritten = forceExtraTier(manifest) catch return fail("out of memory", .{});
+    const rewritten = forceTier(manifest, tier_name) catch return fail("out of memory", .{});
     if (!writeFile(mf_path, rewritten, 0o600)) return fail("cannot rewrite manifest", .{});
     {
         var bz: [4096]u8 = undefined;
@@ -1324,9 +1405,11 @@ fn run(init: std.process.Init.Minimal) u8 {
         _ = linux.chmod(p, 0o755);
     }
 
-    // atomic install: refuse an existing feat (no silent upgrade in v1)
+    // atomic install: refuse an existing feat at this tier (no silent upgrade
+    // in v1). A copy in the other tier is left alone — dispatch resolves
+    // standard/ before extra/, so the tiers don't collide.
     var dest_buf: [4096]u8 = undefined;
-    const dest = std.fmt.bufPrint(&dest_buf, "{s}/extra/{s}", .{ root, name }) catch return 1;
+    const dest = std.fmt.bufPrint(&dest_buf, "{s}/{s}/{s}", .{ root, tier_name, name }) catch return 1;
     if (lstatMode(dest) != null) return fail("{s} is already installed at {s} — remove it first", .{ name, dest });
     {
         var tz: [4096]u8 = undefined;
@@ -1354,12 +1437,20 @@ fn run(init: std.process.Init.Minimal) u8 {
     // intact and simply unreviewed.
     reviewInstalled(root, dest, name, sha);
 
-    print(
-        "gf: installed {s} into the extra tier: {s}\n" ++
-            "    extra feats run quarantined: stripped environment, never as root,\n" ++
-            "    and session feats get no run/prompt hostcalls.\n" ++
-            "    to promote after you trust it:  mv {s} {s}/standard/{s}\n",
-        .{ name, dest, dest, root, name },
-    );
+    if (to_standard) {
+        print(
+            "gf: installed {s} into the standard tier: {s}\n" ++
+                "    run it now:  {s}\n",
+            .{ name, dest, name },
+        );
+    } else {
+        print(
+            "gf: installed {s} into the extra tier: {s}\n" ++
+                "    extra feats run quarantined: stripped environment, never as root,\n" ++
+                "    and session feats get no run/prompt hostcalls.\n" ++
+                "    to promote after you trust it:  mv {s} {s}/standard/{s}\n",
+            .{ name, dest, dest, root, name },
+        );
+    }
     return 0;
 }
