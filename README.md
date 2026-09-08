@@ -70,7 +70,7 @@ case, because the cost there is `fork`/`exec` and the kernel, not the shell.
 wrong-but-fast answer fails instead of scoring well. That check is what caught
 a real arithmetic bug in 0.16.0, which is the main reason it exists.
 
-Linux only. macOS is a preview — see below.
+Linux only.
 
 ## Try it
 
@@ -301,26 +301,6 @@ There is no model involved. zish used to ship a GGUF inference engine for this;
 it was removed in favour of history matching, which is where the useful
 suggestions came from anyway.
 
-## macOS (preview)
-
-zish builds and runs on macOS. CI exercises it on every push: 25 behaviours
-non-interactively (subshells, arithmetic, pipelines, functions, globs,
-background jobs, redirects, heredocs, and every file-test operator checked
-against bash on the same machine) plus a 13-case interactive suite over a real
-pty covering ctrl-Z suspend, `jobs`, `bg`, terminal handover and tab
-completion.
-
-Still called a preview because no human has used it as a daily shell, and
-because there are no prebuilt macOS binaries — shipping one would imply support
-that hasn't been earned yet. Build from source:
-
-```sh
-brew install zig
-zig build --release=safe && ./zig-out/bin/zish
-```
-
-Reports of what breaks are more useful than patches right now.
-
 ## Tests
 
 ```sh
@@ -338,9 +318,8 @@ already been found and fixed.
 
 ## Contributing
 
-Patches welcome, especially portability beyond Linux. Please make sure
-`./tests/regress.sh` and `zig build test` are green, and add a case for
-whatever you fixed.
+Patches welcome. Please make sure `./tests/regress.sh` and `zig build test`
+are green, and add a case for whatever you fixed.
 
 ## License
 

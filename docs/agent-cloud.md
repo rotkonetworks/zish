@@ -35,9 +35,9 @@ So the isolation model is dictated by *what* is isolated:
   microVM.
 
 This mirrors what the incumbents do: Anthropic's Claude Code runs local tools under
-**bubblewrap+seccomp** (Linux) / Seatbelt (macOS) + a network-allowlist proxy — same
-family as zish's Landlock+seccomp; their hosted code-exec moves to containers. Nobody
-found a shortcut around the kernel boundary for native code.
+**bubblewrap+seccomp** on Linux plus a network-allowlist proxy, the same family as
+zish's Landlock+seccomp; their hosted code-exec moves to containers. Nobody found a
+shortcut around the kernel boundary for native code.
 
 ---
 
@@ -223,7 +223,7 @@ already implements most of layers 2–3:
 | | zish agent cloud | Anthropic (hosted) | Cloudflare Agents |
 |---|---|---|---|
 | execution | native binaries in microVM | sandboxed containers | **V8 isolate, virtual FS** (no native) |
-| confinement | Landlock+seccomp (fd-3 attested) | bubblewrap/Seatbelt+proxy | isolate boundary |
+| confinement | Landlock+seccomp (fd-3 attested) | bubblewrap+proxy | isolate boundary |
 | state/idle | VM snapshot/restore (design) | — | Durable Objects (hibernate) |
 | metering | conserved subdivision + signed vouchers | — | per-call (x402) |
 | distinctive | **root-bounded self-subdividing native tree** | managed sandbox | edge-native JS agents |

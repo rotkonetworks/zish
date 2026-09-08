@@ -57,16 +57,8 @@ Correctness fix release. Recommended for anyone on 0.16.0.
 ### changed
 - README benchmark claim corrected from "3-7x" to the measured **1.5-2x**
 - docs no longer describe the removed LLM agent
-- CI now runs `tests/regress.sh` and `bench.sh`, cross-builds for macOS and
-  aarch64-linux, and builds natively on macOS
-
-### macOS (preview, not supported)
-zish now builds on macOS and passes a 16-case smoke test there — basic
-execution, subshells, arithmetic, pipelines, command substitution, functions,
-loops, `-f`/`-d`/`-x` file tests, globs, background jobs, redirects, heredocs
-and here-strings all work. Not yet ported: `-L`/`-h`, `-nt`/`-ot`/`-ef`/`-O`/
-`-G` (statx-based; they return false instead of erroring), and interactive job
-control has not been exercised at all. Treat it as a preview.
+- CI now runs `tests/regress.sh` and `bench.sh` and cross-builds for
+  aarch64-linux
 
 ## v0.16.0
 
