@@ -163,6 +163,14 @@ and `feat run <name>` is the explicit form if you want it.
 A feat is just a binary zish `exec`s: no plugin ABI, no dynamic loading, no
 in-process hooks. See [docs/feat-spec.md](docs/feat-spec.md) for the contract.
 
+### Dashboard (zash)
+
+The `team` and `agent` feats run agent-orgs (a Captain decomposing work across
+parallel workers) and write a live JSONL trace per run. **[zash](https://github.com/rotkonetworks/zash)**
+is a small SolidJS + Bun dashboard that folds that trace in real time — Captain,
+parallel workers, consults, critic, synthesis — lets you talk to the Captain
+in-chat, and shows which model actually ran each step. It lives in its own repo.
+
 ## Driving zish from a program
 
 A shell an agent drives has two jobs a shell you drive doesn't: report what
