@@ -524,6 +524,10 @@ fn reviewLedgerAppend(root: []const u8, sha: []const u8, verdict_word: []const u
 /// Exec `agent --judge` on the installed source and append the verdict. All
 /// failure paths are loud notes that leave the install intact and unreviewed.
 fn reviewInstalled(root: []const u8, dest: []const u8, name: []const u8, sha: []const u8) void {
+    if (!settingOn("review", true)) {
+        print("gf: review is off ({s} installed unreviewed; `gf settings` to re-enable)\n", .{name});
+        return;
+    }
     var sbuf: [4096]u8 = undefined;
     const src_dir = std.fmt.bufPrint(&sbuf, "{s}/src", .{dest}) catch return;
     if (lstatMode(src_dir) == null) {
@@ -1172,6 +1176,104 @@ fn cmdRemove(name: []const u8) u8 {
     return 0;
 }
 
+// ---- gf settings: persistent on/off toggles (config at ~/.zish/gf.conf) -----
+
+const SettingDef = struct { key: []const u8, label: []const u8, desc: []const u8, default_on: bool };
+const GF_SETTINGS = [_]SettingDef{
+    .{ .key = "review", .label = "review", .desc = "AI review-on-install (agent judges each source package, records a verdict)", .default_on = true },
+};
+
+fn gfConfigPath(buf: []u8) ?[]const u8 {
+    if (getEnv("ZISH_GF_CONFIG")) |p| return p;
+    const home = getEnv("HOME") orelse return null;
+    return std.fmt.bufPrint(buf, "{s}/.zish/gf.conf", .{home}) catch null;
+}
+
+/// Read a boolean setting from the config file (`key = on|off`). A missing file
+/// or key returns `default_on`, so a fresh install behaves as the defaults say.
+fn settingOn(key: []const u8, default_on: bool) bool {
+    var cb: [4096]u8 = undefined;
+    const cp = gfConfigPath(&cb) orelse return default_on;
+    const data = readFileAlloc(cp, 64 * 1024) orelse return default_on;
+    defer alloc.free(data);
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        if (!std.mem.startsWith(u8, line, key)) continue;
+        const after = line[key.len..];
+        const eq = std.mem.indexOfScalar(u8, after, '=') orelse continue;
+        if (std.mem.trim(u8, after[0..eq], " \t").len != 0) continue; // "reviewer=" != "review ="
+        const val = std.mem.trim(u8, after[eq + 1 ..], " \t");
+        return std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "true") or
+            std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "yes");
+    }
+    return default_on;
+}
+
+/// Write every known setting to the config file (whole-file rewrite, 0644).
+fn writeSettings(states: []const bool) bool {
+    if (getEnv("HOME")) |h| {
+        var zb: [4096]u8 = undefined;
+        if (std.fmt.bufPrint(&zb, "{s}/.zish", .{h}) catch null) |zp| mkdirP(zp);
+    }
+    var cb: [4096]u8 = undefined;
+    const cp = gfConfigPath(&cb) orelse return false;
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(alloc);
+    out.appendSlice(alloc, "# gf settings — toggle with `gf settings`\n") catch return false;
+    for (GF_SETTINGS, 0..) |s, i| {
+        out.appendSlice(alloc, s.key) catch return false;
+        out.appendSlice(alloc, " = ") catch return false;
+        out.appendSlice(alloc, if (states[i]) "on" else "off") catch return false;
+        out.append(alloc, '\n') catch return false;
+    }
+    return writeFile(cp, out.items, 0o644);
+}
+
+/// `gf settings` — an interactive on/off checklist, same shape as `gf setup`:
+/// pick a number to flip a setting, read from stdin so it also composes
+/// (`echo 1 | gf settings`). Empty selection changes nothing.
+fn cmdSettings() u8 {
+    var states: [GF_SETTINGS.len]bool = undefined;
+    for (GF_SETTINGS, 0..) |s, i| states[i] = settingOn(s.key, s.default_on);
+
+    print("gf settings — toggle by number:\n\n", .{});
+    for (GF_SETTINGS, 0..) |s, i| {
+        print("  {d:>2}) [{s}] {s}  — {s}\n", .{ i + 1, if (states[i]) "on " else "off", s.label, s.desc });
+    }
+    print("\nFlip by number (space/comma-separated), or empty to cancel: ", .{});
+
+    var lb: [256]u8 = undefined;
+    const sel = readSelection(&lb);
+    const trimmed = std.mem.trim(u8, sel, " \t\r");
+    if (trimmed.len == 0) {
+        print("no change.\n", .{});
+        return 0;
+    }
+    var changed = false;
+    var toks = std.mem.tokenizeAny(u8, trimmed, " ,");
+    while (toks.next()) |tok| {
+        const n = std.fmt.parseInt(usize, tok, 10) catch {
+            print("  (ignoring \"{s}\": not a number)\n", .{tok});
+            continue;
+        };
+        if (n < 1 or n > GF_SETTINGS.len) {
+            print("  (ignoring {d}: out of range)\n", .{n});
+            continue;
+        }
+        states[n - 1] = !states[n - 1];
+        changed = true;
+    }
+    if (!changed) {
+        print("no change.\n", .{});
+        return 0;
+    }
+    if (!writeSettings(&states)) return fail("could not write settings to the config", .{});
+    for (GF_SETTINGS, 0..) |s, i| print("  {s} = {s}\n", .{ s.label, if (states[i]) "on" else "off" });
+    return 0;
+}
+
 const FeatState = enum { available, active, inactive };
 
 /// `gf setup` — an interactive checklist over the index. Every feat is shown
@@ -1337,6 +1439,7 @@ fn run(init: std.process.Init.Minimal) u8 {
     _ = args.next(); // argv0
     const first = args.next() orelse {
         print("usage: gf setup                 interactive checklist: install / remove feats from the index\n" ++
+            "       gf settings                toggle options on/off (AI review-on-install, …)\n" ++
             "       gf list                    list every feat in the index (name · version · what it does)\n" ++
             "       gf install <name>          install a feat by name from the feat index (pinned + verified)\n" ++
             "       gf remove <name>           uninstall a feat (from either tier)\n" ++
@@ -1350,6 +1453,11 @@ fn run(init: std.process.Init.Minimal) u8 {
     if (std.mem.eql(u8, first, "setup")) {
         if (args.next() != null) return fail("usage: gf setup", .{});
         return cmdSetup();
+    }
+
+    if (std.mem.eql(u8, first, "settings")) {
+        if (args.next() != null) return fail("usage: gf settings", .{});
+        return cmdSettings();
     }
 
     if (std.mem.eql(u8, first, "remove") or std.mem.eql(u8, first, "uninstall")) {
