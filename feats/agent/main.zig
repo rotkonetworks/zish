@@ -71,7 +71,8 @@ fn jsonEscape(out: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
 
 const ToolCall = struct {
     id: []const u8, // owned
-    command: []const u8, // owned; the run_command "command" argument
+    name: []const u8, // owned; the function name (e.g. run_command, dispatch_team)
+    arguments: []const u8, // owned; the raw JSON-string arguments the model sent
 };
 
 /// What one model response resolves to.
@@ -127,10 +128,11 @@ fn parseResponse(body: []const u8) Assistant {
                 };
                 const id = objStr(call, "id") orelse "call_0";
                 const func = co.get("function") orelse continue;
-                const args_str = objStr(func, "arguments") orelse continue;
-                // arguments is a JSON string; parse it for {"command":...}
-                const command = parseCommandArg(args_str) orelse continue;
-                list.append(alloc, .{ .id = dupe(id), .command = command }) catch continue;
+                const name = objStr(func, "name") orelse continue;
+                // arguments is a JSON string; keep it raw — each executor parses
+                // out the fields its own tool needs.
+                const args_str = objStr(func, "arguments") orelse "{}";
+                list.append(alloc, .{ .id = dupe(id), .name = dupe(name), .arguments = dupe(args_str) }) catch continue;
             }
             if (list.items.len == 0)
                 return .{ .err = dupe("agent: tool_calls present but none parseable") };
@@ -181,8 +183,33 @@ const Message = struct {
     tool_calls_json: []const u8 = "", // owned; verbatim assistant.tool_calls array
 };
 
-/// Build the chat-completions request body from the running history.
-fn buildRequest(model: []const u8, history: []const Message) ![]u8 {
+// Tool-sets. The shell loop offers run_command (executed via the session frame
+// protocol); the captain offers dispatch_team + ask_human (executed by forking
+// the `team` and `ask` feats). Both are plain OpenAI function-tool arrays.
+const SHELL_TOOLS =
+    "[{\"type\":\"function\",\"function\":{\"name\":\"run_command\"," ++
+    "\"description\":\"Run a shell command in the user's live zish session and " ++
+    "return its stdout and exit code.\",\"parameters\":{\"type\":\"object\"," ++
+    "\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"the shell " ++
+    "command to run\"}},\"required\":[\"command\"]}}}]";
+const CAPTAIN_TOOLS =
+    "[{\"type\":\"function\",\"function\":{\"name\":\"dispatch_team\"," ++
+    "\"description\":\"Hand a concrete, self-contained task to your agent team to " ++
+    "build, code, analyze, or verify. Use ONLY for real work — not for questions " ++
+    "you can answer yourself. The team runs asynchronously; you get its result on " ++
+    "a later turn.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"spec\":" ++
+    "{\"type\":\"string\",\"description\":\"the full task, with every reference from " ++
+    "the conversation resolved so the team needs no prior context\"}},\"required\":" ++
+    "[\"spec\"]}}}," ++
+    "{\"type\":\"function\",\"function\":{\"name\":\"ask_human\",\"description\":\"Ask " ++
+    "the human a question and wait for their answer. Use for a genuine choice or " ++
+    "missing detail. Offer 2-4 short options when the answer is a choice; omit " ++
+    "options for a free-form question.\",\"parameters\":{\"type\":\"object\"," ++
+    "\"properties\":{\"question\":{\"type\":\"string\"},\"options\":{\"type\":\"array\"," ++
+    "\"items\":{\"type\":\"string\"}}},\"required\":[\"question\"]}}}]";
+
+/// Build the chat-completions request body from the running history + a tool-set.
+fn buildRequest(model: []const u8, history: []const Message, tools: []const u8) ![]u8 {
     var b: std.ArrayListUnmanaged(u8) = .empty;
     try b.appendSlice(alloc, "{\"model\":\"");
     try jsonEscape(&b, model);
@@ -205,13 +232,9 @@ fn buildRequest(model: []const u8, history: []const Message) ![]u8 {
         }
         try b.append(alloc, '}');
     }
-    // one tool: run_command
-    try b.appendSlice(alloc,
-        "],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"run_command\"," ++
-        "\"description\":\"Run a shell command in the user's live zish session and " ++
-        "return its stdout and exit code.\",\"parameters\":{\"type\":\"object\"," ++
-        "\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"the shell " ++
-        "command to run\"}},\"required\":[\"command\"]}}}]}");
+    try b.appendSlice(alloc, "],\"tools\":");
+    try b.appendSlice(alloc, tools);
+    try b.append(alloc, '}');
     return b.toOwnedSlice(alloc);
 }
 
@@ -502,6 +525,18 @@ pub fn main(init: std.process.Init.Minimal) void {
     if (hasAskFlag(init.args)) {
         linux.exit(runAsk(init.args));
     }
+    // captain: the conversational front. `agent captain --thread <file> <msg>` —
+    // holds a topic thread (OpenAI messages in a JSONL file), runs the tool loop
+    // with the captain tool-set (dispatch_team, ask_human), appends the turn back.
+    // No session host, no hello frame — it forks its tools directly.
+    if (hasCaptainFlag(init.args)) {
+        linux.exit(runCaptain(init.args));
+    }
+    // solo: a self-contained tool-using worker (loop + local run_command). No
+    // session host — used by `team` to give workers real tools.
+    if (hasSoloFlag(init.args)) {
+        linux.exit(runSolo(init.args));
+    }
 
     // consume the hello frame (protocol v0.2+); we do not gate on caps here —
     // a run denial simply ends the loop via runCommand returning null.
@@ -561,7 +596,7 @@ pub fn main(init: std.process.Init.Minimal) void {
 
     var turn: usize = 0;
     while (turn < MAX_TURNS) : (turn += 1) {
-        const request = buildRequest(cfg.model, history.items) catch {
+        const request = buildRequest(cfg.model, history.items, SHELL_TOOLS) catch {
             say("agent: failed to build request");
             break;
         };
@@ -590,7 +625,12 @@ pub fn main(init: std.process.Init.Minimal) void {
                 appendAssistantToolCalls(&history, calls);
                 var aborted = false;
                 for (calls) |call| {
-                    const res = runCommand(call.command) orelse {
+                    // the shell tool-set has one tool; arguments carry {"command":...}
+                    const command = parseCommandArg(call.arguments) orelse {
+                        appendToolResult(&history, call.id, .{ .code = 2, .out = dupe("agent: could not parse command argument") });
+                        continue;
+                    };
+                    const res = runCommand(command) orelse {
                         aborted = true;
                         break;
                     };
@@ -611,36 +651,68 @@ pub fn main(init: std.process.Init.Minimal) void {
 }
 
 fn appendAssistantToolCalls(history: *std.ArrayListUnmanaged(Message), calls: []const ToolCall) void {
-    // reconstruct the tool_calls JSON array the API expects on the assistant msg
-    var arr: std.ArrayListUnmanaged(u8) = .empty;
-    arr.append(alloc, '[') catch return;
-    for (calls, 0..) |c, i| {
-        if (i > 0) arr.append(alloc, ',') catch return;
-        arr.appendSlice(alloc, "{\"id\":\"") catch return;
-        jsonEscape(&arr, c.id) catch return;
-        arr.appendSlice(alloc, "\",\"type\":\"function\",\"function\":{\"name\":\"run_command\",\"arguments\":\"") catch return;
-        // arguments is a JSON string containing {"command":...}
-        var inner: std.ArrayListUnmanaged(u8) = .empty;
-        defer inner.deinit(alloc);
-        inner.appendSlice(alloc, "{\"command\":\"") catch return;
-        jsonEscape(&inner, c.command) catch return;
-        inner.appendSlice(alloc, "\"}") catch return;
-        jsonEscape(&arr, inner.items) catch return; // escape the inner JSON as a string
-        arr.appendSlice(alloc, "\"}}") catch return;
-    }
-    arr.append(alloc, ']') catch return;
     history.append(alloc, .{
         .role = .assistant,
         .content = "",
-        .tool_calls_json = arr.toOwnedSlice(alloc) catch "",
+        .tool_calls_json = renderToolCallsJson(calls),
     }) catch {};
+}
+
+/// Reconstruct the `tool_calls` JSON array the API expects on an assistant msg,
+/// tool-set agnostic: each call carries its own name + raw JSON-string arguments.
+fn renderToolCallsJson(calls: []const ToolCall) []u8 {
+    var arr: std.ArrayListUnmanaged(u8) = .empty;
+    arr.append(alloc, '[') catch return "";
+    for (calls, 0..) |c, i| {
+        if (i > 0) arr.append(alloc, ',') catch return "";
+        arr.appendSlice(alloc, "{\"id\":\"") catch return "";
+        jsonEscape(&arr, c.id) catch return "";
+        arr.appendSlice(alloc, "\",\"type\":\"function\",\"function\":{\"name\":\"") catch return "";
+        jsonEscape(&arr, c.name) catch return "";
+        arr.appendSlice(alloc, "\",\"arguments\":\"") catch return "";
+        jsonEscape(&arr, c.arguments) catch return ""; // escape the raw args JSON as a string
+        arr.appendSlice(alloc, "\"}}") catch return "";
+    }
+    arr.append(alloc, ']') catch return "";
+    return arr.toOwnedSlice(alloc) catch "";
+}
+
+// A tool result is READ up to RESULT_CAP (8 MiB) but must not be FED to the model
+// whole — a single `cat` or verbose build can dump megabytes of tokens into every
+// subsequent request (quadratic cost). Feed head+tail with a line-aware elision
+// marker; the model sees the shape and the ends, not the bulk. Override the window
+// with ZISH_AGENT_TOOL_CAP (bytes of head; tail is half that).
+fn toolHeadCap() usize {
+    const v = getEnv("ZISH_AGENT_TOOL_CAP") orelse return 3000;
+    return std.fmt.parseInt(usize, v, 10) catch 3000;
+}
+/// Bound `out` to head+tail around an elision marker, trimmed to line boundaries.
+fn boundToolOutput(out: []const u8) []u8 {
+    const head_cap = toolHeadCap();
+    const tail_cap = head_cap / 2;
+    if (out.len <= head_cap + tail_cap + 80) return dupe(out);
+    // head: cut at the last newline within head_cap (else the raw cut)
+    var head_end = head_cap;
+    if (std.mem.lastIndexOfScalar(u8, out[0..head_cap], '\n')) |nl| head_end = nl;
+    // tail: start at the first newline within the last tail_cap (else the raw cut)
+    var tail_start = out.len - tail_cap;
+    if (std.mem.indexOfScalar(u8, out[tail_start..], '\n')) |nl| tail_start += nl + 1;
+    const elided = tail_start - head_end;
+    var b: std.ArrayListUnmanaged(u8) = .empty;
+    var mb: [96]u8 = undefined;
+    b.appendSlice(alloc, out[0..head_end]) catch {};
+    b.appendSlice(alloc, std.fmt.bufPrint(&mb, "\n\n… [{d} bytes elided — re-run scoped to see them] …\n\n", .{elided}) catch "\n…\n") catch {};
+    b.appendSlice(alloc, out[tail_start..]) catch {};
+    return b.toOwnedSlice(alloc) catch dupe(out);
 }
 
 fn appendToolResult(history: *std.ArrayListUnmanaged(Message), id: []const u8, res: RunResult) void {
     var c: std.ArrayListUnmanaged(u8) = .empty;
     var hb: [32]u8 = undefined;
     c.appendSlice(alloc, std.fmt.bufPrint(&hb, "[exit {d}]\n", .{res.code}) catch "") catch {};
-    c.appendSlice(alloc, res.out) catch {};
+    const bounded = boundToolOutput(res.out);
+    defer alloc.free(bounded);
+    c.appendSlice(alloc, bounded) catch {};
     history.append(alloc, .{
         .role = .tool,
         .content = c.toOwnedSlice(alloc) catch "",
@@ -956,7 +1028,7 @@ fn splitReasoning(content: []const u8) struct { think: []const u8, answer: []con
 /// When ZISH_ASK_META is set, write `{"pt","ct","think"}` — token usage (from the
 /// response's `usage`) and the reasoning (a `reasoning` field, else the `<think>`
 /// block) — so a caller like `team` can surface real tokens/cost + thinking.
-fn writeAskMeta(body: []const u8, inline_think: []const u8) void {
+fn writeAskMeta(body: []const u8, inline_think: []const u8, model: []const u8) void {
     const mp = getEnv("ZISH_ASK_META") orelse return;
     var pt: i64 = 0;
     var ct: i64 = 0;
@@ -980,7 +1052,9 @@ fn writeAskMeta(body: []const u8, inline_think: []const u8) void {
     var m: std.ArrayListUnmanaged(u8) = .empty;
     defer m.deinit(alloc);
     var nb: [64]u8 = undefined;
-    m.appendSlice(alloc, std.fmt.bufPrint(&nb, "{{\"pt\":{d},\"ct\":{d},\"think\":\"", .{ pt, ct }) catch return) catch return;
+    m.appendSlice(alloc, std.fmt.bufPrint(&nb, "{{\"pt\":{d},\"ct\":{d},\"model\":\"", .{ pt, ct }) catch return) catch return;
+    jsonEscape(&m, model) catch return; // the model that ACTUALLY ran — the source of truth
+    m.appendSlice(alloc, "\",\"think\":\"") catch return;
     jsonEscape(&m, std.mem.trim(u8, think, " \t\r\n")) catch return;
     m.appendSlice(alloc, "\"}") catch return;
     _ = writeFile600(mp, m.items);
@@ -989,6 +1063,10 @@ fn writeAskMeta(body: []const u8, inline_think: []const u8) void {
 fn runAsk(args: std.process.Args) u8 {
     var model: []const u8 = getEnv("ZISH_AGENT_MODEL") orelse DEFAULT_MODEL;
     var mock_path: ?[]const u8 = null;
+    // system prompt: --system <text> wins, else $ZISH_AGENT_SYSTEM, else the
+    // default team-member instruction. Lets a caller (e.g. the `captain` feat)
+    // reuse this plain-completion transport with its own persona.
+    var system: []const u8 = getEnv("ZISH_AGENT_SYSTEM") orelse ASK_SYSTEM;
     var prompt: std.ArrayListUnmanaged(u8) = .empty;
     defer prompt.deinit(alloc);
     var it = std.process.Args.Iterator.init(args);
@@ -997,6 +1075,10 @@ fn runAsk(args: std.process.Args) u8 {
         if (std.mem.eql(u8, a, "--ask")) continue;
         if (std.mem.eql(u8, a, "-m")) {
             model = dupe(it.next() orelse return 2);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--system")) {
+            system = dupe(it.next() orelse return 2);
             continue;
         }
         if (std.mem.eql(u8, a, "--mock")) {
@@ -1043,14 +1125,14 @@ fn runAsk(args: std.process.Args) u8 {
 
     var attempt: usize = 0;
     while (attempt < JUDGE_RETRIES) : (attempt += 1) {
-        const request = buildJudgeRequest(model, ASK_SYSTEM, prompt.items) catch return 2;
+        const request = buildJudgeRequest(model, system, prompt.items) catch return 2;
         const reply = fetchWithBackoff(&mock, home, endpoint, key, request) orelse continue;
         if (reply.status < 200 or reply.status >= 300) continue;
         switch (parseResponse(reply.body)) {
             .text => |t| {
                 const trimmed = std.mem.trim(u8, t, " \t\r\n");
                 const sr = splitReasoning(trimmed); // one splitter, all tags
-                writeAskMeta(reply.body, sr.think); // tokens + thinking → sidecar
+                writeAskMeta(reply.body, sr.think, model); // tokens + model + thinking → sidecar
                 emit(sr.answer); // the answer, reasoning removed
                 emit("\n");
                 return 0;
@@ -1060,6 +1142,666 @@ fn runAsk(args: std.process.Args) u8 {
     }
     warn("agent: --ask produced no response after retries\n");
     return 1;
+}
+
+// ===========================================================================
+// captain — the conversational front (agent's tool loop + a topic thread)
+// ===========================================================================
+
+const CAPTAIN_MAX_TURNS = 8;
+const CAPTAIN_SYSTEM =
+    \\You are the Captain of a small agent organization, in a live chat with a
+    \\human. Converse naturally. Most messages are conversational — a question you
+    \\can answer, a clarification, an opinion, an acknowledgement, small talk, or a
+    \\follow-up — and you simply reply, briefly, in plain text.
+    \\
+    \\You have two tools, for the cases where talking is not enough:
+    \\  • dispatch_team(spec) — hand a concrete task to your team when the human
+    \\    needs something built, coded, analyzed, or verified. Resolve every
+    \\    reference from the conversation ("it", "again", "shorter", "the function")
+    \\    into a self-contained spec. The team works asynchronously; you will see
+    \\    its result on a later turn, so after dispatching, just tell the human you
+    \\    have put the team on it — do NOT dispatch the same work twice.
+    \\  • ask_human(question, options?) — when you genuinely need a decision or a
+    \\    missing detail. Offer 2-4 short options for a choice; omit options to ask
+    \\    open-ended.
+    \\
+    \\Do not use a tool for anything you can answer or decide yourself. Keep replies
+    \\short and human.
+;
+
+fn hasCaptainFlag(args: std.process.Args) bool {
+    var it = std.process.Args.Iterator.init(args);
+    _ = it.next(); // argv0
+    while (it.next()) |a| {
+        if (std.mem.eql(u8, a, "captain")) return true;
+        if (std.mem.eql(u8, a, "--thread")) return true;
+    }
+    return false;
+}
+
+fn nowMs() i64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(.REALTIME, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
+}
+
+fn appendFile(path: []const u8, bytes: []const u8) bool {
+    var z: [4096]u8 = undefined;
+    if (path.len >= z.len) return false;
+    @memcpy(z[0..path.len], path);
+    z[path.len] = 0;
+    const fd: isize = @bitCast(linux.open(@ptrCast(&z), .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o600));
+    if (fd < 0) return false;
+    defer _ = linux.close(@intCast(fd));
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n: isize = @bitCast(linux.write(@intCast(fd), bytes.ptr + off, bytes.len - off));
+        if (n <= 0) return false;
+        off += @intCast(n);
+    }
+    return true;
+}
+
+/// fork+exec `env <args...>` detached (stdio → /dev/null), no wait. Returns the
+/// child pid = the team run's id (it execs team directly; team traces to <pid>).
+fn spawnDetached(args: []const []const u8) ?i32 {
+    var argv: [48]?[*:0]const u8 = undefined;
+    var held: [48][]u8 = undefined;
+    var nh: usize = 0;
+    var n: usize = 0;
+    defer for (held[0..nh]) |h| alloc.free(h);
+    const dz = alloc.dupeZ(u8, "env") catch return null;
+    held[nh] = dz;
+    nh += 1;
+    argv[n] = dz.ptr;
+    n += 1;
+    for (args) |a| {
+        if (n >= argv.len - 1) return null;
+        const z = alloc.dupeZ(u8, a) catch return null;
+        held[nh] = z;
+        nh += 1;
+        argv[n] = z.ptr;
+        n += 1;
+    }
+    argv[n] = null;
+    const argvz: [*:null]const ?[*:0]const u8 = argv[0..n :null];
+    const pid: isize = @bitCast(linux.fork());
+    if (pid < 0) return null;
+    if (pid == 0) {
+        const nfd: isize = @bitCast(linux.open("/dev/null", .{ .ACCMODE = .RDWR }, 0));
+        if (nfd >= 0) {
+            _ = linux.dup2(@intCast(nfd), 0);
+            _ = linux.dup2(@intCast(nfd), 1);
+            _ = linux.dup2(@intCast(nfd), 2);
+        }
+        _ = linux.execve("/usr/bin/env", argvz, @ptrCast(std.c.environ));
+        linux.exit(127);
+    }
+    return @intCast(pid);
+}
+
+/// fork+exec `env <args...>`, capture stdout, wait. Dynamic-argv wrapper.
+fn execCaptureArgs(args: []const []const u8) ?[]u8 {
+    var argv: [48]?[*:0]const u8 = undefined;
+    var held: [48][]u8 = undefined;
+    var nh: usize = 0;
+    var n: usize = 0;
+    defer for (held[0..nh]) |h| alloc.free(h);
+    const dz = alloc.dupeZ(u8, "env") catch return null;
+    held[nh] = dz;
+    nh += 1;
+    argv[n] = dz.ptr;
+    n += 1;
+    for (args) |a| {
+        if (n >= argv.len - 1) return null;
+        const z = alloc.dupeZ(u8, a) catch return null;
+        held[nh] = z;
+        nh += 1;
+        argv[n] = z.ptr;
+        n += 1;
+    }
+    argv[n] = null;
+    const argvz: [*:null]const ?[*:0]const u8 = argv[0..n :null];
+    return execCapture(argvz);
+}
+
+/// The last synth_done answer from a team run's trace, or null if unfinished.
+fn traceAnswer(home: []const u8, run: []const u8) ?[]u8 {
+    var pb: [4096]u8 = undefined;
+    const path = std.fmt.bufPrint(&pb, "{s}/.zish/traces/{s}.jsonl", .{ home, run }) catch return null;
+    const raw = readFileAlloc(path) orelse return null;
+    var answer: ?[]u8 = null;
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |ln| {
+        if (ln.len == 0) continue;
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, ln, .{}) catch continue;
+        if (objStr(parsed.value, "ev")) |ev| if (std.mem.eql(u8, ev, "synth_done")) {
+            if (objStr(parsed.value, "text")) |t| answer = dupe(t);
+        };
+    }
+    return answer;
+}
+
+/// A tool-result string reflecting a dispatched run's live status, re-read from
+/// its trace each turn (stateless refresh).
+fn liveRunStatus(home: []const u8, run: []const u8) []u8 {
+    if (traceAnswer(home, run)) |a| {
+        defer alloc.free(a);
+        return std.fmt.allocPrint(alloc, "The team finished (run {s}). Result:\n{s}", .{ run, a }) catch dupe(a);
+    }
+    return std.fmt.allocPrint(alloc, "The team is still working on this (run {s}).", .{run}) catch dupe("team working");
+}
+
+/// Pull a string field out of a raw JSON arguments string.
+fn argStr(args_json: []const u8, key: []const u8) ?[]u8 {
+    const p = std.json.parseFromSlice(std.json.Value, alloc, args_json, .{}) catch return null;
+    defer p.deinit();
+    return if (objStr(p.value, key)) |s| dupe(s) else null;
+}
+
+/// Seed model history from a topic thread file (OpenAI messages, one per line),
+/// refreshing any dispatch tool-results with the linked run's live status.
+fn seedThread(history: *std.ArrayListUnmanaged(Message), home: []const u8, path: []const u8) void {
+    const raw = readFileAlloc(path) orelse return; // absent = new thread
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |ln| {
+        if (ln.len == 0) continue;
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, ln, .{}) catch continue;
+        const role = objStr(parsed.value, "role") orelse continue;
+        const content = objStr(parsed.value, "content") orelse "";
+        if (std.mem.eql(u8, role, "user")) {
+            history.append(alloc, .{ .role = .user, .content = dupe(content) }) catch {};
+        } else if (std.mem.eql(u8, role, "tool")) {
+            const id = objStr(parsed.value, "tool_call_id") orelse "";
+            var body: []const u8 = content;
+            // dispatch results carry a run id — show the model the LIVE status
+            if (objStr(parsed.value, "name")) |nm| if (std.mem.eql(u8, nm, "dispatch_team")) {
+                if (objStr(parsed.value, "run")) |run| body = liveRunStatus(home, run);
+            };
+            history.append(alloc, .{ .role = .tool, .content = dupe(body), .tool_call_id = dupe(id) }) catch {};
+        } else if (std.mem.eql(u8, role, "assistant")) {
+            const o = switch (parsed.value) {
+                .object => |ob| ob,
+                else => continue,
+            };
+            if (o.get("tool_calls")) |tc| if (tc == .array and tc.array.items.len > 0) {
+                var list: std.ArrayListUnmanaged(ToolCall) = .empty;
+                for (tc.array.items) |call| {
+                    const co = switch (call) {
+                        .object => |c| c,
+                        else => continue,
+                    };
+                    const id = objStr(call, "id") orelse "call_0";
+                    const func = co.get("function") orelse continue;
+                    const nm = objStr(func, "name") orelse continue;
+                    const ar = objStr(func, "arguments") orelse "{}";
+                    list.append(alloc, .{ .id = dupe(id), .name = dupe(nm), .arguments = dupe(ar) }) catch {};
+                }
+                history.append(alloc, .{ .role = .assistant, .content = "", .tool_calls_json = renderToolCallsJson(list.items) }) catch {};
+                continue;
+            };
+            history.append(alloc, .{ .role = .assistant, .content = dupe(content) }) catch {};
+        }
+    }
+}
+
+fn persistUser(path: []const u8, from: []const u8, text: []const u8) void {
+    var j: std.ArrayListUnmanaged(u8) = .empty;
+    defer j.deinit(alloc);
+    j.appendSlice(alloc, "{\"role\":\"user\",\"content\":\"") catch {};
+    jsonEscape(&j, text) catch {};
+    j.appendSlice(alloc, "\",\"from\":\"") catch {};
+    jsonEscape(&j, from) catch {};
+    var nb: [48]u8 = undefined;
+    j.appendSlice(alloc, std.fmt.bufPrint(&nb, "\",\"t\":{d}}}\n", .{nowMs()}) catch "\"}\n") catch {};
+    _ = appendFile(path, j.items);
+}
+fn persistAssistantText(path: []const u8, text: []const u8) void {
+    var j: std.ArrayListUnmanaged(u8) = .empty;
+    defer j.deinit(alloc);
+    j.appendSlice(alloc, "{\"role\":\"assistant\",\"content\":\"") catch {};
+    jsonEscape(&j, text) catch {};
+    var nb: [48]u8 = undefined;
+    j.appendSlice(alloc, std.fmt.bufPrint(&nb, "\",\"t\":{d}}}\n", .{nowMs()}) catch "\"}\n") catch {};
+    _ = appendFile(path, j.items);
+}
+fn persistAssistantToolCalls(path: []const u8, calls: []const ToolCall) void {
+    const arr = renderToolCallsJson(calls);
+    defer alloc.free(arr);
+    var j: std.ArrayListUnmanaged(u8) = .empty;
+    defer j.deinit(alloc);
+    j.appendSlice(alloc, "{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":") catch {};
+    j.appendSlice(alloc, arr) catch {};
+    var nb: [48]u8 = undefined;
+    j.appendSlice(alloc, std.fmt.bufPrint(&nb, ",\"t\":{d}}}\n", .{nowMs()}) catch "}\n") catch {};
+    _ = appendFile(path, j.items);
+}
+fn persistToolResult(path: []const u8, id: []const u8, name: []const u8, run: []const u8, content: []const u8) void {
+    var j: std.ArrayListUnmanaged(u8) = .empty;
+    defer j.deinit(alloc);
+    j.appendSlice(alloc, "{\"role\":\"tool\",\"tool_call_id\":\"") catch {};
+    jsonEscape(&j, id) catch {};
+    j.appendSlice(alloc, "\",\"name\":\"") catch {};
+    jsonEscape(&j, name) catch {};
+    if (run.len > 0) {
+        j.appendSlice(alloc, "\",\"run\":\"") catch {};
+        jsonEscape(&j, run) catch {};
+    }
+    j.appendSlice(alloc, "\",\"content\":\"") catch {};
+    jsonEscape(&j, content) catch {};
+    var nb: [48]u8 = undefined;
+    j.appendSlice(alloc, std.fmt.bufPrint(&nb, "\",\"t\":{d}}}\n", .{nowMs()}) catch "\"}\n") catch {};
+    _ = appendFile(path, j.items);
+}
+
+/// Render the thread as plain text — the -c context handed to a dispatched team.
+fn renderThreadText(home: []const u8, path: []const u8) []u8 {
+    var hist: std.ArrayListUnmanaged(Message) = .empty;
+    seedThread(&hist, home, path);
+    var t: std.ArrayListUnmanaged(u8) = .empty;
+    for (hist.items) |m| switch (m.role) {
+        .user => {
+            t.appendSlice(alloc, "user: ") catch {};
+            t.appendSlice(alloc, m.content) catch {};
+            t.append(alloc, '\n') catch {};
+        },
+        .assistant => if (m.content.len > 0) {
+            t.appendSlice(alloc, "captain: ") catch {};
+            t.appendSlice(alloc, m.content) catch {};
+            t.append(alloc, '\n') catch {};
+        },
+        .tool => {
+            t.appendSlice(alloc, m.content) catch {};
+            t.append(alloc, '\n') catch {};
+        },
+        .system => {},
+    };
+    return t.toOwnedSlice(alloc) catch "";
+}
+
+const ToolOutcome = struct { result: []const u8, run: []const u8 };
+
+/// Execute one captain tool by forking the relevant feat. Returns the tool-result
+/// content fed back to the model, plus a run id when it dispatched a team run.
+fn execCaptainTool(home: []const u8, thread_path: []const u8, budget: []const u8, name: []const u8, args_json: []const u8) ToolOutcome {
+    if (std.mem.eql(u8, name, "dispatch_team")) {
+        const spec = argStr(args_json, "spec") orelse (argStr(args_json, "task") orelse dupe(args_json));
+        // context = the thread transcript so far
+        var cb: [4096]u8 = undefined;
+        const ctx_path = std.fmt.bufPrint(&cb, "{s}.ctx", .{thread_path}) catch return .{ .result = dupe("could not build context path"), .run = dupe("") };
+        const ctx = renderThreadText(home, thread_path);
+        defer alloc.free(ctx);
+        _ = writeFile600(ctx_path, ctx);
+        var tb: [4096]u8 = undefined;
+        const team_bin = std.fmt.bufPrint(&tb, "{s}/.zish/feats/standard/team/bin/team", .{home}) catch return .{ .result = dupe("team bin path error"), .run = dupe("") };
+        const argv = [_][]const u8{ team_bin, "run", budget, "-c", ctx_path, spec };
+        const pid = spawnDetached(&argv) orelse return .{ .result = dupe("could not launch the team"), .run = dupe("") };
+        const run = std.fmt.allocPrint(alloc, "{d}", .{pid}) catch dupe("0");
+        const result = std.fmt.allocPrint(alloc, "Dispatched to the team (run {s}). It is working asynchronously; you will get its result on a later turn. Tell the human you've put the team on it.", .{run}) catch dupe("dispatched");
+        return .{ .result = result, .run = run };
+    }
+    if (std.mem.eql(u8, name, "ask_human")) {
+        const q = argStr(args_json, "question") orelse dupe("(no question)");
+        var ab: [4096]u8 = undefined;
+        const ask_bin = std.fmt.bufPrint(&ab, "{s}/.zish/feats/standard/ask/bin/ask", .{home}) catch return .{ .result = dupe("ask bin path error"), .run = dupe("") };
+        var call: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer call.deinit(alloc);
+        call.append(alloc, ask_bin) catch {};
+        call.append(alloc, q) catch {};
+        // up to 4 options
+        const p = std.json.parseFromSlice(std.json.Value, alloc, args_json, .{}) catch null;
+        if (p) |pp| if (pp.value == .object) if (pp.value.object.get("options")) |ov| if (ov == .array) {
+            for (ov.array.items) |opt| if (opt == .string and call.items.len < 5) {
+                call.append(alloc, opt.string) catch {};
+            };
+        };
+        const answer = execCaptureArgs(call.items) orelse dupe("(no answer)");
+        return .{ .result = std.mem.trim(u8, answer, " \t\r\n"), .run = dupe("") };
+    }
+    return .{ .result = std.fmt.allocPrint(alloc, "unknown tool: {s}", .{name}) catch dupe("unknown tool"), .run = dupe("") };
+}
+
+fn runCaptain(args: std.process.Args) u8 {
+    var model: []const u8 = getEnv("ZISH_CAPTAIN_MODEL") orelse (getEnv("ZISH_AGENT_MODEL") orelse DEFAULT_MODEL);
+    var thread_path: ?[]const u8 = null;
+    var from: []const u8 = "human";
+    var budget: []const u8 = getEnv("ZISH_CAPTAIN_BUDGET") orelse "8";
+    var mock_path: ?[]const u8 = null;
+    var msg: std.ArrayListUnmanaged(u8) = .empty;
+    defer msg.deinit(alloc);
+
+    var it = std.process.Args.Iterator.init(args);
+    _ = it.next(); // argv0
+    while (it.next()) |a| {
+        if (std.mem.eql(u8, a, "captain")) continue;
+        if (std.mem.eql(u8, a, "--thread")) {
+            thread_path = it.next() orelse return usageCaptain();
+        } else if (std.mem.eql(u8, a, "-m")) {
+            model = it.next() orelse return usageCaptain();
+        } else if (std.mem.eql(u8, a, "--from")) {
+            from = it.next() orelse return usageCaptain();
+        } else if (std.mem.eql(u8, a, "--budget")) {
+            budget = it.next() orelse return usageCaptain();
+        } else if (std.mem.eql(u8, a, "--mock")) {
+            mock_path = it.next() orelse return usageCaptain();
+        } else {
+            if (msg.items.len > 0) msg.append(alloc, ' ') catch {};
+            msg.appendSlice(alloc, a) catch {};
+        }
+    }
+    const tpath = thread_path orelse return usageCaptain();
+    if (msg.items.len == 0) {
+        warn("agent captain: no message given\n");
+        return 2;
+    }
+
+    // transport (same seam as runAsk)
+    var mock: ?Mock = null;
+    var home_buf: [4096]u8 = undefined;
+    var home: []const u8 = "";
+    var key: []const u8 = "";
+    if (mock_path) |mp| {
+        const contents = readFileAlloc(mp) orelse {
+            warn("agent captain: could not read mock file\n");
+            return 2;
+        };
+        mock = .{ .lines = std.mem.splitScalar(u8, contents, '\n') };
+        home = getHome(&home_buf) orelse "";
+    } else {
+        home = getHome(&home_buf) orelse {
+            warn("agent captain: HOME not set\n");
+            return 2;
+        };
+        if (agentNeedsKey() or getEnv("ZISH_AGENT_ENDPOINT") != null) {
+            var kbuf: [4096]u8 = undefined;
+            const kpath = std.fmt.bufPrint(&kbuf, "{s}/.zish/openrouter.key", .{home}) catch "";
+            if (readFileAlloc(kpath)) |k| {
+                key = k;
+            } else if (agentNeedsKey()) {
+                warn("agent captain: no API key at ~/.zish/openrouter.key\n");
+                return 2;
+            }
+        }
+    }
+    var ep_buf: [512]u8 = undefined;
+    const endpoint = agentEndpoint(&ep_buf);
+
+    // seed history: persona + prior thread + the new message
+    var history: std.ArrayListUnmanaged(Message) = .empty;
+    history.append(alloc, .{ .role = .system, .content = CAPTAIN_SYSTEM }) catch return 2;
+    seedThread(&history, home, tpath);
+    persistUser(tpath, from, msg.items);
+    history.append(alloc, .{ .role = .user, .content = msg.items }) catch return 2;
+
+    var final: []const u8 = "";
+    var turn: usize = 0;
+    while (turn < CAPTAIN_MAX_TURNS) : (turn += 1) {
+        const request = buildRequest(model, history.items, CAPTAIN_TOOLS) catch return 1;
+        const reply = fetchWithBackoff(&mock, home, endpoint, key, request) orelse {
+            warn("agent captain: request failed\n");
+            break;
+        };
+        if (reply.status < 200 or reply.status >= 300) {
+            warn("agent captain: HTTP error from model API\n");
+            break;
+        }
+        switch (parseResponse(reply.body)) {
+            .err => |e| {
+                warn(e);
+                warn("\n");
+                break;
+            },
+            .text => |t| {
+                const sr = splitReasoning(std.mem.trim(u8, t, " \t\r\n"));
+                if (sr.answer.len > 0) {
+                    persistAssistantText(tpath, sr.answer);
+                    final = sr.answer;
+                }
+                break;
+            },
+            .tools => |calls| {
+                appendAssistantToolCalls(&history, calls);
+                persistAssistantToolCalls(tpath, calls);
+                for (calls) |call| {
+                    const oc = execCaptainTool(home, tpath, budget, call.name, call.arguments);
+                    persistToolResult(tpath, call.id, call.name, oc.run, oc.result);
+                    history.append(alloc, .{ .role = .tool, .content = oc.result, .tool_call_id = dupe(call.id) }) catch {};
+                }
+                // loop: let the captain react to the tool results
+            },
+        }
+    }
+    // final line for a CLI/human caller; the dashboard renders the thread file
+    if (final.len > 0) {
+        emit(final);
+        emit("\n");
+    }
+    return 0;
+}
+
+fn usageCaptain() u8 {
+    warn("usage: agent captain --thread <file> [-m model] [--from name] [--budget n] <message...>\n");
+    return 2;
+}
+
+// ===========================================================================
+// solo — a self-contained TOOL-USING worker. Same model loop as the live-shell
+// agent, but it executes run_command ITSELF (fork+exec, no session host) so it
+// can be a team worker: `agent solo <prompt>` gathers real evidence (read files,
+// `web search`/`web fetch`, run checkers) and prints a findings report. This is
+// what turns tool-less `--ask` workers into agents that actually check.
+// ===========================================================================
+
+const SOLO_SYSTEM =
+    \\You are a focused worker agent with ONE tool, run_command: it runs a shell
+    \\command in a real Linux shell and returns its combined stdout+stderr (bounded)
+    \\and exit code. USE it to gather real evidence — read files (cat, rg, sed),
+    \\search/read the web (`web search <query>`, `web fetch <url>`), run builds and
+    \\checkers — never guess when you can check. Keep commands small and targeted;
+    \\large output is truncated. When you have done the work, reply with a concise
+    \\findings report and NO tool call.
+;
+
+fn soloMaxTurns() usize {
+    const v = getEnv("ZISH_AGENT_MAX_TURNS") orelse return 12;
+    return std.fmt.parseInt(usize, v, 10) catch 12;
+}
+
+/// run_command executed locally: fork+exec `sh -c <command>`, merge stdout+stderr,
+/// capture (bounded read), return {code, out}. No session host involved.
+fn runCommandLocal(command: []const u8) ?RunResult {
+    var argv = [_:null]?[*:0]const u8{ "env", "sh", "-c", undefined, null };
+    const cz = alloc.dupeZ(u8, command) catch return null;
+    defer alloc.free(cz);
+    argv[3] = cz.ptr;
+    var fds: [2]i32 = undefined;
+    if (@as(isize, @bitCast(linux.pipe2(&fds, .{}))) < 0) return null;
+    const pid: isize = @bitCast(linux.fork());
+    if (pid < 0) {
+        _ = linux.close(fds[0]);
+        _ = linux.close(fds[1]);
+        return null;
+    }
+    if (pid == 0) {
+        _ = linux.close(fds[0]);
+        _ = linux.dup2(fds[1], 1);
+        _ = linux.dup2(fds[1], 2); // merge stderr — compiler/checker errors matter
+        _ = linux.close(fds[1]);
+        _ = linux.execve("/usr/bin/env", &argv, @ptrCast(std.c.environ));
+        linux.exit(127);
+    }
+    _ = linux.close(fds[1]);
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    var tmp: [65536]u8 = undefined;
+    while (buf.items.len < RESULT_CAP) {
+        const r: isize = @bitCast(linux.read(fds[0], &tmp, tmp.len));
+        if (r <= 0) break;
+        buf.appendSlice(alloc, tmp[0..@intCast(r)]) catch break;
+    }
+    _ = linux.close(fds[0]);
+    var status: u32 = 0;
+    _ = linux.waitpid(@intCast(pid), &status, 0);
+    const code: i64 = if ((status & 0x7f) != 0) 128 else @intCast((status >> 8) & 0xff);
+    return .{ .code = code, .out = buf.toOwnedSlice(alloc) catch dupe("") };
+}
+
+fn usageOf(body: []const u8) struct { pt: i64, ct: i64 } {
+    const p = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return .{ .pt = 0, .ct = 0 };
+    defer p.deinit();
+    if (p.value == .object) if (p.value.object.get("usage")) |u| {
+        return .{ .pt = objInt(u, "prompt_tokens") orelse 0, .ct = objInt(u, "completion_tokens") orelse 0 };
+    };
+    return .{ .pt = 0, .ct = 0 };
+}
+
+fn hasSoloFlag(args: std.process.Args) bool {
+    var it = std.process.Args.Iterator.init(args);
+    _ = it.next();
+    while (it.next()) |a| {
+        if (std.mem.eql(u8, a, "solo")) return true;
+    }
+    return false;
+}
+
+fn runSolo(args: std.process.Args) u8 {
+    var model: []const u8 = getEnv("ZISH_AGENT_MODEL") orelse DEFAULT_MODEL;
+    var mock_path: ?[]const u8 = null;
+    var prompt: std.ArrayListUnmanaged(u8) = .empty;
+    defer prompt.deinit(alloc);
+    var it = std.process.Args.Iterator.init(args);
+    _ = it.next(); // argv0
+    while (it.next()) |a| {
+        if (std.mem.eql(u8, a, "solo")) continue;
+        if (std.mem.eql(u8, a, "-m")) {
+            model = dupe(it.next() orelse return 2);
+        } else if (std.mem.eql(u8, a, "--mock")) {
+            mock_path = dupe(it.next() orelse return 2);
+        } else {
+            if (prompt.items.len > 0) prompt.append(alloc, ' ') catch return 2;
+            prompt.appendSlice(alloc, a) catch return 2;
+        }
+    }
+    if (prompt.items.len == 0) {
+        warn("agent solo: needs a prompt\n");
+        return 2;
+    }
+
+    // transport (same seam as --ask)
+    var mock: ?Mock = null;
+    var home_buf: [4096]u8 = undefined;
+    var home: []const u8 = "";
+    var key: []const u8 = "";
+    if (mock_path) |mp| {
+        const contents = readFileAlloc(mp) orelse {
+            warn("agent solo: could not read mock file\n");
+            return 2;
+        };
+        mock = .{ .lines = std.mem.splitScalar(u8, contents, '\n') };
+    } else {
+        home = getHome(&home_buf) orelse {
+            warn("agent solo: HOME not set\n");
+            return 2;
+        };
+        if (agentNeedsKey() or getEnv("ZISH_AGENT_ENDPOINT") != null) {
+            var kbuf: [4096]u8 = undefined;
+            const kpath = std.fmt.bufPrint(&kbuf, "{s}/.zish/openrouter.key", .{home}) catch "";
+            if (readFileAlloc(kpath)) |k| {
+                key = k;
+            } else if (agentNeedsKey()) {
+                warn("agent solo: no API key at ~/.zish/openrouter.key\n");
+                return 2;
+            }
+        }
+    }
+    var ep_buf: [512]u8 = undefined;
+    const endpoint = agentEndpoint(&ep_buf);
+
+    var history: std.ArrayListUnmanaged(Message) = .empty;
+    history.append(alloc, .{ .role = .system, .content = SOLO_SYSTEM }) catch return 2;
+    history.append(alloc, .{ .role = .user, .content = prompt.items }) catch return 2;
+
+    var pt_sum: i64 = 0;
+    var ct_sum: i64 = 0;
+    var turn: usize = 0;
+    // loop guard: a model stuck re-issuing the SAME command burns the whole
+    // budget for nothing. If the identical command comes back 3× running, stop.
+    var last_cmd: []const u8 = "";
+    var repeats: usize = 0;
+    const max = soloMaxTurns();
+    while (turn < max) : (turn += 1) {
+        const request = buildRequest(model, history.items, SHELL_TOOLS) catch return 1;
+        const reply = fetchWithBackoff(&mock, home, endpoint, key, request) orelse {
+            warn("agent solo: request failed\n");
+            return 1;
+        };
+        if (reply.status < 200 or reply.status >= 300) {
+            warn("agent solo: HTTP error from model API\n");
+            return 1;
+        }
+        const u = usageOf(reply.body);
+        pt_sum += u.pt;
+        ct_sum += u.ct;
+        switch (parseResponse(reply.body)) {
+            .err => |e| {
+                warn(e);
+                warn("\n");
+                return 1;
+            },
+            .text => |t| {
+                const sr = splitReasoning(std.mem.trim(u8, t, " \t\r\n"));
+                writeSoloMeta(pt_sum, ct_sum, model, sr.think); // summed tokens + model → sidecar
+                emit(sr.answer);
+                emit("\n");
+                return 0;
+            },
+            .tools => |calls| {
+                appendAssistantToolCalls(&history, calls);
+                for (calls) |call| {
+                    const cmd = parseCommandArg(call.arguments) orelse {
+                        appendToolResult(&history, call.id, .{ .code = 2, .out = dupe("agent: could not parse command argument") });
+                        continue;
+                    };
+                    // loop guard
+                    if (std.mem.eql(u8, cmd, last_cmd)) {
+                        repeats += 1;
+                    } else {
+                        repeats = 0;
+                        last_cmd = dupe(cmd);
+                    }
+                    if (repeats >= 2) { // this is the 3rd identical command
+                        writeSoloMeta(pt_sum, ct_sum, model, "");
+                        emit("agent solo: aborted — repeated the same command 3× (loop guard). Partial work above.\n");
+                        return 0;
+                    }
+                    const res = runCommandLocal(cmd) orelse {
+                        appendToolResult(&history, call.id, .{ .code = 127, .out = dupe("agent: command could not run") });
+                        continue;
+                    };
+                    appendToolResult(&history, call.id, res); // bounded inside
+                }
+            },
+        }
+    }
+    // ran out of turns — emit whatever the last assistant text would be as a stub
+    writeSoloMeta(pt_sum, ct_sum, model, "");
+    emit("agent solo: reached the turn limit without a final answer\n");
+    return 0;
+}
+
+/// summed usage + model → the ZISH_ASK_META sidecar, so `team` accounts a solo
+/// worker's WHOLE run (all tool round-trips), not just its last call.
+fn writeSoloMeta(pt: i64, ct: i64, model: []const u8, think: []const u8) void {
+    const mp = getEnv("ZISH_ASK_META") orelse return;
+    var m: std.ArrayListUnmanaged(u8) = .empty;
+    defer m.deinit(alloc);
+    var nb: [64]u8 = undefined;
+    m.appendSlice(alloc, std.fmt.bufPrint(&nb, "{{\"pt\":{d},\"ct\":{d},\"model\":\"", .{ pt, ct }) catch return) catch return;
+    jsonEscape(&m, model) catch return;
+    m.appendSlice(alloc, "\",\"think\":\"") catch return;
+    jsonEscape(&m, std.mem.trim(u8, think, " \t\r\n")) catch return;
+    m.appendSlice(alloc, "\"}") catch return;
+    _ = writeFile600(mp, m.items);
 }
 
 fn runJudge(args: std.process.Args) u8 {
@@ -1167,7 +1909,8 @@ test "parseResponse extracts a tool call and its command" {
     try std.testing.expect(a == .tools);
     try std.testing.expectEqual(@as(usize, 1), a.tools.len);
     try std.testing.expectEqualStrings("call_9", a.tools[0].id);
-    try std.testing.expectEqualStrings("ls -la", a.tools[0].command);
+    try std.testing.expectEqualStrings("run_command", a.tools[0].name);
+    try std.testing.expectEqualStrings("ls -la", parseCommandArg(a.tools[0].arguments).?);
 }
 
 test "parseResponse surfaces an API error body" {
@@ -1212,7 +1955,7 @@ test "buildRequest includes model, system, tool schema" {
         .{ .role = .system, .content = "sys" },
         .{ .role = .user, .content = "hi \"there\"" },
     };
-    const req = try buildRequest("deepseek/deepseek-v4-flash-0731", &hist);
+    const req = try buildRequest("deepseek/deepseek-v4-flash-0731", &hist, SHELL_TOOLS);
     defer alloc.free(req);
     try std.testing.expect(std.mem.indexOf(u8, req, "deepseek/deepseek-v4-flash-0731") != null);
     try std.testing.expect(std.mem.indexOf(u8, req, "\"stream\":false") != null);
