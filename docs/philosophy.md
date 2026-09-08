@@ -69,6 +69,21 @@ The shell earns the execution layer with real, load-bearing primitives:
 - **Feats as the extension ABI** — `fork + exec + argv + stdio`, no plugin ABI,
   no-shadowing. A capability model that is just "programs on a path."
 
+Because a feat is just a program, the model composes both directions: it is a
+command in a pipeline, not a mode that takes over the terminal.
+
+```sh
+git grep -n panic | agent --ask "which of these can actually fire?"
+web fetch "$url"   | agent --ask "summarize the API surface"
+verify lake .      && echo "proof holds"
+```
+
+Nothing runs the model unless you type the command; when you do, it reads stdin
+and writes stdout like any filter, and you are back at a prompt afterward. The
+shell is never subsumed into a chat box. The inverse — a surface where the only
+way to grep is to ask the model to write the grep — costs more tokens and puts
+you in the back seat. Piping the grep result in is cheaper and keeps you driving.
+
 ## 3. The dividing line
 
 The shell provides rich primitives for **execution / containment /
