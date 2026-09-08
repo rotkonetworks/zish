@@ -7,14 +7,14 @@
 //!
 //! Phases (one `agent` call each — the whole loop is single-threaded, spawning
 //! is process-level, never threads):
-//!   1. CAPTAIN decomposes the task into a few independent sub-tasks.
-//!   2. FAN-OUT: per sub-task, carve a budget slice off the root (`budget split`)
-//!      and run a WORKER agent, whose model call is charged (`budget spend`).
-//!   3. CRITIC (MANDATORY): one agent that REFUTES/cross-checks the workers'
-//!      outputs. Load-bearing — collaboration without an adversarial critic is an
-//!      echo chamber that amplifies errors. Never skipped.
-//!   4. SYNTHESIS: the Captain combines only what survived the critic.
-//!   5. VERIFY: the org member that actually RUNS A COMPILER. It extracts code
+//!   1. Captain decomposes the task into a few independent sub-tasks.
+//!   2. Fan-out: per sub-task, carve a budget slice off the root (`budget split`)
+//!      and run a worker agent, whose model call is charged (`budget spend`).
+//!   3. Critic (mandatory): one agent that cross-checks the workers'
+//!      outputs. Collaboration without an adversarial critic lets errors compound
+//!      uncaught. Never skipped.
+//!   4. Synthesis: the captain combines only what survived the critic.
+//!   5. Verify: the org member that actually runs a compiler. It extracts code
 //!      from the answer and compile-checks it for real (rustc/zig/gofmt/…, per
 //!      what's installed) — a model critic reviews text and can't catch a parse
 //!      error. On failure it makes one budget-gated repair against the true
@@ -47,7 +47,7 @@ const RESERVE: i64 = COST * 2; // critic + synth, always kept back
 
 // ---------------------------------------------------------------------------
 // live trace emission — one JSON event per line to ~/.zish/traces/<run>.jsonl,
-// appended AS THINGS HAPPEN. A separate viewer (Deno SSE server + Solid/UnoCSS
+// appended as things happen. A separate viewer (Deno SSE server + Solid/UnoCSS
 // dashboard) tails this to follow the org in real time. team only writes the
 // file; it knows nothing about HTTP. Fire-and-forget; no trace file = no-op.
 // ---------------------------------------------------------------------------
@@ -222,7 +222,7 @@ fn printPrompts() void {
     out("]\n");
 }
 
-/// Proper JSON string escaping that KEEPS content readable (newlines→\n etc.),
+/// Proper JSON string escaping that keeps content readable (newlines→\n etc.),
 /// truncated to `max` bytes — for the actual generated text an agent produced.
 fn jesc(s: []const u8, max: usize) []u8 {
     var o: std.ArrayListUnmanaged(u8) = .empty;
@@ -522,10 +522,10 @@ fn callAgent(bin: []const u8, prompt: []const u8, meta_path: []const u8, cap_n: 
 }
 
 // --- parallel fan-out + hybrid (per-worker model) ---------------------------
-// Workers run CONCURRENTLY (process-level, per the single-threaded-core rule —
+// Workers run concurrently (process-level, per the single-threaded-core rule —
 // fork many, wait all, never threads). `ZISH_TEAM_MODELS` ("m1@backend, m2, ...")
 // is a per-worker roster team rotates across workers, so you can mix a free-but-
-// serial LOCAL model with genuinely-parallel HOSTED ones in one org (the hybrid).
+// serial local model with genuinely-parallel hosted ones in one org (the hybrid).
 const WorkerModel = struct { model: ?[]const u8, backend: ?[]const u8 };
 
 fn loadModels(list: *std.ArrayListUnmanaged(WorkerModel)) void {
@@ -547,7 +547,7 @@ fn modelFor(models: []const WorkerModel, idx: usize) WorkerModel {
 }
 
 // agent's own DEFAULT_MODEL — mirrored so `worker_start` can name the model a
-// worker will ACTUALLY use when no roster/-m is given, instead of the old lie
+// worker will actually use when no roster/-m is given, instead of the old lie
 // "local". Keep in sync with feats/agent DEFAULT_MODEL. The agent still reports
 // the authoritative model back via its meta sidecar (worker_done), so a drift
 // here only affects the pre-call label, never the recorded truth.
@@ -568,9 +568,9 @@ fn envUint(name: [:0]const u8) ?usize {
     return std.fmt.parseInt(usize, v, 10) catch null;
 }
 
-/// Base per-call COMPLETION cap in tokens — the hard cost bound the org hands the
-/// MANY fan-out calls (workers, decompose, critic, consults), where runaway cost
-/// lives. Budget credits bound the NUMBER of calls; this bounds each call's SIZE.
+/// Base per-call completion cap in tokens — the hard cost bound the org hands the
+/// many fan-out calls (workers, decompose, critic, consults), where runaway cost
+/// lives. Budget credits bound the number of calls; this bounds each call's size.
 /// Override ZISH_TEAM_MAX_TOKENS; default 2048.
 fn capBase() usize {
     return envUint("ZISH_TEAM_MAX_TOKENS") orelse 2048;
@@ -584,7 +584,7 @@ fn teamToolsMode() bool {
     return std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
 }
 
-/// Cap for the SYNTHESIS (and repair) — the final DELIVERABLE. Capping the one
+/// Cap for the synthesis (and repair) — the final deliverable. Capping the one
 /// answer call to the same tight budget as fan-out truncates the product
 /// mid-output; it's a single call per run, so give it real room to finish.
 /// Override ZISH_TEAM_SYNTH_MAX_TOKENS; default 4× the base cap.
@@ -593,7 +593,7 @@ fn capSynth() usize {
 }
 
 /// fork+exec `env [ZISH_AGENT_BACKEND=..] agent [-m model] [--mock M] --ask
-/// <prompt>` with stdout → `out_path`; returns the child pid WITHOUT waiting.
+/// <prompt>` with stdout → `out_path`; returns the child pid without waiting.
 fn spawnAgentToFile(bin: []const u8, prompt: []const u8, out_path: []const u8, wm: WorkerModel) ?i32 {
     var argv: [16]?[*:0]const u8 = undefined;
     var held: [16][]u8 = undefined;
@@ -627,7 +627,7 @@ fn spawnAgentToFile(bin: []const u8, prompt: []const u8, out_path: []const u8, w
         if (!push(casg, &held, &nh, &argv, &n)) return null;
     }
     if (!push(bin, &held, &nh, &argv, &n)) return null;
-    // ZISH_TEAM_TOOLS=1 → workers run the TOOL-USING `solo` loop (read files, web,
+    // ZISH_TEAM_TOOLS=1 → workers run the tool-using `solo` loop (read files, web,
     // run checkers) instead of tool-less `--ask`. Costs more (multiple calls per
     // worker) but does real work. The verb goes right after the bin.
     const tools = teamToolsMode();
@@ -666,7 +666,7 @@ fn spawnAgentToFile(bin: []const u8, prompt: []const u8, out_path: []const u8, w
     return @intCast(cpid);
 }
 
-/// Reap ANY finished child, returning its pid (or -1) — so parallel workers get
+/// Reap any finished child, returning its pid (or -1) — so parallel workers get
 /// their true finish times as they complete, not clustered at collect.
 fn waitAny() i32 {
     var status: u32 = 0;
@@ -680,11 +680,11 @@ fn reap(cpid: i32) void {
 }
 
 // ---------------------------------------------------------------------------
-// persona lenses (DATA, not code) — each role embodies a distinct STYLE, not a
+// persona lenses (data, not code) — each role embodies a distinct style, not a
 // biography. Diversity across workers is the point: different lenses catch
 // different failures. Loaded from lenses.toml (ZISH_LENS_FILE, else
 // ZISH_RUBRIC_DIR/lenses.toml, else ~/.zish/rubrics/lenses.toml). Fail-open: no
-// file → plain role prompts, unchanged behaviour. Never CODE — just prompt data.
+// file → plain role prompts, unchanged behaviour. Never code — just prompt data.
 // ---------------------------------------------------------------------------
 const Lens = struct { role: []const u8, name: []const u8, style: []const u8 };
 
@@ -754,7 +754,7 @@ fn lensIntro(lens: ?Lens) []u8 {
 }
 
 // ---------------------------------------------------------------------------
-// org experts — persistent specialists any worker can CONSULT (a lateral
+// org experts — persistent specialists any worker can consult (a lateral
 // information edge, not authority: the worker doesn't command the expert, it
 // asks). A worker emits `BTW-ASK <name>: <question>`; team routes it to that
 // expert and drops the answer on the blackboard. The org pays for the round-trip
@@ -806,7 +806,7 @@ fn expertFor(experts: []const Expert, name: []const u8) ?Expert {
     return null;
 }
 
-/// Service the FIRST `BTW-ASK <expert>: <question>` in a worker's output: route
+/// Service the first `BTW-ASK <expert>: <question>` in a worker's output: route
 /// it to the named expert, charge the org (root, budget-gated), append the answer
 /// to the blackboard. One consult per worker keeps the cost bounded.
 fn serviceBtwAsk(agent_bin: []const u8, budget_bin: []const u8, root_id: []const u8, bb_path: []const u8, experts: []const Expert, wout: []const u8, worker_idx: usize) void {
@@ -866,9 +866,9 @@ fn serviceBtwAsk(agent_bin: []const u8, budget_bin: []const u8, root_id: []const
 }
 
 // ---------------------------------------------------------------------------
-// verifier member — the org member that actually RUNS A COMPILER. A model critic
-// reviews TEXT and cannot catch `idx -= ;`. team delegates the compile-check to
-// the `verify` FEAT (a reusable primitive: `verify caps`, `verify <lang> <code`);
+// verifier member — the org member that actually runs a compiler. A model critic
+// reviews text and cannot catch `idx -= ;`. team delegates the compile-check to
+// the `verify` feat (a reusable primitive: `verify caps`, `verify <lang> <code`);
 // team owns only the orchestration — extract code, gate, one repair round. So the
 // compiler knowledge lives in one place, usable outside team too.
 // ---------------------------------------------------------------------------
@@ -971,8 +971,8 @@ fn printVerifyFail(bb_path: []const u8, lname: []const u8, err: []const u8) void
 }
 
 /// The verifier phase: for every tagged code block in the synth answer, ask the
-/// verify feat to compile-check it; on failure make ONE budget-gated repair
-/// against the REAL compiler error, then re-verify. Always prints the compile
+/// verify feat to compile-check it; on failure make one budget-gated repair
+/// against the real compiler error, then re-verify. Always prints the compile
 /// status — this is what stops the org from committing untested code.
 fn verifyAndGate(agent_bin: []const u8, budget_bin: []const u8, verify_bin: []const u8, root_id: []const u8, bb_path: []const u8, cap_intro: []const u8, final_text: []const u8) void {
     const tagged = extractTagged(final_text);
@@ -1002,7 +1002,7 @@ fn verifyAndGate(agent_bin: []const u8, budget_bin: []const u8, verify_bin: []co
                     defer alloc.free(eesc);
                     emit("{{\"t\":{d},\"ev\":\"verify\",\"lang\":\"{s}\",\"level\":\"syntax\",\"ok\":false,\"repaired\":false,\"err\":\"{s}\"}}", .{ nowMs(), jclean(tc.tag), eesc });
                 }
-                // ONE repair round, budget-gated (an agent call costs like any other)
+                // one repair round, budget-gated (an agent call costs like any other)
                 if ((budgetBalance(budget_bin, root_id) orelse 0) < COST or !budgetSpend(budget_bin, root_id, COST)) {
                     printVerifyFail(bb_path, tc.tag, vr.err);
                     continue;
@@ -1126,7 +1126,7 @@ fn teamRun(root_budget: i64, task: []const u8, context: []const u8) u8 {
         emit("{{\"t\":{d},\"ev\":\"run_start\",\"run\":{d},\"task\":\"{s}\",\"budget\":{d}}}", .{ nowMs(), pid, tc, root_budget });
     }
 
-    // 1. CAPTAIN decompose (charged to root)
+    // 1. captain decompose (charged to root)
     if (!budgetSpend(budget_bin, root_id, COST)) {
         warn("team: cannot afford captain\n");
         return 2;
@@ -1202,7 +1202,7 @@ fn teamRun(root_budget: i64, task: []const u8, context: []const u8) u8 {
     }
     emit("{{\"t\":{d},\"ev\":\"decompose\",\"n\":{d},\"pt\":{d},\"ct\":{d}}}", .{ nowMs(), subs.items.len, dtok.pt, dtok.ct });
 
-    // 1b. HUMAN CHECKPOINT (opt-in): show the plan and let the human abort before
+    // 1b. human checkpoint (opt-in): show the plan and let the human abort before
     //     spending the fan-out budget. Fail-open — no ask feat, no answer, or a
     //     timeout all proceed; only an explicit "Abort" stops the run.
     if (getEnv("ZISH_TEAM_CONFIRM") != null and ask_bin.len > 0 and subs.items.len > 0) {
@@ -1233,8 +1233,8 @@ fn teamRun(root_budget: i64, task: []const u8, context: []const u8) u8 {
         }
     }
 
-    // 2. FAN-OUT workers, IN PARALLEL — the whole point of a team is horizontal
-    //    bandwidth. Split each affordable slice and SPAWN its worker without
+    // 2. fan-out workers, in parallel — the whole point of a team is horizontal
+    //    bandwidth. Split each affordable slice and spawn its worker without
     //    waiting; they run concurrently (process-level, never threads). Then
     //    wait all and collect. Conservation is unchanged: slices are carved
     //    up-front, RESERVE is kept for the critic + synthesis.
@@ -1300,7 +1300,7 @@ fn teamRun(root_budget: i64, task: []const u8, context: []const u8) u8 {
         };
     }
 
-    // Phase B: reap workers AS THEY FINISH (waitpid -1), stamping each true
+    // Phase B: reap workers as they finish (waitpid -1), stamping each true
     // finish time — so per-worker duration and the parallelism metric are real.
     {
         var reaped: usize = 0;
@@ -1341,7 +1341,7 @@ fn teamRun(root_budget: i64, task: []const u8, context: []const u8) u8 {
         const tesc = jesc(think, 6000);
         defer alloc.free(tesc);
         const wdur = if (s.tf > s.t0) s.tf - s.t0 else nowMs() - s.t0;
-        // the model the agent ACTUALLY ran (from its meta) — authoritative; falls
+        // the model the agent actually ran (from its meta) — authoritative; falls
         // back to the intended model if the sidecar didn't report one.
         const amodel = if (meta.model.len > 0) meta.model else intendedModel(modelFor(models.items, s.idx));
         const mesc = jclean(amodel);
@@ -1352,7 +1352,7 @@ fn teamRun(root_budget: i64, task: []const u8, context: []const u8) u8 {
         spawned += 1;
     }
 
-    // 3. CRITIC — MANDATORY. Runs on every path; a worker-only run is a bug. The
+    // 3. critic — mandatory. Runs on every path; a worker-only run is a bug. The
     //    spend is reserved, so it succeeds; even if accounting were exhausted we
     //    still run the critic (fail-open on the safety check), and the ledger
     //    can never go negative because `budget spend` fails closed.
@@ -1385,7 +1385,7 @@ fn teamRun(root_budget: i64, task: []const u8, context: []const u8) u8 {
         emit("{{\"t\":{d},\"ev\":\"critic_done\",\"pt\":{d},\"ct\":{d},\"think\":\"{s}\",\"text\":\"{s}\"}}", .{ nowMs(), ctok.pt, ctok.ct, ctesc, cesc });
     }
 
-    // 4. SYNTHESIS — the Captain keeps only what survived the critic.
+    // 4. synthesis — the captain keeps only what survived the critic.
     _ = budgetSpend(budget_bin, root_id, COST);
     emit("{{\"t\":{d},\"ev\":\"synth_start\"}}", .{nowMs()});
     const bb2 = readFileAlloc(bb_path, MAX_OUT) orelse alloc.dupe(u8, "") catch return 1;
@@ -1426,7 +1426,7 @@ fn teamRun(root_budget: i64, task: []const u8, context: []const u8) u8 {
         emit("{{\"t\":{d},\"ev\":\"synth_done\",\"pt\":{d},\"ct\":{d},\"model\":\"{s}\",\"think\":\"{s}\",\"text\":\"{s}\"}}", .{ nowMs(), stok.pt, stok.ct, smesc, stesc, fesc });
     }
 
-    // 5. VERIFY — the member that actually runs a compiler. Compile any code in
+    // 5. verify — the member that actually runs a compiler. Compile any code in
     //    the answer for real; repair once against the true error. Never ship
     //    untested code silently. No-op on a prose (no-code) answer.
     if (verify_bin.len > 0)

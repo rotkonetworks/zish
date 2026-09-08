@@ -6,7 +6,7 @@
 //!   echo "<code>" | verify zig  → compile-check stdin as zig; exit 0 ok / 1 fail
 //!   verify rust < file.rs       → same, from a file on stdin
 //!
-//! It is COMPILE/CHECK ONLY — it never RUNS the code. Each checker child is
+//! It compiles/checks only — it never runs the code. Each checker child is
 //! `timeout`-wrapped so a pathological input can't hang. Exit: 0 compiles, 1 does
 //! not (diagnostics on stdout), 3 no checker for that language (skip, not fail),
 //! 2 usage error.
@@ -21,7 +21,7 @@ const MAX_IN = 4 * 1024 * 1024;
 const Lang = enum { zig, rust, python, go, c, cpp, ts, js, bash, lean, coq, kani };
 const ALL = [_]Lang{ .zig, .rust, .python, .go, .c, .cpp, .ts, .js, .bash, .lean, .coq, .kani };
 
-/// Proof oracles differ from compilers: they attest a THEOREM is proved, so they
+/// Proof oracles differ from compilers: they attest a theorem is proved, so they
 /// (a) get a longer default timeout and (b) must reject proof holes — a Lean
 /// `sorry` or a Coq `admit`/`Admitted` type-checks but proves nothing, and for a
 /// counterfeiting proof "it compiled" ≠ "it holds". Fail closed on holes.
@@ -129,7 +129,7 @@ fn onPath(name: []const u8) bool {
 const Run = struct { out: []u8, code: u8 };
 
 /// fork+exec `env timeout <n> <argv…>` capturing stdout+stderr merged. The child
-/// is a COMPILER, never the checked code.
+/// is a compiler, never the checked code.
 fn runChecker(args: []const []const u8, timeout_s: u32) ?Run {
     return runCheckerIn(args, timeout_s, null);
 }
@@ -282,11 +282,11 @@ fn check(l: Lang, code: []const u8) u8 {
 
 // --- lake mode: a whole Lean 4 project ---------------------------------------
 //
-// `verify lake <dir>` attests a lake PROJECT, not a snippet. The attestation is
-// only worth anything if none of the project's OWN sources admit a goal, so the
-// hole scan walks `<dir>` for `*.lean` first — excluding `.lake/` (the dependency
+// `verify lake <dir>` attests a lake project, not a snippet. The attestation is
+// only worth anything if none of the project's own sources admit a goal, so the
+// hole scan walks `<dir>` for `*.lean` first, excluding `.lake/` (the dependency
 // and build tree: mathlib etc. legitimately carry `sorry` in docs/tests and are
-// not what we are attesting). The scan must be CONCLUSIVE: anything it cannot
+// not what we are attesting). The scan must be conclusive: anything it cannot
 // read, or a walk that trips a cap, is reported as inconclusive and fails (1)
 // rather than being skipped — an unscanned file could be the hidden hole.
 
@@ -381,10 +381,10 @@ const Walker = struct {
                     // ENOTDIR: a non-directory; fall through to the file check.
                 }
                 if (!std.mem.endsWith(u8, name, ".lean")) continue;
-                // Only a REGULAR file is scannable: opening a FIFO named X.lean
+                // Only a regular file is scannable: opening a FIFO named X.lean
                 // would block forever (this scan is not under `timeout`), and a
                 // device/socket is not a source. NONBLOCK makes the open itself
-                // never block; the type check is then done on the OPENED fd (not
+                // never block; the type check is then done on the opened fd (not
                 // by path) so nothing can be swapped in between. Symlinks are
                 // followed, as lake does.
                 const ffd: isize = @bitCast(linux.openat(dfd, namez, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true }, 0));
@@ -421,8 +421,8 @@ fn checkLake(dir: []const u8) u8 {
         warn(std.fmt.bufPrint(&b, "verify: lake: '{s}' is not a lake project (no lakefile.lean/lakefile.toml)\n", .{dir}) catch "verify: lake: not a lake project\n");
         return 2;
     }
-    // Hole gate BEFORE the toolchain check (same order as single-file proofs):
-    // a holed project is a definitive FAIL, never a "no checker" skip.
+    // Hole gate before the toolchain check (same order as single-file proofs):
+    // a holed project is a definitive fail, never a "no checker" skip.
     if (lakeHoleScan(dir)) |s| {
         var b: [4600]u8 = undefined;
         const msg = switch (s.fail) {
@@ -525,8 +525,8 @@ fn run(args: std.process.Args) u8 {
         warn("verify: no code on stdin\n");
         return 2;
     }
-    // Proof-hole gate runs BEFORE the toolchain check: a proof that admits its goal
-    // is a definitive FAIL (1), never an ambiguous "no checker" skip — fail closed.
+    // Proof-hole gate runs before the toolchain check: a proof that admits its goal
+    // is a definitive fail (1), never an ambiguous "no checker" skip — fail closed.
     if (isProof(l)) {
         if (proofHole(l, code)) |tok| {
             var b: [160]u8 = undefined;
@@ -537,7 +537,7 @@ fn run(args: std.process.Args) u8 {
     if (!onPath(spec(l).bin)) {
         var b: [256]u8 = undefined;
         warn(std.fmt.bufPrint(&b, "verify: '{s}' toolchain ('{s}') not installed\n", .{ spec(l).name, spec(l).bin }) catch "verify: toolchain missing\n");
-        return 4; // KNOWN language, checker missing — distinct from an unknown tag (3)
+        return 4; // known language, checker missing — distinct from an unknown tag (3)
     }
     return check(l, code);
 }

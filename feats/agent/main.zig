@@ -13,7 +13,7 @@
 //! Grammar (one-shot, the old `agent exec -p` shape):
 //!   agent [-m <model>] [--mock <file>] <query...>
 //!
-//! Transport is injected at ONE seam — `fetchCompletion(request) → {status,
+//! Transport is injected at one seam — `fetchCompletion(request) → {status,
 //! body}`. Production execs `curl`; `--mock <file>` reads canned responses
 //! from a JSONL file (one `{"status":N,"body":"<json>"}` per line, consumed in
 //! order), so the whole loop — parsing, tool-call mapping, backoff on 429 — is
@@ -515,7 +515,7 @@ const Config = struct {
 pub fn main(init: std.process.Init.Minimal) void {
     // Judge mode is a plain one-shot invocation (gf/steward/benchmark exec the
     // binary directly): no session host, no hello frame, no session frames.
-    // Branch BEFORE the handshake the model loop needs.
+    // Branch before the handshake the model loop needs.
     if (hasJudgeFlag(init.args)) {
         linux.exit(runJudge(init.args));
     }
@@ -684,7 +684,7 @@ fn renderToolCallsJson(calls: []const ToolCall) []u8 {
     return arr.toOwnedSlice(alloc) catch "";
 }
 
-// A tool result is READ up to RESULT_CAP (8 MiB) but must not be FED to the model
+// A tool result is read up to RESULT_CAP (8 MiB) but must not be fed to the model
 // whole — a single `cat` or verbose build can dump megabytes of tokens into every
 // subsequent request (quadratic cost). Feed head+tail with a line-aware elision
 // marker; the model sees the shape and the ends, not the bulk. Override the window
@@ -840,7 +840,7 @@ fn parseArgs(args: std.process.Args) ?Config {
 // judge mode — `agent --judge <rubric> <subject...>`
 //
 // The generalized "analyze-then-score-against-rubric" primitive (SmellBench's
-// stabilizing insight): a plain ONE-SHOT completion, no tool loop, no session
+// stabilizing insight): a plain one-shot completion, no tool loop, no session
 // frames, no hello handshake. Reads a rubric file + subject files, asks the
 // model to analyze then score, validates the JSON verdict, prints it to
 // stdout. gf (and later the steward, the reviewer benchmark, dispute
@@ -850,7 +850,7 @@ fn parseArgs(args: std.process.Args) ?Config {
 
 const JUDGE_RETRIES = 3;
 
-// Subject-agnostic: the RUBRIC carries the domain (a feat, a PKGBUILD, a diff);
+// Subject-agnostic: the rubric carries the domain (a feat, a PKGBUILD, a diff);
 // this prompt only defines the analyze-then-score-against-the-rubric contract.
 const JUDGE_SYSTEM =
     "You are a meticulous reviewer. You are given a scoring rubric and a subject " ++
@@ -927,7 +927,7 @@ fn buildJudgeRequest(model: []const u8, system: []const u8, user: []const u8) ![
     try b.appendSlice(alloc, "\"},{\"role\":\"user\",\"content\":\"");
     try jsonEscape(&b, user);
     try b.appendSlice(alloc, "\"}]");
-    // ZISH_AGENT_MAX_TOKENS caps COMPLETION per call — the hard bound on cost, so
+    // ZISH_AGENT_MAX_TOKENS caps completion per call — the hard bound on cost, so
     // no single call can run away (a 40k-token generation becomes impossible).
     if (getEnv("ZISH_AGENT_MAX_TOKENS")) |mt| {
         var ok = mt.len > 0 and mt.len < 8;
@@ -1060,7 +1060,7 @@ fn writeAskMeta(body: []const u8, inline_think: []const u8, model: []const u8) v
     defer m.deinit(alloc);
     var nb: [64]u8 = undefined;
     m.appendSlice(alloc, std.fmt.bufPrint(&nb, "{{\"pt\":{d},\"ct\":{d},\"model\":\"", .{ pt, ct }) catch return) catch return;
-    jsonEscape(&m, model) catch return; // the model that ACTUALLY ran — the source of truth
+    jsonEscape(&m, model) catch return; // the model that actually ran — the source of truth
     m.appendSlice(alloc, "\",\"think\":\"") catch return;
     jsonEscape(&m, std.mem.trim(u8, think, " \t\r\n")) catch return;
     m.appendSlice(alloc, "\"}") catch return;
@@ -1478,7 +1478,7 @@ fn seedThread(history: *std.ArrayListUnmanaged(Message), home: []const u8, path:
         } else if (std.mem.eql(u8, role, "tool")) {
             const id = objStr(parsed.value, "tool_call_id") orelse "";
             var body: []const u8 = content;
-            // dispatch results carry a run id — show the model the LIVE status
+            // dispatch results carry a run id — show the model the live status
             if (objStr(parsed.value, "name")) |nm| if (std.mem.eql(u8, nm, "dispatch_team")) {
                 if (objStr(parsed.value, "run")) |run| body = liveRunStatus(home, run);
             };
@@ -1759,11 +1759,11 @@ fn usageCaptain() u8 {
 }
 
 // ===========================================================================
-// solo — a self-contained TOOL-USING worker. Same model loop as the live-shell
-// agent, but it executes run_command ITSELF (fork+exec, no session host) so it
+// solo — a self-contained tool-using worker. Same model loop as the live-shell
+// agent, but it executes run_command itself (fork+exec, no session host) so it
 // can be a team worker: `agent solo <prompt>` gathers real evidence (read files,
-// `web search`/`web fetch`, run checkers) and prints a findings report. This is
-// what turns tool-less `--ask` workers into agents that actually check.
+// `web search`/`web fetch`, run checkers) and prints a findings report. Turns
+// tool-less `--ask` workers into agents that gather real evidence.
 // ===========================================================================
 
 const SOLO_SYSTEM =
@@ -1897,7 +1897,7 @@ fn runSolo(args: std.process.Args) u8 {
     var pt_sum: i64 = 0;
     var ct_sum: i64 = 0;
     var turn: usize = 0;
-    // loop guard: a model stuck re-issuing the SAME command burns the whole
+    // loop guard: a model stuck re-issuing the same command burns the whole
     // budget for nothing. If the identical command comes back 3× running, stop.
     var last_cmd: []const u8 = "";
     var repeats: usize = 0;
@@ -1963,7 +1963,7 @@ fn runSolo(args: std.process.Args) u8 {
 }
 
 /// summed usage + model → the ZISH_ASK_META sidecar, so `team` accounts a solo
-/// worker's WHOLE run (all tool round-trips), not just its last call.
+/// worker's whole run (all tool round-trips), not just its last call.
 fn writeSoloMeta(pt: i64, ct: i64, model: []const u8, think: []const u8) void {
     const mp = getEnv("ZISH_ASK_META") orelse return;
     var m: std.ArrayListUnmanaged(u8) = .empty;
@@ -2043,7 +2043,7 @@ fn runJudge(args: std.process.Args) u8 {
             .text => |t| {
                 const obj = extractJsonObject(t) orelse continue;
                 if (!verdictValid(obj)) continue;
-                emit(obj); // plain JSON verdict to stdout — NOT a session frame
+                emit(obj); // plain JSON verdict to stdout — not a session frame
                 emit("\n");
                 return 0;
             },
