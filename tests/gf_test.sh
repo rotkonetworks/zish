@@ -469,6 +469,19 @@ PY
     case "$so" in *"signedfeat"*"[signed]"*) ok "gf search finds the feat and flags it signed" ;; *) bad "search: $so" ;; esac
 fi
 
+# ---- gf settings / setup: ZFS-style list/get/set + exit-code discipline -----
+SG() { HOME="$T/home" ZISH_FEAT_PATH="$T/feats" "$T/gf" "$@"; }
+[ "$(SG settings review)" = "true" ] && ok "settings get: bare value, default true" || bad "settings get: $(SG settings review)"
+SG settings | grep -q "review	true	" && ok "settings list is tab-separated (ZFS-style)" || bad "settings list not tabular: $(SG settings | cat -A)"
+SG settings review false >/dev/null 2>&1 && [ "$(SG settings review)" = "false" ] && ok "settings set persists (true->false)" || bad "settings set failed"
+SG settings review true  >/dev/null 2>&1  # restore
+SG settings review >/dev/null 2>&1; [ $? -eq 0 ] && ok "settings get -> exit 0" || bad "settings get exit != 0"
+SG settings bogus       >/dev/null 2>&1; [ $? -eq 2 ] && ok "unknown setting -> exit 2 (usage)" || bad "unknown setting exit != 2"
+SG settings review maybe >/dev/null 2>&1; [ $? -eq 2 ] && ok "bad value -> exit 2 (usage)" || bad "bad value exit != 2"
+# setup mirrors the same key true/false shape (installed = boolean)
+[ "$(SG setup idxdemo)" = "false" ] && ok "setup get: uninstalled feat is false" || bad "setup get: $(SG setup idxdemo)"
+SG setup idxdemo maybe   >/dev/null 2>&1; [ $? -eq 2 ] && ok "setup bad value -> exit 2 (usage)" || bad "setup bad value exit != 2"
+
 echo
 total=$((pass+fail))
 if [ "$fail" -eq 0 ]; then

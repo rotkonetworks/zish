@@ -211,11 +211,21 @@ fn toZ(buf: []u8, s: []const u8) ?[*:0]const u8 {
     return @ptrCast(buf.ptr);
 }
 
+/// Runtime failure: message to stderr, exit 1.
 fn fail(comptime fmt: []const u8, args: anytype) u8 {
     var buf: [512]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, "gf: " ++ fmt ++ "\n", args) catch return 1;
     _ = linux.write(2, msg.ptr, msg.len);
     return 1;
+}
+
+/// CLI misuse (bad args/flags): message to stderr, exit 2 — distinct from a
+/// runtime failure so scripts can tell "you called it wrong" from "it didn't work".
+fn usage(comptime fmt: []const u8, args: anytype) u8 {
+    var buf: [512]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "gf: " ++ fmt ++ "\n", args) catch return 2;
+    _ = linux.write(2, msg.ptr, msg.len);
+    return 2;
 }
 
 fn print(comptime fmt: []const u8, args: anytype) void {
@@ -1178,9 +1188,9 @@ fn cmdRemove(name: []const u8) u8 {
 
 // ---- gf settings: persistent on/off toggles (config at ~/.zish/gf.conf) -----
 
-const SettingDef = struct { key: []const u8, label: []const u8, desc: []const u8, default_on: bool };
+const SettingDef = struct { key: []const u8, desc: []const u8, default_on: bool };
 const GF_SETTINGS = [_]SettingDef{
-    .{ .key = "review", .label = "review", .desc = "AI review-on-install (agent judges each source package, records a verdict)", .default_on = true },
+    .{ .key = "review", .desc = "AI review-on-install (agent judges each source package, records a verdict)", .default_on = true },
 };
 
 fn gfConfigPath(buf: []u8) ?[]const u8 {
@@ -1189,12 +1199,13 @@ fn gfConfigPath(buf: []u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s}/.zish/gf.conf", .{home}) catch null;
 }
 
-/// Read a boolean setting from the config file (`key = on|off`). A missing file
-/// or key returns `default_on`, so a fresh install behaves as the defaults say.
-fn settingOn(key: []const u8, default_on: bool) bool {
+/// Read a boolean setting from the config file (`key = true|false`). A missing
+/// file or key returns `default_val`, so a fresh install behaves as the defaults
+/// say. Only the literal `true` is true; anything else (including a typo) is false.
+fn settingOn(key: []const u8, default_val: bool) bool {
     var cb: [4096]u8 = undefined;
-    const cp = gfConfigPath(&cb) orelse return default_on;
-    const data = readFileAlloc(cp, 64 * 1024) orelse return default_on;
+    const cp = gfConfigPath(&cb) orelse return default_val;
+    const data = readFileAlloc(cp, 64 * 1024) orelse return default_val;
     defer alloc.free(data);
     var lines = std.mem.splitScalar(u8, data, '\n');
     while (lines.next()) |raw| {
@@ -1205,10 +1216,9 @@ fn settingOn(key: []const u8, default_on: bool) bool {
         const eq = std.mem.indexOfScalar(u8, after, '=') orelse continue;
         if (std.mem.trim(u8, after[0..eq], " \t").len != 0) continue; // "reviewer=" != "review ="
         const val = std.mem.trim(u8, after[eq + 1 ..], " \t");
-        return std.mem.eql(u8, val, "on") or std.mem.eql(u8, val, "true") or
-            std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "yes");
+        return std.mem.eql(u8, val, "true");
     }
-    return default_on;
+    return default_val;
 }
 
 /// Write every known setting to the config file (whole-file rewrite, 0644).
@@ -1225,52 +1235,50 @@ fn writeSettings(states: []const bool) bool {
     for (GF_SETTINGS, 0..) |s, i| {
         out.appendSlice(alloc, s.key) catch return false;
         out.appendSlice(alloc, " = ") catch return false;
-        out.appendSlice(alloc, if (states[i]) "on" else "off") catch return false;
+        out.appendSlice(alloc, if (states[i]) "true" else "false") catch return false;
         out.append(alloc, '\n') catch return false;
     }
     return writeFile(cp, out.items, 0o644);
 }
 
-/// `gf settings` — an interactive on/off checklist, same shape as `gf setup`:
-/// pick a number to flip a setting, read from stdin so it also composes
-/// (`echo 1 | gf settings`). Empty selection changes nothing.
+/// `gf settings` — list every setting with its value, ZFS `get all` style:
+/// tab-separated `key<TAB>value<TAB>description`, one per line, greppable and
+/// awk-able. No interactive mode: get one with `gf settings <key>`, set one with
+/// `gf settings <key> true|false` (a picker belongs on a catalog like `gf setup`,
+/// not on a handful of properties).
 fn cmdSettings() u8 {
+    for (GF_SETTINGS) |s| {
+        const v = settingOn(s.key, s.default_on);
+        print("{s}\t{s}\t{s}\n", .{ s.key, if (v) "true" else "false", s.desc });
+    }
+    return 0;
+}
+
+/// The scriptable, non-interactive face of settings. `gf settings <key>` prints
+/// the value (bare `true`/`false` on stdout, for `[ "$(gf settings review)" = true ]`);
+/// `gf settings <key> true|false` sets it. Exit 0 on success, 2 on a bad key/value.
+fn cmdSetting(key: []const u8, val: ?[]const u8) u8 {
+    var idx: ?usize = null;
+    for (GF_SETTINGS, 0..) |s, i| {
+        if (std.mem.eql(u8, s.key, key)) idx = i;
+    }
+    const si = idx orelse return usage("unknown setting \"{s}\" (run `gf settings` to list)", .{key});
+
+    if (val == null) {
+        print("{s}\n", .{if (settingOn(key, GF_SETTINGS[si].default_on)) "true" else "false"});
+        return 0;
+    }
+    const on = if (std.mem.eql(u8, val.?, "true"))
+        true
+    else if (std.mem.eql(u8, val.?, "false"))
+        false
+    else
+        return usage("value must be true or false, got \"{s}\"", .{val.?});
+
     var states: [GF_SETTINGS.len]bool = undefined;
     for (GF_SETTINGS, 0..) |s, i| states[i] = settingOn(s.key, s.default_on);
-
-    print("gf settings — toggle by number:\n\n", .{});
-    for (GF_SETTINGS, 0..) |s, i| {
-        print("  {d:>2}) [{s}] {s}  — {s}\n", .{ i + 1, if (states[i]) "on " else "off", s.label, s.desc });
-    }
-    print("\nFlip by number (space/comma-separated), or empty to cancel: ", .{});
-
-    var lb: [256]u8 = undefined;
-    const sel = readSelection(&lb);
-    const trimmed = std.mem.trim(u8, sel, " \t\r");
-    if (trimmed.len == 0) {
-        print("no change.\n", .{});
-        return 0;
-    }
-    var changed = false;
-    var toks = std.mem.tokenizeAny(u8, trimmed, " ,");
-    while (toks.next()) |tok| {
-        const n = std.fmt.parseInt(usize, tok, 10) catch {
-            print("  (ignoring \"{s}\": not a number)\n", .{tok});
-            continue;
-        };
-        if (n < 1 or n > GF_SETTINGS.len) {
-            print("  (ignoring {d}: out of range)\n", .{n});
-            continue;
-        }
-        states[n - 1] = !states[n - 1];
-        changed = true;
-    }
-    if (!changed) {
-        print("no change.\n", .{});
-        return 0;
-    }
-    if (!writeSettings(&states)) return fail("could not write settings to the config", .{});
-    for (GF_SETTINGS, 0..) |s, i| print("  {s} = {s}\n", .{ s.label, if (states[i]) "on" else "off" });
+    states[si] = on;
+    if (!writeSettings(&states)) return fail("could not write settings", .{});
     return 0;
 }
 
@@ -1389,6 +1397,39 @@ fn cmdSetup() u8 {
     return if (fail_n == 0) 0 else 1;
 }
 
+/// The scriptable face of setup, mirroring `gf settings <key> [true|false]`: a
+/// feat is a boolean "installed". `gf setup <feat>` prints its state (true/false);
+/// `gf setup <feat> true` installs it, `gf setup <feat> false` removes it — each
+/// through the same `gf install`/`gf remove` path (re-exec), so tier/pin/ledger
+/// rules match. Exit follows that child (0 ok, 1 runtime), or 2 on a bad value.
+fn cmdSetupOne(feat: []const u8, val: ?[]const u8) u8 {
+    if (!validName(feat)) return usage("invalid feat name: {s}", .{feat});
+
+    if (val == null) {
+        var rb: [4096]u8 = undefined;
+        const root = featRootPath(&rb) orelse return fail("no HOME", .{});
+        var installed = false;
+        for ([_][]const u8{ "standard", "extra" }) |tier| {
+            var pb: [4096]u8 = undefined;
+            const p = std.fmt.bufPrint(&pb, "{s}/{s}/{s}", .{ root, tier, feat }) catch continue;
+            if (lstatMode(p) != null) installed = true;
+        }
+        print("{s}\n", .{if (installed) "true" else "false"});
+        return 0;
+    }
+
+    var nz: [256]u8 = undefined;
+    const np = toZ(&nz, feat) orelse return fail("name too long", .{});
+    if (std.mem.eql(u8, val.?, "true")) {
+        const argv = [_:null]?[*:0]const u8{ "gf", "install", np, null };
+        return execSelf(&argv);
+    } else if (std.mem.eql(u8, val.?, "false")) {
+        const argv = [_:null]?[*:0]const u8{ "gf", "remove", np, null };
+        return execSelf(&argv);
+    }
+    return usage("value must be true or false, got \"{s}\"", .{val.?});
+}
+
 /// `gf search [query]` / `gf list` — AUR-style discovery over the index. Both
 /// fold the index into one readable line per feat (name · version · what it
 /// does), deduped and arch-filtered so a multi-arch index reads as one feat per
@@ -1439,7 +1480,7 @@ fn run(init: std.process.Init.Minimal) u8 {
     _ = args.next(); // argv0
     const first = args.next() orelse {
         print("usage: gf setup                 interactive checklist: install / remove feats from the index\n" ++
-            "       gf settings                toggle options on/off (AI review-on-install, …)\n" ++
+            "       gf settings [<key> [true|false]]  list settings, or get/set one (review, …)\n" ++
             "       gf list                    list every feat in the index (name · version · what it does)\n" ++
             "       gf install <name>          install a feat by name from the feat index (pinned + verified)\n" ++
             "       gf remove <name>           uninstall a feat (from either tier)\n" ++
@@ -1451,35 +1492,41 @@ fn run(init: std.process.Init.Minimal) u8 {
     };
 
     if (std.mem.eql(u8, first, "setup")) {
-        if (args.next() != null) return fail("usage: gf setup", .{});
-        return cmdSetup();
+        const feat = args.next();
+        if (feat == null) return cmdSetup(); // interactive checklist
+        const val = args.next();
+        if (args.next() != null) return usage("usage: gf setup [<feat> [true|false]]", .{});
+        return cmdSetupOne(feat.?, val); // scriptable: get state, or install(true)/remove(false)
     }
 
     if (std.mem.eql(u8, first, "settings")) {
-        if (args.next() != null) return fail("usage: gf settings", .{});
-        return cmdSettings();
+        const key = args.next();
+        if (key == null) return cmdSettings(); // interactive checklist
+        const val = args.next();
+        if (args.next() != null) return usage("usage: gf settings [<key> [true|false]]", .{});
+        return cmdSetting(key.?, val); // scriptable get/set
     }
 
     if (std.mem.eql(u8, first, "remove") or std.mem.eql(u8, first, "uninstall")) {
-        const name = args.next() orelse return fail("usage: gf remove <name>", .{});
-        if (args.next() != null) return fail("usage: gf remove <name>", .{});
+        const name = args.next() orelse return usage("usage: gf remove <name>", .{});
+        if (args.next() != null) return usage("usage: gf remove <name>", .{});
         return cmdRemove(name);
     }
 
     if (std.mem.eql(u8, first, "list")) {
-        if (args.next() != null) return fail("usage: gf list", .{});
+        if (args.next() != null) return usage("usage: gf list", .{});
         return cmdSearch("");
     }
 
     if (std.mem.eql(u8, first, "search")) {
         const q = args.next() orelse "";
-        if (args.next() != null) return fail("usage: gf search [query]", .{});
+        if (args.next() != null) return usage("usage: gf search [query]", .{});
         return cmdSearch(q);
     }
 
     if (std.mem.eql(u8, first, "publish")) {
         const dir = args.next();
-        if (args.next() != null) return fail("usage: gf publish [dir]", .{});
+        if (args.next() != null) return usage("usage: gf publish [dir]", .{});
         return cmdPublish(dir);
     }
 
@@ -1504,8 +1551,8 @@ fn run(init: std.process.Init.Minimal) u8 {
     var to_standard = false; // trusted default-index tarball → standard tier
     const url = blk: {
         if (std.mem.eql(u8, first, "install")) {
-            const name_arg = args.next() orelse return fail("usage: gf install <name>", .{});
-            if (args.next() != null) return fail("unexpected extra argument", .{});
+            const name_arg = args.next() orelse return usage("usage: gf install <name>", .{});
+            if (args.next() != null) return usage("unexpected extra argument", .{});
             const ix = indexUrl();
             const r = resolveIndex(ix.url, name_arg) orelse
                 return fail("{s} not found in the feat index ({s})", .{ name_arg, ix.url });
@@ -1527,7 +1574,7 @@ fn run(init: std.process.Init.Minimal) u8 {
             }
             break :blk r.loc;
         }
-        if (args.next() != null) return fail("unexpected extra argument", .{});
+        if (args.next() != null) return usage("unexpected extra argument", .{});
         break :blk first;
     };
 
