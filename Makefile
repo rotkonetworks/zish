@@ -65,9 +65,9 @@ test-pty: build
 # ---- standard feats (python-replacement tier) ----
 # Compiles feats/<name>/main.zig and stages bin + feat.toml into the registry.
 ZISH_FEAT_DIR ?= $(HOME)/.zish/feats/standard
-FEAT_NAMES := cnt pk frq snf jls calc para agent gf aur budget verify ask team
+FEAT_NAMES := cnt pk frq snf jls calc para agent gf aur budget verify ask team web
 # Feats needing libc (para uses execvp for PATH+env resolution).
-FEAT_LIBC := para agent gf aur budget verify ask team
+FEAT_LIBC := para agent gf aur budget verify ask team web
 
 .PHONY: feats
 feats:

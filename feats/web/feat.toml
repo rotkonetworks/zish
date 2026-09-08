@@ -1,0 +1,5 @@
+name = "web"
+version = "0.1.0"
+tier = "standard"
+bin = "web"
+help = "web search + readable page fetch (keyless DuckDuckGo by default) — grounding for agents: `web search <query>`, `web fetch <url>`"
