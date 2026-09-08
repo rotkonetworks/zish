@@ -61,22 +61,14 @@ jobs:
 
   # ── Portability ────────────────────────────────────────────────────────────
   #
-  # zish is Linux-only at runtime, but the tree is being ported. These jobs stop
-  # that work from rotting: without them the next raw std.os.linux call silently
-  # undoes it, because a Linux syscall wrapper compiles fine for every target.
-  #
-  # Build-only, deliberately. A Mach-O binary that links proves nothing about
-  # whether job control or terminal handling behave on macOS — that needs the
-  # remaining statx/waitpid sites ported and a real run. Do not read a green
-  # check here as "macOS is supported".
+  # zish is Linux-only, but must build for non-x86 Linux too. This cross-build
+  # stops a raw std.os.linux call that only compiles on x86_64 from slipping in.
   cross-build:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         target:
-          - aarch64-macos
-          - x86_64-macos
           - aarch64-linux
     steps:
       - name: checkout
@@ -87,105 +79,7 @@ jobs:
         with:
           version: 0.16.0
 
-      # --prefix keeps the cross output away from zig-out. Overwriting it with a
-      # foreign binary is not hypothetical: it happened during development and
-      # bench.sh failed with "Exec format error" on a Mach-O binary.
+      # --prefix keeps the cross output away from zig-out (a foreign binary there
+      # once broke bench.sh with "Exec format error").
       - name: cross-build ${{ matrix.target }}
         run: zig build -Dtarget=${{ matrix.target }} -Dlto=false --prefix /tmp/out-${{ matrix.target }}
-
-  # Native macOS build, against the real SDK and linker rather than Zig's
-  # cross-compilation stubs. Catches what cross-building cannot.
-  macos-build:
-    runs-on: macos-latest
-    continue-on-error: true # porting in progress; must not gate merges yet
-    steps:
-      - name: checkout
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-      - name: setup zig 0.16.0
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: 0.16.0
-
-      - name: build
-        run: zig build --release=safe -Dlto=false
-
-      # Informational only, and deliberately per-feature: each line prints its
-      # own ok/FAIL so the log is a porting to-do list rather than a single red
-      # cross. The statx-based file tests and raw waitpid are expected to be
-      # among the failures until those sites are ported.
-      - name: smoke (informational)
-        continue-on-error: true
-        run: |
-          Z=$PWD/zig-out/bin/zish   # absolute: the stat tests cd elsewhere
-          fails=0
-          check() { # check NAME EXPECTED SCRIPT
-            got=$("$Z" -c "$3" 2>&1) || true
-            if [ "$got" = "$2" ]; then
-              printf 'ok    %s\n' "$1"
-            else
-              printf 'FAIL  %-22s expected=%q got=%q\n' "$1" "$2" "$got"
-              fails=$((fails+1))
-            fi
-          }
-          # Differential: assert zish agrees with bash *on this machine*, rather
-          # than hardcoding an answer. Some of these are genuinely
-          # platform-specific — BSD gives a new file the directory's group, not
-          # the process's, so `[ -G f ]` is legitimately false on macOS where it
-          # is true on Linux. Hardcoding "yes" tested the platform, not zish.
-          checkvs() { # checkvs NAME SCRIPT
-            got=$("$Z" -c "$2" 2>&1) || true
-            want=$(bash -c "$2" 2>&1) || true
-            if [ "$got" = "$want" ]; then
-              printf 'ok    %-22s (= bash: %q)\n' "$1" "$want"
-            else
-              printf 'FAIL  %-22s bash=%q zish=%q\n' "$1" "$want" "$got"
-              fails=$((fails+1))
-            fi
-          }
-          "$Z" --version
-          check basic          'hello'   'echo hello'
-          check subshell       'a
-          b'                             '( echo a; echo b )'
-          check arithmetic     '12'      'x=6; echo $(($x * 2))'
-          check positional     '6'       'f() { echo $(($1 * 2)); }; f 3'
-          check pipeline       'HELLO'   '/bin/echo hello | tr a-z A-Z'
-          check cmdsubst       'sub'     'x=$(/bin/echo sub); echo $x'
-          check func           'in'      'f() { echo in; }; f'
-          check loop           '1 2 3'   'for i in 1 2 3; do printf "%s " $i; done | sed "s/ $//"'
-          check file_test_f    'yes'     '[ -f /etc/hosts ] && echo yes || echo no'
-          check file_test_d    'yes'     '[ -d /tmp ] && echo yes || echo no'
-          check file_test_x    'yes'     '[ -x /bin/sh ] && echo yes || echo no'
-          check glob           'ok'      'cd /tmp && mkdir -p zt && touch zt/a.txt && set -- zt/*.txt && [ "$1" = "zt/a.txt" ] && echo ok'
-          check background     'bg'      '/bin/echo bg & wait'
-          check redirect       'w'       'echo w > /tmp/zt.txt; cat /tmp/zt.txt'
-          check heredoc        'hd'      'cat <<EOF
-          hd
-          EOF'
-          check herestring     'hs'      'cat <<< hs'
-          # stat-backed operators. These were statx-only and silently returned
-          # false on macOS; they are the point of this run.
-          cd /tmp && rm -rf zt2 && mkdir zt2 && cd zt2
-          touch old && sleep 1 && touch new && ln -s old lnk
-          checkvs symlink        '[ -L lnk ] && echo yes || echo no'
-          checkvs not_symlink    '[ -L old ] && echo yes || echo no'
-          checkvs newer_than     '[ new -nt old ] && echo yes || echo no'
-          checkvs older_than     '[ old -ot new ] && echo yes || echo no'
-          checkvs same_file      '[ old -ef old ] && echo yes || echo no'
-          checkvs diff_file      '[ old -ef new ] && echo yes || echo no'
-          checkvs owned_by_me    '[ -O old ] && echo yes || echo no'
-          checkvs group_is_mine  '[ -G old ] && echo yes || echo no'
-          # waitpid path
-          check wait_status    '7'       '(exit 7) & wait $!; echo $?'
-          cd - >/dev/null
-          echo "---"
-          echo "macOS smoke failures: $fails"
-
-      # The interactive suite is why the macOS port matters: TIOCSPGRP and the
-      # tcsetpgrp handover are computed for BSD but were never exercised, and
-      # CI is the only Mac available. Informational until it is consistently
-      # green here.
-      - name: pty suite (informational)
-        continue-on-error: true
-        timeout-minutes: 8
-        run: python3 -u tests/pty_test.py

@@ -492,9 +492,9 @@ if selected "heredoc resists /tmp symlink attack"; then
     v=$(mktemp); printf 'SACRED' > "$v"
     now=$(date +%s%3N 2>/dev/null || echo 0)
     for d in $(seq 0 400); do ln -sf "$v" "/tmp/zish_heredoc_e_$((now+d))_1" 2>/dev/null; done
-    "$OLDPWD/$ZISH" -c 'cat <<EOF >/dev/null
+    (cd "$WORK" && "$OLDPWD/$ZISH" -c 'cat <<EOF >/dev/null
 PWNED
-EOF' >/dev/null 2>&1
+EOF') >/dev/null 2>&1
     if [ "$(cat "$v")" = "SACRED" ]; then report_pass "heredoc resists /tmp symlink attack"
     else report_fail "heredoc resists /tmp symlink attack" "victim untouched" "victim overwritten" "arbitrary file write"; fi
     rm -f /tmp/zish_heredoc_e_* "$v"
