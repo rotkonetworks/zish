@@ -344,6 +344,26 @@ else
     bad "gf list failed: $(cat "$T/ol1")"
 fi
 
+# ---- gf remove uninstalls a feat -------------------------------------------
+IGF "$T/index.jsonl" install idxdemo >/dev/null 2>&1  # ensure it is installed
+if HOME="$T/home" ZISH_FEAT_PATH="$T/feats" "$T/gf" remove idxdemo >"$T/orm1" 2>&1 && [ ! -e "$T/feats/extra/idxdemo" ]; then
+    ok "gf remove uninstalls a feat"
+else
+    bad "gf remove failed: $(cat "$T/orm1")"
+fi
+# removing something that is not installed -> a clear error, not a crash
+if HOME="$T/home" ZISH_FEAT_PATH="$T/feats" "$T/gf" remove nope >"$T/orm2" 2>&1; then
+    bad "remove of a missing feat unexpectedly succeeded"
+else
+    grep -q "not installed" "$T/orm2" && ok "remove of a missing feat is a clear error" || bad "wrong remove error: $(cat "$T/orm2")"
+fi
+# a name with a path escape is refused (gf builds the path, never the caller)
+if HOME="$T/home" ZISH_FEAT_PATH="$T/feats" "$T/gf" remove ../../etc >"$T/orm3" 2>&1; then
+    bad "remove accepted a path-escaping name"
+else
+    grep -q "invalid feat name" "$T/orm3" && ok "remove refuses a path-escaping name" || bad "wrong escape error: $(cat "$T/orm3")"
+fi
+
 # ---- install from a git user-repo (the publish model: git + a pinned ref) --
 # A user publishes a feat as a git repo (feat.toml + src/); the index maps the
 # name to {git, ref}. gf clones at the ref, builds via the source-package path

@@ -1,5 +1,5 @@
 name = "gf"
-version = "0.1.0"
+version = "0.2.0"
 tier = "standard"
 bin = "gf"
-help = "fetch a feat tarball and install it into the extra tier: gf <url>"
+help = "the feat package manager: gf setup (pick from a checklist), gf install/remove <name>, gf list, gf <url>"

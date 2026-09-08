@@ -70,6 +70,28 @@ fn indexUrl() struct { url: []const u8, is_default: bool } {
     return .{ .url = DEFAULT_FEAT_INDEX, .is_default = true };
 }
 
+/// Read one line of selection from stdin (without the newline). In a terminal
+/// the human types it; piped (`echo "1 3" | gf setup`) it is read the same way.
+/// Immediate EOF returns an empty line, which `gf setup` treats as "cancel" —
+/// so it never hangs when stdin is /dev/null. EINTR-safe.
+fn readSelection(buf: []u8) []const u8 {
+    var n: usize = 0;
+    while (n < buf.len) {
+        var c: [1]u8 = undefined;
+        const rc = linux.read(0, &c, 1);
+        const r: isize = @bitCast(rc);
+        if (r < 0) {
+            if (-r == @intFromEnum(linux.E.INTR)) continue;
+            break;
+        }
+        if (r == 0) break; // EOF
+        if (c[0] == '\n') break;
+        buf[n] = c[0];
+        n += 1;
+    }
+    return buf[0..n];
+}
+
 // ===========================================================================
 // pure helpers (unit-tested)
 // ===========================================================================
@@ -210,6 +232,25 @@ fn execStatus(argv: [*:null]const ?[*:0]const u8) u8 {
     if (pid < 0) return 255;
     if (pid == 0) {
         _ = linux.execve("/usr/bin/env", argv, @ptrCast(std.c.environ));
+        linux.exit(127);
+    }
+    var status: u32 = 0;
+    _ = linux.waitpid(@intCast(pid), &status, 0);
+    if ((status & 0x7f) != 0) return 255;
+    return @truncate((status >> 8) & 0xff);
+}
+
+/// Re-exec THIS gf binary (fork + execve of /proc/self/exe, resolved in the
+/// still-gf child before the exec). `gf setup` uses it to install each pick
+/// through the exact `gf install <name>` path — same tier, sha-pin, and ledger.
+/// (Routing through `env` would not work: env replaces the image, so
+/// /proc/self/exe would then point at env, not gf.)
+fn execSelf(argv: [*:null]const ?[*:0]const u8) u8 {
+    const pid_rc = linux.fork();
+    const pid: isize = @bitCast(pid_rc);
+    if (pid < 0) return 255;
+    if (pid == 0) {
+        _ = linux.execve("/proc/self/exe", argv, @ptrCast(std.c.environ));
         linux.exit(127);
     }
     var status: u32 = 0;
@@ -1111,6 +1152,141 @@ fn cmdPublish(dir_arg: ?[]const u8) u8 {
     return 0;
 }
 
+/// `gf remove <name>` — uninstall a feat from the feat root (both tiers). gf
+/// builds the path from a charset-checked name, so it can never escape the root.
+fn cmdRemove(name: []const u8) u8 {
+    if (!validName(name)) return fail("invalid feat name: {s}", .{name});
+    var rb: [4096]u8 = undefined;
+    const root = featRootPath(&rb) orelse return fail("no HOME", .{});
+    var removed = false;
+    for ([_][]const u8{ "standard", "extra" }) |tier| {
+        var pb: [4096]u8 = undefined;
+        const p = std.fmt.bufPrint(&pb, "{s}/{s}/{s}", .{ root, tier, name }) catch continue;
+        if (lstatMode(p) != null) {
+            rmRf(p);
+            print("gf: removed {s} from the {s} tier\n", .{ name, tier });
+            removed = true;
+        }
+    }
+    if (!removed) return fail("{s} is not installed", .{name});
+    return 0;
+}
+
+const FeatState = enum { available, active, inactive };
+
+/// `gf setup` — an interactive checklist over the index. Every feat is shown
+/// with its state: available (not installed), active (standard tier, callable),
+/// or inactive (extra tier, quarantined). Picking a number toggles it — install
+/// an available feat, remove an installed one — each via a re-exec of the same
+/// `gf install`/`gf remove` path, so the tier, sha-pin and ledger rules match.
+fn cmdSetup() u8 {
+    const ix = indexUrl();
+    const data = fetchIndex(ix.url) orelse return fail("could not fetch the feat index ({s})", .{ix.url});
+    defer alloc.free(data);
+    var rb: [4096]u8 = undefined;
+    const root = featRootPath(&rb) orelse return fail("no HOME", .{});
+
+    const Item = struct { name: []const u8, ver: []const u8, desc: []const u8, state: FeatState };
+    var items: std.ArrayListUnmanaged(Item) = .empty;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(alloc);
+    var lines = std.mem.splitScalar(u8, data, '\n');
+    while (lines.next()) |ln| {
+        const line = std.mem.trim(u8, ln, " \t\r");
+        if (line.len == 0) continue;
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch continue;
+        defer parsed.deinit();
+        const nm = objStr2(parsed.value, "name") orelse continue;
+        if (objStr2(parsed.value, "arch")) |a| {
+            if (!std.mem.eql(u8, a, HOST_ARCH)) continue;
+        }
+        if (seen.contains(nm)) continue;
+        seen.put(alloc, alloc.dupe(u8, nm) catch nm, {}) catch {};
+        var sb: [4096]u8 = undefined;
+        var eb: [4096]u8 = undefined;
+        const sp = std.fmt.bufPrint(&sb, "{s}/standard/{s}", .{ root, nm }) catch continue;
+        const ep = std.fmt.bufPrint(&eb, "{s}/extra/{s}", .{ root, nm }) catch continue;
+        const state: FeatState = if (lstatMode(sp) != null) .active else if (lstatMode(ep) != null) .inactive else .available;
+        items.append(alloc, .{
+            .name = alloc.dupe(u8, nm) catch continue,
+            .ver = alloc.dupe(u8, objStr2(parsed.value, "version") orelse "") catch "",
+            .desc = alloc.dupe(u8, objStr2(parsed.value, "desc") orelse "") catch "",
+            .state = state,
+        }) catch {};
+    }
+
+    if (items.items.len == 0) {
+        print("gf setup: the feat index is empty ({s}).\n", .{ix.url});
+        return 0;
+    }
+    print("Feats (from {s}) — [ ] available  [*] active  [~] inactive:\n\n", .{ix.url});
+    for (items.items, 0..) |it, i| {
+        const mark = switch (it.state) {
+            .available => "[ ]",
+            .active => "[*]",
+            .inactive => "[~]",
+        };
+        if (it.desc.len != 0) {
+            print("  {d:>2}) {s} {s}  {s}  — {s}\n", .{ i + 1, mark, it.name, it.ver, it.desc });
+        } else {
+            print("  {d:>2}) {s} {s}  {s}\n", .{ i + 1, mark, it.name, it.ver });
+        }
+    }
+    print("\nToggle by number (install an available feat, remove an installed one), 'all', or empty to cancel: ", .{});
+
+    var lb: [1024]u8 = undefined;
+    const sel = readSelection(&lb);
+    const trimmed = std.mem.trim(u8, sel, " \t\r");
+    if (trimmed.len == 0) {
+        print("cancelled.\n", .{});
+        return 0;
+    }
+
+    var chosen: std.ArrayListUnmanaged(usize) = .empty;
+    defer chosen.deinit(alloc);
+    if (std.ascii.eqlIgnoreCase(trimmed, "all")) {
+        for (0..items.items.len) |i| chosen.append(alloc, i) catch {};
+    } else {
+        var toks = std.mem.tokenizeAny(u8, trimmed, " ,");
+        while (toks.next()) |tok| {
+            const n = std.fmt.parseInt(usize, tok, 10) catch {
+                print("  (ignoring \"{s}\": not a number)\n", .{tok});
+                continue;
+            };
+            if (n < 1 or n > items.items.len) {
+                print("  (ignoring {d}: out of range)\n", .{n});
+                continue;
+            }
+            chosen.append(alloc, n - 1) catch {};
+        }
+    }
+    if (chosen.items.len == 0) {
+        print("nothing selected.\n", .{});
+        return 0;
+    }
+
+    // each pick toggles: available → install, installed → remove. Both go
+    // through a re-exec of this same gf binary (/proc/self/exe), inheriting the
+    // environment, so the index/tier/pin rules are identical to running the
+    // command directly.
+    var did: usize = 0;
+    var fail_n: usize = 0;
+    for (chosen.items) |i| {
+        const it = items.items[i];
+        var nz: [256]u8 = undefined;
+        const np = toZ(&nz, it.name) orelse {
+            fail_n += 1;
+            continue;
+        };
+        const verb: [*:0]const u8 = if (it.state == .available) "install" else "remove";
+        print("\n→ {s} {s} …\n", .{ verb, it.name });
+        const argv = [_:null]?[*:0]const u8{ "gf", verb, np, null };
+        if (execSelf(&argv) == 0) did += 1 else fail_n += 1;
+    }
+    print("\ngf setup: {d} changed, {d} failed.\n", .{ did, fail_n });
+    return if (fail_n == 0) 0 else 1;
+}
+
 /// `gf search [query]` / `gf list` — AUR-style discovery over the index. Both
 /// fold the index into one readable line per feat (name · version · what it
 /// does), deduped and arch-filtered so a multi-arch index reads as one feat per
@@ -1160,14 +1336,27 @@ fn run(init: std.process.Init.Minimal) u8 {
     var args = std.process.Args.Iterator.init(init.args);
     _ = args.next(); // argv0
     const first = args.next() orelse {
-        print("usage: gf list                  list every feat in the index (name · version · what it does)\n" ++
+        print("usage: gf setup                 interactive checklist: install / remove feats from the index\n" ++
+            "       gf list                    list every feat in the index (name · version · what it does)\n" ++
             "       gf install <name>          install a feat by name from the feat index (pinned + verified)\n" ++
+            "       gf remove <name>           uninstall a feat (from either tier)\n" ++
             "       gf search <query>          find feats in the index (AUR-style)\n" ++
             "       gf <url>                   fetch a feat tarball from a URL, install into the extra tier\n" ++
             "       gf publish [dir]           sign + push a release tag, emit the index line (cargo-style)\n" ++
             "       gf status [feat] [--json]  show install + review history (the ledger fold)\n", .{});
         return 1;
     };
+
+    if (std.mem.eql(u8, first, "setup")) {
+        if (args.next() != null) return fail("usage: gf setup", .{});
+        return cmdSetup();
+    }
+
+    if (std.mem.eql(u8, first, "remove") or std.mem.eql(u8, first, "uninstall")) {
+        const name = args.next() orelse return fail("usage: gf remove <name>", .{});
+        if (args.next() != null) return fail("usage: gf remove <name>", .{});
+        return cmdRemove(name);
+    }
 
     if (std.mem.eql(u8, first, "list")) {
         if (args.next() != null) return fail("usage: gf list", .{});
