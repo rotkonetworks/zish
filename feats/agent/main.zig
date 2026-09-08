@@ -537,6 +537,13 @@ pub fn main(init: std.process.Init.Minimal) void {
     if (hasSoloFlag(init.args)) {
         linux.exit(runSolo(init.args));
     }
+    // edit: a region filter. `agent edit "<instruction>"` reads a snippet on
+    // stdin, applies the instruction, writes the result on stdout. Meant to be
+    // driven from an editor (vim `:'<,'>!agent edit "..."`) so the human keeps
+    // driving and the model only touches the handed-over region.
+    if (hasEditFlag(init.args)) {
+        linux.exit(runEdit(init.args));
+    }
 
     // consume the hello frame (protocol v0.2+); we do not gate on caps here —
     // a run denial simply ends the loop via runCommand returning null.
@@ -1141,6 +1148,160 @@ fn runAsk(args: std.process.Args) u8 {
         }
     }
     warn("agent: --ask produced no response after retries\n");
+    return 1;
+}
+
+// ===========================================================================
+// edit — a region filter (stdin → model → stdout), driven from an editor
+// ===========================================================================
+
+const EDIT_SYSTEM =
+    \\You transform a snippet of code or text according to an instruction.
+    \\The user message is the instruction, then a line "-----", then the snippet.
+    \\Return ONLY the transformed snippet: the whole snippet with the change
+    \\applied, nothing else. No explanation, no commentary, no markdown fences.
+    \\Preserve the surrounding indentation and style. If the instruction cannot be
+    \\applied, return the snippet unchanged.
+;
+
+fn hasEditFlag(args: std.process.Args) bool {
+    var it = std.process.Args.Iterator.init(args);
+    _ = it.next(); // argv0
+    if (it.next()) |a| return std.mem.eql(u8, a, "edit");
+    return false;
+}
+
+/// Read all of stdin (the region to transform). EINTR-safe; caps at 8 MiB so a
+/// runaway pipe can't exhaust memory.
+fn readAllStdin() []u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    var tmp: [65536]u8 = undefined;
+    while (buf.items.len < 8 << 20) {
+        const rc = linux.read(0, &tmp, tmp.len);
+        const n: isize = @bitCast(rc);
+        if (n < 0) {
+            if (-n == @intFromEnum(linux.E.INTR)) continue;
+            break;
+        }
+        if (n == 0) break; // EOF
+        buf.appendSlice(alloc, tmp[0..@intCast(n)]) catch break;
+    }
+    return buf.toOwnedSlice(alloc) catch "";
+}
+
+/// Strip one surrounding markdown code fence if the model wrapped its answer in
+/// one despite instructions (```lang\n … \n```). Returns the inner text, else s.
+fn stripFences(s: []const u8) []const u8 {
+    const t = std.mem.trim(u8, s, " \t\r\n");
+    if (!std.mem.startsWith(u8, t, "```")) return s;
+    const first_nl = std.mem.indexOfScalar(u8, t, '\n') orelse return s;
+    if (!std.mem.endsWith(u8, t, "```")) return s;
+    const inner = t[first_nl + 1 .. t.len - 3];
+    // right-trim only: the region's own leading indentation must be preserved
+    var end = inner.len;
+    while (end > 0 and (inner[end - 1] == ' ' or inner[end - 1] == '\t' or
+        inner[end - 1] == '\r' or inner[end - 1] == '\n')) end -= 1;
+    return inner[0..end];
+}
+
+test "stripFences unwraps a fence, preserves indentation, leaves plain text" {
+    try std.testing.expectEqualStrings("const x = 1;", stripFences("```zig\nconst x = 1;\n```"));
+    try std.testing.expectEqualStrings("  indented", stripFences("```\n  indented\n```"));
+    try std.testing.expectEqualStrings("no fence here", stripFences("no fence here"));
+    // a lone opening fence with no close is left alone (don't mangle real text)
+    try std.testing.expectEqualStrings("```not closed", stripFences("```not closed"));
+}
+
+fn runEdit(args: std.process.Args) u8 {
+    var model: []const u8 = getEnv("ZISH_AGENT_MODEL") orelse DEFAULT_MODEL;
+    var mock_path: ?[]const u8 = null;
+    var system: []const u8 = getEnv("ZISH_AGENT_SYSTEM") orelse EDIT_SYSTEM;
+    var instr: std.ArrayListUnmanaged(u8) = .empty;
+    defer instr.deinit(alloc);
+    var it = std.process.Args.Iterator.init(args);
+    _ = it.next(); // argv0
+    _ = it.next(); // "edit"
+    while (it.next()) |a| {
+        if (std.mem.eql(u8, a, "-m")) {
+            model = dupe(it.next() orelse return 2);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--system")) {
+            system = dupe(it.next() orelse return 2);
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--mock")) {
+            mock_path = dupe(it.next() orelse return 2);
+            continue;
+        }
+        if (instr.items.len > 0) instr.append(alloc, ' ') catch return 2;
+        instr.appendSlice(alloc, a) catch return 2;
+    }
+    if (instr.items.len == 0) {
+        warn("agent: edit needs an instruction (agent edit \"<what to change>\")\n");
+        return 2;
+    }
+    const region = readAllStdin();
+    if (region.len == 0) {
+        warn("agent: edit reads the region to change on stdin, but it was empty\n");
+        return 2;
+    }
+    // user content = instruction, marker, region — the shape EDIT_SYSTEM parses
+    var content: std.ArrayListUnmanaged(u8) = .empty;
+    defer content.deinit(alloc);
+    content.appendSlice(alloc, instr.items) catch return 2;
+    content.appendSlice(alloc, "\n-----\n") catch return 2;
+    content.appendSlice(alloc, region) catch return 2;
+
+    // transport: same seam as runAsk (mock file, or curl + key + backend)
+    var mock: ?Mock = null;
+    var home_buf: [4096]u8 = undefined;
+    var home: []const u8 = "";
+    var key: []const u8 = "";
+    if (mock_path) |mp| {
+        const contents = readFileAlloc(mp) orelse {
+            warn("agent: could not read mock file\n");
+            return 2;
+        };
+        mock = .{ .lines = std.mem.splitScalar(u8, contents, '\n') };
+    } else {
+        home = getHome(&home_buf) orelse {
+            warn("agent: HOME not set\n");
+            return 2;
+        };
+        if (agentNeedsKey() or getEnv("ZISH_AGENT_ENDPOINT") != null) {
+            var kbuf: [4096]u8 = undefined;
+            const kpath = std.fmt.bufPrint(&kbuf, "{s}/.zish/openrouter.key", .{home}) catch "";
+            if (readFileAlloc(kpath)) |k| {
+                key = k;
+            } else if (agentNeedsKey()) {
+                warn("agent: no API key at ~/.zish/openrouter.key\n");
+                return 2;
+            }
+        }
+    }
+    var ep_buf: [512]u8 = undefined;
+    const endpoint = agentEndpoint(&ep_buf);
+
+    var attempt: usize = 0;
+    while (attempt < JUDGE_RETRIES) : (attempt += 1) {
+        const request = buildJudgeRequest(model, system, content.items) catch return 2;
+        const reply = fetchWithBackoff(&mock, home, endpoint, key, request) orelse continue;
+        if (reply.status < 200 or reply.status >= 300) continue;
+        switch (parseResponse(reply.body)) {
+            .text => |t| {
+                const trimmed = std.mem.trim(u8, t, " \t\r\n");
+                const sr = splitReasoning(trimmed); // strip any <think>
+                writeAskMeta(reply.body, sr.think, model); // tokens/model → sidecar, off stdout
+                const out = stripFences(sr.answer); // hand the editor clean code
+                emit(out);
+                if (out.len == 0 or out[out.len - 1] != '\n') emit("\n");
+                return 0;
+            },
+            else => continue, // no tools sent, so .tools shouldn't happen; retry
+        }
+    }
+    warn("agent: edit produced no response after retries\n");
     return 1;
 }
 
