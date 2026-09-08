@@ -74,18 +74,18 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
-    // Stage the standard feat set beside the binary so it ships WITH zish:
-    // <prefix>/share/zish/feats/standard/<name>/{bin/<name>, feat.toml}. The
-    // resolver searches this system tier in addition to the writable
-    // ~/.zish/feats, so gf and the standard feats are present out of the box
-    // (like curl on $PATH) while user installs still land in $HOME. `zig build
-    // --prefix $out` ships them for nix; `make feats` stays the local-dev path
-    // into ~/.zish.
-    const feat_names = [_][]const u8{
-        "cnt",  "pk",    "frq",    "snf",    "jls", "calc", "para", "agent",
-        "gf",   "aur",   "budget", "verify", "ask", "team", "web",
-    };
-    const feat_libc = [_][]const u8{ "para", "agent", "gf", "aur", "budget", "verify", "ask", "team", "web" };
+    // Ship the CORE feat set beside the binary — the lean base, grown with the
+    // package manager (Arch = base + pacman, not everything preinstalled):
+    // <prefix>/share/zish/feats/standard/<name>/{bin/<name>, feat.toml}. Core is
+    // the zero-dep unix utilities plus gf itself; the heavy/situational feats
+    // (agent, team, web, aur, budget, verify, ask) are published to the gf index
+    // by `make dist-all` and installed on demand, so the base carries no
+    // LLM-agent stack and the Nix closure stays small. The resolver searches this
+    // system tier plus the writable ~/.zish/feats (where gf installs), so core is
+    // present out of the box like curl on $PATH. `zig build --prefix $out` ships
+    // core for nix; `make feats` stays the local-dev path into ~/.zish.
+    const feat_names = [_][]const u8{ "cnt", "pk", "frq", "snf", "jls", "calc", "para", "gf" };
+    const feat_libc = [_][]const u8{ "para", "gf" }; // the core feats that need libc
     for (feat_names) |name| {
         var needs_libc = false;
         for (feat_libc) |l| {
