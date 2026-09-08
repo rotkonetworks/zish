@@ -269,10 +269,17 @@ fn execSelf(argv: [*:null]const ?[*:0]const u8) u8 {
     return @truncate((status >> 8) & 0xff);
 }
 
+/// mkdir -p: create every ancestor of `path`, then `path` itself. A single
+/// mkdir would fail on a fresh install where ~/.zish doesn't exist yet — the
+/// very first `gf install`. EEXIST on an existing segment is ignored.
 fn mkdirP(path: []const u8) void {
     var z: [4096]u8 = undefined;
-    const p = toZ(&z, path) orelse return;
-    _ = linux.mkdir(p, 0o700);
+    var i: usize = 0;
+    while (i < path.len) : (i += 1) {
+        if (path[i] != '/' or i == 0) continue; // skip the leading slash
+        if (toZ(&z, path[0..i])) |p| _ = linux.mkdir(p, 0o700);
+    }
+    if (toZ(&z, path)) |p| _ = linux.mkdir(p, 0o700);
 }
 
 // statx with SYMLINK_NOFOLLOW == lstat: the mode must describe the entry

@@ -469,6 +469,16 @@ PY
     case "$so" in *"signedfeat"*"[signed]"*) ok "gf search finds the feat and flags it signed" ;; *) bad "search: $so" ;; esac
 fi
 
+# ---- fresh HOME: mkdir -p must create ~/.zish/feats from scratch --------------
+# The first install on a brand-new system: HOME exists but ~/.zish does not, and
+# no ZISH_FEAT_PATH. A non-recursive mkdir would fail here (curl write error).
+FRESH="$T/freshhome"; rm -rf "$FRESH"; mkdir -p "$FRESH"
+if HOME="$FRESH" "$T/gf" "file://$T/gfdemo.tar.gz" >"$T/ofresh" 2>&1 && [ -x "$FRESH/.zish/feats/extra/gfdemo/bin/gfdemo" ]; then
+    ok "install into a fresh HOME creates ~/.zish/feats (mkdir -p)"
+else
+    bad "fresh-HOME install failed: $(cat "$T/ofresh")"
+fi
+
 # ---- gf settings / setup: ZFS-style list/get/set + exit-code discipline -----
 SG() { HOME="$T/home" ZISH_FEAT_PATH="$T/feats" "$T/gf" "$@"; }
 [ "$(SG settings review)" = "true" ] && ok "settings get: bare value, default true" || bad "settings get: $(SG settings review)"
