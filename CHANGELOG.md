@@ -1,5 +1,31 @@
 # changelog
 
+## v0.22.0
+
+Feats now ship with zish, and gf is a real package manager. Rolls up 0.21.x.
+
+### added
+- **Feats ship with the shell.** The core set — the zero-dep utilities `cnt pk
+  frq snf jls calc para` plus `gf` — installs beside the binary and resolves out
+  of the box (a second, read-only system tier alongside `~/.zish/feats`). The
+  heavier feats (`agent team web aur budget verify ask`) install on demand.
+  Selectable with `-Dfeats=core|all`; Nix exposes `zish` and `zish-full`.
+- **`gf` — the feat package manager.** `gf install <name>` / `gf setup` / `gf
+  list` / `gf remove` / `gf settings`, against a signed, sha-pinned index.
+  ZFS-style CLI: booleans, get/set, exit codes 0/1/2. Untrusted installs are
+  quarantined, and the AUR build-script hole is closed (recipes are data, not
+  code). Feat binaries are static musl, so they run anywhere, NixOS included.
+- **`agent edit`** — a stdin→stdout region filter for editors; the captain
+  conversation reads a piped message, so it composes as a filter too.
+
+### fixed
+- First `gf install` on a fresh system (no `~/.zish` yet) failed — `mkdir -p` is
+  now recursive.
+- AUR publish failed on host-key verification: ssh read `/root/.ssh` (getpwuid)
+  while the workflow wrote `$HOME/.ssh`. Pinned by absolute path now, via
+  `GIT_SSH_COMMAND`.
+- CI: `OLDPWD` unbound in `regress.sh` under `set -u`; removed the macOS builds.
+
 ## v0.20.1
 
 Correctness fix release over 0.20.0. Recommended for everyone: two of these
