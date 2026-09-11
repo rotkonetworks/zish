@@ -593,6 +593,11 @@ pub const Lexer = struct {
                                 }
                                 return self.makeTokenValue(.RedirectHereDocLiteral, "<<");
                             }
+                            if (self.peek() == @as(u8, '&')) {
+                                // <&fd / <&word — dup a fd into stdin; <&- closes it
+                                _ = self.advance();
+                                return self.makeTokenValue(.RedirectFd, "<&");
+                            }
                             return self.makeTokenValue(.RedirectInput, "<");
                         },
                         '0'...'9' => {

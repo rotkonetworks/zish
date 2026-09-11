@@ -311,6 +311,7 @@ pub const posix = struct {
                 .MFILE => return error.ProcessFdQuotaExceeded,
                 .NAMETOOLONG => return error.NameTooLong,
                 .NFILE => return error.SystemFdQuotaExceeded,
+                .NXIO => return error.NoDevice,
                 .NODEV => return error.NoDevice,
                 .NOENT => return error.FileNotFound,
                 .SRCH => return error.ProcessNotFound,

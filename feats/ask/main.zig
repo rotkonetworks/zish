@@ -10,8 +10,21 @@
 //! Protocol (file-based, matches zish's file-shaped org state): writes the
 //! question to ~/.zish/asks/<id>.json, then polls for ~/.zish/asks/<id>.answer.
 //! For multiple choice the answer file holds the chosen 0-based INDEX; ask prints
-//! that option's text. For an open question it holds free text, printed as-is.
-//! Exit 0 = answered (answer on stdout), 3 = timed out, 2 = usage.
+//! that option's text. With -m (checkbox) it holds comma-separated indices and
+//! ask prints each chosen option on its own line, in the order given, deduped.
+//! Anything that is not a valid index (a typed "Other" answer) is echoed
+//! verbatim. For an open question it holds free text, printed as-is.
+//! Exit 0 = answered (answer on stdout), 3 = timed out, 2 = usage, 128+signal if interrupted.
+//!
+//! Herdr: when running inside a Herdr pane (HERDR_ENV=1 with HERDR_PANE_ID and
+//! HERDR_BIN_PATH set) ask also reports the pane as `blocked` with the question
+//! as the message, so the sidebar lights it up like an agent permission prompt —
+//! including on remote machines. The report is released on every exit path
+//! (answer, timeout, SIGINT/SIGTERM). It is best-effort: the reporter child gets
+//! /dev/null for all three fds so it can never pollute the answer on stdout, and
+//! a hung Herdr socket is killed after a bound instead of delaying the ask.
+//! Herdr keeps one hook authority per pane, last writer wins; releasing hands
+//! the pane back to screen detection or the previous integration's next report.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -82,6 +95,130 @@ fn nowNs() u64 {
     return @as(u64, @intCast(ts.sec)) *% 1_000_000_000 +% @as(u64, @intCast(ts.nsec));
 }
 
+// ---------------------------------------------------------------------------
+// Herdr lifecycle reporting (best-effort, never blocks the ask)
+// ---------------------------------------------------------------------------
+
+const HERDR_SOURCE = "custom:zish-ask";
+const HERDR_AGENT = "ask";
+const HERDR_MESSAGE_CAP = 200;
+const HERDR_REPORT_WAIT_MS: u64 = 5000;
+
+/// Which signal interrupted us (0 = none). Atomic: written from a handler,
+/// read in the poll loop; a plain global could legally be hoisted in ReleaseFast.
+var interrupted_by = std.atomic.Value(u32).init(0);
+
+fn interrupted() bool {
+    return interrupted_by.load(.acquire) != 0;
+}
+
+fn onSignal(sig: linux.SIG) callconv(.c) void {
+    interrupted_by.store(@intFromEnum(sig), .release);
+}
+
+/// SIGINT/SIGTERM only set a flag: nanosleep returns EINTR, the poll loop sees
+/// the flag and returns normally, so the defers (unlink + herdr release) run.
+fn installSignalHandlers() void {
+    const act = linux.Sigaction{
+        .handler = .{ .handler = onSignal },
+        .mask = std.mem.zeroes(linux.sigset_t),
+        .flags = 0,
+    };
+    _ = linux.sigaction(linux.SIG.INT, &act, null);
+    _ = linux.sigaction(linux.SIG.TERM, &act, null);
+}
+
+const HerdrPane = struct {
+    bin: []const u8,
+    pane: []const u8,
+
+    /// Present only when Herdr says so AND both handles are non-empty.
+    fn detect() ?HerdrPane {
+        const env = getEnv("HERDR_ENV") orelse return null;
+        if (!std.mem.eql(u8, env, "1")) return null;
+        const bin = getEnv("HERDR_BIN_PATH") orelse return null;
+        const pane = getEnv("HERDR_PANE_ID") orelse return null;
+        if (bin.len == 0 or pane.len == 0) return null;
+        return .{ .bin = bin, .pane = pane };
+    }
+
+    fn reportBlocked(self: HerdrPane, question: []const u8) void {
+        var msg: [HERDR_MESSAGE_CAP + 1]u8 = undefined;
+        const m = sidebarMessage(&msg, question);
+        self.exec(&.{ "pane", "report-agent", self.pane, "--source", HERDR_SOURCE, "--agent", HERDR_AGENT, "--state", "blocked", "--message", m });
+    }
+
+    fn release(self: HerdrPane) void {
+        self.exec(&.{ "pane", "release-agent", self.pane, "--source", HERDR_SOURCE, "--agent", HERDR_AGENT });
+    }
+
+    /// fork+execve(bin, argv), all three fds on /dev/null, reaped within
+    /// HERDR_REPORT_WAIT_MS or killed. Every failure is silently ignored: the
+    /// report is a courtesy to the sidebar, the ask itself must still work.
+    fn exec(self: HerdrPane, args: []const []const u8) void {
+        var zbuf: [8192]u8 = undefined;
+        var argv: [16:null]?[*:0]const u8 = undefined;
+        if (args.len + 1 >= argv.len) return;
+        var off: usize = 0;
+        argv[0] = zAt(&zbuf, &off, self.bin) orelse return;
+        for (args, 1..) |a, i| argv[i] = zAt(&zbuf, &off, a) orelse return;
+        argv[args.len + 1] = null;
+        var binz: [4096]u8 = undefined;
+        const bin = toZ(&binz, self.bin) orelse return;
+
+        const pid: isize = @bitCast(linux.fork());
+        if (pid < 0) return;
+        if (pid == 0) {
+            const devnull: isize = @bitCast(linux.open("/dev/null", .{ .ACCMODE = .RDWR }, 0));
+            if (devnull >= 0) {
+                _ = linux.dup2(@intCast(devnull), 0);
+                _ = linux.dup2(@intCast(devnull), 1);
+                _ = linux.dup2(@intCast(devnull), 2);
+                if (devnull > 2) _ = linux.close(@intCast(devnull));
+            }
+            _ = linux.execve(bin, &argv, @ptrCast(std.c.environ));
+            linux.exit(127);
+        }
+        const deadline = nowNs() + HERDR_REPORT_WAIT_MS * 1_000_000;
+        var status: u32 = 0;
+        while (true) {
+            const rc: isize = @bitCast(linux.waitpid(@intCast(pid), &status, linux.W.NOHANG));
+            if (rc == pid) return;
+            if (rc < 0 and linux.errno(@as(usize, @bitCast(rc))) != .INTR) return;
+            if (nowNs() >= deadline) break;
+            var ts: linux.timespec = .{ .sec = 0, .nsec = 20 * 1_000_000 };
+            _ = linux.nanosleep(&ts, &ts);
+        }
+        _ = linux.kill(@intCast(pid), linux.SIG.KILL);
+        _ = linux.waitpid(@intCast(pid), &status, 0);
+    }
+};
+
+/// Copy `s` NUL-terminated into `buf` at `*off`, bumping the offset.
+fn zAt(buf: []u8, off: *usize, s: []const u8) ?[*:0]const u8 {
+    if (off.* + s.len + 1 > buf.len) return null;
+    const start = off.*;
+    @memcpy(buf[start .. start + s.len], s);
+    buf[start + s.len] = 0;
+    off.* = start + s.len + 1;
+    return @ptrCast(buf.ptr + start);
+}
+
+/// The question, capped to HERDR_MESSAGE_CAP bytes at a UTF-8 boundary, with
+/// control bytes flattened to spaces: it is headed for a sidebar, not a terminal.
+fn sidebarMessage(buf: []u8, q: []const u8) []const u8 {
+    var n: usize = 0;
+    for (q) |c| {
+        if (n >= HERDR_MESSAGE_CAP) break;
+        buf[n] = if (c < 0x20 or c == 0x7f) ' ' else c;
+        n += 1;
+    }
+    // don't split a multibyte sequence: back off over continuation bytes
+    if (n < q.len) while (n > 0 and (buf[n - 1] & 0xC0) == 0x80) : (n -= 1) {};
+    if (n < q.len and n > 0 and buf[n - 1] >= 0xC0) n -= 1;
+    return buf[0..n];
+}
+
 /// JSON-escape into `o`.
 fn jsonEsc(o: *std.ArrayListUnmanaged(u8), s: []const u8) void {
     for (s) |c| switch (c) {
@@ -137,6 +274,10 @@ fn run(args: std.process.Args) u8 {
         warn("ask: give 0 (open) or 2-4 options\n");
         return 2;
     }
+    if (multi and options.items.len == 0) {
+        warn("ask: -m needs options to choose from\n");
+        return 2;
+    }
 
     const home = getEnv("HOME") orelse {
         warn("ask: HOME unset\n");
@@ -186,9 +327,17 @@ fn run(args: std.process.Args) u8 {
     defer unlinkPath(qpath);
     defer unlinkPath(apath);
 
+    // handlers first: a signal during the (bounded) report must still release
+    installSignalHandlers();
+
+    // surface the question in Herdr's sidebar; released on every exit path
+    const herdr = HerdrPane.detect();
+    if (herdr) |h| h.reportBlocked(q);
+    defer if (herdr) |h| h.release();
+
     // block, polling for the answer file
     const deadline = nowNs() + timeout_s *% 1_000_000_000;
-    while (nowNs() < deadline) {
+    while (nowNs() < deadline and !interrupted()) {
         if (readFileAlloc(apath)) |raw| {
             defer alloc.free(raw);
             const ans = std.mem.trim(u8, raw, " \t\r\n");
@@ -196,6 +345,11 @@ fn run(args: std.process.Args) u8 {
                 // written but empty; keep waiting a beat
             } else if (options.items.len == 0) {
                 out(ans); // open question — free text
+                out("\n");
+                return 0;
+            } else if (multi) {
+                // checkbox: "0,2" -> the chosen options, one per line
+                if (!printChecked(ans, options.items)) out(ans);
                 out("\n");
                 return 0;
             } else {
@@ -217,11 +371,56 @@ fn run(args: std.process.Args) u8 {
         var ts: linux.timespec = .{ .sec = 0, .nsec = POLL_MS * 1_000_000 };
         _ = linux.nanosleep(&ts, &ts);
     }
+    const sig = interrupted_by.load(.acquire);
+    if (sig != 0) {
+        warn("ask: interrupted\n");
+        return @intCast(128 + (sig & 0x7f));
+    }
     warn("ask: timed out with no answer\n");
     return 3;
 }
 
+/// Checkbox answer: comma-separated 0-based indices. Prints each chosen option
+/// on its own line (order as given, duplicates dropped) and returns true.
+/// Returns false without printing when any token is not an in-range index, so
+/// the caller can echo the raw answer (a typed "Other") verbatim instead.
+fn printChecked(ans: []const u8, options: []const []const u8) bool {
+    var picked: [4]usize = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, ans, ',');
+    while (it.next()) |tok| {
+        const t = std.mem.trim(u8, tok, " \t");
+        if (t.len == 0) return false;
+        const idx = std.fmt.parseInt(usize, t, 10) catch return false;
+        if (idx >= options.len) return false;
+        var dup = false;
+        for (picked[0..n]) |p| dup = dup or p == idx;
+        if (dup) continue;
+        if (n >= picked.len) return false;
+        picked[n] = idx;
+        n += 1;
+    }
+    if (n == 0) return false;
+    for (picked[0..n], 0..) |idx, i| {
+        if (i > 0) out("\n");
+        out(options[idx]);
+    }
+    return true;
+}
+
+test "printChecked accepts in-range comma lists and rejects anything else" {
+    const opts = [_][]const u8{ "a", "b", "c" };
+    // silent success paths (output goes to fd 1; only the verdict is checked here)
+    try std.testing.expect(printChecked("0", &opts));
+    try std.testing.expect(printChecked("2, 0,2", &opts));
+    try std.testing.expect(!printChecked("", &opts));
+    try std.testing.expect(!printChecked("3", &opts));
+    try std.testing.expect(!printChecked("0,", &opts));
+    try std.testing.expect(!printChecked("0,x", &opts));
+    try std.testing.expect(!printChecked("something else", &opts));
+}
+
 fn usageErr() u8 {
-    warn("usage: ask [-t <seconds>] \"<question>\" [\"opt1\" ... \"opt4\"]\n");
+    warn("usage: ask [-t <seconds>] [-m] \"<question>\" [\"opt1\" ... \"opt4\"]\n");
     return 2;
 }
