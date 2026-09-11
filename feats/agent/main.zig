@@ -34,7 +34,17 @@ const linux = std.os.linux;
 
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash-0731";
 const ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
-const MAX_TURNS = 24; // hard cap on model round-trips per query (runaway guard)
+const DEFAULT_MAX_TURNS = 24; // model round-trips per query when the caller names none
+
+/// The turn budget for one query. The caller that pays picks the ceiling:
+/// `--turns N`, else `ZISH_AGENT_MAX_TURNS`, else `fallback`. Hardcoding this
+/// was the same defect as a hidden cost — a commander could not budget a
+/// worker, so a broad task died mid-collection with no way to give it room.
+fn resolveMaxTurns(explicit: ?usize, fallback: usize) usize {
+    if (explicit) |n| return n;
+    const v = getEnv("ZISH_AGENT_MAX_TURNS") orelse return fallback;
+    return std.fmt.parseInt(usize, v, 10) catch fallback;
+}
 const MAX_RETRIES = 5; // per-request retry cap for 429/5xx
 const RESULT_CAP = 8 * 1024 * 1024; // matches zish's session RESULT_CAP
 const SYSTEM_PROMPT =
@@ -510,6 +520,8 @@ const Config = struct {
     model: []const u8 = DEFAULT_MODEL,
     mock_path: ?[]const u8 = null,
     query: []const u8 = "",
+    /// Caller-supplied ceiling on model round-trips; null defers to env/default.
+    max_turns: ?usize = null,
 };
 
 pub fn main(init: std.process.Init.Minimal) void {
@@ -551,7 +563,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     _ = readLine(&hbuf);
 
     const cfg = parseArgs(init.args) orelse {
-        say("agent: usage: agent [-m model] [--mock file] <query>");
+        say("agent: usage: agent [-m model] [--turns N] [--mock file] <query>");
         emit("{\"t\":\"done\"}\n");
         return;
     };
@@ -602,7 +614,8 @@ pub fn main(init: std.process.Init.Minimal) void {
     history.append(alloc, .{ .role = .user, .content = cfg.query }) catch return;
 
     var turn: usize = 0;
-    while (turn < MAX_TURNS) : (turn += 1) {
+    const max_turns = resolveMaxTurns(cfg.max_turns, DEFAULT_MAX_TURNS);
+    while (turn < max_turns) : (turn += 1) {
         const request = buildRequest(cfg.model, history.items, SHELL_TOOLS) catch {
             say("agent: failed to build request");
             break;
@@ -827,6 +840,9 @@ fn parseArgs(args: std.process.Args) ?Config {
         } else if (std.mem.eql(u8, a, "--mock")) {
             const v = it.next() orelse return null;
             cfg.mock_path = dupe(v);
+        } else if (std.mem.eql(u8, a, "--turns")) {
+            const v = it.next() orelse return null;
+            cfg.max_turns = std.fmt.parseInt(usize, v, 10) catch return null;
         } else {
             if (query.items.len > 0) query.append(alloc, ' ') catch return null;
             query.appendSlice(alloc, a) catch return null;
@@ -1777,8 +1793,7 @@ const SOLO_SYSTEM =
 ;
 
 fn soloMaxTurns() usize {
-    const v = getEnv("ZISH_AGENT_MAX_TURNS") orelse return 12;
-    return std.fmt.parseInt(usize, v, 10) catch 12;
+    return resolveMaxTurns(null, 12);
 }
 
 /// run_command executed locally: fork+exec `sh -c <command>`, merge stdout+stderr,
