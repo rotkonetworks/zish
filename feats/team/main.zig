@@ -689,17 +689,16 @@ fn reap(cpid: i32) void {
 // ---------------------------------------------------------------------------
 // persona lenses (data, not code) — each role embodies a distinct style, not a
 // biography. Diversity across workers is the point: different lenses catch
-// different failures. Loaded from lenses.toml (ZISH_LENS_FILE, else
-// ZISH_RUBRIC_DIR/lenses.toml, else ~/.zish/rubrics/lenses.toml). Fail-open: no
-// file → plain role prompts, unchanged behaviour. Never code — just prompt data.
+// failures. Loaded from lenses.toml: ZISH_LENS_FILE if set, else
+// feat.rubricFile (ZISH_RUBRIC_DIR, then ~/.zish/rubrics, then the feat's own
+// rubrics/ beside the binary). Fail-open: no file → plain role prompts,
+// unchanged behaviour. Never code — just prompt data.
 // ---------------------------------------------------------------------------
 const Lens = struct { role: []const u8, name: []const u8, style: []const u8 };
 
 fn lensPath(io: std.Io, buf: []u8) ?[]const u8 {
     if (getEnv(io, "ZISH_LENS_FILE")) |p| return p;
-    if (getEnv(io, "ZISH_RUBRIC_DIR")) |d| return std.fmt.bufPrint(buf, "{s}/lenses.toml", .{d}) catch null;
-    const home = getEnv(io, "HOME") orelse return null;
-    return std.fmt.bufPrint(buf, "{s}/.zish/rubrics/lenses.toml", .{home}) catch null;
+    return feat.rubricFile(alloc, io, buf, "lenses.toml");
 }
 
 /// Parse `[[lens]]` blocks (role/name/style keys). Returns the owning content
@@ -767,15 +766,13 @@ fn lensIntro(lens: ?Lens) []u8 {
 // expert and drops the answer on the blackboard. The org pays for the round-trip
 // (charged to root, budget-gated so a consult can never breach the grant or the
 // critic/synth reserve). Data-driven + fail-open, same as lenses:
-// experts.toml (ZISH_EXPERTS_FILE / ZISH_RUBRIC_DIR / ~/.zish/rubrics).
+// experts.toml (ZISH_EXPERTS_FILE if set, else feat.rubricFile).
 // ---------------------------------------------------------------------------
 const Expert = struct { name: []const u8, style: []const u8 };
 
 fn expertsPath(io: std.Io, buf: []u8) ?[]const u8 {
     if (getEnv(io, "ZISH_EXPERTS_FILE")) |p| return p;
-    if (getEnv(io, "ZISH_RUBRIC_DIR")) |d| return std.fmt.bufPrint(buf, "{s}/experts.toml", .{d}) catch null;
-    const home = getEnv(io, "HOME") orelse return null;
-    return std.fmt.bufPrint(buf, "{s}/.zish/rubrics/experts.toml", .{home}) catch null;
+    return feat.rubricFile(alloc, io, buf, "experts.toml");
 }
 
 fn loadExperts(io: std.Io, list: *std.ArrayListUnmanaged(Expert)) ?[]u8 {

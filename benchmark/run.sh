@@ -23,7 +23,7 @@
 set -u
 cd "$(dirname "$0")/.."
 
-RUBRIC="${ZISH_BENCH_RUBRIC:-rubrics/pkgbuild-review-v1.toml}"
+RUBRIC="${ZISH_BENCH_RUBRIC:-feats/aur/rubrics/pkgbuild-review-v1.toml}"
 CORPUS="benchmark/pkgbuilds"
 LABELS="benchmark/labels.jsonl"
 AGENT=/tmp/agent-bench

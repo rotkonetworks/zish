@@ -203,3 +203,78 @@ pub fn publish(io: std.Io, path: []const u8, bytes: []const u8) !void {
 pub fn readFile(alloc: std.mem.Allocator, io: std.Io, path: []const u8, limit: usize) ![]u8 {
     return std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(limit));
 }
+
+// ---------------------------------------------------------------------------
+// feat data files — the rubrics and prompt data a feat reads at runtime
+//
+// These belong to the feat that reads them, not to the repo root and not to one
+// shared `~/.zish/rubrics` directory: a rubric IS that feat's data, and it has
+// exactly one consumer. Keeping them in the feat directory is also what makes
+// them *travel* — the same directory is staged into the registry whatever built
+// it (`make feats`, the AUR package, a `gf install`), so a feat's data reaches a
+// fresh machine with no extra root to search and nothing in $HOME.
+// ---------------------------------------------------------------------------
+
+/// This process's own executable path (no trailing NUL), from /proc/self/exe.
+/// Null when it cannot be read, or when it was truncated — a truncated path is
+/// not this binary.
+pub fn selfExe(buf: []u8) ?[]const u8 {
+    const rc: isize = @bitCast(std.os.linux.readlink("/proc/self/exe", buf.ptr, buf.len));
+    if (rc <= 0) return null;
+    const n: usize = @intCast(rc);
+    if (n >= buf.len) return null;
+    return buf[0..n];
+}
+
+/// Whether `path` names something that exists. Symlinks are not followed, so a
+/// dangling link reads as absent.
+pub fn fileExists(path: []const u8) bool {
+    var z: [4096]u8 = undefined;
+    const p = zPath(&z, path) orelse return false;
+    var stx: std.os.linux.Statx = undefined;
+    const rc = std.os.linux.statx(std.os.linux.AT.FDCWD, p, std.os.linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true }, &stx);
+    return @as(isize, @bitCast(rc)) == 0;
+}
+
+/// NUL-terminate `s` into `z` for the raw syscalls above. Null if it does not fit.
+fn zPath(z: []u8, s: []const u8) ?[*:0]const u8 {
+    if (s.len >= z.len) return null;
+    @memcpy(z[0..s.len], s);
+    z[s.len] = 0;
+    return @ptrCast(z.ptr);
+}
+
+/// Resolve a data file that ships with the feat reading it — `name` is a bare
+/// filename, e.g. `lenses.toml`.
+///
+/// First hit wins:
+///
+///   1. `$ZISH_RUBRIC_DIR/<name>` — an explicit override. When set it is the
+///      ONLY place searched, so a caller that names a directory gets that
+///      directory or nothing (the rule `ZISH_FEAT_PATH` already has for feats).
+///   2. `$HOME/.zish/rubrics/<name>` — the user's own copy, which overrides the
+///      shipped one, exactly as a user feat shadows a shipped feat.
+///   3. `<featdir>/rubrics/<name>` — shipped beside the binary. `<featdir>` comes
+///      from /proc/self/exe (`<featdir>/bin/<feat>`), so this works identically
+///      for a user-root feat and a system-root one.
+///
+/// Returns a path into `buf`, or null when the file is nowhere.
+pub fn rubricFile(alloc: std.mem.Allocator, io: std.Io, buf: []u8, name: []const u8) ?[]const u8 {
+    if (env(alloc, io, "ZISH_RUBRIC_DIR")) |d| {
+        defer alloc.free(d);
+        const p = std.fmt.bufPrint(buf, "{s}/{s}", .{ d, name }) catch return null;
+        return if (fileExists(p)) p else null;
+    }
+    if (env(alloc, io, "HOME")) |home| {
+        defer alloc.free(home);
+        if (std.fmt.bufPrint(buf, "{s}/.zish/rubrics/{s}", .{ home, name })) |p| {
+            if (fileExists(p)) return p;
+        } else |_| {}
+    }
+    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe = selfExe(&exe_buf) orelse return null;
+    const bindir = std.fs.path.dirname(exe) orelse return null;
+    const featdir = std.fs.path.dirname(bindir) orelse return null;
+    const p = std.fmt.bufPrint(buf, "{s}/rubrics/{s}", .{ featdir, name }) catch return null;
+    return if (fileExists(p)) p else null;
+}

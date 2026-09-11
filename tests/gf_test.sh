@@ -161,7 +161,7 @@ echo "building agent feat for review tests..."
 mkdir -p "$T/feats/standard/agent/bin" "$T/rubrics"
 if zig build-exe -lc feats/agent/main.zig -femit-bin="$T/feats/standard/agent/bin/agent" >/dev/null 2>&1; then
     printf 'name = "agent"\ntier = "standard"\nkind = "session"\nbin = "agent"\n' > "$T/feats/standard/agent/feat.toml"
-    cp -f rubrics/feat-review-v1.toml "$T/rubrics/feat-review-v1.toml"
+    cp -f feats/gf/rubrics/feat-review-v1.toml "$T/rubrics/feat-review-v1.toml"
     # mock verdict: content is a JSON verdict; wrap as an OpenRouter completion
     python3 - "$T/verdict-mock.jsonl" <<'PY'
 import json, sys

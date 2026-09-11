@@ -496,20 +496,6 @@ fn resolveAgentBin(root: []const u8, buf: []u8) ?[]const u8 {
     return null;
 }
 
-/// The review rubric path: $ZISH_RUBRIC_DIR/feat-review-v1.toml, else
-/// $HOME/.zish/rubrics/feat-review-v1.toml.
-fn resolveRubric(init: std.process.Init, buf: []u8) ?[]const u8 {
-    if (feat.env(init.arena.allocator(), init.io, "ZISH_RUBRIC_DIR")) |d| {
-        const p = std.fmt.bufPrint(buf, "{s}/feat-review-v1.toml", .{d}) catch return null;
-        if (lstatMode(p) != null) return p;
-        return null;
-    }
-    const home = feat.env(init.arena.allocator(), init.io, "HOME") orelse return null;
-    const p = std.fmt.bufPrint(buf, "{s}/.zish/rubrics/feat-review-v1.toml", .{home}) catch return null;
-    if (lstatMode(p) != null) return p;
-    return null;
-}
-
 /// Append a review verdict to the ledger, joined to the install by sha256.
 /// The bare pass/fail is lifted to top level for greppability; the full
 /// verdict object rides along as an escaped string under "result".
@@ -565,7 +551,7 @@ fn reviewInstalled(init: std.process.Init, root: []const u8, dest: []const u8, n
         return;
     };
     var rbuf: [4096]u8 = undefined;
-    const rubric = resolveRubric(init, &rbuf) orelse {
+    const rubric = feat.rubricFile(init.arena.allocator(), init.io, &rbuf, "feat-review-v1.toml") orelse {
         print("gf: no review rubric found; skipping review\n", .{});
         return;
     };

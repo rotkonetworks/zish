@@ -24,9 +24,10 @@ build() {
     # Standard feats. The repo's own target decides which feats exist and which
     # need libc (FEAT_NAMES/FEAT_LIBC), so there is no second list here to drift,
     # and it stages exactly the registry layout the shell reads:
-    # <stage>/<name>/{feat.toml,bin/<name>}. Both stage dirs live in $srcdir so
-    # the build writes nothing outside the build tree.
-    make feats ZISH_FEAT_DIR="$srcdir/feats-standard" ZISH_RUBRIC_DIR="$srcdir/rubrics"
+    # <stage>/<name>/{feat.toml,bin/<name>,rubrics/}. Each feat's rubrics ride
+    # along in its own directory — data that travels with the feat that reads it,
+    # so a packaged install needs no separate data root.
+    make feats ZISH_FEAT_DIR="$srcdir/feats-standard"
 }
 
 # No check(): `zig build test` builds the test exe in Debug (all modules +

@@ -235,16 +235,6 @@ fn resolveAgentBin(root: []const u8, buf: []u8) ?[]const u8 {
     return null;
 }
 
-fn resolveRubric(init: std.process.Init, buf: []u8) ?[]const u8 {
-    if (feat.env(init.arena.allocator(), init.io, "ZISH_RUBRIC_DIR")) |d| {
-        const p = std.fmt.bufPrint(buf, "{s}/{s}.toml", .{ d, RUBRIC }) catch return null;
-        return if (exists(p)) p else null;
-    }
-    const home = feat.env(init.arena.allocator(), init.io, "HOME") orelse return null;
-    const p = std.fmt.bufPrint(buf, "{s}/.zish/rubrics/{s}.toml", .{ home, RUBRIC }) catch return null;
-    return if (exists(p)) p else null;
-}
-
 /// One AUR-review store, keyed by PKGBUILD content hash, shared by both verbs.
 /// A diff reviewed via `aur review` and a full PKGBUILD reviewed via `aur check`
 /// are different bytes → different hashes, so they never collide; they just
@@ -956,7 +946,7 @@ fn reviewPager(init: std.process.Init) u8 {
     var agentb: [4096]u8 = undefined;
     var rubb: [4096]u8 = undefined;
     const agent_bin: ?[]const u8 = if (featRootPath(init, &rootb)) |root| resolveAgentBin(root, &agentb) else null;
-    const rubric: ?[]const u8 = resolveRubric(init, &rubb);
+    const rubric: ?[]const u8 = feat.rubricFile(init.arena.allocator(), init.io, &rubb, RUBRIC ++ ".toml");
 
     const home = feat.env(init.arena.allocator(), init.io, "HOME") orelse return 0;
     var subjb: [4096]u8 = undefined;
@@ -1026,7 +1016,7 @@ fn checkGate(init: std.process.Init, json: bool, targets: []const []const u8) u8
         return 2;
     };
     var rubb: [4096]u8 = undefined;
-    const rubric = resolveRubric(init, &rubb) orelse {
+    const rubric = feat.rubricFile(init.arena.allocator(), init.io, &rubb, RUBRIC ++ ".toml") orelse {
         warn("aur: pkgbuild-review rubric not found — cannot review.\n");
         return 2;
     };

@@ -17,7 +17,7 @@ zig build-exe -lc feats/aur/main.zig -femit-bin="$T/aur" >/dev/null 2>&1 || {
 zig build-exe -lc feats/agent/main.zig -femit-bin="$T/home/.zish/feats/standard/agent/bin/agent" >/dev/null 2>&1 || {
     echo "FAIL: agent does not compile"; exit 1; }
 printf 'name = "agent"\ntier = "standard"\nkind = "session"\nbin = "agent"\n' > "$T/home/.zish/feats/standard/agent/feat.toml"
-cp -f rubrics/pkgbuild-review-v1.toml "$T/home/.zish/rubrics/"
+cp -f feats/aur/rubrics/pkgbuild-review-v1.toml "$T/home/.zish/rubrics/"
 
 # ---- a mock verdict for `agent --judge` (verdict word is arg 1) -------------
 mkverdict() {
