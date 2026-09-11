@@ -2,6 +2,7 @@
 const std = @import("std");
 const Shell = @import("Shell.zig");
 const ast = @import("ast.zig");
+const argv_mod = @import("argv.zig");
 const parser = @import("parser.zig");
 const input_mod = @import("input.zig");
 const BindableAction = input_mod.BindableAction;
@@ -1622,21 +1623,11 @@ fn exec(shell: *Shell, args: []const []const u8) !u8 {
     const cmd_name = args[1];
     const full_path = shell.lookupCommand(cmd_name) orelse cmd_name;
 
-    var argv_buf: [256]?[*:0]const u8 = undefined;
-    // Fail closed rather than silently exec with a truncated argv.
-    if (args.len - 1 >= argv_buf.len) {
-        try shell.stderr().writeAll("exec: too many arguments\n");
-        return 1;
-    }
-    var arg_count: usize = 0;
-    for (args[1..]) |arg| {
-        const duped = try shell.allocator.dupeZ(u8, arg);
-        argv_buf[arg_count] = duped.ptr;
-        arg_count += 1;
-    }
-    argv_buf[arg_count] = null;
-
-    const argv = argv_buf[0..arg_count :null];
+    // Sized to the command rather than to a fixed array: a longer argv is not an
+    // error, it is just a longer argv. The process is replaced or exits below,
+    // so the store is deliberately not freed.
+    const argv_store = try argv_mod.fromSlices(shell.allocator, args[1..]);
+    const argv = argv_store.view();
     // Pass the shell's full environment (exported vars set this session), not the
     // raw process environ — otherwise `FOO=1; exec env` loses FOO.
     const eval_mod = @import("eval.zig");
@@ -2412,17 +2403,9 @@ fn runTimedCommand(shell: *Shell, cmd_args: []const []const u8) !BenchSample {
     if (pid == 0) {
         // child: own pgroup + terminal, then default signals, then exec
         fg_session.setupChild();
-        var argv_buf: [256]?[*:0]const u8 = undefined;
-        if (cmd_args.len >= argv_buf.len) {
-            compat.posix.exit(126);
-        }
-        for (cmd_args, 0..) |arg, i| {
-            const arg_z = shell.allocator.dupeZ(u8, arg) catch compat.posix.exit(127);
-            argv_buf[i] = arg_z.ptr;
-        }
-        argv_buf[cmd_args.len] = null;
-
-        const argv = argv_buf[0..cmd_args.len :null];
+        // Sized to the command; the child execs or exits, so it is not freed.
+        const argv_store = argv_mod.fromSlices(shell.allocator, cmd_args) catch compat.posix.exit(127);
+        const argv = argv_store.view();
         compat.posix.execvpeZ(argv[0].?, argv, @ptrCast(std.c.environ)) catch {};
         compat.posix.exit(127);
     }

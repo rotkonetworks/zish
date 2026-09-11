@@ -718,6 +718,8 @@ same_as_bash "printf %q space"             "printf '%q\n' 'hello world'"
 same_as_bash "printf %q newline"           'printf "%q\n" "$(printf "a\nb")"'
 same_as_bash "printf %q metachars"         "printf '%q\n' 'a|b;c'"
 same_as_bash "exec passes exported var"   'export ZQ=hi; exec printenv ZQ'
+same_as_bash "exec fd dup persists to read"  'printf "gate\n" | { exec 9>&0 8>&1 0</dev/null; read -r x <&9; echo got=$x; }'
+same_as_bash "exec redirect persists for session" 'exec >/tmp/zish_exec_out_$$; echo line1; echo line2; cat /tmp/zish_exec_out_$$'
 
 # Export tracking: a plain assignment is shell-local and must NOT leak into a
 # child's environment (it did — every shell variable, incl. secrets, was
@@ -789,6 +791,16 @@ same_as_bash "[ -x on non-exec file"       '[ -x /etc/hostname ] && echo yes || 
 # The FIFO itself: old zish hung here (open with no writer blocks); harness
 # timeout makes a regression fail red. bash and fixed zish both return 1 fast.
 same_as_bash "[ -x fifo no hang"           'mkfifo hangfifo; [ -x hangfifo ]; echo $?; rm -f hangfifo'
+
+# Argument and construct counts are bounded by the input, not by a constant.
+# These three were real: a 256-slot argv silently dropped the tail of a large
+# expansion, and the same 256 was a parse-time cap — so a 300-argument command
+# failed with `TooManyChildren` and a 300-command script with `TooManyCommands`.
+# `ls` here is external, so it exercises the exec path (not a shell builtin).
+same_as_bash "300-arg expansion"           'i=0; while [ $i -lt 300 ]; do set -- "$@" "a$i"; i=$((i+1)); done; /bin/echo "$@" | wc -w'
+same_as_bash "300 files matched by glob"   'rm -rf many.zz; mkdir -p many.zz; i=0; while [ $i -lt 300 ]; do : > many.zz/f$i; i=$((i+1)); done; ls many.zz/* | wc -l; rm -rf many.zz'
+same_as_bash "300-arg literal command"     'f=big.$$; printf "/bin/echo" > $f; i=0; while [ $i -lt 300 ]; do printf " a%s" "$i" >> $f; i=$((i+1)); done; printf "\n" >> $f; . ./$f | wc -w; rm -f $f'
+same_as_bash "300-command script"          'f=cmds.$$; i=0; while [ $i -lt 300 ]; do printf "v=%s\n" "$i" >> $f; i=$((i+1)); done; printf "echo ok\n" >> $f; . ./$f; rm -f $f'
 
 # ---------------------------------------------------------------------------
 printf '\n%s\n' "para feat"

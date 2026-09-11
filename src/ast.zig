@@ -90,15 +90,21 @@ pub const AstNode = struct {
 // typestate-based ast builder with security guarantees
 pub const AstBuilder = struct {
     arena: std.heap.ArenaAllocator,
-    node_count: u32,  // prevent ast explosion
+    node_count: u32, // prevent ast explosion
+    /// Ceiling on nodes for one parse. Derived from the input length by the
+    /// parser rather than fixed: the parse's own text is what bounds the work,
+    /// and a constant here rejected ordinary programs (a 401-line script died
+    /// with `TooManyCommands`, then `AstTooComplex`, long before any real
+    /// adversarial input).
+    max_nodes: usize,
 
-    const max_nodes = 1024;  // prevent dos via massive asts
     const Self = @This();
 
-    pub fn init(parent_allocator: std.mem.Allocator) Self {
+    pub fn init(parent_allocator: std.mem.Allocator, max_nodes: usize) Self {
         return Self{
             .arena = std.heap.ArenaAllocator.init(parent_allocator),
             .node_count = 0,
+            .max_nodes = max_nodes,
         };
     }
 
@@ -116,16 +122,11 @@ pub const AstBuilder = struct {
         column: u32,
     ) !*const AstNode {
         // prevent ast explosion attacks
-        if (self.node_count >= max_nodes) {
+        if (self.node_count >= self.max_nodes) {
             return error.AstTooComplex;
         }
 
         const allocator = self.arena.allocator();
-
-        // bounds check children array
-        if (children.len > 256) {
-            return error.TooManyChildren;
-        }
 
         const node = try allocator.create(AstNode);
         node.* = AstNode{

@@ -52,6 +52,11 @@ pub const Parser = struct {
     current_token: lexer.Token,
     peek_token: lexer.Token,
     recursion_depth: types.RecursionDepth,
+    /// Length of the text being parsed. Every list item — command, pipeline
+    /// stage, argument — consumes at least one input byte, so this bounds each
+    /// construct's count without rejecting anything a real program can contain.
+    /// The bound that actually limits work is `MAX_COMMAND_LENGTH` on the input.
+    source_len: usize,
 
     const Self = @This();
 
@@ -60,7 +65,11 @@ pub const Parser = struct {
 
         return Self{
             .lexer = lex,
-            .builder = ast.AstBuilder.init(allocator),
+            // A node costs at least one input byte to write, so the input length
+            // is the tightest bound that cannot reject a real program; the
+            // multiple is a defensive margin over that floor, not a limit.
+            .builder = ast.AstBuilder.init(allocator, input.len * 2 + 1024),
+            .source_len = input.len,
             .state = .initial,
             .current_token = lexer.Token.EMPTY,
             .peek_token = lexer.Token.EMPTY,
@@ -123,7 +132,7 @@ pub const Parser = struct {
             }
 
             // prevent dos via massive command lists
-            if (commands.items.len >= types.MAX_ARGS_COUNT) {
+            if (commands.items.len >= self.source_len) {
                 return error.TooManyCommands;
             }
 
@@ -210,7 +219,7 @@ pub const Parser = struct {
         while (self.current_token.ty == .Pipe) {
             try self.nextToken(); // consume pipe token
 
-            if (pipeline_commands.items.len >= types.MAX_ARGS_COUNT) {
+            if (pipeline_commands.items.len >= self.source_len) {
                 return error.TooManyPipelineCommands;
             }
 
@@ -721,7 +730,7 @@ pub const Parser = struct {
             self.current_token.ty != .Do and
             self.current_token.ty != .Eof)
         {
-            if (values.items.len >= types.MAX_ARGS_COUNT) {
+            if (values.items.len >= self.source_len) {
                 return error.TooManyArguments;
             }
 
@@ -789,7 +798,7 @@ pub const Parser = struct {
             self.current_token.ty != .Do and
             self.current_token.ty != .Eof)
         {
-            if (values.items.len >= types.MAX_ARGS_COUNT) {
+            if (values.items.len >= self.source_len) {
                 return error.TooManyArguments;
             }
             const value = try self.parseword();

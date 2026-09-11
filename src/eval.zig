@@ -2,6 +2,7 @@
 const std = @import("std");
 const compat = @import("compat.zig");
 const ast = @import("ast.zig");
+const argv_mod = @import("argv.zig");
 const glob = @import("glob.zig");
 const Shell = @import("Shell.zig");
 const brace = @import("brace.zig");
@@ -1377,18 +1378,14 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
         }
     }
 
-    // build null-terminated argv on stack
-    // expanded_args contains [:0]const u8 (null-terminated slices)
-    var argv_buf: [256]?[*:0]const u8 = undefined;
-    if (expanded_args.items.len >= argv_buf.len) {
-        try shell.stdout().print("zish: too many arguments\n", .{});
+    // expanded_args holds [:0]const u8, so only the pointer array is allocated —
+    // sized to the command, because a glob expands past any fixed bound.
+    var argv_store = argv_mod.fromSentinel(shell.allocator, expanded_args.items) catch {
+        try shell.stderr().writeAll("zish: argument list too long\n");
         return 1;
-    }
-    for (expanded_args.items, 0..) |arg, i| {
-        argv_buf[i] = arg.ptr;
-    }
-    argv_buf[expanded_args.items.len] = null;
-    const argv = argv_buf[0..expanded_args.items.len :null];
+    };
+    defer argv_store.deinit();
+    const argv = argv_store.view();
 
     // This forked child was created to run exactly this node and nothing else,
     // so exec in place instead of forking again. Any other node still has body
@@ -1513,44 +1510,26 @@ fn needsExpansion(node: *const ast.AstNode) bool {
 
 // Exec a simple command directly (no variable expansion needed)
 fn execSimpleCommand(shell: *Shell, node: *const ast.AstNode) void {
-    var argv_buf: [256]?[*:0]const u8 = undefined;
-    var arg_count: usize = 0;
-
     // AST node values (and lookupCommand results) are plain []const u8 — NOT
     // null-terminated. Passing their .ptr straight to execvpeZ reads past the
     // slice into whatever bytes follow in memory, so argv[0] becomes e.g.
     // "/tmp/x.sh\4&\220" and exec fails with 127. Whether the trailing byte
     // happens to be \0 depends on adjacent memory (what the previous pipeline
     // stage left behind), which is why the failure looked left-command
-    // dependent. Copy every argument into a local buffer with a real \0.
-    var str_buf: [16384]u8 = undefined;
-    var str_pos: usize = 0;
-    const addZ = struct {
-        fn f(buf: []u8, pos: *usize, s: []const u8) ?[*:0]const u8 {
-            if (pos.* + s.len + 1 > buf.len) return null;
-            @memcpy(buf[pos.*..][0..s.len], s);
-            buf[pos.* + s.len] = 0;
-            const p: [*:0]const u8 = @ptrCast(buf[pos.*..].ptr);
-            pos.* += s.len + 1;
-            return p;
-        }
-    }.f;
-
-    // First arg might need path lookup
+    // dependent. argv.zig copies every argument into an owned buffer with a
+    // real \0.
+    //
+    // This runs in the forked child that exists to exec exactly this node, so it
+    // never returns and the allocations are deliberately not freed.
     const cmd_name = node.children[0].value;
     const path = if (shell.lookupCommand(cmd_name)) |full_path| full_path else cmd_name;
-    argv_buf[0] = addZ(&str_buf, &str_pos, path) orelse compat.posix.exit(127);
-    arg_count = 1;
 
-    // Rest of args as-is
-    for (node.children[1..]) |child| {
-        if (arg_count >= 255) break;
-        argv_buf[arg_count] = addZ(&str_buf, &str_pos, child.value) orelse break;
-        arg_count += 1;
-    }
-    argv_buf[arg_count] = null;
+    const raw = shell.allocator.alloc([]const u8, node.children.len) catch compat.posix.exit(127);
+    raw[0] = path;
+    for (node.children[1..], 1..) |child, i| raw[i] = child.value;
 
-    const argv = argv_buf[0..arg_count :null];
+    const argv_store = argv_mod.fromSlices(shell.allocator, raw) catch compat.posix.exit(127);
+    const argv = argv_store.view();
     const envp = buildEnvironment(shell) catch @as([*:null]const ?[*:0]const u8, @ptrCast(std.c.environ));
     compat.posix.execvpeZ(argv[0].?, argv, envp) catch {};
     compat.posix.exit(127);
@@ -1834,11 +1813,16 @@ pub fn evaluateRedirect(shell: *Shell, node: *const ast.AstNode) !u8 {
     // CLOEXEC) and restore them all afterwards. See FdSaver for why the
     // backups must live outside the user-addressable fd range.
     var saver: FdSaver = .{};
+    // `exec` redirections are permanent: they change the shell's own execution
+    // environment (bash) — `exec 9>&0` must survive past this command. Only
+    // the no-command form gets committed; with a command, execve replaces
+    // the process so restore never runs anyway。
+    var exec_persist = false;
     defer {
         // Builtins write through a buffered writer on fd 1; flush it into the
-        // redirect target before restoring the original fds.
+        // redirect target before restoring the original fds。
         shell.stdout().flush() catch {};
-        saver.restoreAll();
+        if (!exec_persist) saver.restoreAll();
     }
 
     // apply in source order (innermost redirect node = leftmost in source)
@@ -1852,6 +1836,23 @@ pub fn evaluateRedirect(shell: *Shell, node: *const ast.AstNode) !u8 {
             shell.stderr().print("zish: {s}\n", .{redirectErrorText(err)}) catch {};
             return 1;
         };
+    }
+
+    // `exec` with redirections and no command is bash's way to change the shell's
+    // own fds permanently: `exec 9>&0 8>&1 0</dev/null` (the minimal
+    // harness's opening gambit) makes those dups persist in the session, then
+    // returns. With a real command the generic path above already applies the
+    // redirs before execve replaces the process, so restore never runs — we only
+    // need to special-case the no-command form here。
+    if (command.node_type == .command and command.children.len == 1) {
+
+        const w = command.children[0];
+        if (w.node_type == .word and std.mem.eql(u8, w.value, "exec")) {
+            exec_persist = true;
+            saver.commit();
+            return 0;
+
+        }
     }
 
     return evaluateAst(shell, command);
@@ -1922,6 +1923,19 @@ const FdSaver = struct {
                 compat.posix.close(bak.*);
             }
             bak.* = not_saved;
+        }
+    }
+
+    /// Commit (persistent) redirects: release the high backups WITHOUT
+    /// restoring the saved fds. Used for `exec <redirs>` where the redirections
+    /// become permanent properties of the shell itself.
+    fn commit(self: *FdSaver) void {
+        for (&self.saved) |*bak| {
+            if (bak.* == not_saved) continue;
+            if (bak.* != was_closed) compat.posix.close(bak.*);
+            bak.* = not_saved;
+
+
         }
     }
 };
@@ -2141,6 +2155,23 @@ fn applyFdRedirect(shell: *Shell, op: []const u8, target: []const u8, saver: *Fd
             saver.save(STDERR);
             try compat.posix.dup2(file.handle, STDOUT);
             try compat.posix.dup2(file.handle, STDERR);
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, op, "<&")) {
+        // <&digit -> dup that fd into stdin; <&- closes stdin. Bash has no
+        // <&file form: a non-number target is an invalid fd dup.
+        if (target.len > 0 and allDigits(target)) {
+            const src = std.fmt.parseInt(i32, target, 10) catch return;
+            saver.save(compat.posix.STDIN_FILENO);
+            try compat.posix.dup2(src, compat.posix.STDIN_FILENO);
+        } else if (target.len == 1 and target[0] == '-') {
+            saver.save(compat.posix.STDIN_FILENO);
+            if (compat.posix.fstat(compat.posix.STDIN_FILENO)) |_| compat.posix.close(compat.posix.STDIN_FILENO) else |_| {}
+        } else {
+            return error.InvalidArgument;
+ // bash: no file named word for <&word
         }
         return;
     }

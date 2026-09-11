@@ -7,7 +7,6 @@ const compat = @import("compat.zig");
 pub const MAX_COMMAND_LENGTH = 64 * 1024;
 pub const MAX_TOKEN_LENGTH = 1024;
 pub const MAX_RECURSION_DEPTH = 32;
-pub const MAX_ARGS_COUNT = 256;
 
 pub const MAX_PROMPT_LENGTH =
     std.fs.max_path_bytes +
