@@ -1,0 +1,7 @@
+name = "bus"
+tier = "standard"
+version = "0.1.0"
+help = "durable message log between agents: publish to a channel, read from a cursor"
+bin = "bus"
+usage = "bus pub <channel> [--from LABEL] [text...]  |  bus read <channel> [--after NAME] [--follow] [--json] [--print-cursor]"
+summary = "publish/read an append-only channel log"
