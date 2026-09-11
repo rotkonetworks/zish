@@ -869,6 +869,22 @@ pub const Parser = struct {
         );
     }
 
+    /// A case arm's body may be empty. `a) ;;` is a legal no-op arm in bash and
+    /// dash (verified against both), while an empty body in every other
+    /// construct — function, group, subshell, `if`, loops — is a syntax error
+    /// there too, so the case arm is the only place that needs this. An empty
+    /// `.list` evaluates to status 0, which is what a no-op arm does.
+    fn parsecasebody(self: *Self) parsererror!*const ast.AstNode {
+        while (self.current_token.ty == .Semicolon or self.current_token.ty == .NewLine) {
+            try self.nextToken();
+        }
+        if (self.current_token.ty == .DoubleSemi or self.current_token.ty == .Esac) {
+            const tok = self.current_token;
+            return self.builder.createnode(.list, "", &[_]*const ast.AstNode{}, tok.line, tok.column);
+        }
+        return self.parsecommandlist();
+    }
+
     fn parsecaseitem(self: *Self) parsererror!*const ast.AstNode {
         const item_token = self.current_token;
         const allocator = self.builder.arena.allocator();
@@ -915,8 +931,8 @@ pub const Parser = struct {
         }
         try self.nextToken(); // consume ')'
 
-        // parse body (command list until ';;' or 'esac')
-        const body = try self.parsecommandlist();
+        // parse body (command list until ';;' or 'esac'); may be empty
+        const body = try self.parsecasebody();
 
         // expect ';;' to terminate case item (optional before esac)
         if (self.current_token.ty == .DoubleSemi) {

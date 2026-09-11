@@ -801,6 +801,17 @@ same_as_bash "300-arg expansion"           'i=0; while [ $i -lt 300 ]; do set --
 same_as_bash "300 files matched by glob"   'rm -rf many.zz; mkdir -p many.zz; i=0; while [ $i -lt 300 ]; do : > many.zz/f$i; i=$((i+1)); done; ls many.zz/* | wc -l; rm -rf many.zz'
 same_as_bash "300-arg literal command"     'f=big.$$; printf "/bin/echo" > $f; i=0; while [ $i -lt 300 ]; do printf " a%s" "$i" >> $f; i=$((i+1)); done; printf "\n" >> $f; . ./$f | wc -w; rm -f $f'
 same_as_bash "300-command script"          'f=cmds.$$; i=0; while [ $i -lt 300 ]; do printf "v=%s\n" "$i" >> $f; i=$((i+1)); done; printf "echo ok\n" >> $f; . ./$f; rm -f $f'
+# An empty case arm is a legal no-op in bash and dash; zish rejected the whole
+# script with `EmptyInput`. Only the case arm may be empty — an empty function,
+# group, subshell, if, or loop body is a syntax error in bash too (verified).
+same_as_bash "case empty arm"              'case a in a) ;; *) echo n ;; esac; echo ok'
+same_as_bash "case arm newline then ;;"    'case a in
+  a)
+    ;;
+  *) echo other ;;
+esac
+echo ok'
+same_as_bash "case empty arm, esac-ended"  'case b in a) ;; b) echo hit ;; esac'
 
 # ---------------------------------------------------------------------------
 printf '\n%s\n' "para feat"
