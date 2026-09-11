@@ -938,16 +938,16 @@ fn deliverAnswer(shell: *Shell, s: *Session, text: []const u8) bool {
 /// separate process — a Claude Code / IRC front-end reads the same records).
 /// A record whose host process is gone is shown as `[stale]` and its file is
 /// swept, so a crashed shell leaves no permanent ghost.
-pub fn listRegistry(shell: *Shell) !void {
+pub fn listRegistry(shell: *Shell, json: bool) !void {
     const alloc = shell.allocator;
     const out = shell.stdout();
     var dbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir_path = sessionsDir(alloc, &dbuf) catch {
-        try out.writeAll("session: no registry\n");
+        if (!json) try out.writeAll("session: no registry\n");
         return;
     };
     var dir = std.Io.Dir.cwd().openDir(compat.io(), dir_path, .{ .iterate = true }) catch {
-        try out.writeAll("session: none active\n");
+        if (!json) try out.writeAll("session: none active\n");
         return;
     };
     defer dir.close(compat.io());
@@ -983,15 +983,36 @@ pub fn listRegistry(shell: *Shell) !void {
                     } else |_| {}
                 }
             }
-            try out.print("[{d}] {s}  [stale host {d}, swept]\n", .{ id, name, host });
-            found = true;
-            continue;
         }
-        try out.print("[{d}] {s}  {s}  host={d}  {s}\n", .{ id, name, state, host, transcript });
-        if (q.len > 0) try out.print("    ? {s}\n", .{q});
+        if (json) {
+            // One record per session, swept ones included — a supervisor wants
+            // to see a worker disappear, not infer it from a gap. Fields are
+            // the ones needed to act: `host`/`id` address `session answer|kill`,
+            // `state` says whether `q` is a parked question worth answering.
+            var line: std.ArrayListUnmanaged(u8) = .empty;
+            defer line.deinit(alloc);
+            var num: [24]u8 = undefined;
+            try line.appendSlice(alloc, "{\"id\":");
+            try line.appendSlice(alloc, std.fmt.bufPrint(&num, "{d}", .{id}) catch "0");
+            try line.appendSlice(alloc, ",\"host\":");
+            try line.appendSlice(alloc, std.fmt.bufPrint(&num, "{d}", .{host}) catch "0");
+            try line.appendSlice(alloc, ",\"name\":\"");
+            try appendJsonEscaped(&line, alloc, name);
+            try line.appendSlice(alloc, "\",\"state\":\"");
+            try appendJsonEscaped(&line, alloc, if (alive) state else "stale");
+            try line.appendSlice(alloc, "\",\"q\":\"");
+            try appendJsonEscaped(&line, alloc, q);
+            try line.appendSlice(alloc, "\"}\n");
+            try out.writeAll(line.items);
+        } else if (!alive) {
+            try out.print("[{d}] {s}  [stale host {d}, swept]\n", .{ id, name, host });
+        } else {
+            try out.print("[{d}] {s}  {s}  host={d}  {s}\n", .{ id, name, state, host, transcript });
+            if (q.len > 0) try out.print("    ? {s}\n", .{q});
+        }
         found = true;
     }
-    if (!found) try out.writeAll("session: none active\n");
+    if (!found and !json) try out.writeAll("session: none active\n");
 }
 
 fn objInt(v: std.json.Value, key: []const u8) ?i64 {

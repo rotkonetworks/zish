@@ -1936,8 +1936,19 @@ fn sessionCmd(shell: *Shell, args: []const []const u8) !u8 {
     if (args.len < 2 or std.mem.eql(u8, args[1], "list")) {
         // File-based registry: reads ~/.zish/sessions/*.meta, so it works from
         // ANY zish process (a Claude Code / IRC front-end lists the interactive
-        // shell's sessions), not just the hosting one.
-        try session_mod.listRegistry(shell);
+        // shell's sessions), not just the hosting one. `--json` is one record
+        // per line, for a supervisor rather than an eye.
+        var json = false;
+        for (args[1..]) |arg| {
+            if (std.mem.eql(u8, arg, "list")) continue;
+            if (std.mem.eql(u8, arg, "--json")) {
+                json = true;
+                continue;
+            }
+            try shell.stderr().print("session: unknown list option: {s}\n", .{arg});
+            return 2;
+        }
+        try session_mod.listRegistry(shell, json);
         return 0;
     }
 
