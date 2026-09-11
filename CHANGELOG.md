@@ -1,5 +1,61 @@
 # changelog
 
+## v0.23.0
+
+The shell stops disagreeing with bash in ways nobody asked about, feats stop
+linking libc, and an agent can finally see what its workers cost. Everything
+here came out of running zish under real work for a day rather than auditing it.
+
+### added
+- **`feats/lib/feat.zig`** — a primitives-only shared library (env, slurp,
+  terse output, JSON escaping, atomic publish, exit-code constants). Feats no
+  longer each re-implement the same six helpers, which is where the conventions
+  drifted. Imports go through a per-feat relative symlink, because Zig confines
+  an import to the root file's own directory tree.
+- **`bus`** — a durable message log between agents. One message is one file
+  created `O_EXCL`, so publishing is atomic with no locking and a reader never
+  sees a partial record; names are zero-padded microseconds, so lexicographic
+  order is chronological and a cursor is just the last name seen. A subscriber
+  that was not connected still gets the history. Threads are a record field,
+  never part of the channel name.
+- **`feat list -n | --json | --json=full`** — a machine-readable catalog,
+  ordered by tier then name, so a harness can render its own tool schema from
+  the shell instead of hardcoding one.
+- **`session list --json`**, and a **`usage` frame**: a hosted agent reports
+  per-turn token spend, the host keeps the running totals in `.meta`, and the
+  transcript records per-turn deltas with the cumulative totals on `end`. A
+  finished session now keeps its registry record (with its cost) for an hour
+  instead of vanishing.
+- **`zish --version --json`** — a capability probe (version, build mode, frame
+  protocol, feature list), so a harness can tell "this binary predates the
+  feature" from "the feature is broken".
+- **`agent --turns N`** — the turn budget is the caller's to set, via the flag
+  or `ZISH_AGENT_MAX_TURNS`. It was a hardcoded constant that a commander could
+  not raise, which killed a real run mid-collection.
+
+### fixed
+- **argv is sized to the command.** It was a 256-slot stack array: a longer
+  expansion silently *dropped* the tail of the argument list, and the other
+  path printed its error to **stdout**, so `ls big-glob | wc -l` counted the
+  message as data and reported 1 with exit 0.
+- **Parser limits derive from the input**, not from constants. `MAX_ARGS_COUNT
+  = 256` and `max_nodes = 1024` refused ordinary programs — a 300-argument
+  command and a 401-line script — long before any adversarial input.
+- **A case arm may be empty** (`a) ;;` is a legal no-op in bash and dash; zish
+  failed the whole script with `EmptyError`).
+- **`printf` `*` takes its width and precision from the arguments.** It was
+  parsed as the unknown conversion `*` plus a literal `s`, so
+  `printf '[%*s]' 5 x` printed `[s][s]` — on the padding idiom, in a builtin.
+- **Eight feats no longer link libc.** They linked it only because Zig 0.16
+  removed `std.posix.getenv`; `FEAT_LIBC` is now `para` alone, which genuinely
+  needs `execvp`. `feat.env` reads `/proc/self/environ` instead.
+- **Feats restore SIGPIPE.** Full `std.process.Init` installs a no-op handler
+  for its io layer, so a feat whose reader went away exited 0 instead of 141.
+- **`web fetch` reports a failed fetch** (it discarded curl's exit status, so a
+  DNS failure or timeout looked like an empty page with exit 0).
+- **`budget tree` no longer drops accounts** whose id overflowed a fixed 512-byte
+  row buffer — the row was appended as *nothing*, with exit 0.
+
 ## v0.22.0
 
 Feats now ship with zish, and gf is a real package manager. Rolls up 0.21.x.
