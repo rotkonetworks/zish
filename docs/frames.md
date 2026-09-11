@@ -38,7 +38,10 @@ replies, **not** intents. And neither is a *feat*: a feat is the *program*
 
 ## 1. The vocabulary
 
-Nine wire frames, stable across v0.1 → v0.3. Direction is host↔guest.
+Ten wire frames. The original nine are stable across v0.1 → v0.3; `usage` is the
+one addition since (v0.4), and it is deliberately an *announcement* rather than a
+hostcall, so it needs no capability bit and a guest that never sends it still
+works. Direction is host↔guest.
 
 ### 1.1 Guest → host (the intents)
 
@@ -191,6 +194,9 @@ reading work from any process. See the read-side fold in `gf status` and
 
 `hello.proto` is the version seam. v0.1 = say/run/prompt/done + result/event;
 v0.2 added `hello` (capability announcement) + `error`; v0.3 added pidfd tool
-children and real exit codes. The vocabulary is intended to stay small: if a
+children and real exit codes; v0.4 added `usage` and the retained `ended`
+registry record. `usage` is additive and ignorable in both directions, so it
+needs no proto bump: an old host ignores the frame, and an old guest simply
+never sends one. The vocabulary is intended to stay small: if a
 new feature needs a **new frame type**, be suspicious — `run` plus a new feat
 is almost always the answer instead (see [philosophy.md](philosophy.md) §5).
