@@ -630,6 +630,16 @@ pub fn main(init: std.process.Init.Minimal) void {
             break;
         }
 
+        // Report what this turn cost. The host is the only party that can keep a
+        // ledger, and only this feat knows the numbers — so a frame is the only
+        // way a commander ever sees them. Emitted before anything can end the
+        // session, so a run that dies later still left its spend recorded.
+        const u = usageOf(reply.body);
+        if (u.pt > 0 or u.ct > 0) {
+            var ub: [80]u8 = undefined;
+            emit(std.fmt.bufPrint(&ub, "{{\"t\":\"usage\",\"in\":{d},\"out\":{d}}}\n", .{ u.pt, u.ct }) catch "{\"t\":\"usage\"}\n");
+        }
+
         switch (parseResponse(reply.body)) {
             .err => |e| {
                 say(e);

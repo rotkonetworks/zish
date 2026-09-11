@@ -152,6 +152,11 @@ pub const Session = struct {
     ctl_buf: std.ArrayListUnmanaged(u8) = .empty, // unparsed control-FIFO bytes
     pending_q: ?[]u8 = null, // sanitized question awaiting `session answer`
     tool: ?ToolChild = null, // the in-flight run, if any
+    /// Tokens the guest has reported spending, summed across its turns. Only the
+    /// guest can know this — the host never talks to a model — so it arrives as a
+    /// `usage` frame and is mirrored into `.meta` for a supervisor to read.
+    usage_in: u64 = 0,
+    usage_out: u64 = 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -492,7 +497,16 @@ fn writeMeta(shell: *Shell, s: *const Session) void {
     if (s.ctl_path) |cp| appendJsonEscaped(&b, alloc, cp) catch return;
     b.appendSlice(alloc, "\",\"q\":\"") catch return;
     if (s.pending_q) |q| appendJsonEscaped(&b, alloc, q) catch return;
-    b.appendSlice(alloc, "\"}\n") catch return;
+    // Running totals, so one read of this file answers "what has it cost?".
+    // A 24-byte buffer because u64 is 20 digits and the 16-byte `nb` above is
+    // only sized for a pid/id — a too-small buffer here would fail the write
+    // and take the whole `.meta` record down with it.
+    var ub: [24]u8 = undefined;
+    b.appendSlice(alloc, "\",\"in\":") catch return;
+    b.appendSlice(alloc, std.fmt.bufPrint(&ub, "{d}", .{s.usage_in}) catch return) catch return;
+    b.appendSlice(alloc, ",\"out\":") catch return;
+    b.appendSlice(alloc, std.fmt.bufPrint(&ub, "{d}", .{s.usage_out}) catch return) catch return;
+    b.appendSlice(alloc, "}\n") catch return;
 
     var pz: [std.fs.max_path_bytes]u8 = undefined;
     const pathz = std.fmt.bufPrintZ(&pz, "{s}", .{path}) catch return;
@@ -560,6 +574,23 @@ fn logKV(shell: *Shell, fd: compat.posix.fd_t, kind: []const u8, key: []const u8
     b.appendSlice(alloc, "\":\"") catch return;
     appendJsonEscaped(&b, alloc, val) catch return;
     b.appendSlice(alloc, "\"}\n") catch return;
+    writeAllFd(fd, b.items);
+}
+
+/// Append `{"t":"usage","in":N,"out":N}`. Numbers stay numbers — a ledger that
+/// gets summed downstream should not make its consumer parse them back out of
+/// strings, and `logKV`'s single-string shape would do exactly that.
+fn logUsage(shell: *Shell, fd: compat.posix.fd_t, in_tok: u64, out_tok: u64) void {
+    if (fd < 0) return;
+    const alloc = shell.allocator;
+    var b: std.ArrayListUnmanaged(u8) = .empty;
+    defer b.deinit(alloc);
+    var num: [24]u8 = undefined;
+    b.appendSlice(alloc, "{\"t\":\"usage\",\"in\":") catch return;
+    b.appendSlice(alloc, std.fmt.bufPrint(&num, "{d}", .{in_tok}) catch return) catch return;
+    b.appendSlice(alloc, ",\"out\":") catch return;
+    b.appendSlice(alloc, std.fmt.bufPrint(&num, "{d}", .{out_tok}) catch return) catch return;
+    b.appendSlice(alloc, "}\n") catch return;
     writeAllFd(fd, b.items);
 }
 
@@ -672,6 +703,25 @@ fn handleAsyncFrame(shell: *Shell, s: *Session, line: []const u8) !bool {
         var note = beginAbovePrompt(shell);
         note.print("\x1b[2m[sess {d}:{s}]\x1b[0m asks: {s}\n        \x1b[2mreply:\x1b[0m session answer {d} <text>\n", .{ s.id, s.name, q, s.id }) catch {};
         endAbovePrompt(shell);
+        return false;
+    }
+
+    if (std.mem.eql(u8, t, "usage")) {
+        // The guest reports what it spent. It is the only party that can know —
+        // the host never talks to a model — and reporting is optional, so a feat
+        // predating this field simply never sends it (unknown frames are ignored).
+        const in_tok = frameInt(parsed.value, "in") orelse 0;
+        const out_tok = frameInt(parsed.value, "out") orelse 0;
+        const in_delta: u64 = if (in_tok > 0) @intCast(in_tok) else 0;
+        const out_delta: u64 = if (out_tok > 0) @intCast(out_tok) else 0;
+        if (in_delta == 0 and out_delta == 0) return false;
+        // The log records what happened (per-turn deltas, summable); `.meta`
+        // holds the running state, because a supervisor polls one small file per
+        // session rather than replaying a transcript that can be megabytes.
+        s.usage_in +|= in_delta;
+        s.usage_out +|= out_delta;
+        logUsage(shell, s.transcript_fd, in_delta, out_delta);
+        writeMeta(shell, s);
         return false;
     }
 
@@ -969,6 +1019,8 @@ pub fn listRegistry(shell: *Shell, json: bool) !void {
         const state = objStr(parsed.value, "state") orelse "?";
         const transcript = objStr(parsed.value, "transcript") orelse "";
         const q = objStr(parsed.value, "q") orelse "";
+        const tok_in: i64 = objInt(parsed.value, "in") orelse 0;
+        const tok_out: i64 = objInt(parsed.value, "out") orelse 0;
 
         // liveness: kill(host, 0) — 0 or EPERM = exists, ESRCH = gone.
         const alive = host > 0 and hostAlive(@intCast(host));
@@ -1002,7 +1054,13 @@ pub fn listRegistry(shell: *Shell, json: bool) !void {
             try appendJsonEscaped(&line, alloc, if (alive) state else "stale");
             try line.appendSlice(alloc, "\",\"q\":\"");
             try appendJsonEscaped(&line, alloc, q);
-            try line.appendSlice(alloc, "\"}\n");
+            // Cost is the number a commander steers a fleet by, so it belongs in
+            // the cheap catalog rather than only in `.meta` or the transcript.
+            try line.appendSlice(alloc, "\",\"in\":");
+            try line.appendSlice(alloc, std.fmt.bufPrint(&num, "{d}", .{tok_in}) catch "0");
+            try line.appendSlice(alloc, ",\"out\":");
+            try line.appendSlice(alloc, std.fmt.bufPrint(&num, "{d}", .{tok_out}) catch "0");
+            try line.appendSlice(alloc, "}\n");
             try out.writeAll(line.items);
         } else if (!alive) {
             try out.print("[{d}] {s}  [stale host {d}, swept]\n", .{ id, name, host });
@@ -1305,6 +1363,20 @@ fn frameStr(v: std.json.Value, key: []const u8) []const u8 {
     return switch (obj.get(key) orelse return "") {
         .string => |str| str,
         else => "",
+    };
+}
+
+/// A numeric frame field, or null when absent or not a number. Absent is not an
+/// error: the frame vocabulary stays forward-compatible, so a guest predating a
+/// field must keep working.
+fn frameInt(v: std.json.Value, key: []const u8) ?i64 {
+    const obj = switch (v) {
+        .object => |o| o,
+        else => return null,
+    };
+    return switch (obj.get(key) orelse return null) {
+        .integer => |n| n,
+        else => null,
     };
 }
 
