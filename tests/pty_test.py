@@ -1334,13 +1334,19 @@ def _(sh):
         out = clean(r.stdout)
         assert "pester" in out, f"cross-process list missing the session: {out!r}"
         assert "awaiting" in out, f"registry did not reflect the awaiting state: {out!r}"
-        # release the session; its meta must then be swept
+        # release the session. Its registry record is RETAINED as `ended`: a
+        # supervisor that was not polling at the instant it finished still needs
+        # the cost, and deleting the record would take the only pointer to the
+        # transcript with it. The record is aged out by ENDED_META_TTL_SECS.
         small.sendline("session answer 1 yes")
         expect_soon(small, "ended")
         r2 = _sp.run([ZISH, "-c", "session list"], env=env,
                      capture_output=True, text=True, timeout=10)
-        assert "pester" not in clean(r2.stdout), \
-            f"ended session's meta not swept: {clean(r2.stdout)!r}"
+        out2 = clean(r2.stdout)
+        assert "pester" in out2 and "ended" in out2, \
+            f"ended session should be retained with state 'ended': {out2!r}"
+        assert "running" not in out2 and "awaiting" not in out2, \
+            f"ended session still reads as live: {out2!r}"
     finally:
         small.close()
         shutil.rmtree(featroot, ignore_errors=True)
@@ -1461,14 +1467,22 @@ def _(sh):
                     capture_output=True, text=True, timeout=10)
         assert r.returncode == 0, f"remote kill failed: rc={r.returncode} err={r.stderr!r}"
         expect_soon(small, "ended")
-        # meta and ctl FIFO are gone: nothing left for another process to see
+        # The host tears the session down, but its record is retained as `ended`
+        # (same rule as above), so another process sees a finished session
+        # rather than nothing at all.
         r2 = _sp.run([ZISH, "-c", "session list"], env=env,
                      capture_output=True, text=True, timeout=10)
-        assert "pester" not in clean(r2.stdout), \
-            f"killed session still in registry: {clean(r2.stdout)!r}"
-        left = [f for f in os.listdir(os.path.join(small.home, ".zish", "sessions"))
-                if f.endswith(".ctl") or f.endswith(".meta")]
-        assert not left, f"control/meta files not cleaned up: {left}"
+        out2 = clean(r2.stdout)
+        assert "ended" in out2, \
+            f"killed session should be recorded as 'ended': {out2!r}"
+        assert "awaiting" not in out2 and "running" not in out2, \
+            f"killed session still reads as live: {out2!r}"
+        # The control FIFO is torn down with the session, but the registry
+        # record is retained as `ended` — retaining it is the point, so only the
+        # FIFO must be gone. Orphaned FIFOs are the leak worth catching.
+        left_ctl = [f for f in os.listdir(os.path.join(small.home, ".zish", "sessions"))
+                    if f.endswith(".ctl")]
+        assert not left_ctl, f"control FIFO not cleaned up: {left_ctl}"
     finally:
         small.close()
         shutil.rmtree(featroot, ignore_errors=True)
