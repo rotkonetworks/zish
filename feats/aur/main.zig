@@ -79,14 +79,6 @@ fn warn(bytes: []const u8) void {
     writeFd(2, bytes);
 }
 
-/// Raw tcgetattr syscall, not libc: 0 means "a terminal", anything else (incl.
-/// EBADF) is not — the same answer `std.c.tcgetattr(fd, &t) == 0` gave, and the
-/// disposition aur's "piped? act as a pager" decision depends on.
-fn isTty(fd: i32) bool {
-    var t: linux.termios = undefined;
-    return @as(isize, @bitCast(linux.tcgetattr(fd, &t))) == 0;
-}
-
 fn slurp(fd: i32, cap: usize) []u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     var tmp: [65536]u8 = undefined;
@@ -745,7 +737,7 @@ fn printHeader(verdict_raw: []const u8, cached: bool) void {
     defer parsed.deinit();
     const verdict = objStr(parsed.value, "verdict") orelse "unknown";
     const analysis = objStr(parsed.value, "analysis") orelse "";
-    const col = isTty(1);
+    const col = feat.isTty(1);
 
     var b: std.ArrayListUnmanaged(u8) = .empty;
     defer b.deinit(alloc);
@@ -884,15 +876,9 @@ fn printLine(pkg: []const u8, rv: Reviewed, col: bool) void {
 // ---------------------------------------------------------------------------
 
 pub fn main(init: std.process.Init) u8 {
-    // `Init` installs a no-op SIGPIPE handler for its io; a feat exec'd by the
-    // shell must keep the inherited disposition, where a closed stdout kills
-    // the writer — the behaviour of the -lc build this replaces.
-    var dfl: std.posix.Sigaction = .{
-        .handler = .{ .handler = std.posix.SIG.DFL },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(.PIPE, &dfl, null);
+    // Full Init installs a no-op SIGPIPE handler; a filter must die on a closed
+    // stdout like every other CLI, so restore the default before doing anything.
+    feat.restoreSigpipe();
     return run(init);
 }
 
@@ -925,7 +911,7 @@ fn run(init: std.process.Init) u8 {
     }
     // No verb: act as a pager when stdin is piped (so a bare `PAGER=aur` in
     // yay's config just works); otherwise show help.
-    if (!isTty(0)) return reviewPager(init);
+    if (!feat.isTty(0)) return reviewPager(init);
     printHelp();
     return 0;
 }
@@ -988,7 +974,7 @@ fn reviewPager(init: std.process.Init) u8 {
 }
 
 fn checkGate(init: std.process.Init, json: bool, targets: []const []const u8) u8 {
-    const col = isTty(1) and !json;
+    const col = feat.isTty(1) and !json;
     const helper = feat.env(init.arena.allocator(), init.io, "AUR_HELPER") orelse "yay";
 
     var pkgs: std.ArrayListUnmanaged([]const u8) = .empty;
