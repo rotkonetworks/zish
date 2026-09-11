@@ -492,6 +492,28 @@ SG settings review maybe >/dev/null 2>&1; [ $? -eq 2 ] && ok "bad value -> exit 
 [ "$(SG setup idxdemo)" = "false" ] && ok "setup get: uninstalled feat is false" || bad "setup get: $(SG setup idxdemo)"
 SG setup idxdemo maybe   >/dev/null 2>&1; [ $? -eq 2 ] && ok "setup bad value -> exit 2 (usage)" || bad "setup bad value exit != 2"
 
+# ---- SIGPIPE: a closed stdout kills gf (141), not a quiet 0 -----------------
+# gf is a filter, so when the reader of its stdout is gone its next write must
+# take SIGPIPE — the disposition every other CLI has. Full `std.process.Init`
+# installs a no-op handler instead, which is why `feat.restoreSigpipe()` exists.
+# The index here is big enough (5000 entries → ~1 MiB of catalog) that the
+# reader has certainly exited before gf fills the 64 KiB pipe buffer, so the
+# case is determined, not a race: without the primitive gf swallows EPIPE at
+# whatever write lands after `head -c1` is gone and exits 0.
+python3 - "$T/bigindex.jsonl" <<'PY'
+import sys
+with open(sys.argv[1], "w") as f:
+    for i in range(5000):
+        f.write('{"name":"feat%05d","version":"v1.0.0","url":"file:///dev/null",'
+                '"sha256":"%064x","desc":"a feat with a long enough one-line description %d"}\n'
+                % (i, i, i))
+PY
+env -i HOME="$T/home" ZISH_FEAT_INDEX="file://$T/bigindex.jsonl" \
+    "$T/gf" list 2>/dev/null | head -c1 >/dev/null
+rc=${PIPESTATUS[0]}
+[ "$rc" -eq 141 ] && ok "gf list, stdout reader gone -> exit 141 (SIGPIPE)" \
+    || bad "gf list over a closed stdout -> exit $rc (want 141)"
+
 echo
 total=$((pass+fail))
 if [ "$fail" -eq 0 ]; then

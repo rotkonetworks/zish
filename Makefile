@@ -58,6 +58,7 @@ test: build
 	./tests/ask_test.sh
 	./tests/team_test.sh
 	./tests/bus_test.sh
+	./tests/web_test.sh
 	./benchmark/run.sh --selftest
 
 test-pty: build

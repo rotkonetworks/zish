@@ -264,6 +264,27 @@ PY
         && ok "a disagreement resets reputation to 0" || bad "rep not reset: $(cat "$RHOME2/.zish/aur-trust.jsonl" 2>/dev/null)"
 fi
 
+# ---- SIGPIPE: a closed stdout kills the pager (141), not a quiet 0 ----------
+# `aur review` is a pager over stdin, so a closed stdout must kill it — the
+# disposition every other CLI has, restored by `feat.restoreSigpipe()` (full
+# `std.process.Init` installs a no-op handler instead). A clean HOME keeps the
+# case deterministic: no reviewer is reachable, review fail-opens and streams
+# the raw diff, which (256 KiB) is far past the 64 KiB pipe buffer, so the write
+# that lands after `head -c1` is gone fails. Without the primitive that write
+# returns EPIPE, aur swallows it, and the pager exits 0.
+python3 - "$T/pipe.diff" <<'PY'
+import sys
+with open(sys.argv[1], "w") as f:
+    f.write("diff --git a/PKGBUILD b/PKGBUILD\n")
+    for i in range(4096):
+        f.write("+ line %d of a piped PKGBUILD diff, filler filler filler filler\n" % i)
+PY
+PIPEHOME="$T/pipehome"; mkdir -p "$PIPEHOME"
+env -i HOME="$PIPEHOME" "$T/aur" review <"$T/pipe.diff" 2>/dev/null | head -c1 >/dev/null
+rc=${PIPESTATUS[0]}
+[ "$rc" -eq 141 ] && ok "aur review, stdout reader gone -> exit 141 (SIGPIPE)" \
+    || bad "aur review over a closed stdout -> exit $rc (want 141)"
+
 echo
 total=$((pass+fail))
 if [ "$fail" -eq 0 ]; then

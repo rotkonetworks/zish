@@ -91,6 +91,23 @@ tot=$(total root)
 rootbal=$(bal root)
 [ "$rootbal" = "$((POOL - CARVE * n))" ] && ok "root balance matches successes (root=$rootbal, n=$n)" || bad "root=$rootbal, expected $((POOL - CARVE*n))"
 
+echo "== (f) SIGPIPE: a closed stdout kills budget (141), not a quiet 0 =="
+# A filter must die when the reader of its stdout is gone. `tree` is the one
+# verb with unbounded output; long ids make 300 accounts clear the 64 KiB pipe
+# buffer, so the write that lands after `head -c1` has exited fails. Full
+# `std.process.Init` installs a no-op SIGPIPE handler — `feat.restoreSigpipe()`
+# puts the default back. Red without it (EPIPE swallowed, exit 0), green (141).
+fresh
+"$B" new root 1000 >/dev/null 2>&1
+pad=$(printf '%*s' 390 ''); pad=${pad// /x}
+for i in $(seq 1 300); do
+    "$B" split root "acc$i$pad" 1 >/dev/null 2>&1
+done
+env -i ZISH_BUDGET_DIR="$ZISH_BUDGET_DIR" "$B" tree root 2>/dev/null | head -c1 >/dev/null
+rc=${PIPESTATUS[0]}
+[ "$rc" -eq 141 ] && ok "budget tree, stdout reader gone -> exit 141 (SIGPIPE)" \
+    || bad "budget tree over a closed stdout -> exit $rc (want 141)"
+
 echo
 tot=$((pass+fail))
 if [ "$fail" -eq 0 ]; then
