@@ -68,6 +68,9 @@ test-pty: build
 # ---- standard feats (python-replacement tier) ----
 # Compiles feats/<name>/main.zig and stages bin + feat.toml into the registry.
 ZISH_FEAT_DIR ?= $(HOME)/.zish/feats/standard
+# Where `feats` stages the rubric TOMLs. A default a packager can point
+# elsewhere, so a package build never writes into the builder's $HOME.
+ZISH_RUBRIC_DIR ?= $(HOME)/.zish/rubrics
 FEAT_NAMES := cnt pk frq snf jls calc para agent gf aur budget verify ask team web bus
 # Feats needing libc, with the reason. Keep this list and the reason in sync —
 # a new entry is a justification, not a convenience. `para` needs execvp for
@@ -90,8 +93,8 @@ feats:
 		echo "staged feat: $$f"; \
 	done; \
 	if [ -n "$$failed" ]; then echo "FEATS FAILED TO BUILD:$$failed" >&2; exit 1; fi
-	@mkdir -p $(HOME)/.zish/rubrics
-	@cp -f rubrics/*.toml $(HOME)/.zish/rubrics/ 2>/dev/null && \
+	@mkdir -p $(ZISH_RUBRIC_DIR)
+	@cp -f rubrics/*.toml $(ZISH_RUBRIC_DIR)/ 2>/dev/null && \
 		echo "staged rubrics" || true
 
 # ---- feat distribution ----
