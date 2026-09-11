@@ -411,6 +411,7 @@ fn cmdRead(arena: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
 }
 
 pub fn main(init: std.process.Init) void {
+    feat.restoreSigpipe();
     const arena = init.arena.allocator();
     const io = init.io;
     const argv = init.minimal.args.toSlice(arena) catch {

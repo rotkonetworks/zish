@@ -101,9 +101,40 @@ pub fn slurpStdin(alloc: std.mem.Allocator, io: std.Io) ![]u8 {
 ///
 /// A feat that would otherwise read stdin must check this: an agent running it
 /// with no pipe and no redirect would otherwise block forever on a prompt
-/// nobody can answer. Fail closed — an unreadable stdin is treated as a tty.
+/// nobody can answer. Fail closed — an unreadable stdin is treated as a tty,
+/// because "I could not ask" must not become "I blocked".
 pub fn stdinIsTty(io: std.Io) bool {
     return std.Io.File.stdin().isTty(io) catch true;
+}
+
+/// Whether `fd` is a terminal. Errors read as "not a terminal" (a closed fd, or
+/// an fd that is not a tty), which is what a caller asking about an output or an
+/// arbitrary descriptor wants.
+///
+/// Deliberately separate from `stdinIsTty`, which fails *closed*: the two
+/// disagree on failure, and that disagreement is the point. A feat about to read
+/// stdin must treat "unknown" as a terminal; a feat choosing pager-vs-help on a
+/// closed stdin — as `aur` does — must treat it as not one.
+pub fn isTty(fd: std.posix.fd_t) bool {
+    var t: std.os.linux.termios = undefined;
+    return @as(isize, @bitCast(std.os.linux.tcgetattr(fd, &t))) == 0;
+}
+
+/// Restore SIGPIPE to its default disposition: die on a closed stdout.
+///
+/// Full `std.process.Init` installs a no-op SIGPIPE handler, because its io
+/// layer reports EPIPE rather than taking the signal. For a CLI filter that is a
+/// behaviour change — `feat ... | head -c1` then exits 0 where the same feat
+/// built against libc exits 141, and the producer keeps writing into a pipe
+/// nobody is reading. Feats are filters, so they want the traditional
+/// disposition; call this once at the top of `main`.
+pub fn restoreSigpipe() void {
+    var dfl: std.posix.Sigaction = .{
+        .handler = .{ .handler = std.posix.SIG.DFL },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.PIPE, &dfl, null);
 }
 
 /// Write `bytes` to stdout, once. Returns false if the write failed.
