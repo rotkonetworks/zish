@@ -3,6 +3,9 @@
 # The invariant under test: the sum of live balances in a tree can never exceed
 # the root grant, and no split/spend can mint credits — not even under concurrent
 # splits of the same parent (the fork-bomb hole).
+# Also pinned: `tree` reports every account in the subtree plus the total — a
+# long id must not silently drop a row — and a closed stdout kills the process
+# (141), not a quiet 0.
 set -u
 cd "$(dirname "$0")/.."
 
@@ -107,6 +110,27 @@ env -i ZISH_BUDGET_DIR="$ZISH_BUDGET_DIR" "$B" tree root 2>/dev/null | head -c1 
 rc=${PIPESTATUS[0]}
 [ "$rc" -eq 141 ] && ok "budget tree, stdout reader gone -> exit 141 (SIGPIPE)" \
     || bad "budget tree over a closed stdout -> exit $rc (want 141)"
+
+echo "== (g) tree lists a child whose id overflows a row buffer =="
+# Rows used to be formatted through one fixed `[512]u8` and `catch ""`: an id
+# long enough to overflow that buffer made the row format fail and the catch
+# appended *nothing*, so the child vanished from the tree — exit 0, no
+# diagnostic, the account simply gone. A 600-char id (over 512) must be a row
+# like any other, with the total still counting it.
+fresh
+"$B" new root 1000 >/dev/null 2>&1
+long=$(printf '%*s' 600 ''); long=${long// /L}
+"$B" split root "$long" 250 >/dev/null 2>&1 && ok "split a 600-char child id" || bad "split of the long id failed"
+[ "$(bal "$long")" = "250" ] && ok "the long-id child exists with its own balance (250)" || bad "balance of long id: $(bal "$long")"
+o=$("$B" tree root 2>/dev/null); rc=$?
+[ "$rc" -eq 0 ] && ok "tree of a long-id tree exits 0" || bad "tree exit $rc"
+rows=$(printf '%s\n' "$o" | awk -F'\t' 'NF{n++} END{print n+0}')
+[ "$rows" -eq 3 ] && ok "one row per account plus the total (3)" || bad "tree rows=$rows, want 3 (root + long id + total)"
+case "$o" in
+    *"$(printf '%s\t250\troot' "$long")"*) ok "the 600-char child is listed with its parent" ;;
+    *) bad "long-id child missing from the tree" ;;
+esac
+[ "$(total root)" = "1000" ] && ok "total still counts the long-id child (1000)" || bad "total=$(total root), want 1000"
 
 echo
 tot=$((pass+fail))

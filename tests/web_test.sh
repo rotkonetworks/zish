@@ -4,9 +4,10 @@
 # stub log its argv, which is how the query encoding and the backend template
 # are checked. What is pinned is the observable contract of each verb: fetch
 # strips tags / decodes entities / honours ZISH_WEB_MAX and its truncation
-# notice; search parses DuckDuckGo's markup when no backend is configured and
-# fails loudly when the markup yields nothing; usage errors exit 2; and a dead
-# stdout reader kills the process with SIGPIPE (141), not a quiet 0.
+# notice / treats a non-zero curl exit as a failure (exit 1, no stdout) rather
+# than an empty page; search parses DuckDuckGo's markup when no backend is
+# configured and fails loudly when the markup yields nothing; usage errors exit
+# 2; and a dead stdout reader kills the process with SIGPIPE (141), not a quiet 0.
 set -u
 cd "$(dirname "$0")/.."
 
@@ -34,6 +35,10 @@ printf '%s\n' "$*" >> "${STUB_LOG:?}"
 for a in "$@"; do url="$a"; done
 case "$url" in
   *big*)        yes 'lorem ipsum dolor sit amet consectetur adipiscing elit' | head -c 131072 ;;
+  # Non-zero exit after emitting a partial body: what curl does on a timeout,
+  # a reset connection, or DNS failure mid-transfer. The feat must not read
+  # those bytes as a complete (if short) page.
+  *fail*)       printf '<html><body><h1>Partial</h1><p>cut off mid' ; exit 7 ;;
   *duckduckgo*) cat "${STUB_BODY:?}" ;;
   *)            printf '<html><body><h1>Title</h1><p>Hello &amp; goodbye &mdash; ok</p><script>var x=1;</script></body></html>\n' ;;
 esac
@@ -84,6 +89,22 @@ o=$(ZISH_WEB_MAX=10 W fetch http://stub/page); rc=$?
 [ "$rc" -eq 0 ] && ok "bounded fetch still exits 0" || bad "bounded fetch exit $rc"
 case "$o" in *"[truncated"*) ok "over the bound -> truncation notice" ;; *) bad "no notice: <$o>" ;; esac
 case "$o" in *goodbye*) bad "text past the bound leaked: <$o>" ;; *) ok "nothing past the bound is emitted" ;; esac
+
+echo "== fetch: a non-zero curl is a failure, not an empty page =="
+# curl exits non-zero on a timeout, a refused connection, a DNS failure — and
+# may already have written part of the body. Collecting the child's status and
+# discarding it made those bytes read as a complete, successful page (exit 0),
+# indistinguishable from a genuinely empty document. Fail closed: exit 1, no
+# stdout at all, and the reason on stderr.
+gone
+o=$(W fetch http://stub/fail 2>"$T/fail.err"); rc=$?
+[ "$rc" -eq 1 ] && ok "curl exits non-zero -> fetch exits 1" || bad "failed fetch exit $rc: <$o>"
+[ -z "$o" ] && ok "failed fetch emits nothing on stdout (partial body dropped)" \
+    || bad "failed fetch printed a partial page: <$o>"
+case "$(cat "$T/fail.err")" in
+    *"fetch failed"*) ok "failed fetch says why on stderr" ;;
+    *) bad "no failure diagnostic: <$(cat "$T/fail.err")>" ;;
+esac
 
 echo "== search: DuckDuckGo markup parsed (default backend) =="
 gone
