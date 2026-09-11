@@ -356,6 +356,42 @@ else
     SKIP=$((SKIP + 7))
 fi
 
+# `feat list --json` emitted `"summary":""` for every feat that declared only
+# `help` — 19 of the 20 shipped ones — because `summary` was a separate opt-in
+# key. The machine-readable catalog an agent picks tools from was therefore a
+# list of names with blank descriptions, which is not a catalog. The
+# description now falls back to `help`. Built in a private root so the case
+# tests the emitter rather than whatever the developer has staged.
+if selected "feat list --json describes every feat"; then
+    fr="$WORK/featroot"
+    mkdir -p "$fr/standard/probe/bin"
+    printf 'name = "probe"\ntier = "standard"\nversion = "1.0.0"\nhelp = "a probe that describes itself"\nbin = "probe"\n' \
+        > "$fr/standard/probe/feat.toml"
+    got=$(cd "$WORK" && ZISH_FEAT_PATH="$fr" timeout 10 "$OLDPWD/$ZISH" -c 'feat list --json' 2>/dev/null)
+    case "$got" in
+        *'"summary":"a probe that describes itself"'*)
+            report_pass "feat list --json describes every feat" ;;
+        *)
+            report_fail "feat list --json describes every feat" \
+                'summary falls back to help' "$got" \
+                "blank summary for a feat that declares help" ;;
+    esac
+
+    # A curated `summary` still wins: the fallback must fill a gap, not
+    # overrule a feat that deliberately chose a terser phrase.
+    printf 'name = "probe"\ntier = "standard"\nversion = "1.0.0"\nhelp = "the long form"\nbin = "probe"\nsummary = "terse"\n' \
+        > "$fr/standard/probe/feat.toml"
+    got=$(cd "$WORK" && ZISH_FEAT_PATH="$fr" timeout 10 "$OLDPWD/$ZISH" -c 'feat list --json' 2>/dev/null)
+    case "$got" in
+        *'"summary":"terse"'*)
+            report_pass "feat list --json keeps a curated summary" ;;
+        *)
+            report_fail "feat list --json keeps a curated summary" \
+                'summary stays "terse"' "$got" \
+                "the help fallback overruled an explicit summary" ;;
+    esac
+fi
+
 # ---------------------------------------------------------------------------
 printf '\n%s\n' "session trace (fd 3)"
 # ---------------------------------------------------------------------------

@@ -4090,8 +4090,12 @@ const FeatEntry = struct {
     version: []const u8,
     bin: []const u8,
     usage: []const u8,
-    /// The optional short description. Empty when the manifest omits it, which
-    /// is why `json_brief` stays cheap: prose is opt-in per feat, never derived.
+    /// The short description: the manifest's `summary` when a feat curates a
+    /// terser one, else its `help`. Never empty for a feat that describes
+    /// itself at all — a catalog an agent picks tools from cannot have blank
+    /// entries, and leaving it to each manifest to remember is a bug generator,
+    /// not a policy. `help` is the phrase the human `tsv` listing already
+    /// prints, so the two views cannot describe a feat differently.
     summary: []const u8,
     help: []const u8,
 };
@@ -4169,6 +4173,8 @@ fn featList(shell: *Shell, alloc: std.mem.Allocator, format: FeatListFormat) !u8
                     }
                 }.f;
 
+                const help = get(aa, content, "help", "");
+                const summary = get(aa, content, "summary", "");
                 entries.append(aa, .{
                     .tier = tier_name,
                     .name = get(aa, content, "name", entry.name),
@@ -4176,8 +4182,8 @@ fn featList(shell: *Shell, alloc: std.mem.Allocator, format: FeatListFormat) !u8
                     .version = get(aa, content, "version", ""),
                     .bin = get(aa, content, "bin", entry.name),
                     .usage = get(aa, content, "usage", ""),
-                    .summary = get(aa, content, "summary", ""),
-                    .help = get(aa, content, "help", ""),
+                    .summary = if (summary.len > 0) summary else help,
+                    .help = help,
                 }) catch continue;
                 seen.append(aa, aa.dupe(u8, key) catch continue) catch {};
             }
@@ -4235,13 +4241,22 @@ fn featHelp(shell: *Shell, alloc: std.mem.Allocator, raw: []const u8) !u8 {
     return 0;
 }
 
+/// One line, printed on every usage path — including unknown option and unknown
+/// subcommand — so a caller who guesses the flag placement (`feat --json=full`)
+/// is corrected instead of stonewalled.
+const feat_usage = "feat: usage: feat list [-n|--json[=brief|full]] | help <name> | run <name> [args...]\n";
+
 fn featCmd(shell: *Shell, args: []const []const u8) !u8 {
     const alloc = shell.allocator;
     if (args.len < 2) {
-        try shell.stdout().writeAll("feat: usage: feat list [-n|--json[=full]] | help <name> | run <name> [args...]\n");
+        try shell.stdout().writeAll(feat_usage);
         return 2;
     }
     const sub = args[1];
+    if (std.mem.eql(u8, sub, "-h") or std.mem.eql(u8, sub, "--help")) {
+        try shell.stdout().writeAll(feat_usage);
+        return 0;
+    }
     if (std.mem.eql(u8, sub, "list")) {
         // One verbosity axis: `-n` for names, `--json` for the structured
         // catalog, `--json=full` when a consumer needs the prose too.
@@ -4255,8 +4270,12 @@ fn featCmd(shell: *Shell, args: []const []const u8) !u8 {
                 format = .json_full;
             } else if (std.mem.eql(u8, arg, "--json=brief")) {
                 format = .json_brief;
+            } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+                try shell.stdout().writeAll(feat_usage);
+                return 0;
             } else {
                 try shell.stderr().print("feat: unknown list option: {s}\n", .{arg});
+                try shell.stderr().writeAll(feat_usage);
                 return 2;
             }
         }
@@ -4280,6 +4299,7 @@ fn featCmd(shell: *Shell, args: []const []const u8) !u8 {
         }
         return try featExec(shell, resolved.tier, resolved.bin, args[3..]);
     }
-    try shell.stdout().writeAll("feat: unknown subcommand\n");
+    try shell.stderr().print("feat: unknown subcommand: {s}\n", .{sub});
+    try shell.stderr().writeAll(feat_usage);
     return 2;
 }
