@@ -50,6 +50,7 @@ test: build
 	./tests/regress.sh
 	zig build test
 	zig test feats/agent/main.zig
+	./tests/agent_test.sh
 	zig test -lc feats/gf/main.zig
 	./tests/gf_test.sh
 	./tests/aur_test.sh
