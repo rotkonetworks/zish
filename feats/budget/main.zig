@@ -333,12 +333,23 @@ fn cmdTree(init: std.process.Init, root: []const u8) u8 {
     for (list.items, 0..) |a, i| {
         if (!inSubtree(&list, i, root)) continue;
         total += a.bal;
-        var lb: [512]u8 = undefined;
         const parent = if (a.parent.len == 0) "-" else a.parent;
-        b.appendSlice(alloc, std.fmt.bufPrint(&lb, "{s}\t{d}\t{s}\n", .{ a.id, a.bal, parent }) catch "") catch {};
+        // Appended piecewise rather than through a fixed row buffer: a
+        // `[512]u8` here made `bufPrint` fail for a long id and the `catch ""`
+        // then appended *nothing*, so the child vanished from the tree with
+        // exit 0. Only the balance needs a buffer, and u64 always fits one.
+        var nb: [24]u8 = undefined;
+        b.appendSlice(alloc, a.id) catch continue;
+        b.append(alloc, '\t') catch continue;
+        b.appendSlice(alloc, std.fmt.bufPrint(&nb, "{d}", .{a.bal}) catch "0") catch continue;
+        b.append(alloc, '\t') catch continue;
+        b.appendSlice(alloc, parent) catch continue;
+        b.append(alloc, '\n') catch continue;
     }
-    var tb: [64]u8 = undefined;
-    b.appendSlice(alloc, std.fmt.bufPrint(&tb, "total\t{d}\n", .{total}) catch "") catch {};
+    var tb: [32]u8 = undefined;
+    b.appendSlice(alloc, "total\t") catch {};
+    b.appendSlice(alloc, std.fmt.bufPrint(&tb, "{d}", .{total}) catch "0") catch {};
+    b.append(alloc, '\n') catch {};
     out(b.items);
     return 0;
 }

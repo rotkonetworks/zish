@@ -102,6 +102,12 @@ fn curlGet(init: std.process.Init, url: []const u8) ?[]u8 {
     _ = linux.close(fds[0]);
     var status: u32 = 0;
     _ = linux.waitpid(@intCast(pid), &status, 0);
+    // A failed fetch is not an empty page. curl exits non-zero for a DNS
+    // failure, a timeout, or a refused connection, and returning an empty slice
+    // for those made the caller report success with no output — indistinguishable
+    // from a page that really was empty, and unreachable from the feat's own
+    // "fetch failed" path. Fail closed instead.
+    if (!std.posix.W.IFEXITED(status) or std.posix.W.EXITSTATUS(status) != 0) return null;
     return buf.toOwnedSlice(alloc) catch null;
 }
 
