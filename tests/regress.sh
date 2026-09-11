@@ -592,6 +592,26 @@ expect "long token plain"              $'ok' 0 "echo ${LONG} >/dev/null; echo ok
 expect "long quoted token"             $'ok' 0 "echo \"${LONG}\" >/dev/null; echo ok"
 unset LONG
 
+# The double buffer was rotated in startToken, i.e. once per *scan*, so a scan
+# that emitted no token — a line continuation, a comment — consumed a rotation
+# for nothing. buf_idx then came back around to the buffer still holding the
+# last EMITTED token, and the parser holds one token of lookahead, so those
+# bytes were still live. The word before the continuation was silently
+# rewritten with the next word's leading bytes:
+#
+#     echo 'xaa' \        ->   Aaa A        (bash: xaa A)
+#       "A"
+#
+# Rotation now happens per emitted token (rotateBuf), which is the invariant
+# that actually matters: two consecutive emitted tokens never share a buffer.
+same_as_bash "continuation keeps the quoted word"  $'echo \'xaa\' \\\n  "A"'
+same_as_bash "continuation keeps the format word"  $'printf \'x%s\' \\\n  "A" "B"'
+same_as_bash "continuation quoted both sides"      $'echo \'aaaa\' \\\n  \'bbbb\''
+same_as_bash "continuation after many args"        $'echo a \'bb\' c \'dd\' \\\n  "ee"'
+# and the continuation must still JOIN a word it splits
+same_as_bash "continuation mid-word still joins"   $'echo aa\\\nbb'
+same_as_bash "continuation inside quotes joins"    $'echo \'aa\\\nbb\''
+
 # ---------------------------------------------------------------------------
 printf '\n%s\n' "integer overflow in arithmetic"
 # ---------------------------------------------------------------------------

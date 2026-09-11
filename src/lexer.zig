@@ -185,7 +185,23 @@ pub const Lexer = struct {
         self.token_col = self.column;
         self.buf_len = 0;
         self.use_buf = false;
-        // alternate buffer for next token (double-buffering)
+    }
+
+    /// Hand the other buffer to the next token. Called when a token is actually
+    /// EMITTED, never when one is merely started.
+    ///
+    /// A scan that emits nothing — a line continuation, a comment — wrote
+    /// nothing, so consuming a rotation for it would hand the next token the
+    /// buffer still holding the last emitted token's bytes. The parser holds one
+    /// token of lookahead, so those bytes are still live, and the aliasing
+    /// silently rewrote the word before a continuation:
+    ///
+    ///     echo 'xaa' \        ->  emitted  Aaa A      (bash: xaa A)
+    ///       "A"
+    ///
+    /// Two consecutive emitted tokens always land in different buffers; that is
+    /// the whole invariant, and it only needs to hold per emitted token.
+    fn rotateBuf(self: *Self) void {
         self.buf_idx = 1 - self.buf_idx;
     }
 
@@ -195,6 +211,7 @@ pub const Lexer = struct {
         else
             self.input[self.token_start..self.pos];
 
+        self.rotateBuf();
         return Token{
             .ty = if (ty == .Word) classifyWord(value) else ty,
             .value = value,
@@ -229,6 +246,7 @@ pub const Lexer = struct {
     }
 
     fn makeTokenValue(self: *Self, ty: TokenType, value: []const u8) Token {
+        self.rotateBuf();
         return Token{
             .ty = ty,
             .value = value,
@@ -258,6 +276,7 @@ pub const Lexer = struct {
             _ = self.advance();
         }
 
+        self.rotateBuf();
         return Token{
             .ty = ty,
             .value = self.buf[self.buf_idx][0..self.buf_len],
