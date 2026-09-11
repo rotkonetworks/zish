@@ -28,16 +28,13 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const feat = @import("lib/feat.zig");
 const alloc = std.heap.page_allocator;
 
 const MAX = 1 << 20;
 const POLL_MS = 200;
 const DEFAULT_TIMEOUT_S: u64 = 300;
 
-fn getEnv(name: [:0]const u8) ?[]const u8 {
-    const v = std.c.getenv(name.ptr) orelse return null;
-    return std.mem.span(v);
-}
 fn toZ(buf: []u8, s: []const u8) ?[*:0]const u8 {
     if (s.len >= buf.len) return null;
     @memcpy(buf[0..s.len], s);
@@ -133,29 +130,34 @@ const HerdrPane = struct {
     pane: []const u8,
 
     /// Present only when Herdr says so AND both handles are non-empty.
-    fn detect() ?HerdrPane {
-        const env = getEnv("HERDR_ENV") orelse return null;
+    fn detect(init: std.process.Init) ?HerdrPane {
+        // The shared primitive hands back allocated values; the process arena
+        // owns them, so they live exactly as long as the environ memory they
+        // replaced.
+        const arena = init.arena.allocator();
+        const env = feat.env(arena, init.io, "HERDR_ENV") orelse return null;
         if (!std.mem.eql(u8, env, "1")) return null;
-        const bin = getEnv("HERDR_BIN_PATH") orelse return null;
-        const pane = getEnv("HERDR_PANE_ID") orelse return null;
+        const bin = feat.env(arena, init.io, "HERDR_BIN_PATH") orelse return null;
+        const pane = feat.env(arena, init.io, "HERDR_PANE_ID") orelse return null;
         if (bin.len == 0 or pane.len == 0) return null;
         return .{ .bin = bin, .pane = pane };
     }
 
-    fn reportBlocked(self: HerdrPane, question: []const u8) void {
+    fn reportBlocked(self: HerdrPane, init: std.process.Init, question: []const u8) void {
         var msg: [HERDR_MESSAGE_CAP + 1]u8 = undefined;
         const m = sidebarMessage(&msg, question);
-        self.exec(&.{ "pane", "report-agent", self.pane, "--source", HERDR_SOURCE, "--agent", HERDR_AGENT, "--state", "blocked", "--message", m });
+        self.exec(init, &.{ "pane", "report-agent", self.pane, "--source", HERDR_SOURCE, "--agent", HERDR_AGENT, "--state", "blocked", "--message", m });
     }
 
-    fn release(self: HerdrPane) void {
-        self.exec(&.{ "pane", "release-agent", self.pane, "--source", HERDR_SOURCE, "--agent", HERDR_AGENT });
+    fn release(self: HerdrPane, init: std.process.Init) void {
+        self.exec(init, &.{ "pane", "release-agent", self.pane, "--source", HERDR_SOURCE, "--agent", HERDR_AGENT });
     }
 
-    /// fork+execve(bin, argv), all three fds on /dev/null, reaped within
-    /// HERDR_REPORT_WAIT_MS or killed. Every failure is silently ignored: the
-    /// report is a courtesy to the sidebar, the ask itself must still work.
-    fn exec(self: HerdrPane, args: []const []const u8) void {
+    /// fork+execve(bin, argv), the reporter inheriting our environment, all
+    /// three fds on /dev/null, reaped within HERDR_REPORT_WAIT_MS or killed.
+    /// Every failure is silently ignored: the report is a courtesy to the
+    /// sidebar, the ask itself must still work.
+    fn exec(self: HerdrPane, init: std.process.Init, args: []const []const u8) void {
         var zbuf: [8192]u8 = undefined;
         var argv: [16:null]?[*:0]const u8 = undefined;
         if (args.len + 1 >= argv.len) return;
@@ -176,7 +178,9 @@ const HerdrPane = struct {
                 _ = linux.dup2(@intCast(devnull), 2);
                 if (devnull > 2) _ = linux.close(@intCast(devnull));
             }
-            _ = linux.execve(bin, &argv, @ptrCast(std.c.environ));
+            // The reporter inherits this process's environment block, taken
+            // from the startup data Zig already holds — no libc environ needed.
+            _ = linux.execve(bin, &argv, init.minimal.environ.block.slice.ptr);
             linux.exit(127);
         }
         const deadline = nowNs() + HERDR_REPORT_WAIT_MS * 1_000_000;
@@ -231,12 +235,12 @@ fn jsonEsc(o: *std.ArrayListUnmanaged(u8), s: []const u8) void {
     };
 }
 
-pub fn main(init: std.process.Init.Minimal) u8 {
-    return run(init.args);
+pub fn main(init: std.process.Init) u8 {
+    return run(init);
 }
 
-fn run(args: std.process.Args) u8 {
-    var it = args.iterate();
+fn run(init: std.process.Init) u8 {
+    var it = init.minimal.args.iterate();
     _ = it.next(); // argv[0]
 
     var timeout_s: u64 = DEFAULT_TIMEOUT_S;
@@ -279,7 +283,7 @@ fn run(args: std.process.Args) u8 {
         return 2;
     }
 
-    const home = getEnv("HOME") orelse {
+    const home = feat.env(init.arena.allocator(), init.io, "HOME") orelse {
         warn("ask: HOME unset\n");
         return 2;
     };
@@ -331,9 +335,9 @@ fn run(args: std.process.Args) u8 {
     installSignalHandlers();
 
     // surface the question in Herdr's sidebar; released on every exit path
-    const herdr = HerdrPane.detect();
-    if (herdr) |h| h.reportBlocked(q);
-    defer if (herdr) |h| h.release();
+    const herdr = HerdrPane.detect(init);
+    if (herdr) |h| h.reportBlocked(init, q);
+    defer if (herdr) |h| h.release(init);
 
     // block, polling for the answer file
     const deadline = nowNs() + timeout_s *% 1_000_000_000;

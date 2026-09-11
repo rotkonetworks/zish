@@ -15,16 +15,21 @@
 const std = @import("std");
 const linux = std.os.linux;
 const alloc = std.heap.page_allocator;
+// Shared feat primitives. Zig confines imports to the root file's own
+// directory, so this feat dir carries a `lib/feat.zig` symlink to
+// ../lib/feat.zig — which keeps the Makefile's `zig build-exe
+// feats/<name>/main.zig` recipe (and the musl dist build) exact.
+const feat = @import("lib/feat.zig");
 
 const UA = "Mozilla/5.0 (X11; Linux x86_64) zish-web/1";
 const FETCH_CAP = 4 * 1024 * 1024; // read cap from curl
 const DEFAULT_MAX = 20000; // bytes of text handed back
 const MAX_RESULTS = 8;
 
-fn getEnv(name: [:0]const u8) ?[]const u8 {
-    const v = std.c.getenv(name.ptr) orelse return null;
-    return std.mem.span(v);
-}
+// Environment lookups go through `feat.env`, the shared zero-libc reader (Zig
+// 0.16 dropped `std.posix.getenv`). It wants an io and returns allocated
+// bytes; the process arena `std.process.Init` hands us owns them, so callers
+// never free — the same borrow `std.c.getenv` used to give.
 fn writeFd(fd: i32, b: []const u8) void {
     var off: usize = 0;
     while (off < b.len) {
@@ -40,14 +45,14 @@ fn warn(b: []const u8) void {
     writeFd(2, b);
 }
 
-fn webMax() usize {
-    const v = getEnv("ZISH_WEB_MAX") orelse return DEFAULT_MAX;
+fn webMax(init: std.process.Init) usize {
+    const v = feat.env(init.arena.allocator(), init.io, "ZISH_WEB_MAX") orelse return DEFAULT_MAX;
     return std.fmt.parseInt(usize, v, 10) catch DEFAULT_MAX;
 }
 
 // --- curl fetch (fork+exec /usr/bin/env curl, capture stdout) ----------------
 
-fn curlGet(url: []const u8) ?[]u8 {
+fn curlGet(init: std.process.Init, url: []const u8) ?[]u8 {
     var argv: [16]?[*:0]const u8 = undefined;
     var held: [16][]u8 = undefined;
     var nh: usize = 0;
@@ -63,7 +68,7 @@ fn curlGet(url: []const u8) ?[]u8 {
             return true;
         }
     }.z;
-    const timeout = getEnv("ZISH_WEB_TIMEOUT") orelse "20";
+    const timeout = feat.env(init.arena.allocator(), init.io, "ZISH_WEB_TIMEOUT") orelse "20";
     for ([_][]const u8{ "env", "curl", "-sL", "--max-time", timeout, "-A", UA, url }) |a| {
         if (!push(a, &held, &nh, &argv, &n)) return null;
     }
@@ -82,7 +87,8 @@ fn curlGet(url: []const u8) ?[]u8 {
         _ = linux.close(fds[0]);
         _ = linux.dup2(fds[1], 1);
         _ = linux.close(fds[1]);
-        _ = linux.execve("/usr/bin/env", argvz, @ptrCast(std.c.environ));
+        // the inherited environment block, handed to us by the startup (envp)
+        _ = linux.execve("/usr/bin/env", argvz, init.minimal.environ.block.slice.ptr);
         linux.exit(127);
     }
     _ = linux.close(fds[1]);
@@ -274,22 +280,22 @@ fn htmlToText(html: []const u8) []u8 {
     return o.toOwnedSlice(alloc) catch dupe(decoded);
 }
 
-fn boundText(t: []const u8) []const u8 {
-    const max = webMax();
+fn boundText(init: std.process.Init, t: []const u8) []const u8 {
+    const max = webMax(init);
     return if (t.len > max) t[0..max] else t;
 }
 
 // --- verbs -------------------------------------------------------------------
 
-fn doFetch(url: []const u8) u8 {
-    const html = curlGet(url) orelse {
+fn doFetch(init: std.process.Init, url: []const u8) u8 {
+    const html = curlGet(init, url) orelse {
         warn("web: fetch failed (curl error or timeout)\n");
         return 1;
     };
     defer alloc.free(html);
     const text = htmlToText(html);
     defer alloc.free(text);
-    const b = boundText(text);
+    const b = boundText(init, text);
     out(b);
     if (b.len < text.len) out("\n\n… [truncated — raise ZISH_WEB_MAX or fetch a deeper link] …\n");
     out("\n");
@@ -298,9 +304,9 @@ fn doFetch(url: []const u8) u8 {
 
 /// DuckDuckGo HTML scrape: extract result anchors (real URL from the `uddg`
 /// redirect param) + their snippets. Falls out gracefully if the markup shifts.
-fn doSearch(query: []const u8) u8 {
+fn doSearch(init: std.process.Init, query: []const u8) u8 {
     // custom backend?
-    if (getEnv("ZISH_WEB_SEARCH")) |tmpl| {
+    if (feat.env(init.arena.allocator(), init.io, "ZISH_WEB_SEARCH")) |tmpl| {
         var url: std.ArrayListUnmanaged(u8) = .empty;
         defer url.deinit(alloc);
         if (std.mem.indexOf(u8, tmpl, "{q}")) |at| {
@@ -311,14 +317,14 @@ fn doSearch(query: []const u8) u8 {
             url.appendSlice(alloc, tmpl) catch {};
             urlEncode(&url, query);
         }
-        const body = curlGet(url.items) orelse {
+        const body = curlGet(init, url.items) orelse {
             warn("web: search backend fetch failed\n");
             return 1;
         };
         defer alloc.free(body);
         const text = htmlToText(body); // best-effort: print as text (JSON stays JSON)
         defer alloc.free(text);
-        out(boundText(text));
+        out(boundText(init, text));
         out("\n");
         return 0;
     }
@@ -327,7 +333,7 @@ fn doSearch(query: []const u8) u8 {
     defer url.deinit(alloc);
     url.appendSlice(alloc, "https://html.duckduckgo.com/html/?q=") catch {};
     urlEncode(&url, query);
-    const body = curlGet(url.items) orelse {
+    const body = curlGet(init, url.items) orelse {
         warn("web: search failed (curl error or timeout)\n");
         return 1;
     };
@@ -392,8 +398,18 @@ fn doSearch(query: []const u8) u8 {
     return 0;
 }
 
-pub fn main(init: std.process.Init.Minimal) u8 {
-    var it = init.args.iterate();
+pub fn main(init: std.process.Init) u8 {
+    // `Init` installs a no-op SIGPIPE handler for its io; a feat exec'd by the
+    // shell must keep the inherited disposition, where a closed stdout kills
+    // the writer — the behaviour of the -lc build this replaces.
+    var dfl: std.posix.Sigaction = .{
+        .handler = .{ .handler = std.posix.SIG.DFL },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.PIPE, &dfl, null);
+
+    var it = init.minimal.args.iterate();
     _ = it.next(); // argv0
     const verb = it.next() orelse {
         warn("usage: web search <query> | web fetch <url>\n");
@@ -404,7 +420,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             warn("web: fetch needs a URL\n");
             return 2;
         };
-        return doFetch(url);
+        return doFetch(init, url);
     }
     if (std.mem.eql(u8, verb, "search") or std.mem.eql(u8, verb, "s")) {
         var q: std.ArrayListUnmanaged(u8) = .empty;
@@ -417,7 +433,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             warn("web: search needs a query\n");
             return 2;
         }
-        return doSearch(q.items);
+        return doSearch(init, q.items);
     }
     // bare `web <query...>` → search (verb is the first query word)
     var q: std.ArrayListUnmanaged(u8) = .empty;
@@ -427,5 +443,5 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         q.append(alloc, ' ') catch {};
         q.appendSlice(alloc, w) catch {};
     }
-    return doSearch(q.items);
+    return doSearch(init, q.items);
 }

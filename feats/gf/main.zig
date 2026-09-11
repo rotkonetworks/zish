@@ -38,6 +38,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
+// Shared feat primitives. Zig confines imports to the root file's own
+// directory, so this feat dir carries a `lib/feat.zig` symlink to
+// ../lib/feat.zig — which keeps the Makefile's `zig build-exe
+// feats/<name>/main.zig` recipe (and the musl dist build) exact.
+const feat = @import("lib/feat.zig");
 
 const alloc = std.heap.page_allocator;
 
@@ -65,8 +70,8 @@ const HOST_ARCH: []const u8 = switch (builtin.target.cpu.arch) {
 /// built-in default. `is_default` is the trust signal — only the built-in
 /// default (rotko's own release channel) earns a standard-tier install; a
 /// user-pointed index or a bare URL stays quarantined in extra/.
-fn indexUrl() struct { url: []const u8, is_default: bool } {
-    if (getEnv("ZISH_FEAT_INDEX")) |u| return .{ .url = u, .is_default = false };
+fn indexUrl(init: std.process.Init) struct { url: []const u8, is_default: bool } {
+    if (feat.env(init.arena.allocator(), init.io, "ZISH_FEAT_INDEX")) |u| return .{ .url = u, .is_default = false };
     return .{ .url = DEFAULT_FEAT_INDEX, .is_default = true };
 }
 
@@ -199,10 +204,10 @@ test "forceTier rewrites or appends the tier line" {
 // syscall plumbing
 // ===========================================================================
 
-fn getEnv(name: [:0]const u8) ?[]const u8 {
-    const v = std.c.getenv(name.ptr) orelse return null;
-    return std.mem.span(v);
-}
+// Environment lookups go through `feat.env`, the shared zero-libc reader (Zig
+// 0.16 dropped `std.posix.getenv`). It wants an io and returns allocated
+// bytes; the process arena `std.process.Init` hands us owns them, so callers
+// never free — the same borrow `std.c.getenv` used to give.
 
 fn toZ(buf: []u8, s: []const u8) ?[*:0]const u8 {
     if (s.len >= buf.len) return null;
@@ -236,12 +241,13 @@ fn print(comptime fmt: []const u8, args: anytype) void {
 
 /// fork+exec via /usr/bin/env, inherit stdio, return the child's exit code
 /// (255 on spawn/abnormal-exit).
-fn execStatus(argv: [*:null]const ?[*:0]const u8) u8 {
+fn execStatus(init: std.process.Init, argv: [*:null]const ?[*:0]const u8) u8 {
     const pid_rc = linux.fork();
     const pid: isize = @bitCast(pid_rc);
     if (pid < 0) return 255;
     if (pid == 0) {
-        _ = linux.execve("/usr/bin/env", argv, @ptrCast(std.c.environ));
+        // the inherited environment block, handed to us by the startup (envp)
+        _ = linux.execve("/usr/bin/env", argv, init.minimal.environ.block.slice.ptr);
         linux.exit(127);
     }
     var status: u32 = 0;
@@ -255,12 +261,13 @@ fn execStatus(argv: [*:null]const ?[*:0]const u8) u8 {
 /// through the exact `gf install <name>` path — same tier, sha-pin, and ledger.
 /// (Routing through `env` would not work: env replaces the image, so
 /// /proc/self/exe would then point at env, not gf.)
-fn execSelf(argv: [*:null]const ?[*:0]const u8) u8 {
+fn execSelf(init: std.process.Init, argv: [*:null]const ?[*:0]const u8) u8 {
     const pid_rc = linux.fork();
     const pid: isize = @bitCast(pid_rc);
     if (pid < 0) return 255;
     if (pid == 0) {
-        _ = linux.execve("/proc/self/exe", argv, @ptrCast(std.c.environ));
+        // the inherited environment block, handed to us by the startup (envp)
+        _ = linux.execve("/proc/self/exe", argv, init.minimal.environ.block.slice.ptr);
         linux.exit(127);
     }
     var status: u32 = 0;
@@ -341,7 +348,7 @@ fn writeFile(path: []const u8, bytes: []const u8, mode: u32) bool {
 
 /// fork+exec via /usr/bin/env, capturing stdout (for sha256sum). Returns null
 /// on spawn failure or non-zero exit.
-fn execCapture(argv: [*:null]const ?[*:0]const u8) ?[]u8 {
+fn execCapture(init: std.process.Init, argv: [*:null]const ?[*:0]const u8) ?[]u8 {
     var fds: [2]i32 = undefined;
     if (@as(isize, @bitCast(linux.pipe2(&fds, .{}))) < 0) return null;
     const pid_rc = linux.fork();
@@ -355,7 +362,8 @@ fn execCapture(argv: [*:null]const ?[*:0]const u8) ?[]u8 {
         _ = linux.close(fds[0]);
         _ = linux.dup2(fds[1], 1);
         _ = linux.close(fds[1]);
-        _ = linux.execve("/usr/bin/env", argv, @ptrCast(std.c.environ));
+        // the inherited environment block, handed to us by the startup (envp)
+        _ = linux.execve("/usr/bin/env", argv, init.minimal.environ.block.slice.ptr);
         linux.exit(127);
     }
     _ = linux.close(fds[1]);
@@ -375,11 +383,11 @@ fn execCapture(argv: [*:null]const ?[*:0]const u8) ?[]u8 {
 }
 
 /// sha256 of a file, as 64 hex chars, via sha256sum.
-fn sha256File(path: []const u8) ?[]const u8 {
+fn sha256File(init: std.process.Init, path: []const u8) ?[]const u8 {
     var z: [4096]u8 = undefined;
     const p = toZ(&z, path) orelse return null;
     const argv = [_:null]?[*:0]const u8{ "env", "sha256sum", "--", p, null };
-    const out = execCapture(&argv) orelse return null;
+    const out = execCapture(init, &argv) orelse return null;
     if (out.len < 64) return null;
     for (out[0..64]) |c| {
         if (!std.ascii.isHex(c)) return null;
@@ -387,11 +395,11 @@ fn sha256File(path: []const u8) ?[]const u8 {
     return out[0..64];
 }
 
-fn rmRf(path: []const u8) void {
+fn rmRf(init: std.process.Init, path: []const u8) void {
     var z: [4096]u8 = undefined;
     const p = toZ(&z, path) orelse return;
     const argv = [_:null]?[*:0]const u8{ "env", "rm", "-rf", "--", p, null };
-    _ = execStatus(&argv);
+    _ = execStatus(init, &argv);
 }
 
 // ===========================================================================
@@ -490,13 +498,13 @@ fn resolveAgentBin(root: []const u8, buf: []u8) ?[]const u8 {
 
 /// The review rubric path: $ZISH_RUBRIC_DIR/feat-review-v1.toml, else
 /// $HOME/.zish/rubrics/feat-review-v1.toml.
-fn resolveRubric(buf: []u8) ?[]const u8 {
-    if (getEnv("ZISH_RUBRIC_DIR")) |d| {
+fn resolveRubric(init: std.process.Init, buf: []u8) ?[]const u8 {
+    if (feat.env(init.arena.allocator(), init.io, "ZISH_RUBRIC_DIR")) |d| {
         const p = std.fmt.bufPrint(buf, "{s}/feat-review-v1.toml", .{d}) catch return null;
         if (lstatMode(p) != null) return p;
         return null;
     }
-    const home = getEnv("HOME") orelse return null;
+    const home = feat.env(init.arena.allocator(), init.io, "HOME") orelse return null;
     const p = std.fmt.bufPrint(buf, "{s}/.zish/rubrics/feat-review-v1.toml", .{home}) catch return null;
     if (lstatMode(p) != null) return p;
     return null;
@@ -505,8 +513,8 @@ fn resolveRubric(buf: []u8) ?[]const u8 {
 /// Append a review verdict to the ledger, joined to the install by sha256.
 /// The bare pass/fail is lifted to top level for greppability; the full
 /// verdict object rides along as an escaped string under "result".
-fn reviewLedgerAppend(root: []const u8, sha: []const u8, verdict_word: []const u8, verdict_raw: []const u8) void {
-    const model = getEnv("ZISH_JUDGE_MODEL") orelse "deepseek/deepseek-v4-flash-0731";
+fn reviewLedgerAppend(init: std.process.Init, root: []const u8, sha: []const u8, verdict_word: []const u8, verdict_raw: []const u8) void {
+    const model = feat.env(init.arena.allocator(), init.io, "ZISH_JUDGE_MODEL") orelse "deepseek/deepseek-v4-flash-0731";
     var line: std.ArrayListUnmanaged(u8) = .empty;
     defer line.deinit(alloc);
     line.appendSlice(alloc, "{\"t\":\"review\",\"sha256\":\"") catch return;
@@ -540,8 +548,8 @@ fn reviewLedgerAppend(root: []const u8, sha: []const u8, verdict_word: []const u
 
 /// Exec `agent --judge` on the installed source and append the verdict. All
 /// failure paths are loud notes that leave the install intact and unreviewed.
-fn reviewInstalled(root: []const u8, dest: []const u8, name: []const u8, sha: []const u8) void {
-    if (!settingOn("review", true)) {
+fn reviewInstalled(init: std.process.Init, root: []const u8, dest: []const u8, name: []const u8, sha: []const u8) void {
+    if (!settingOn(init, "review", true)) {
         print("gf: review is off ({s} installed unreviewed; `gf settings` to re-enable)\n", .{name});
         return;
     }
@@ -557,7 +565,7 @@ fn reviewInstalled(root: []const u8, dest: []const u8, name: []const u8, sha: []
         return;
     };
     var rbuf: [4096]u8 = undefined;
-    const rubric = resolveRubric(&rbuf) orelse {
+    const rubric = resolveRubric(init, &rbuf) orelse {
         print("gf: no review rubric found; skipping review\n", .{});
         return;
     };
@@ -581,7 +589,7 @@ fn reviewInstalled(root: []const u8, dest: []const u8, name: []const u8, sha: []
     n += 1;
     argv[n] = push(agent_bin, &held, &nheld) orelse return;
     n += 1;
-    if (getEnv("ZISH_JUDGE_MOCK")) |m| {
+    if (feat.env(init.arena.allocator(), init.io, "ZISH_JUDGE_MOCK")) |m| {
         argv[n] = push("--mock", &held, &nheld) orelse return;
         n += 1;
         argv[n] = push(m, &held, &nheld) orelse return;
@@ -595,7 +603,7 @@ fn reviewInstalled(root: []const u8, dest: []const u8, name: []const u8, sha: []
     n += 1;
     // each source file (bounded)
     var names_buf: [64][]u8 = undefined;
-    if (listDir(src_dir, &names_buf)) |srcs| {
+    if (listDir(init, src_dir, &names_buf)) |srcs| {
         for (srcs) |sname| {
             if (n >= argv.len - 1) break;
             var fb: [4096]u8 = undefined;
@@ -607,7 +615,7 @@ fn reviewInstalled(root: []const u8, dest: []const u8, name: []const u8, sha: []
     argv[n] = null;
     const argv_z: [*:null]const ?[*:0]const u8 = argv[0..n :null];
 
-    const out = execCapture(argv_z) orelse {
+    const out = execCapture(init, argv_z) orelse {
         print("gf: review produced no verdict; {s} stands installed but unreviewed\n", .{name});
         return;
     };
@@ -622,7 +630,7 @@ fn reviewInstalled(root: []const u8, dest: []const u8, name: []const u8, sha: []
     };
     defer parsed.deinit();
     const word = objStr2(parsed.value, "verdict") orelse "unknown";
-    reviewLedgerAppend(root, sha, word, out);
+    reviewLedgerAppend(init, root, sha, word, out);
     print("gf: reviewed {s}: verdict {s} (recorded in ledger)\n", .{ name, word });
 }
 
@@ -641,7 +649,7 @@ const S_IFDIR: u32 = 0o040000;
 /// else lives at top level. Returns null on pass, a message on refusal.
 /// `member` is the required file inside the payload dir (bin_name for binary,
 /// the manifest's src for source).
-fn validateTree(tmp: []const u8, payload_dir: []const u8, member: []const u8) ?[]const u8 {
+fn validateTree(init: std.process.Init, tmp: []const u8, payload_dir: []const u8, member: []const u8) ?[]const u8 {
     var pbuf: [4096]u8 = undefined;
 
     const mf = std.fmt.bufPrint(&pbuf, "{s}/feat.toml", .{tmp}) catch return "path too long";
@@ -655,7 +663,7 @@ fn validateTree(tmp: []const u8, payload_dir: []const u8, member: []const u8) ?[
 
     // top level: nothing but feat.toml and the one payload dir
     var names_buf: [64][]u8 = undefined;
-    const top = listDir(tmp, &names_buf) orelse return "cannot open archive dir";
+    const top = listDir(init, tmp, &names_buf) orelse return "cannot open archive dir";
     for (top) |n| {
         if (std.mem.eql(u8, n, "feat.toml") or std.mem.eql(u8, n, payload_dir)) continue;
         return "archive contains files outside feat.toml + payload dir";
@@ -664,7 +672,7 @@ fn validateTree(tmp: []const u8, payload_dir: []const u8, member: []const u8) ?[
     // payload dir: regular files only (lstat: a symlink here is the attack)
     var found = false;
     var mnames_buf: [64][]u8 = undefined;
-    const members = listDir(dir, &mnames_buf) orelse return "cannot open payload dir";
+    const members = listDir(init, dir, &mnames_buf) orelse return "cannot open payload dir";
     for (members) |n| {
         var fbuf: [4096]u8 = undefined;
         const fp = std.fmt.bufPrint(&fbuf, "{s}/{s}", .{ dir, n }) catch return "path too long";
@@ -679,14 +687,13 @@ fn validateTree(tmp: []const u8, payload_dir: []const u8, member: []const u8) ?[
 /// List a directory's entries (skipping . and ..) via libc opendir/readdir.
 /// Names are duped into `alloc`; more than names.len entries fails closed
 /// (null) — a legitimate feat archive is tiny.
-fn listDir(path: []const u8, names: [][]u8) ?[][]u8 {
-    var z: [4096]u8 = undefined;
-    const p = toZ(&z, path) orelse return null;
-    const d = std.c.opendir(p) orelse return null;
-    defer _ = std.c.closedir(d);
+fn listDir(init: std.process.Init, path: []const u8, names: [][]u8) ?[][]u8 {
+    var dir = std.Io.Dir.openDirAbsolute(init.io, path, .{ .iterate = true }) catch return null;
+    defer dir.close(init.io);
+    var it = dir.iterate();
     var n: usize = 0;
-    while (std.c.readdir(d)) |ent| {
-        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.name)));
+    while (it.next(init.io) catch return null) |ent| {
+        const name = ent.name;
         if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
         if (n >= names.len) return null; // absurdly large archive: fail closed
         names[n] = alloc.dupe(u8, name) catch return null;
@@ -717,7 +724,7 @@ fn validSrcName(s: []const u8) bool {
 /// on success, a message on refusal or build failure. Everything here is data
 /// gf controls; the publisher's only inputs are the (charset-checked) filename
 /// and the source itself, which is what reviewers read.
-fn buildSource(tmp: []const u8, lang: []const u8, src_file: []const u8, bin_name: []const u8, want_libc: bool) ?[]const u8 {
+fn buildSource(init: std.process.Init, tmp: []const u8, lang: []const u8, src_file: []const u8, bin_name: []const u8, want_libc: bool) ?[]const u8 {
     var sbuf: [4096]u8 = undefined;
     var obuf: [4096]u8 = undefined;
     const src_path = std.fmt.bufPrint(&sbuf, "{s}/src/{s}", .{ tmp, src_file }) catch return "path too long";
@@ -738,14 +745,14 @@ fn buildSource(tmp: []const u8, lang: []const u8, src_file: []const u8, bin_name
         // zig cc: -O2, static-ish, output binary. libc flag is irrelevant (cc
         // links libc anyway); we ignore it for C.
         const argv = [_:null]?[*:0]const u8{ "env", "zig", "cc", "-O2", "-o", op, sp, null };
-        st = execStatus(&argv);
+        st = execStatus(init, &argv);
     } else if (std.mem.eql(u8, lang, "zig")) {
         if (want_libc) {
             const argv = [_:null]?[*:0]const u8{ "env", "zig", "build-exe", "-OReleaseFast", "-fstrip", "-lc", sp, emit.ptr, null };
-            st = execStatus(&argv);
+            st = execStatus(init, &argv);
         } else {
             const argv = [_:null]?[*:0]const u8{ "env", "zig", "build-exe", "-OReleaseFast", "-fstrip", sp, emit.ptr, null };
-            st = execStatus(&argv);
+            st = execStatus(init, &argv);
         }
     } else {
         return "unsupported lang (want \"c\" or \"zig\")";
@@ -772,8 +779,8 @@ test "validSrcName allows one extension dot, rejects traversal" {
 
 /// Refuse names that collide with an executable on PATH. Dispatch-time
 /// no-shadowing already makes such a feat inert; refusing here is honest UX.
-fn shadowsPath(name: []const u8) bool {
-    const path_env = getEnv("PATH") orelse return false;
+fn shadowsPath(init: std.process.Init, name: []const u8) bool {
+    const path_env = feat.env(init.arena.allocator(), init.io, "PATH") orelse return false;
     var dirs = std.mem.splitScalar(u8, path_env, ':');
     while (dirs.next()) |d| {
         if (d.len == 0) continue;
@@ -958,14 +965,24 @@ fn writeAll1(bytes: []const u8) void {
 // main
 // ===========================================================================
 
-pub fn main(init: std.process.Init.Minimal) void {
+pub fn main(init: std.process.Init) void {
+    // `Init` installs a no-op SIGPIPE handler for its io; a feat exec'd by the
+    // shell must keep the inherited disposition, where a closed stdout kills
+    // the writer — the behaviour of the -lc build this replaces.
+    var dfl: std.posix.Sigaction = .{
+        .handler = .{ .handler = std.posix.SIG.DFL },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.PIPE, &dfl, null);
+
     linux.exit(run(init));
 }
 
 /// Feat root: same resolution as zish (ZISH_FEAT_PATH overrides).
-fn featRootPath(buf: []u8) ?[]const u8 {
-    if (getEnv("ZISH_FEAT_PATH")) |p| return p;
-    const home = getEnv("HOME") orelse return null;
+fn featRootPath(init: std.process.Init, buf: []u8) ?[]const u8 {
+    if (feat.env(init.arena.allocator(), init.io, "ZISH_FEAT_PATH")) |p| return p;
+    const home = feat.env(init.arena.allocator(), init.io, "HOME") orelse return null;
     return std.fmt.bufPrint(buf, "{s}/.zish/feats", .{home}) catch null;
 }
 
@@ -984,18 +1001,18 @@ const ResolvedKind = enum { git, tarball };
 const Resolved = struct { kind: ResolvedKind, loc: []const u8, pin: []const u8, publisher: ?[]const u8 };
 
 /// Fetch the index body (curl, protocol-restricted, size-capped). Caller frees.
-fn fetchIndex(idx_url: []const u8) ?[]u8 {
+fn fetchIndex(init: std.process.Init, idx_url: []const u8) ?[]u8 {
     var uz: [4096]u8 = undefined;
     const up = toZ(&uz, idx_url) orelse return null;
     const argv = [_:null]?[*:0]const u8{
         "env",            "curl", "-fsSL",     "--max-time", "60", "--proto", "=http,https,file",
         "--max-filesize", "4194304",           up,           null,
     };
-    return execCapture(&argv);
+    return execCapture(init, &argv);
 }
 
-fn resolveIndex(idx_url: []const u8, name: []const u8) ?Resolved {
-    const data = fetchIndex(idx_url) orelse return null;
+fn resolveIndex(init: std.process.Init, idx_url: []const u8, name: []const u8) ?Resolved {
+    const data = fetchIndex(init, idx_url) orelse return null;
     defer alloc.free(data);
     // last match wins: republishing appends a newer line for the same name, so
     // the newest entry (later in the file) supersedes — cargo-like versioning.
@@ -1082,9 +1099,9 @@ fn appendLine(path: []const u8, line: []const u8) bool {
 /// signed tag from feat.toml's version, pushes it, and emits (or appends) the
 /// index line binding name → repo → ref → publisher key. One key signs both
 /// your published tags and your review verdicts.
-fn cmdPublish(dir_arg: ?[]const u8) u8 {
+fn cmdPublish(init: std.process.Init, dir_arg: ?[]const u8) u8 {
     const dir = dir_arg orelse ".";
-    const key = getEnv("ZISH_SIGN_KEY") orelse
+    const key = feat.env(init.arena.allocator(), init.io, "ZISH_SIGN_KEY") orelse
         return fail("set ZISH_SIGN_KEY to your ssh signing key (the same key that signs your reviews)", .{});
 
     var mb: [4096]u8 = undefined;
@@ -1101,11 +1118,11 @@ fn cmdPublish(dir_arg: ?[]const u8) u8 {
     const dp = toZ(&dz, dir) orelse return 1;
     {
         const argv = [_:null]?[*:0]const u8{ "env", "git", "-C", dp, "rev-parse", "--is-inside-work-tree", null };
-        if (execStatus(&argv) != 0) return fail("{s} is not a git repository", .{dir});
+        if (execStatus(init, &argv) != 0) return fail("{s} is not a git repository", .{dir});
     }
     const origin_raw = blk: {
         const argv = [_:null]?[*:0]const u8{ "env", "git", "-C", dp, "remote", "get-url", "origin", null };
-        break :blk execCapture(&argv) orelse
+        break :blk execCapture(init, &argv) orelse
             return fail("no 'origin' remote — add one: git -C {s} remote add origin <url>", .{dir});
     };
     defer alloc.free(origin_raw);
@@ -1125,12 +1142,12 @@ fn cmdPublish(dir_arg: ?[]const u8) u8 {
     {
         // signed annotated tag: ssh format, key from ZISH_SIGN_KEY
         const argv = [_:null]?[*:0]const u8{ "env", "git", "-C", dp, "-c", "gpg.format=ssh", "-c", skp, "tag", "-s", rp, "-m", mp, null };
-        if (execStatus(&argv) != 0)
+        if (execStatus(init, &argv) != 0)
             return fail("could not create signed tag {s} (already exists, or key {s} unreadable?)", .{ ver, key });
     }
     {
         const argv = [_:null]?[*:0]const u8{ "env", "git", "-C", dp, "push", "origin", rp, null };
-        if (execStatus(&argv) != 0) return fail("git push origin {s} failed", .{ver});
+        if (execStatus(init, &argv) != 0) return fail("git push origin {s} failed", .{ver});
     }
 
     var pkb: [4096]u8 = undefined;
@@ -1153,7 +1170,7 @@ fn cmdPublish(dir_arg: ?[]const u8) u8 {
 
     // If the index is a local file we control, append the line automatically
     // (cargo-to-crates.io ease). Otherwise print it for the user to add.
-    if (getEnv("ZISH_FEAT_INDEX")) |idx| {
+    if (feat.env(init.arena.allocator(), init.io, "ZISH_FEAT_INDEX")) |idx| {
         const local: ?[]const u8 = if (std.mem.startsWith(u8, idx, "file://"))
             idx[7..]
         else if (std.mem.indexOf(u8, idx, "://") == null)
@@ -1175,16 +1192,16 @@ fn cmdPublish(dir_arg: ?[]const u8) u8 {
 
 /// `gf remove <name>` — uninstall a feat from the feat root (both tiers). gf
 /// builds the path from a charset-checked name, so it can never escape the root.
-fn cmdRemove(name: []const u8) u8 {
+fn cmdRemove(init: std.process.Init, name: []const u8) u8 {
     if (!validName(name)) return fail("invalid feat name: {s}", .{name});
     var rb: [4096]u8 = undefined;
-    const root = featRootPath(&rb) orelse return fail("no HOME", .{});
+    const root = featRootPath(init, &rb) orelse return fail("no HOME", .{});
     var removed = false;
     for ([_][]const u8{ "standard", "extra" }) |tier| {
         var pb: [4096]u8 = undefined;
         const p = std.fmt.bufPrint(&pb, "{s}/{s}/{s}", .{ root, tier, name }) catch continue;
         if (lstatMode(p) != null) {
-            rmRf(p);
+            rmRf(init, p);
             print("gf: removed {s} from the {s} tier\n", .{ name, tier });
             removed = true;
         }
@@ -1200,18 +1217,18 @@ const GF_SETTINGS = [_]SettingDef{
     .{ .key = "review", .desc = "AI review-on-install (agent judges each source package, records a verdict)", .default_on = true },
 };
 
-fn gfConfigPath(buf: []u8) ?[]const u8 {
-    if (getEnv("ZISH_GF_CONFIG")) |p| return p;
-    const home = getEnv("HOME") orelse return null;
+fn gfConfigPath(init: std.process.Init, buf: []u8) ?[]const u8 {
+    if (feat.env(init.arena.allocator(), init.io, "ZISH_GF_CONFIG")) |p| return p;
+    const home = feat.env(init.arena.allocator(), init.io, "HOME") orelse return null;
     return std.fmt.bufPrint(buf, "{s}/.zish/gf.conf", .{home}) catch null;
 }
 
 /// Read a boolean setting from the config file (`key = true|false`). A missing
 /// file or key returns `default_val`, so a fresh install behaves as the defaults
 /// say. Only the literal `true` is true; anything else (including a typo) is false.
-fn settingOn(key: []const u8, default_val: bool) bool {
+fn settingOn(init: std.process.Init, key: []const u8, default_val: bool) bool {
     var cb: [4096]u8 = undefined;
-    const cp = gfConfigPath(&cb) orelse return default_val;
+    const cp = gfConfigPath(init, &cb) orelse return default_val;
     const data = readFileAlloc(cp, 64 * 1024) orelse return default_val;
     defer alloc.free(data);
     var lines = std.mem.splitScalar(u8, data, '\n');
@@ -1229,13 +1246,13 @@ fn settingOn(key: []const u8, default_val: bool) bool {
 }
 
 /// Write every known setting to the config file (whole-file rewrite, 0644).
-fn writeSettings(states: []const bool) bool {
-    if (getEnv("HOME")) |h| {
+fn writeSettings(init: std.process.Init, states: []const bool) bool {
+    if (feat.env(init.arena.allocator(), init.io, "HOME")) |h| {
         var zb: [4096]u8 = undefined;
         if (std.fmt.bufPrint(&zb, "{s}/.zish", .{h}) catch null) |zp| mkdirP(zp);
     }
     var cb: [4096]u8 = undefined;
-    const cp = gfConfigPath(&cb) orelse return false;
+    const cp = gfConfigPath(init, &cb) orelse return false;
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(alloc);
     out.appendSlice(alloc, "# gf settings — toggle with `gf settings`\n") catch return false;
@@ -1253,9 +1270,9 @@ fn writeSettings(states: []const bool) bool {
 /// awk-able. No interactive mode: get one with `gf settings <key>`, set one with
 /// `gf settings <key> true|false` (a picker belongs on a catalog like `gf setup`,
 /// not on a handful of properties).
-fn cmdSettings() u8 {
+fn cmdSettings(init: std.process.Init) u8 {
     for (GF_SETTINGS) |s| {
-        const v = settingOn(s.key, s.default_on);
+        const v = settingOn(init, s.key, s.default_on);
         print("{s}\t{s}\t{s}\n", .{ s.key, if (v) "true" else "false", s.desc });
     }
     return 0;
@@ -1264,7 +1281,7 @@ fn cmdSettings() u8 {
 /// The scriptable, non-interactive face of settings. `gf settings <key>` prints
 /// the value (bare `true`/`false` on stdout, for `[ "$(gf settings review)" = true ]`);
 /// `gf settings <key> true|false` sets it. Exit 0 on success, 2 on a bad key/value.
-fn cmdSetting(key: []const u8, val: ?[]const u8) u8 {
+fn cmdSetting(init: std.process.Init, key: []const u8, val: ?[]const u8) u8 {
     var idx: ?usize = null;
     for (GF_SETTINGS, 0..) |s, i| {
         if (std.mem.eql(u8, s.key, key)) idx = i;
@@ -1272,7 +1289,7 @@ fn cmdSetting(key: []const u8, val: ?[]const u8) u8 {
     const si = idx orelse return usage("unknown setting \"{s}\" (run `gf settings` to list)", .{key});
 
     if (val == null) {
-        print("{s}\n", .{if (settingOn(key, GF_SETTINGS[si].default_on)) "true" else "false"});
+        print("{s}\n", .{if (settingOn(init, key, GF_SETTINGS[si].default_on)) "true" else "false"});
         return 0;
     }
     const on = if (std.mem.eql(u8, val.?, "true"))
@@ -1283,9 +1300,9 @@ fn cmdSetting(key: []const u8, val: ?[]const u8) u8 {
         return usage("value must be true or false, got \"{s}\"", .{val.?});
 
     var states: [GF_SETTINGS.len]bool = undefined;
-    for (GF_SETTINGS, 0..) |s, i| states[i] = settingOn(s.key, s.default_on);
+    for (GF_SETTINGS, 0..) |s, i| states[i] = settingOn(init, s.key, s.default_on);
     states[si] = on;
-    if (!writeSettings(&states)) return fail("could not write settings", .{});
+    if (!writeSettings(init, &states)) return fail("could not write settings", .{});
     return 0;
 }
 
@@ -1296,12 +1313,12 @@ const FeatState = enum { available, active, inactive };
 /// or inactive (extra tier, quarantined). Picking a number toggles it — install
 /// an available feat, remove an installed one — each via a re-exec of the same
 /// `gf install`/`gf remove` path, so the tier, sha-pin and ledger rules match.
-fn cmdSetup() u8 {
-    const ix = indexUrl();
-    const data = fetchIndex(ix.url) orelse return fail("could not fetch the feat index ({s})", .{ix.url});
+fn cmdSetup(init: std.process.Init) u8 {
+    const ix = indexUrl(init);
+    const data = fetchIndex(init, ix.url) orelse return fail("could not fetch the feat index ({s})", .{ix.url});
     defer alloc.free(data);
     var rb: [4096]u8 = undefined;
-    const root = featRootPath(&rb) orelse return fail("no HOME", .{});
+    const root = featRootPath(init, &rb) orelse return fail("no HOME", .{});
 
     const Item = struct { name: []const u8, ver: []const u8, desc: []const u8, state: FeatState };
     var items: std.ArrayListUnmanaged(Item) = .empty;
@@ -1398,7 +1415,7 @@ fn cmdSetup() u8 {
         const verb: [*:0]const u8 = if (it.state == .available) "install" else "remove";
         print("\n→ {s} {s} …\n", .{ verb, it.name });
         const argv = [_:null]?[*:0]const u8{ "gf", verb, np, null };
-        if (execSelf(&argv) == 0) did += 1 else fail_n += 1;
+        if (execSelf(init, &argv) == 0) did += 1 else fail_n += 1;
     }
     print("\ngf setup: {d} changed, {d} failed.\n", .{ did, fail_n });
     return if (fail_n == 0) 0 else 1;
@@ -1409,16 +1426,16 @@ fn cmdSetup() u8 {
 /// `gf setup <feat> true` installs it, `gf setup <feat> false` removes it — each
 /// through the same `gf install`/`gf remove` path (re-exec), so tier/pin/ledger
 /// rules match. Exit follows that child (0 ok, 1 runtime), or 2 on a bad value.
-fn cmdSetupOne(feat: []const u8, val: ?[]const u8) u8 {
-    if (!validName(feat)) return usage("invalid feat name: {s}", .{feat});
+fn cmdSetupOne(init: std.process.Init, feat_name: []const u8, val: ?[]const u8) u8 {
+    if (!validName(feat_name)) return usage("invalid feat name: {s}", .{feat_name});
 
     if (val == null) {
         var rb: [4096]u8 = undefined;
-        const root = featRootPath(&rb) orelse return fail("no HOME", .{});
+        const root = featRootPath(init, &rb) orelse return fail("no HOME", .{});
         var installed = false;
         for ([_][]const u8{ "standard", "extra" }) |tier| {
             var pb: [4096]u8 = undefined;
-            const p = std.fmt.bufPrint(&pb, "{s}/{s}/{s}", .{ root, tier, feat }) catch continue;
+            const p = std.fmt.bufPrint(&pb, "{s}/{s}/{s}", .{ root, tier, feat_name }) catch continue;
             if (lstatMode(p) != null) installed = true;
         }
         print("{s}\n", .{if (installed) "true" else "false"});
@@ -1426,13 +1443,13 @@ fn cmdSetupOne(feat: []const u8, val: ?[]const u8) u8 {
     }
 
     var nz: [256]u8 = undefined;
-    const np = toZ(&nz, feat) orelse return fail("name too long", .{});
+    const np = toZ(&nz, feat_name) orelse return fail("name too long", .{});
     if (std.mem.eql(u8, val.?, "true")) {
         const argv = [_:null]?[*:0]const u8{ "gf", "install", np, null };
-        return execSelf(&argv);
+        return execSelf(init, &argv);
     } else if (std.mem.eql(u8, val.?, "false")) {
         const argv = [_:null]?[*:0]const u8{ "gf", "remove", np, null };
-        return execSelf(&argv);
+        return execSelf(init, &argv);
     }
     return usage("value must be true or false, got \"{s}\"", .{val.?});
 }
@@ -1442,9 +1459,9 @@ fn cmdSetupOne(feat: []const u8, val: ?[]const u8) u8 {
 /// does), deduped and arch-filtered so a multi-arch index reads as one feat per
 /// name; search narrows by a substring on the name, list shows everything.
 /// Zero-config: resolves the built-in default index unless ZISH_FEAT_INDEX is set.
-fn cmdSearch(query: []const u8) u8 {
-    const ix = indexUrl();
-    const data = fetchIndex(ix.url) orelse return fail("could not fetch the feat index ({s})", .{ix.url});
+fn cmdSearch(init: std.process.Init, query: []const u8) u8 {
+    const ix = indexUrl(init);
+    const data = fetchIndex(init, ix.url) orelse return fail("could not fetch the feat index ({s})", .{ix.url});
     defer alloc.free(data);
     // Dedup by name: a multi-arch index has one line per (name, arch); collapse
     // to the entries that apply to THIS host so each feat prints once.
@@ -1482,8 +1499,8 @@ fn cmdSearch(query: []const u8) u8 {
     return 0;
 }
 
-fn run(init: std.process.Init.Minimal) u8 {
-    var args = std.process.Args.Iterator.init(init.args);
+fn run(init: std.process.Init) u8 {
+    var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.next(); // argv0
     const first = args.next() orelse {
         print("usage: gf setup                 interactive checklist: install / remove feats from the index\n" ++
@@ -1499,42 +1516,42 @@ fn run(init: std.process.Init.Minimal) u8 {
     };
 
     if (std.mem.eql(u8, first, "setup")) {
-        const feat = args.next();
-        if (feat == null) return cmdSetup(); // interactive checklist
+        const name_arg = args.next();
+        if (name_arg == null) return cmdSetup(init); // interactive checklist
         const val = args.next();
         if (args.next() != null) return usage("usage: gf setup [<feat> [true|false]]", .{});
-        return cmdSetupOne(feat.?, val); // scriptable: get state, or install(true)/remove(false)
+        return cmdSetupOne(init, name_arg.?, val); // scriptable: get state, or install(true)/remove(false)
     }
 
     if (std.mem.eql(u8, first, "settings")) {
         const key = args.next();
-        if (key == null) return cmdSettings(); // interactive checklist
+        if (key == null) return cmdSettings(init); // interactive checklist
         const val = args.next();
         if (args.next() != null) return usage("usage: gf settings [<key> [true|false]]", .{});
-        return cmdSetting(key.?, val); // scriptable get/set
+        return cmdSetting(init, key.?, val); // scriptable get/set
     }
 
     if (std.mem.eql(u8, first, "remove") or std.mem.eql(u8, first, "uninstall")) {
         const name = args.next() orelse return usage("usage: gf remove <name>", .{});
         if (args.next() != null) return usage("usage: gf remove <name>", .{});
-        return cmdRemove(name);
+        return cmdRemove(init, name);
     }
 
     if (std.mem.eql(u8, first, "list")) {
         if (args.next() != null) return usage("usage: gf list", .{});
-        return cmdSearch("");
+        return cmdSearch(init, "");
     }
 
     if (std.mem.eql(u8, first, "search")) {
         const q = args.next() orelse "";
         if (args.next() != null) return usage("usage: gf search [query]", .{});
-        return cmdSearch(q);
+        return cmdSearch(init, q);
     }
 
     if (std.mem.eql(u8, first, "publish")) {
         const dir = args.next();
         if (args.next() != null) return usage("usage: gf publish [dir]", .{});
-        return cmdPublish(dir);
+        return cmdPublish(init, dir);
     }
 
     // `gf status [feat] [--json]` — the read-side fold over the ledger.
@@ -1545,7 +1562,7 @@ fn run(init: std.process.Init.Minimal) u8 {
             if (std.mem.eql(u8, a, "--json")) json = true else name = a;
         }
         var rb: [4096]u8 = undefined;
-        const root = featRootPath(&rb) orelse return fail("no HOME", .{});
+        const root = featRootPath(init, &rb) orelse return fail("no HOME", .{});
         return cmdStatus(root, name, json);
     }
 
@@ -1560,8 +1577,8 @@ fn run(init: std.process.Init.Minimal) u8 {
         if (std.mem.eql(u8, first, "install")) {
             const name_arg = args.next() orelse return usage("usage: gf install <name>", .{});
             if (args.next() != null) return usage("unexpected extra argument", .{});
-            const ix = indexUrl();
-            const r = resolveIndex(ix.url, name_arg) orelse
+            const ix = indexUrl(init);
+            const r = resolveIndex(init, ix.url, name_arg) orelse
                 return fail("{s} not found in the feat index ({s})", .{ name_arg, ix.url });
             switch (r.kind) {
                 .tarball => {
@@ -1591,7 +1608,7 @@ fn run(init: std.process.Init.Minimal) u8 {
     // extra/ (quarantined).
     const tier_name: []const u8 = if (to_standard) "standard" else "extra";
     var root_buf: [4096]u8 = undefined;
-    const root = featRootPath(&root_buf) orelse return fail("no HOME", .{});
+    const root = featRootPath(init, &root_buf) orelse return fail("no HOME", .{});
     mkdirP(root);
     var tierdir_buf: [4096]u8 = undefined;
     const tier_dir = std.fmt.bufPrint(&tierdir_buf, "{s}/{s}", .{ root, tier_name }) catch return fail("path too long", .{});
@@ -1603,7 +1620,7 @@ fn run(init: std.process.Init.Minimal) u8 {
     const tmp = std.fmt.bufPrint(&tmp_buf, "{s}/.gf-tmp-{d}", .{ root, pid }) catch return fail("path too long", .{});
     mkdirP(tmp);
     var cleanup_tmp = true;
-    defer if (cleanup_tmp) rmRf(tmp);
+    defer if (cleanup_tmp) rmRf(init, tmp);
 
     // Fetch the payload into `tmp` (feat.toml at the top, bin/ or src/ beside
     // it) by one of two paths: clone a git user-repo at its pinned ref, or
@@ -1626,13 +1643,13 @@ fn run(init: std.process.Init.Minimal) u8 {
                 "env", "GIT_ALLOW_PROTOCOL=file:git:http:https:ssh", "GIT_TERMINAL_PROMPT=0",
                 "git", "clone", "--quiet", up, tp, null,
             };
-            if (execStatus(&argv) != 0) return fail("git clone failed: {s}", .{url});
+            if (execStatus(init, &argv) != 0) return fail("git clone failed: {s}", .{url});
         }
         {
             const argv = [_:null]?[*:0]const u8{
                 "env", "git", "-C", tp, "-c", "advice.detachedHead=false", "checkout", "--quiet", rp, null,
             };
-            if (execStatus(&argv) != 0) return fail("git checkout {s} failed (ref not found in {s}?)", .{ ref, url });
+            if (execStatus(init, &argv) != 0) return fail("git checkout {s} failed (ref not found in {s}?)", .{ ref, url });
         }
         // When the index declares a publisher key, the ref MUST be a tag signed
         // by that key. We verify with a wildcard-principal allowed_signers (the
@@ -1654,8 +1671,8 @@ fn run(init: std.process.Init.Minimal) u8 {
             const argv = [_:null]?[*:0]const u8{
                 "env", "git", "-C", tp, "-c", "gpg.format=ssh", "-c", cfgp, "tag", "-v", rp, null,
             };
-            const vrc = execStatus(&argv);
-            rmRf(af);
+            const vrc = execStatus(init, &argv);
+            rmRf(init, af);
             if (vrc != 0)
                 return fail("publisher signature check failed for {s} — refusing (tag not signed by the index's publisher key)", .{ref});
             print("gf: publisher signature verified ({s})\n", .{ref});
@@ -1663,7 +1680,7 @@ fn run(init: std.process.Init.Minimal) u8 {
         // drop .git so it is never staged into the tier
         var gd_buf: [4096]u8 = undefined;
         const gd = std.fmt.bufPrint(&gd_buf, "{s}/.git", .{tmp}) catch return 1;
-        rmRf(gd);
+        rmRf(init, gd);
         // The PIN is enforced above by checking out the immutable ref — not by a
         // byte hash. The ledger sha256 for a git install is the hash of the
         // installed artifact, computed after staging (below).
@@ -1687,7 +1704,7 @@ fn run(init: std.process.Init.Minimal) u8 {
                 up,
                 null,
             };
-            const st = execStatus(&argv);
+            const st = execStatus(init, &argv);
             if (st != 0) return fail("download failed (curl exit {d}): {s}", .{ st, url });
         }
         // curl's --max-filesize misses some servers; verify the landed size too
@@ -1701,11 +1718,11 @@ fn run(init: std.process.Init.Minimal) u8 {
             const ap = toZ(&az, archive) orelse return 1;
             const tp = toZ(&tz, tmp) orelse return 1;
             const argv = [_:null]?[*:0]const u8{ "env", "tar", "-xzf", ap, "-C", tp, null };
-            const st = execStatus(&argv);
+            const st = execStatus(init, &argv);
             if (st != 0) return fail("extract failed (tar exit {d})", .{st});
         }
         // hash the exact bytes; sha-pin to the index; then drop the archive
-        sha = sha256File(archive) orelse "";
+        sha = sha256File(init, archive) orelse "";
         if (expected_sha) |want| {
             if (want.len != sha.len or !std.ascii.eqlIgnoreCase(want, sha))
                 return fail("sha256 mismatch: index expected {s}, downloaded {s} — refusing", .{ want, sha });
@@ -1733,13 +1750,13 @@ fn run(init: std.process.Init.Minimal) u8 {
         const lang = manifestField(manifest, "lang") orelse return fail("source package needs a lang field", .{});
         const want_libc = if (manifestField(manifest, "libc")) |l| std.mem.eql(u8, l, "true") else false;
         if (!validSrcName(src_file)) return fail("invalid src filename {s}", .{src_file});
-        if (validateTree(tmp, "src", src_file)) |why| return fail("{s}", .{why});
-        if (shadowsPath(name)) return fail("name {s} collides with an installed command — a feat never shadows a real binary", .{name});
+        if (validateTree(init, tmp, "src", src_file)) |why| return fail("{s}", .{why});
+        if (shadowsPath(init, name)) return fail("name {s} collides with an installed command — a feat never shadows a real binary", .{name});
         print("gf: building {s} from source ({s})...\n", .{ name, lang });
-        if (buildSource(tmp, lang, src_file, bin_name, want_libc)) |why| return fail("{s}", .{why});
+        if (buildSource(init, tmp, lang, src_file, bin_name, want_libc)) |why| return fail("{s}", .{why});
     } else {
-        if (validateTree(tmp, "bin", bin_name)) |why| return fail("{s}", .{why});
-        if (shadowsPath(name)) return fail("name {s} collides with an installed command — a feat never shadows a real binary", .{name});
+        if (validateTree(init, tmp, "bin", bin_name)) |why| return fail("{s}", .{why});
+        if (shadowsPath(init, name)) return fail("name {s} collides with an installed command — a feat never shadows a real binary", .{name});
     }
 
     // force the quarantine tier in the manifest, mark the binary executable
@@ -1773,7 +1790,7 @@ fn run(init: std.process.Init.Minimal) u8 {
     if (git_ref != null and sha.len == 0) {
         var bz: [4096]u8 = undefined;
         const bp = std.fmt.bufPrint(&bz, "{s}/bin/{s}", .{ dest, bin_name }) catch return 1;
-        sha = sha256File(bp) orelse "";
+        sha = sha256File(init, bp) orelse "";
     }
 
     // attest the install in the append-only ledger (name, content hash,
@@ -1783,7 +1800,7 @@ fn run(init: std.process.Init.Minimal) u8 {
     // review-on-install: the agent judges the source and appends a verdict
     // beside the install event. Decoupled — any failure leaves the install
     // intact and simply unreviewed.
-    reviewInstalled(root, dest, name, sha);
+    reviewInstalled(init, root, dest, name, sha);
 
     if (to_standard) {
         print(

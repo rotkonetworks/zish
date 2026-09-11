@@ -67,8 +67,12 @@ test-pty: build
 # Compiles feats/<name>/main.zig and stages bin + feat.toml into the registry.
 ZISH_FEAT_DIR ?= $(HOME)/.zish/feats/standard
 FEAT_NAMES := cnt pk frq snf jls calc para agent gf aur budget verify ask team web bus
-# Feats needing libc (para uses execvp for PATH+env resolution).
-FEAT_LIBC := para agent gf aur budget verify ask team web
+# Feats needing libc, with the reason. Keep this list and the reason in sync —
+# a new entry is a justification, not a convenience. `para` needs execvp for
+# PATH search plus environ; every other feat was only reaching for
+# `std.c.getenv`/`std.c.environ`, which Zig 0.16 removed from std, and now uses
+# `feat.env` (reads /proc/self/environ) from feats/lib/feat.zig instead.
+FEAT_LIBC := para
 
 .PHONY: feats
 feats:

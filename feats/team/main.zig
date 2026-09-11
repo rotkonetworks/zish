@@ -38,7 +38,15 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const feat = @import("lib/feat.zig");
 const alloc = std.heap.page_allocator;
+
+/// The environment block the kernel handed us, for `execve` to pass on verbatim
+/// (a child inherits it, and every worker is such a child). `start.zig` captures
+/// envp off the initial stack for the libc and freestanding start paths alike,
+/// so this replaces the libc symbol `std.c.environ`. Looking a variable *up* is
+/// `feat.env`'s job; nothing here reads this directly. Set at the top of `main`.
+var child_envp: [*:null]const ?[*:0]const u8 = @ptrCast(&[1]?[*:0]const u8{null});
 
 const MAX_OUT = 16 * 1024 * 1024;
 const MAX_WORKERS = 4;
@@ -158,9 +166,9 @@ fn defaultPrompt(name: []const u8) []const u8 {
 
 /// Load a prompt template: ~/.zish/prompts/<name>.txt if it exists and is
 /// non-empty, else the built-in default. Owned; caller frees.
-fn loadPrompt(name: []const u8) []u8 {
+fn loadPrompt(io: std.Io, name: []const u8) []u8 {
     const def = defaultPrompt(name);
-    const home = getEnv("HOME") orelse return alloc.dupe(u8, def) catch (alloc.dupe(u8, "") catch unreachable);
+    const home = getEnv(io, "HOME") orelse return alloc.dupe(u8, def) catch (alloc.dupe(u8, "") catch unreachable);
     var pb: [4096]u8 = undefined;
     if (std.fmt.bufPrint(&pb, "{s}/.zish/prompts/{s}.txt", .{ home, name })) |path| {
         if (readFileAlloc(path, MAX_OUT)) |c| {
@@ -205,11 +213,11 @@ fn renderTemplate(template: []const u8, pairs: []const [2][]const u8) []u8 {
 const PROMPT_NAMES = [_][]const u8{ "decompose", "worker", "critic", "synth", "repair" };
 
 /// Print the editable prompts as a JSON array of {name, default, current}.
-fn printPrompts() void {
+fn printPrompts(io: std.Io) void {
     out("[");
     for (PROMPT_NAMES, 0..) |name, i| {
         if (i > 0) out(",");
-        const cur = loadPrompt(name);
+        const cur = loadPrompt(io, name);
         defer alloc.free(cur);
         const de = jesc(defaultPrompt(name), 100000);
         defer alloc.free(de);
@@ -249,9 +257,8 @@ fn jesc(s: []const u8, max: usize) []u8 {
 // small helpers (syscall-shaped, matching feats/aur & feats/gf)
 // ---------------------------------------------------------------------------
 
-fn getEnv(name: [:0]const u8) ?[]const u8 {
-    const v = std.c.getenv(name.ptr) orelse return null;
-    return std.mem.span(v);
+fn getEnv(io: std.Io, name: []const u8) ?[]const u8 {
+    return feat.env(alloc, io, name);
 }
 
 fn toZ(buf: []u8, s: []const u8) ?[*:0]const u8 {
@@ -404,7 +411,7 @@ fn exec(args: []const []const u8, opts: ExecOpts) ?ExecResult {
             _ = linux.dup2(in_fds[0], 0);
             _ = linux.close(in_fds[0]);
         }
-        _ = linux.execve("/usr/bin/env", argvz, @ptrCast(std.c.environ));
+        _ = linux.execve("/usr/bin/env", argvz, child_envp);
         linux.exit(127);
     }
     _ = linux.close(fds[1]);
@@ -425,9 +432,9 @@ fn exec(args: []const []const u8, opts: ExecOpts) ?ExecResult {
 // feat resolution (same rules as aur/gf/zish)
 // ---------------------------------------------------------------------------
 
-fn featRootPath(buf: []u8) ?[]const u8 {
-    if (getEnv("ZISH_FEAT_PATH")) |p| return p;
-    const home = getEnv("HOME") orelse return null;
+fn featRootPath(io: std.Io, buf: []u8) ?[]const u8 {
+    if (getEnv(io, "ZISH_FEAT_PATH")) |p| return p;
+    const home = getEnv(io, "HOME") orelse return null;
     return std.fmt.bufPrint(buf, "{s}/.zish/feats", .{home}) catch null;
 }
 
@@ -483,7 +490,7 @@ fn budgetBalance(bin: []const u8, id: []const u8) ?i64 {
 /// Passes --mock through when ZISH_JUDGE_MOCK is set, so a test can stay offline.
 /// Call the agent one-shot. When `meta_path` is non-empty, the agent writes its
 /// token usage + thinking there (via ZISH_ASK_META, injected as an `env` NAME=VAL).
-fn callAgent(bin: []const u8, prompt: []const u8, meta_path: []const u8, cap_n: usize) ?[]u8 {
+fn callAgent(io: std.Io, bin: []const u8, prompt: []const u8, meta_path: []const u8, cap_n: usize) ?[]u8 {
     var masg_buf: [4096]u8 = undefined;
     const masg: []const u8 = if (meta_path.len > 0)
         (std.fmt.bufPrint(&masg_buf, "ZISH_ASK_META={s}", .{meta_path}) catch "")
@@ -503,7 +510,7 @@ fn callAgent(bin: []const u8, prompt: []const u8, meta_path: []const u8, cap_n: 
     }
     args[n] = bin;
     n += 1;
-    if (getEnv("ZISH_JUDGE_MOCK")) |m| {
+    if (getEnv(io, "ZISH_JUDGE_MOCK")) |m| {
         args[n] = "--mock";
         n += 1;
         args[n] = m;
@@ -528,8 +535,8 @@ fn callAgent(bin: []const u8, prompt: []const u8, meta_path: []const u8, cap_n: 
 // serial local model with genuinely-parallel hosted ones in one org (the hybrid).
 const WorkerModel = struct { model: ?[]const u8, backend: ?[]const u8 };
 
-fn loadModels(list: *std.ArrayListUnmanaged(WorkerModel)) void {
-    const spec = getEnv("ZISH_TEAM_MODELS") orelse return; // env memory is stable
+fn loadModels(io: std.Io, list: *std.ArrayListUnmanaged(WorkerModel)) void {
+    const spec = getEnv(io, "ZISH_TEAM_MODELS") orelse return; // a process-lifetime value
     var it = std.mem.splitScalar(u8, spec, ',');
     while (it.next()) |raw| {
         const e = std.mem.trim(u8, raw, " \t");
@@ -555,14 +562,14 @@ const AGENT_DEFAULT_MODEL = "deepseek/deepseek-v4-flash-0731";
 
 /// The model a worker will actually run with: explicit roster model → the
 /// process-wide ZISH_AGENT_MODEL → the agent default. Never "local".
-fn intendedModel(wm: WorkerModel) []const u8 {
+fn intendedModel(io: std.Io, wm: WorkerModel) []const u8 {
     if (wm.model) |m| return m;
-    if (getEnv("ZISH_AGENT_MODEL")) |m| return m;
+    if (getEnv(io, "ZISH_AGENT_MODEL")) |m| return m;
     return AGENT_DEFAULT_MODEL;
 }
 
-fn envUint(name: [:0]const u8) ?usize {
-    const v = getEnv(name) orelse return null;
+fn envUint(io: std.Io, name: []const u8) ?usize {
+    const v = getEnv(io, name) orelse return null;
     if (v.len == 0 or v.len >= 8) return null;
     for (v) |c| if (c < '0' or c > '9') return null;
     return std.fmt.parseInt(usize, v, 10) catch null;
@@ -572,15 +579,15 @@ fn envUint(name: [:0]const u8) ?usize {
 /// many fan-out calls (workers, decompose, critic, consults), where runaway cost
 /// lives. Budget credits bound the number of calls; this bounds each call's size.
 /// Override ZISH_TEAM_MAX_TOKENS; default 2048.
-fn capBase() usize {
-    return envUint("ZISH_TEAM_MAX_TOKENS") orelse 2048;
+fn capBase(io: std.Io) usize {
+    return envUint(io, "ZISH_TEAM_MAX_TOKENS") orelse 2048;
 }
 
 /// Workers run the tool-using `agent solo` loop (real shell/web/checker access)
 /// instead of tool-less `--ask` when ZISH_TEAM_TOOLS=1. This is what a long-form,
 /// evidence-gathering run (e.g. formal-verification research) needs.
-fn teamToolsMode() bool {
-    const v = getEnv("ZISH_TEAM_TOOLS") orelse return false;
+fn teamToolsMode(io: std.Io) bool {
+    const v = getEnv(io, "ZISH_TEAM_TOOLS") orelse return false;
     return std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
 }
 
@@ -588,13 +595,13 @@ fn teamToolsMode() bool {
 /// answer call to the same tight budget as fan-out truncates the product
 /// mid-output; it's a single call per run, so give it real room to finish.
 /// Override ZISH_TEAM_SYNTH_MAX_TOKENS; default 4× the base cap.
-fn capSynth() usize {
-    return envUint("ZISH_TEAM_SYNTH_MAX_TOKENS") orelse (capBase() * 4);
+fn capSynth(io: std.Io) usize {
+    return envUint(io, "ZISH_TEAM_SYNTH_MAX_TOKENS") orelse (capBase(io) * 4);
 }
 
 /// fork+exec `env [ZISH_AGENT_BACKEND=..] agent [-m model] [--mock M] --ask
 /// <prompt>` with stdout → `out_path`; returns the child pid without waiting.
-fn spawnAgentToFile(bin: []const u8, prompt: []const u8, out_path: []const u8, wm: WorkerModel) ?i32 {
+fn spawnAgentToFile(io: std.Io, bin: []const u8, prompt: []const u8, out_path: []const u8, wm: WorkerModel) ?i32 {
     var argv: [16]?[*:0]const u8 = undefined;
     var held: [16][]u8 = undefined;
     var nh: usize = 0;
@@ -623,14 +630,14 @@ fn spawnAgentToFile(bin: []const u8, prompt: []const u8, out_path: []const u8, w
     }
     { // completion cap — the hard per-call cost bound (agent's max_tokens)
         var cb: [64]u8 = undefined;
-        const casg = std.fmt.bufPrint(&cb, "ZISH_AGENT_MAX_TOKENS={d}", .{capBase()}) catch return null;
+        const casg = std.fmt.bufPrint(&cb, "ZISH_AGENT_MAX_TOKENS={d}", .{capBase(io)}) catch return null;
         if (!push(casg, &held, &nh, &argv, &n)) return null;
     }
     if (!push(bin, &held, &nh, &argv, &n)) return null;
     // ZISH_TEAM_TOOLS=1 → workers run the tool-using `solo` loop (read files, web,
     // run checkers) instead of tool-less `--ask`. Costs more (multiple calls per
     // worker) but does real work. The verb goes right after the bin.
-    const tools = teamToolsMode();
+    const tools = teamToolsMode(io);
     if (tools) {
         if (!push("solo", &held, &nh, &argv, &n)) return null;
     }
@@ -638,7 +645,7 @@ fn spawnAgentToFile(bin: []const u8, prompt: []const u8, out_path: []const u8, w
         if (!push("-m", &held, &nh, &argv, &n)) return null;
         if (!push(m, &held, &nh, &argv, &n)) return null;
     }
-    if (getEnv("ZISH_JUDGE_MOCK")) |mock| {
+    if (getEnv(io, "ZISH_JUDGE_MOCK")) |mock| {
         if (!push("--mock", &held, &nh, &argv, &n)) return null;
         if (!push(mock, &held, &nh, &argv, &n)) return null;
     }
@@ -660,7 +667,7 @@ fn spawnAgentToFile(bin: []const u8, prompt: []const u8, out_path: []const u8, w
             _ = linux.dup2(@intCast(fd), 1);
             _ = linux.close(@intCast(fd));
         }
-        _ = linux.execve("/usr/bin/env", argvz, @ptrCast(std.c.environ));
+        _ = linux.execve("/usr/bin/env", argvz, child_envp);
         linux.exit(127);
     }
     return @intCast(cpid);
@@ -688,18 +695,18 @@ fn reap(cpid: i32) void {
 // ---------------------------------------------------------------------------
 const Lens = struct { role: []const u8, name: []const u8, style: []const u8 };
 
-fn lensPath(buf: []u8) ?[]const u8 {
-    if (getEnv("ZISH_LENS_FILE")) |p| return p;
-    if (getEnv("ZISH_RUBRIC_DIR")) |d| return std.fmt.bufPrint(buf, "{s}/lenses.toml", .{d}) catch null;
-    const home = getEnv("HOME") orelse return null;
+fn lensPath(io: std.Io, buf: []u8) ?[]const u8 {
+    if (getEnv(io, "ZISH_LENS_FILE")) |p| return p;
+    if (getEnv(io, "ZISH_RUBRIC_DIR")) |d| return std.fmt.bufPrint(buf, "{s}/lenses.toml", .{d}) catch null;
+    const home = getEnv(io, "HOME") orelse return null;
     return std.fmt.bufPrint(buf, "{s}/.zish/rubrics/lenses.toml", .{home}) catch null;
 }
 
 /// Parse `[[lens]]` blocks (role/name/style keys). Returns the owning content
 /// buffer (Lens slices point into it — keep it alive), or null if no file.
-fn loadLenses(list: *std.ArrayListUnmanaged(Lens)) ?[]u8 {
+fn loadLenses(io: std.Io, list: *std.ArrayListUnmanaged(Lens)) ?[]u8 {
     var pb: [4096]u8 = undefined;
-    const path = lensPath(&pb) orelse return null;
+    const path = lensPath(io, &pb) orelse return null;
     const content = readFileAlloc(path, MAX_OUT) orelse return null;
     var role: []const u8 = "";
     var name: []const u8 = "";
@@ -764,16 +771,16 @@ fn lensIntro(lens: ?Lens) []u8 {
 // ---------------------------------------------------------------------------
 const Expert = struct { name: []const u8, style: []const u8 };
 
-fn expertsPath(buf: []u8) ?[]const u8 {
-    if (getEnv("ZISH_EXPERTS_FILE")) |p| return p;
-    if (getEnv("ZISH_RUBRIC_DIR")) |d| return std.fmt.bufPrint(buf, "{s}/experts.toml", .{d}) catch null;
-    const home = getEnv("HOME") orelse return null;
+fn expertsPath(io: std.Io, buf: []u8) ?[]const u8 {
+    if (getEnv(io, "ZISH_EXPERTS_FILE")) |p| return p;
+    if (getEnv(io, "ZISH_RUBRIC_DIR")) |d| return std.fmt.bufPrint(buf, "{s}/experts.toml", .{d}) catch null;
+    const home = getEnv(io, "HOME") orelse return null;
     return std.fmt.bufPrint(buf, "{s}/.zish/rubrics/experts.toml", .{home}) catch null;
 }
 
-fn loadExperts(list: *std.ArrayListUnmanaged(Expert)) ?[]u8 {
+fn loadExperts(io: std.Io, list: *std.ArrayListUnmanaged(Expert)) ?[]u8 {
     var pb: [4096]u8 = undefined;
-    const path = expertsPath(&pb) orelse return null;
+    const path = expertsPath(io, &pb) orelse return null;
     const content = readFileAlloc(path, MAX_OUT) orelse return null;
     var name: []const u8 = "";
     var style: []const u8 = "";
@@ -809,7 +816,7 @@ fn expertFor(experts: []const Expert, name: []const u8) ?Expert {
 /// Service the first `BTW-ASK <expert>: <question>` in a worker's output: route
 /// it to the named expert, charge the org (root, budget-gated), append the answer
 /// to the blackboard. One consult per worker keeps the cost bounded.
-fn serviceBtwAsk(agent_bin: []const u8, budget_bin: []const u8, root_id: []const u8, bb_path: []const u8, experts: []const Expert, wout: []const u8, worker_idx: usize) void {
+fn serviceBtwAsk(io: std.Io, agent_bin: []const u8, budget_bin: []const u8, root_id: []const u8, bb_path: []const u8, experts: []const Expert, wout: []const u8, worker_idx: usize) void {
     if (experts.len == 0) return;
     var lines = std.mem.splitScalar(u8, wout, '\n');
     while (lines.next()) |ln| {
@@ -840,7 +847,7 @@ fn serviceBtwAsk(agent_bin: []const u8, budget_bin: []const u8, root_id: []const
         defer alloc.free(eprompt);
         var emeta_buf: [4096]u8 = undefined;
         const emp = std.fmt.bufPrint(&emeta_buf, "{s}.consult.meta", .{bb_path}) catch "";
-        const eout = callAgent(agent_bin, eprompt, emp, capBase()) orelse {
+        const eout = callAgent(io, agent_bin, eprompt, emp, capBase(io)) orelse {
             const e = std.fmt.allocPrint(alloc, "(expert {s} unavailable)\n", .{exp.name}) catch return;
             defer alloc.free(e);
             appendFile(bb_path, e);
@@ -974,7 +981,7 @@ fn printVerifyFail(bb_path: []const u8, lname: []const u8, err: []const u8) void
 /// verify feat to compile-check it; on failure make one budget-gated repair
 /// against the real compiler error, then re-verify. Always prints the compile
 /// status — this is what stops the org from committing untested code.
-fn verifyAndGate(agent_bin: []const u8, budget_bin: []const u8, verify_bin: []const u8, root_id: []const u8, bb_path: []const u8, cap_intro: []const u8, final_text: []const u8) void {
+fn verifyAndGate(io: std.Io, agent_bin: []const u8, budget_bin: []const u8, verify_bin: []const u8, root_id: []const u8, bb_path: []const u8, cap_intro: []const u8, final_text: []const u8) void {
     const tagged = extractTagged(final_text);
     defer freeTagged(tagged);
     for (tagged) |tc| {
@@ -1008,14 +1015,14 @@ fn verifyAndGate(agent_bin: []const u8, budget_bin: []const u8, verify_bin: []co
                     continue;
                 }
                 var rbud_buf: [160]u8 = undefined;
-                const rbud = std.fmt.bufPrint(&rbud_buf, " Keep within ~{d} output tokens (reasoning included, hard-cut) — return the code, minimal reasoning.", .{capSynth()}) catch "";
-                const rtmpl = loadPrompt("repair");
+                const rbud = std.fmt.bufPrint(&rbud_buf, " Keep within ~{d} output tokens (reasoning included, hard-cut) — return the code, minimal reasoning.", .{capSynth(io)}) catch "";
+                const rtmpl = loadPrompt(io, "repair");
         defer alloc.free(rtmpl);
         const rprompt = renderTemplate(rtmpl, &.{ .{ "lens", cap_intro }, .{ "lang", tc.tag }, .{ "budget", rbud }, .{ "error", vr.err }, .{ "code", tc.code } });
                 defer alloc.free(rprompt);
                 var rmeta_buf: [4096]u8 = undefined;
                 const rmp = std.fmt.bufPrint(&rmeta_buf, "{s}.repair.meta", .{bb_path}) catch "";
-                const fixed = callAgent(agent_bin, rprompt, rmp, capSynth()) orelse {
+                const fixed = callAgent(io, agent_bin, rprompt, rmp, capSynth(io)) orelse {
                     printVerifyFail(bb_path, tc.tag, vr.err);
                     continue;
                 };
@@ -1052,7 +1059,7 @@ fn verifyAndGate(agent_bin: []const u8, budget_bin: []const u8, verify_bin: []co
 // orchestration
 // ---------------------------------------------------------------------------
 
-fn teamRun(root_budget: i64, task: []const u8, context: []const u8) u8 {
+fn teamRun(io: std.Io, root_budget: i64, task: []const u8, context: []const u8) u8 {
     // A dispatched run can carry the topic's prior conversation for continuity.
     // It is prepended to the decompose + synth prompts (workers get only their
     // subtask). Rendered into the {context} slot; empty = no preamble.
@@ -1062,7 +1069,7 @@ fn teamRun(root_budget: i64, task: []const u8, context: []const u8) u8 {
         "";
     defer if (ctx_block.len > 0) alloc.free(ctx_block);
     var rb: [4096]u8 = undefined;
-    const root = featRootPath(&rb) orelse {
+    const root = featRootPath(io, &rb) orelse {
         warn("team: no feat root (HOME unset)\n");
         return 2;
     };
@@ -1100,7 +1107,7 @@ fn teamRun(root_budget: i64, task: []const u8, context: []const u8) u8 {
         return 2;
     }
 
-    const home = getEnv("HOME") orelse "";
+    const home = getEnv(io, "HOME") orelse "";
     // ~/.zish/traces holds the whole run: the event stream (.jsonl) AND the full
     // transcript (.md). Both PERSIST — the point is to read what every agent
     // generated, live and after. (No unlink.)
@@ -1135,7 +1142,7 @@ fn teamRun(root_budget: i64, task: []const u8, context: []const u8) u8 {
     // a biography. No lens file ⇒ cap_intro/etc are "" and prompts are unchanged.
     var lenses: std.ArrayListUnmanaged(Lens) = .empty;
     defer lenses.deinit(alloc);
-    const lens_content = loadLenses(&lenses);
+    const lens_content = loadLenses(io, &lenses);
     defer if (lens_content) |c| alloc.free(c);
     const cap_intro = lensIntro(lensFor(lenses.items, "captain", 0));
     defer alloc.free(cap_intro);
@@ -1143,7 +1150,7 @@ fn teamRun(root_budget: i64, task: []const u8, context: []const u8) u8 {
     // org experts a worker may consult via `BTW-ASK <name>: ...` (fail-open)
     var experts: std.ArrayListUnmanaged(Expert) = .empty;
     defer experts.deinit(alloc);
-    const experts_content = loadExperts(&experts);
+    const experts_content = loadExperts(io, &experts);
     defer if (experts_content) |c| alloc.free(c);
     var enames: std.ArrayListUnmanaged(u8) = .empty;
     defer enames.deinit(alloc);
@@ -1169,19 +1176,19 @@ fn teamRun(root_budget: i64, task: []const u8, context: []const u8) u8 {
     // the number (and that reasoning counts toward it) lets the model allocate.
     const bmsg = " OUTPUT BUDGET: keep your COMPLETE response within ~{d} tokens (~{d} words). Any reasoning/thinking counts toward this limit and it is HARD-CUT at the end — so reason briefly and make sure your final answer is fully written before you reach it.";
     var budgetline_buf: [320]u8 = undefined;
-    const cap_n = capBase(); // workers / decompose / critic
+    const cap_n = capBase(io); // workers / decompose / critic
     const budgetline = std.fmt.bufPrint(&budgetline_buf, bmsg, .{ cap_n, cap_n * 3 / 4 }) catch "";
     var sbudget_buf: [320]u8 = undefined; // synthesis gets its own, larger budget
-    const scap_n = capSynth();
+    const scap_n = capSynth(io);
     const sbudgetline = std.fmt.bufPrint(&sbudget_buf, bmsg, .{ scap_n, scap_n * 3 / 4 }) catch "";
 
-    const dtmpl = loadPrompt("decompose");
+    const dtmpl = loadPrompt(io, "decompose");
     defer alloc.free(dtmpl);
     const dprompt = renderTemplate(dtmpl, &.{ .{ "lens", cap_intro }, .{ "caps", capline }, .{ "budget", budgetline }, .{ "context", ctx_block }, .{ "task", task } });
     defer alloc.free(dprompt);
     var dmeta_buf: [4096]u8 = undefined;
     const dmp = std.fmt.bufPrint(&dmeta_buf, "{s}.dec.meta", .{bb_path}) catch "";
-    const decomp = callAgent(agent_bin, dprompt, dmp, capBase()) orelse {
+    const decomp = callAgent(io, agent_bin, dprompt, dmp, capBase(io)) orelse {
         warn("team: captain (decompose) call failed\n");
         return 1;
     };
@@ -1205,7 +1212,7 @@ fn teamRun(root_budget: i64, task: []const u8, context: []const u8) u8 {
     // 1b. human checkpoint (opt-in): show the plan and let the human abort before
     //     spending the fan-out budget. Fail-open — no ask feat, no answer, or a
     //     timeout all proceed; only an explicit "Abort" stops the run.
-    if (getEnv("ZISH_TEAM_CONFIRM") != null and ask_bin.len > 0 and subs.items.len > 0) {
+    if (getEnv(io, "ZISH_TEAM_CONFIRM") != null and ask_bin.len > 0 and subs.items.len > 0) {
         var qb: std.ArrayListUnmanaged(u8) = .empty;
         defer qb.deinit(alloc);
         qb.appendSlice(alloc, "Captain's plan — ") catch {};
@@ -1240,7 +1247,7 @@ fn teamRun(root_budget: i64, task: []const u8, context: []const u8) u8 {
     //    up-front, RESERVE is kept for the critic + synthesis.
     var models: std.ArrayListUnmanaged(WorkerModel) = .empty;
     defer models.deinit(alloc);
-    loadModels(&models); // ZISH_TEAM_MODELS → per-worker (hybrid local+hosted)
+    loadModels(io, &models); // ZISH_TEAM_MODELS → per-worker (hybrid local+hosted)
 
     const Spawn = struct { cpid: i32, out_path: []u8, sub: []const u8, idx: usize, t0: i64, tf: i64 };
     var spawns: std.ArrayListUnmanaged(Spawn) = .empty;
@@ -1276,19 +1283,19 @@ fn teamRun(root_budget: i64, task: []const u8, context: []const u8) u8 {
         else
             (alloc.dupe(u8, "") catch unreachable);
         defer alloc.free(btw);
-        const wtmpl = loadPrompt("worker");
+        const wtmpl = loadPrompt(io, "worker");
         defer alloc.free(wtmpl);
         const wprompt = renderTemplate(wtmpl, &.{ .{ "lens", w_intro }, .{ "consult", btw }, .{ "caps", capline }, .{ "budget", budgetline }, .{ "context", ctx_block }, .{ "sub", sub } });
         defer alloc.free(wprompt);
         const out_path = std.fmt.allocPrint(alloc, "{s}/.zish/.team-{d}-w{d}.out", .{ home, pid, i }) catch continue;
         {
-            const mc = jclean(intendedModel(modelFor(models.items, i)));
+            const mc = jclean(intendedModel(io, modelFor(models.items, i)));
             defer alloc.free(mc);
             const sc = jclean(sub);
             defer alloc.free(sc);
             emit("{{\"t\":{d},\"ev\":\"worker_start\",\"i\":{d},\"model\":\"{s}\",\"sub\":\"{s}\"}}", .{ nowMs(), i, mc, sc });
         }
-        const cpid = spawnAgentToFile(agent_bin, wprompt, out_path, modelFor(models.items, i)) orelse {
+        const cpid = spawnAgentToFile(io, agent_bin, wprompt, out_path, modelFor(models.items, i)) orelse {
             alloc.free(out_path);
             appendFile(bb_path, "(worker spawn failed)\n");
             continue;
@@ -1343,12 +1350,12 @@ fn teamRun(root_budget: i64, task: []const u8, context: []const u8) u8 {
         const wdur = if (s.tf > s.t0) s.tf - s.t0 else nowMs() - s.t0;
         // the model the agent actually ran (from its meta) — authoritative; falls
         // back to the intended model if the sidecar didn't report one.
-        const amodel = if (meta.model.len > 0) meta.model else intendedModel(modelFor(models.items, s.idx));
+        const amodel = if (meta.model.len > 0) meta.model else intendedModel(io, modelFor(models.items, s.idx));
         const mesc = jclean(amodel);
         defer alloc.free(mesc);
         emit("{{\"t\":{d},\"ev\":\"worker_done\",\"i\":{d},\"t0\":{d},\"dur\":{d},\"chars\":{d},\"pt\":{d},\"ct\":{d},\"model\":\"{s}\",\"think\":\"{s}\",\"out\":\"{s}\"}}", .{ nowMs(), s.idx, s.t0, wdur, trimmed.len, meta.pt, meta.ct, mesc, tesc, oesc });
         // a worker may consult an org expert (lateral info edge, org-funded)
-        serviceBtwAsk(agent_bin, budget_bin, root_id, bb_path, experts.items, wout, s.idx);
+        serviceBtwAsk(io, agent_bin, budget_bin, root_id, bb_path, experts.items, wout, s.idx);
         spawned += 1;
     }
 
@@ -1362,13 +1369,13 @@ fn teamRun(root_budget: i64, task: []const u8, context: []const u8) u8 {
     defer alloc.free(bb1);
     const crit_intro = lensIntro(lensFor(lenses.items, "critic", 0));
     defer alloc.free(crit_intro);
-    const ctmpl = loadPrompt("critic");
+    const ctmpl = loadPrompt(io, "critic");
     defer alloc.free(ctmpl);
     const cprompt = renderTemplate(ctmpl, &.{ .{ "lens", crit_intro }, .{ "budget", budgetline }, .{ "blackboard", bb1 } });
     defer alloc.free(cprompt);
     var cmeta_buf: [4096]u8 = undefined;
     const cmp = std.fmt.bufPrint(&cmeta_buf, "{s}.crit.meta", .{bb_path}) catch "";
-    const crit = callAgent(agent_bin, cprompt, cmp, capBase()) orelse alloc.dupe(u8, "(critic unavailable)") catch return 1;
+    const crit = callAgent(io, agent_bin, cprompt, cmp, capBase(io)) orelse alloc.dupe(u8, "(critic unavailable)") catch return 1;
     defer alloc.free(crit);
     const centry = std.fmt.allocPrint(alloc, "## critic\n{s}\n", .{std.mem.trim(u8, crit, " \t\r\n")}) catch return 1;
     defer alloc.free(centry);
@@ -1398,13 +1405,13 @@ fn teamRun(root_budget: i64, task: []const u8, context: []const u8) u8 {
         (std.fmt.bufPrint(&human_block_buf, " The human(s) sent guidance DURING the run — honor it over the workers where they conflict:\n{s}", .{says}) catch "")
     else
         "";
-    const stmpl = loadPrompt("synth");
+    const stmpl = loadPrompt(io, "synth");
     defer alloc.free(stmpl);
     const sprompt = renderTemplate(stmpl, &.{ .{ "lens", cap_intro }, .{ "caps", capline }, .{ "budget", sbudgetline }, .{ "human", human_block }, .{ "context", ctx_block }, .{ "blackboard", bb2 } });
     defer alloc.free(sprompt);
     var smeta_buf: [4096]u8 = undefined;
     const smp = std.fmt.bufPrint(&smeta_buf, "{s}.synth.meta", .{bb_path}) catch "";
-    const final = callAgent(agent_bin, sprompt, smp, capSynth()) orelse {
+    const final = callAgent(io, agent_bin, sprompt, smp, capSynth(io)) orelse {
         warn("team: synthesis call failed\n");
         return 1;
     };
@@ -1420,7 +1427,7 @@ fn teamRun(root_budget: i64, task: []const u8, context: []const u8) u8 {
         defer alloc.free(fesc);
         const stesc = jesc(sthink, 6000);
         defer alloc.free(stesc);
-        const smodel = if (stok.model.len > 0) stok.model else intendedModel(modelFor(models.items, 0));
+        const smodel = if (stok.model.len > 0) stok.model else intendedModel(io, modelFor(models.items, 0));
         const smesc = jclean(smodel);
         defer alloc.free(smesc);
         emit("{{\"t\":{d},\"ev\":\"synth_done\",\"pt\":{d},\"ct\":{d},\"model\":\"{s}\",\"think\":\"{s}\",\"text\":\"{s}\"}}", .{ nowMs(), stok.pt, stok.ct, smesc, stesc, fesc });
@@ -1430,7 +1437,7 @@ fn teamRun(root_budget: i64, task: []const u8, context: []const u8) u8 {
     //    the answer for real; repair once against the true error. Never ship
     //    untested code silently. No-op on a prose (no-code) answer.
     if (verify_bin.len > 0)
-        verifyAndGate(agent_bin, budget_bin, verify_bin, root_id, bb_path, cap_intro, final);
+        verifyAndGate(io, agent_bin, budget_bin, verify_bin, root_id, bb_path, cap_intro, final);
 
     // stderr summary: make the conservation visible — how the root grant was
     // spent across the org (captain + workers + critic + synth).
@@ -1445,11 +1452,16 @@ fn teamRun(root_budget: i64, task: []const u8, context: []const u8) u8 {
 // main
 // ---------------------------------------------------------------------------
 
-pub fn main(init: std.process.Init.Minimal) u8 {
-    return run(init.args);
+pub fn main(init: std.process.Init) u8 {
+    // `std.process.Init` is the only io this feat has: everything that reads an
+    // environment variable takes it as an argument. The environment block itself
+    // is captured once — it is a kernel-provided constant, not a service with a
+    // lifetime — because execve needs it verbatim to give each child its env.
+    child_envp = @ptrCast(init.minimal.environ.block.slice.ptr);
+    return run(init.io, init.minimal.args);
 }
 
-fn run(args: std.process.Args) u8 {
+fn run(io: std.Io, args: std.process.Args) u8 {
     var it = args.iterate();
     _ = it.next(); // argv[0]
     const verb = it.next() orelse {
@@ -1463,7 +1475,7 @@ fn run(args: std.process.Args) u8 {
     if (std.mem.eql(u8, verb, "prompts")) {
         // print the editable prompts as JSON {name, default, current} — the
         // single source of truth the dashboard reads (no duplicated defaults).
-        printPrompts();
+        printPrompts(io);
         return 0;
     }
     if (!std.mem.eql(u8, verb, "run")) {
@@ -1485,7 +1497,7 @@ fn run(args: std.process.Args) u8 {
 
     // remaining args = the task (joined with spaces); `-c <file>` supplies a
     // conversation-context file (thread continuity), also via $ZISH_TEAM_CONTEXT.
-    var ctx_path: ?[]const u8 = getEnv("ZISH_TEAM_CONTEXT");
+    var ctx_path: ?[]const u8 = getEnv(io, "ZISH_TEAM_CONTEXT");
     var task: std.ArrayListUnmanaged(u8) = .empty;
     defer task.deinit(alloc);
     var first = true;
@@ -1506,7 +1518,7 @@ fn run(args: std.process.Args) u8 {
         return 2;
     }
     const context: []const u8 = if (ctx_path) |p| (readFileAlloc(p, MAX_OUT) orelse "") else "";
-    return teamRun(root_budget, task.items, context);
+    return teamRun(io, root_budget, task.items, context);
 }
 
 fn printHelp() void {

@@ -37,6 +37,11 @@
 const std = @import("std");
 const linux = std.os.linux;
 const alloc = std.heap.page_allocator;
+// Shared feat primitives. Zig confines imports to the root file's own
+// directory, so this feat dir carries a `lib/feat.zig` symlink to
+// ../lib/feat.zig — which keeps the Makefile's `zig build-exe
+// feats/<name>/main.zig` recipe (and the musl dist build) exact.
+const feat = @import("lib/feat.zig");
 
 const MAX_OUT = 16 * 1024 * 1024;
 const RUBRIC = "pkgbuild-review-v1";
@@ -45,10 +50,10 @@ const RUBRIC = "pkgbuild-review-v1";
 // small helpers (feats are standalone; kept syscall-shaped like aurev/gf)
 // ---------------------------------------------------------------------------
 
-fn getEnv(name: [:0]const u8) ?[]const u8 {
-    const v = std.c.getenv(name.ptr) orelse return null;
-    return std.mem.span(v);
-}
+// Environment lookups go through `feat.env`, the shared zero-libc reader (Zig
+// 0.16 dropped `std.posix.getenv`). It wants an io and returns allocated
+// bytes; the process arena `std.process.Init` hands us owns them, so callers
+// never free — the same borrow `std.c.getenv` used to give.
 
 fn toZ(buf: []u8, s: []const u8) ?[*:0]const u8 {
     if (s.len >= buf.len) return null;
@@ -74,9 +79,12 @@ fn warn(bytes: []const u8) void {
     writeFd(2, bytes);
 }
 
+/// Raw tcgetattr syscall, not libc: 0 means "a terminal", anything else (incl.
+/// EBADF) is not — the same answer `std.c.tcgetattr(fd, &t) == 0` gave, and the
+/// disposition aur's "piped? act as a pager" decision depends on.
 fn isTty(fd: i32) bool {
-    var t: std.c.termios = undefined;
-    return std.c.tcgetattr(fd, &t) == 0;
+    var t: linux.termios = undefined;
+    return @as(isize, @bitCast(linux.tcgetattr(fd, &t))) == 0;
 }
 
 fn slurp(fd: i32, cap: usize) []u8 {
@@ -139,7 +147,7 @@ const ExecResult = struct { out: []u8, code: u8 };
 /// there. args[0] is the program name; the rest are its arguments. Returns null
 /// only on a spawn/plumbing failure (never on a non-zero child exit — callers
 /// decide what a code means).
-fn exec(cwd: ?[]const u8, args: []const []const u8) ?ExecResult {
+fn exec(init: std.process.Init, cwd: ?[]const u8, args: []const []const u8) ?ExecResult {
     var argv: [40]?[*:0]const u8 = undefined;
     var held: [40][]u8 = undefined;
     var nh: usize = 0;
@@ -178,7 +186,8 @@ fn exec(cwd: ?[]const u8, args: []const []const u8) ?ExecResult {
         _ = linux.close(fds[0]);
         _ = linux.dup2(fds[1], 1);
         _ = linux.close(fds[1]);
-        _ = linux.execve("/usr/bin/env", argvz, @ptrCast(std.c.environ));
+        // the inherited environment block, handed to us by the startup (envp)
+        _ = linux.execve("/usr/bin/env", argvz, init.minimal.environ.block.slice.ptr);
         linux.exit(127);
     }
     _ = linux.close(fds[1]);
@@ -190,8 +199,8 @@ fn exec(cwd: ?[]const u8, args: []const []const u8) ?ExecResult {
     return .{ .out = data, .code = code };
 }
 
-fn sha256File(path: []const u8) ?[]const u8 {
-    const r = exec(null, &.{ "sha256sum", "--", path }) orelse return null;
+fn sha256File(init: std.process.Init, path: []const u8) ?[]const u8 {
+    const r = exec(init, null, &.{ "sha256sum", "--", path }) orelse return null;
     if (r.code != 0 or r.out.len < 64) return null;
     for (r.out[0..64]) |c| if (!std.ascii.isHex(c)) return null;
     return r.out[0..64];
@@ -220,9 +229,9 @@ fn objStr(v: std.json.Value, key: []const u8) ?[]const u8 {
 // path resolution — same rules as aurev/gf/zish
 // ---------------------------------------------------------------------------
 
-fn featRootPath(buf: []u8) ?[]const u8 {
-    if (getEnv("ZISH_FEAT_PATH")) |p| return p;
-    const home = getEnv("HOME") orelse return null;
+fn featRootPath(init: std.process.Init, buf: []u8) ?[]const u8 {
+    if (feat.env(init.arena.allocator(), init.io, "ZISH_FEAT_PATH")) |p| return p;
+    const home = feat.env(init.arena.allocator(), init.io, "HOME") orelse return null;
     return std.fmt.bufPrint(buf, "{s}/.zish/feats", .{home}) catch null;
 }
 
@@ -234,12 +243,12 @@ fn resolveAgentBin(root: []const u8, buf: []u8) ?[]const u8 {
     return null;
 }
 
-fn resolveRubric(buf: []u8) ?[]const u8 {
-    if (getEnv("ZISH_RUBRIC_DIR")) |d| {
+fn resolveRubric(init: std.process.Init, buf: []u8) ?[]const u8 {
+    if (feat.env(init.arena.allocator(), init.io, "ZISH_RUBRIC_DIR")) |d| {
         const p = std.fmt.bufPrint(buf, "{s}/{s}.toml", .{ d, RUBRIC }) catch return null;
         return if (exists(p)) p else null;
     }
-    const home = getEnv("HOME") orelse return null;
+    const home = feat.env(init.arena.allocator(), init.io, "HOME") orelse return null;
     const p = std.fmt.bufPrint(buf, "{s}/.zish/rubrics/{s}.toml", .{ home, RUBRIC }) catch return null;
     return if (exists(p)) p else null;
 }
@@ -248,8 +257,8 @@ fn resolveRubric(buf: []u8) ?[]const u8 {
 /// A diff reviewed via `aur review` and a full PKGBUILD reviewed via `aur check`
 /// are different bytes → different hashes, so they never collide; they just
 /// live in the same ledger. (The file keeps its historical `aurev.jsonl` name.)
-fn ledgerPath(buf: []u8) ?[]const u8 {
-    const home = getEnv("HOME") orelse return null;
+fn ledgerPath(init: std.process.Init, buf: []u8) ?[]const u8 {
+    const home = feat.env(init.arena.allocator(), init.io, "HOME") orelse return null;
     return std.fmt.bufPrint(buf, "{s}/.zish/aurev.jsonl", .{home}) catch null;
 }
 
@@ -272,8 +281,8 @@ fn ledgerPath(buf: []u8) ?[]const u8 {
 // ---------------------------------------------------------------------------
 const SIGN_NS = "zish-review";
 
-fn sigTempPath(buf: []u8, tag: []const u8) ?[]const u8 {
-    const home = getEnv("HOME") orelse return null;
+fn sigTempPath(init: std.process.Init, buf: []u8, tag: []const u8) ?[]const u8 {
+    const home = feat.env(init.arena.allocator(), init.io, "HOME") orelse return null;
     return std.fmt.bufPrint(buf, "{s}/.zish/.sig-{s}-{d}", .{ home, tag, linux.getpid() }) catch null;
 }
 
@@ -294,7 +303,7 @@ fn writeSignMsg(path: []const u8, rubric: []const u8, sha: []const u8, result: [
 
 /// Run env+args with `stdin_path` as fd0 and stdout/stderr sent to /dev/null
 /// (ssh-keygen's own chatter must not pollute aur's output). Returns exit code.
-fn execStdinFile(stdin_path: []const u8, args: []const []const u8) u8 {
+fn execStdinFile(init: std.process.Init, stdin_path: []const u8, args: []const []const u8) u8 {
     var argv: [40]?[*:0]const u8 = undefined;
     var held: [40][]u8 = undefined;
     var nh: usize = 0;
@@ -331,7 +340,8 @@ fn execStdinFile(stdin_path: []const u8, args: []const []const u8) u8 {
             _ = linux.dup2(@intCast(dn), 2);
             _ = linux.close(@intCast(dn));
         }
-        _ = linux.execve("/usr/bin/env", argvz, @ptrCast(std.c.environ));
+        // the inherited environment block, handed to us by the startup (envp)
+        _ = linux.execve("/usr/bin/env", argvz, init.minimal.environ.block.slice.ptr);
         linux.exit(127);
     }
     var status: u32 = 0;
@@ -342,15 +352,15 @@ fn execStdinFile(stdin_path: []const u8, args: []const []const u8) u8 {
 /// Sign a verdict with the configured ssh key. Returns base64(ssh-signature),
 /// or null when no key is set / signing fails (fail-open — caller records the
 /// review unsigned).
-fn signReview(rubric: []const u8, sha: []const u8, result: []const u8) ?[]u8 {
-    const key = getEnv("ZISH_SIGN_KEY") orelse return null;
+fn signReview(init: std.process.Init, rubric: []const u8, sha: []const u8, result: []const u8) ?[]u8 {
+    const key = feat.env(init.arena.allocator(), init.io, "ZISH_SIGN_KEY") orelse return null;
     var mb: [4096]u8 = undefined;
-    const msg = sigTempPath(&mb, "sign") orelse return null;
+    const msg = sigTempPath(init, &mb, "sign") orelse return null;
     if (!writeSignMsg(msg, rubric, sha, result)) return null;
     defer unlinkPath(msg);
     // ssh-keygen -Y sign -n <ns> -f <key> <msg>  →  writes <msg>.sig (its
     // "Signing file …" chatter is sent to /dev/null via execStdinFile).
-    if (execStdinFile("/dev/null", &.{ "ssh-keygen", "-Y", "sign", "-n", SIGN_NS, "-f", key, msg }) != 0) return null;
+    if (execStdinFile(init, "/dev/null", &.{ "ssh-keygen", "-Y", "sign", "-n", SIGN_NS, "-f", key, msg }) != 0) return null;
     var sb: [4160]u8 = undefined;
     const sigpath = std.fmt.bufPrint(&sb, "{s}.sig", .{msg}) catch return null;
     defer unlinkPath(sigpath);
@@ -364,8 +374,8 @@ fn signReview(rubric: []const u8, sha: []const u8, result: []const u8) ?[]u8 {
 
 /// Verify a peer's signed verdict against the trust set. True only if the
 /// signature is valid for `signer` under ZISH_SIGNERS (fail-closed).
-fn verifyReview(rubric: []const u8, signer: []const u8, sig_b64: []const u8, sha: []const u8, result: []const u8) bool {
-    const signers = getEnv("ZISH_SIGNERS") orelse return false;
+fn verifyReview(init: std.process.Init, rubric: []const u8, signer: []const u8, sig_b64: []const u8, sha: []const u8, result: []const u8) bool {
+    const signers = feat.env(init.arena.allocator(), init.io, "ZISH_SIGNERS") orelse return false;
     if (signer.len == 0 or sig_b64.len == 0) return false;
     const dec = std.base64.standard.Decoder;
     const rawlen = dec.calcSizeForSlice(sig_b64) catch return false;
@@ -373,15 +383,15 @@ fn verifyReview(rubric: []const u8, signer: []const u8, sig_b64: []const u8, sha
     defer alloc.free(sigraw);
     dec.decode(sigraw, sig_b64) catch return false;
     var sb: [4096]u8 = undefined;
-    const sigpath = sigTempPath(&sb, "vsig") orelse return false;
+    const sigpath = sigTempPath(init, &sb, "vsig") orelse return false;
     if (!writeFileMode(sigpath, sigraw, 0o600)) return false;
     defer unlinkPath(sigpath);
     var mb: [4096]u8 = undefined;
-    const msg = sigTempPath(&mb, "vmsg") orelse return false;
+    const msg = sigTempPath(init, &mb, "vmsg") orelse return false;
     if (!writeSignMsg(msg, rubric, sha, result)) return false;
     defer unlinkPath(msg);
     // ssh-keygen -Y verify -f <signers> -I <signer> -n <ns> -s <sig>  < msg
-    return execStdinFile(msg, &.{ "ssh-keygen", "-Y", "verify", "-f", signers, "-I", signer, "-n", SIGN_NS, "-s", sigpath }) == 0;
+    return execStdinFile(init, msg, &.{ "ssh-keygen", "-Y", "verify", "-f", signers, "-I", signer, "-n", SIGN_NS, "-s", sigpath }) == 0;
 }
 
 /// A verdict for these exact bytes: your own ledger first (trusted as self),
@@ -394,20 +404,20 @@ fn verifyReview(rubric: []const u8, signer: []const u8, sig_b64: []const u8, sha
 // Purely local: no scores shared, no global benchmark. `~/.zish/aur-trust.jsonl`
 // is append-only; the last line for a signer wins.
 // ---------------------------------------------------------------------------
-fn trustThreshold() usize {
-    if (getEnv("ZISH_TRUST_AT")) |v| return std.fmt.parseInt(usize, v, 10) catch 3;
+fn trustThreshold(init: std.process.Init) usize {
+    if (feat.env(init.arena.allocator(), init.io, "ZISH_TRUST_AT")) |v| return std.fmt.parseInt(usize, v, 10) catch 3;
     return 3;
 }
 
-fn repPath(buf: []u8) ?[]const u8 {
-    const home = getEnv("HOME") orelse return null;
+fn repPath(init: std.process.Init, buf: []u8) ?[]const u8 {
+    const home = feat.env(init.arena.allocator(), init.io, "HOME") orelse return null;
     return std.fmt.bufPrint(buf, "{s}/.zish/aur-trust.jsonl", .{home}) catch null;
 }
 
-fn repGet(signer: []const u8) usize {
+fn repGet(init: std.process.Init, signer: []const u8) usize {
     if (signer.len == 0) return 0;
     var pb: [4096]u8 = undefined;
-    const p = repPath(&pb) orelse return 0;
+    const p = repPath(init, &pb) orelse return 0;
     const content = readFileAlloc(p, MAX_OUT) orelse return 0;
     defer alloc.free(content);
     var rep: usize = 0;
@@ -433,7 +443,7 @@ fn repGet(signer: []const u8) usize {
     return rep;
 }
 
-fn repSet(signer: []const u8, n: usize) void {
+fn repSet(init: std.process.Init, signer: []const u8, n: usize) void {
     if (signer.len == 0) return;
     var line: std.ArrayListUnmanaged(u8) = .empty;
     defer line.deinit(alloc);
@@ -442,7 +452,7 @@ fn repSet(signer: []const u8, n: usize) void {
     var nb: [32]u8 = undefined;
     line.appendSlice(alloc, std.fmt.bufPrint(&nb, "\",\"rep\":{d}}}\n", .{n}) catch return) catch return;
     var pb: [4096]u8 = undefined;
-    const p = repPath(&pb) orelse return;
+    const p = repPath(init, &pb) orelse return;
     var z: [4096]u8 = undefined;
     const pz = toZ(&z, p) orelse return;
     const fd_rc = linux.open(pz, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o600);
@@ -452,9 +462,9 @@ fn repSet(signer: []const u8, n: usize) void {
     writeFd(@intCast(fd), line.items);
 }
 
-fn findInLedger(sha: []const u8) ?[]u8 {
+fn findInLedger(init: std.process.Init, sha: []const u8) ?[]u8 {
     var lb: [4096]u8 = undefined;
-    const lp = ledgerPath(&lb) orelse return null;
+    const lp = ledgerPath(init, &lb) orelse return null;
     const content = readFileAlloc(lp, MAX_OUT) orelse return null;
     defer alloc.free(content);
     var lines = std.mem.splitScalar(u8, content, '\n');
@@ -480,10 +490,10 @@ fn findInLedger(sha: []const u8) ?[]u8 {
 const FeedEntry = struct { url: []u8, body: ?[]u8 };
 var feed_cache: std.ArrayListUnmanaged(FeedEntry) = .empty;
 
-fn feedBody(url: []const u8) ?[]const u8 {
+fn feedBody(init: std.process.Init, url: []const u8) ?[]const u8 {
     for (feed_cache.items) |e| if (std.mem.eql(u8, e.url, url)) return e.body;
     var body: ?[]u8 = null;
-    if (exec(null, &.{ "curl", "-fsSL", "--max-time", "30", "--proto", "=http,https,file", url })) |r| {
+    if (exec(init, null, &.{ "curl", "-fsSL", "--max-time", "30", "--proto", "=http,https,file", url })) |r| {
         if (r.code == 0) body = r.out else alloc.free(r.out);
     }
     const ku = alloc.dupe(u8, url) catch return body;
@@ -504,13 +514,13 @@ fn freeFeedVerdicts(list: *std.ArrayListUnmanaged(FeedVerdict)) void {
 /// Gather every verified peer verdict for `sha` across all feeds: graded under
 /// our rubric AND signature valid against our trust set. Whether to REUSE one
 /// is a separate, reputation-gated decision (see reviewPkgbuild).
-fn collectFeedVerdicts(sha: []const u8, out_list: *std.ArrayListUnmanaged(FeedVerdict)) void {
-    const feeds = getEnv("ZISH_REVIEW_FEEDS") orelse return;
+fn collectFeedVerdicts(init: std.process.Init, sha: []const u8, out_list: *std.ArrayListUnmanaged(FeedVerdict)) void {
+    const feeds = feat.env(init.arena.allocator(), init.io, "ZISH_REVIEW_FEEDS") orelse return;
     var it = std.mem.splitScalar(u8, feeds, ',');
     while (it.next()) |raw| {
         const url = std.mem.trim(u8, raw, " \t");
         if (url.len == 0) continue;
-        const body = feedBody(url) orelse continue;
+        const body = feedBody(init, url) orelse continue;
         var lines = std.mem.splitScalar(u8, body, '\n');
         while (lines.next()) |ln| {
             const line = std.mem.trim(u8, ln, " \t\r");
@@ -524,7 +534,7 @@ fn collectFeedVerdicts(sha: []const u8, out_list: *std.ArrayListUnmanaged(FeedVe
             const res = objStr(parsed.value, "result") orelse continue;
             const signer = objStr(parsed.value, "signer") orelse "";
             const sig = objStr(parsed.value, "sig") orelse "";
-            if (!verifyReview(RUBRIC, signer, sig, sha, res)) continue;
+            if (!verifyReview(init, RUBRIC, signer, sig, sha, res)) continue;
             const sdup = alloc.dupe(u8, signer) catch continue;
             const rdup = alloc.dupe(u8, res) catch {
                 alloc.free(sdup);
@@ -538,16 +548,16 @@ fn collectFeedVerdicts(sha: []const u8, out_list: *std.ArrayListUnmanaged(FeedVe
     }
 }
 
-fn recordReview(sha: []const u8, verdict_word: []const u8, verdict_raw: []const u8) void {
-    const model = getEnv("ZISH_JUDGE_MODEL") orelse "deepseek/deepseek-v4-flash-0731";
+fn recordReview(init: std.process.Init, sha: []const u8, verdict_word: []const u8, verdict_raw: []const u8) void {
+    const model = feat.env(init.arena.allocator(), init.io, "ZISH_JUDGE_MODEL") orelse "deepseek/deepseek-v4-flash-0731";
     // Canonicalize the result to exactly the bytes we store (control chars
     // dropped, same as appendJsonStr) so the signature covers what a verifier
     // reconstructs from the stored line.
     var canon: std.ArrayListUnmanaged(u8) = .empty;
     defer canon.deinit(alloc);
     for (verdict_raw) |c| if (c >= 0x20) (canon.append(alloc, c) catch return);
-    const signer = getEnv("ZISH_SIGNER_ID") orelse "";
-    const sig = signReview(RUBRIC, sha, canon.items);
+    const signer = feat.env(init.arena.allocator(), init.io, "ZISH_SIGNER_ID") orelse "";
+    const sig = signReview(init, RUBRIC, sha, canon.items);
     defer if (sig) |s| alloc.free(s);
 
     var line: std.ArrayListUnmanaged(u8) = .empty;
@@ -568,7 +578,7 @@ fn recordReview(sha: []const u8, verdict_word: []const u8, verdict_raw: []const 
     line.appendSlice(alloc, std.fmt.bufPrint(&tb, "\",\"ts\":{d}}}\n", .{nowSeconds()}) catch return) catch return;
 
     var lb: [4096]u8 = undefined;
-    const lp = ledgerPath(&lb) orelse return;
+    const lp = ledgerPath(init, &lb) orelse return;
     var z: [4096]u8 = undefined;
     const p = toZ(&z, lp) orelse return;
     const fd_rc = linux.open(p, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, 0o600);
@@ -593,12 +603,12 @@ const Reviewed = struct {
 
 /// Judge a single PKGBUILD file: cache read by content hash, else a fresh
 /// `agent --judge`. Never installs anything.
-fn reviewPkgbuild(agent_bin: ?[]const u8, rubric: ?[]const u8, path: []const u8) Reviewed {
-    const sha = sha256File(path) orelse "";
+fn reviewPkgbuild(init: std.process.Init, agent_bin: ?[]const u8, rubric: ?[]const u8, path: []const u8) Reviewed {
+    const sha = sha256File(init, path) orelse "";
 
     // 1. our own prior verdict for these exact bytes — always trusted, free
     if (sha.len > 0) {
-        if (findInLedger(sha)) |cached| {
+        if (findInLedger(init, sha)) |cached| {
             const word = verdictWord(cached);
             return .{ .outcome = wordOutcome(word), .verdict = cached, .cached = true };
         }
@@ -607,13 +617,13 @@ fn reviewPkgbuild(agent_bin: ?[]const u8, rubric: ?[]const u8, path: []const u8)
     // 2. every verified peer verdict for these bytes (signature + rubric checked)
     var feeds: std.ArrayListUnmanaged(FeedVerdict) = .empty;
     defer freeFeedVerdicts(&feeds);
-    if (sha.len > 0) collectFeedVerdicts(sha, &feeds);
+    if (sha.len > 0) collectFeedVerdicts(init, sha, &feeds);
 
     // 3. a peer we've locally vetted (rep >= threshold) → REUSE, skip the judge.
     // This is the token saving: once earned, their signature stands in for a call.
-    const thresh = trustThreshold();
+    const thresh = trustThreshold(init);
     for (feeds.items) |fv| {
-        if (repGet(fv.signer) >= thresh) {
+        if (repGet(init, fv.signer) >= thresh) {
             const word = verdictWord(fv.result);
             const dup = alloc.dupe(u8, fv.result) catch
                 return .{ .outcome = .unreviewable, .verdict = &.{}, .cached = false };
@@ -629,7 +639,7 @@ fn reviewPkgbuild(agent_bin: ?[]const u8, rubric: ?[]const u8, path: []const u8)
     var n: usize = 0;
     args[n] = abin;
     n += 1;
-    if (getEnv("ZISH_JUDGE_MOCK")) |m| {
+    if (feat.env(init.arena.allocator(), init.io, "ZISH_JUDGE_MOCK")) |m| {
         args[n] = "--mock";
         n += 1;
         args[n] = m;
@@ -642,7 +652,7 @@ fn reviewPkgbuild(agent_bin: ?[]const u8, rubric: ?[]const u8, path: []const u8)
     args[n] = path;
     n += 1;
 
-    const r = exec(null, args[0..n]) orelse
+    const r = exec(init, null, args[0..n]) orelse
         return .{ .outcome = .unreviewable, .verdict = &.{}, .cached = false };
     if (r.code != 0 or r.out.len == 0 or r.out[0] != '{')
         return .{ .outcome = .unreviewable, .verdict = &.{}, .cached = false };
@@ -655,12 +665,12 @@ fn reviewPkgbuild(agent_bin: ?[]const u8, rubric: ?[]const u8, path: []const u8)
     // count up (toward being trusted enough to reuse), a disagreement resets it.
     for (feeds.items) |fv| {
         if (std.mem.eql(u8, verdictWord(fv.result), word))
-            repSet(fv.signer, repGet(fv.signer) + 1)
+            repSet(init, fv.signer, repGet(init, fv.signer) + 1)
         else
-            repSet(fv.signer, 0);
+            repSet(init, fv.signer, 0);
     }
 
-    if (sha.len > 0) recordReview(sha, word, r.out);
+    if (sha.len > 0) recordReview(init, sha, word, r.out);
     return .{ .outcome = wordOutcome(word), .verdict = r.out, .cached = false };
 }
 
@@ -689,8 +699,8 @@ fn wordOutcome(word: []const u8) Outcome {
 /// subdir named after the pkgbase; for the common case (pkgbase == pkgname)
 /// that is `base_dir/pkg/PKGBUILD`. Otherwise we walk one level to find the
 /// single cloned dir's PKGBUILD. Returns null if the fetch failed.
-fn fetchPkgbuild(helper: []const u8, base_dir: []const u8, pkg: []const u8, buf: []u8) ?[]const u8 {
-    const r = exec(base_dir, &.{ helper, "-G", "--", pkg }) orelse return null;
+fn fetchPkgbuild(init: std.process.Init, helper: []const u8, base_dir: []const u8, pkg: []const u8, buf: []u8) ?[]const u8 {
+    const r = exec(init, base_dir, &.{ helper, "-G", "--", pkg }) orelse return null;
     alloc.free(r.out);
     if (r.code != 0) return null;
 
@@ -700,7 +710,7 @@ fn fetchPkgbuild(helper: []const u8, base_dir: []const u8, pkg: []const u8, buf:
 
     // fallback (split packages: the clone dir is the pkgbase, not the pkgname):
     // let `find` locate the single fetched PKGBUILD rather than walk dirents.
-    const f = exec(null, &.{ "find", base_dir, "-maxdepth", "2", "-name", "PKGBUILD", "-type", "f" }) orelse return null;
+    const f = exec(init, null, &.{ "find", base_dir, "-maxdepth", "2", "-name", "PKGBUILD", "-type", "f" }) orelse return null;
     defer alloc.free(f.out);
     if (f.code != 0) return null;
     var flines = std.mem.splitScalar(u8, f.out, '\n');
@@ -873,16 +883,25 @@ fn printLine(pkg: []const u8, rv: Reviewed, col: bool) void {
 // main
 // ---------------------------------------------------------------------------
 
-pub fn main(init: std.process.Init.Minimal) u8 {
-    return run(init.args);
+pub fn main(init: std.process.Init) u8 {
+    // `Init` installs a no-op SIGPIPE handler for its io; a feat exec'd by the
+    // shell must keep the inherited disposition, where a closed stdout kills
+    // the writer — the behaviour of the -lc build this replaces.
+    var dfl: std.posix.Sigaction = .{
+        .handler = .{ .handler = std.posix.SIG.DFL },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.PIPE, &dfl, null);
+    return run(init);
 }
 
-fn run(args: std.process.Args) u8 {
+fn run(init: std.process.Init) u8 {
     var verb: ?[]const u8 = null;
     var json = false;
     var targets: std.ArrayListUnmanaged([]const u8) = .empty;
     defer targets.deinit(alloc);
-    var it = args.iterate();
+    var it = init.minimal.args.iterate();
     _ = it.next(); // skip argv[0]
     while (it.next()) |a| {
         if (std.mem.eql(u8, a, "--json")) {
@@ -901,12 +920,12 @@ fn run(args: std.process.Args) u8 {
         }
     }
     if (verb) |v| {
-        if (std.mem.eql(u8, v, "review")) return reviewPager();
-        return checkGate(json, targets.items);
+        if (std.mem.eql(u8, v, "review")) return reviewPager(init);
+        return checkGate(init, json, targets.items);
     }
     // No verb: act as a pager when stdin is piped (so a bare `PAGER=aur` in
     // yay's config just works); otherwise show help.
-    if (!isTty(0)) return reviewPager();
+    if (!isTty(0)) return reviewPager(init);
     printHelp();
     return 0;
 }
@@ -935,7 +954,7 @@ fn printHelp() void {
 // is ALWAYS printed, review or no review, so it never breaks yay's flow.
 // ---------------------------------------------------------------------------
 
-fn reviewPager() u8 {
+fn reviewPager(init: std.process.Init) u8 {
     const input = slurp(0, MAX_OUT);
     if (input.len == 0) return 0; // nothing piped in
 
@@ -950,16 +969,16 @@ fn reviewPager() u8 {
     var rootb: [4096]u8 = undefined;
     var agentb: [4096]u8 = undefined;
     var rubb: [4096]u8 = undefined;
-    const agent_bin: ?[]const u8 = if (featRootPath(&rootb)) |root| resolveAgentBin(root, &agentb) else null;
-    const rubric: ?[]const u8 = resolveRubric(&rubb);
+    const agent_bin: ?[]const u8 = if (featRootPath(init, &rootb)) |root| resolveAgentBin(root, &agentb) else null;
+    const rubric: ?[]const u8 = resolveRubric(init, &rubb);
 
-    const home = getEnv("HOME") orelse return 0;
+    const home = feat.env(init.arena.allocator(), init.io, "HOME") orelse return 0;
     var subjb: [4096]u8 = undefined;
     const subj = std.fmt.bufPrint(&subjb, "{s}/.zish/.aur_review_{d}", .{ home, linux.getpid() }) catch return 0;
     if (!writeFileMode(subj, input, 0o600)) return 0;
     defer unlinkPath(subj);
 
-    const rv = reviewPkgbuild(agent_bin, rubric, subj);
+    const rv = reviewPkgbuild(init, agent_bin, rubric, subj);
     defer if (rv.verdict.len > 0) alloc.free(rv.verdict);
     if (rv.verdict.len > 0) {
         printHeader(rv.verdict, rv.cached);
@@ -968,9 +987,9 @@ fn reviewPager() u8 {
     return 0;
 }
 
-fn checkGate(json: bool, targets: []const []const u8) u8 {
+fn checkGate(init: std.process.Init, json: bool, targets: []const []const u8) u8 {
     const col = isTty(1) and !json;
-    const helper = getEnv("AUR_HELPER") orelse "yay";
+    const helper = feat.env(init.arena.allocator(), init.io, "AUR_HELPER") orelse "yay";
 
     var pkgs: std.ArrayListUnmanaged([]const u8) = .empty;
     defer pkgs.deinit(alloc);
@@ -985,7 +1004,7 @@ fn checkGate(json: bool, targets: []const []const u8) u8 {
         // no targets = the sysupgrade sense: every pending AUR update.
         // `-Qua -q` prints one bare package name per line; a non-zero exit with
         // no output means "nothing to upgrade", which is success, not failure.
-        const list = exec(null, &.{ helper, "-Qua", "-q" }) orelse {
+        const list = exec(init, null, &.{ helper, "-Qua", "-q" }) orelse {
             warn("aur: could not run the AUR helper (");
             warn(helper);
             warn("). set AUR_HELPER if it is named differently.\n");
@@ -1010,7 +1029,7 @@ fn checkGate(json: bool, targets: []const []const u8) u8 {
     // not a gate. The user keeps the manual override of running the helper
     // directly.
     var rootb: [4096]u8 = undefined;
-    const root = featRootPath(&rootb) orelse {
+    const root = featRootPath(init, &rootb) orelse {
         warn("aur: no feat root (HOME unset).\n");
         return 2;
     };
@@ -1021,7 +1040,7 @@ fn checkGate(json: bool, targets: []const []const u8) u8 {
         return 2;
     };
     var rubb: [4096]u8 = undefined;
-    const rubric = resolveRubric(&rubb) orelse {
+    const rubric = resolveRubric(init, &rubb) orelse {
         warn("aur: pkgbuild-review rubric not found — cannot review.\n");
         return 2;
     };
@@ -1032,7 +1051,7 @@ fn checkGate(json: bool, targets: []const []const u8) u8 {
     var basez: [256]u8 = undefined;
     if (toZ(&basez, base_dir)) |bz| _ = linux.mkdir(bz, 0o700);
     defer {
-        const rm = exec(null, &.{ "rm", "-rf", "--", base_dir });
+        const rm = exec(init, null, &.{ "rm", "-rf", "--", base_dir });
         if (rm) |r| alloc.free(r.out);
     }
 
@@ -1050,9 +1069,9 @@ fn checkGate(json: bool, targets: []const []const u8) u8 {
     for (pkgs.items, 0..) |pkg, i| {
         var pathb: [4096]u8 = undefined;
         const rv = blk: {
-            const pb = fetchPkgbuild(helper, base_dir, pkg, &pathb) orelse
+            const pb = fetchPkgbuild(init, helper, base_dir, pkg, &pathb) orelse
                 break :blk Reviewed{ .outcome = .unreviewable, .verdict = &.{}, .cached = false };
-            break :blk reviewPkgbuild(agent_bin, rubric, pb);
+            break :blk reviewPkgbuild(init, agent_bin, rubric, pb);
         };
         defer if (rv.verdict.len > 0) alloc.free(rv.verdict);
 

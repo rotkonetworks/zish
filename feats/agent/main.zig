@@ -31,6 +31,14 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const feat = @import("lib/feat.zig");
+
+/// The environment block the kernel handed us, for `execve` to pass on verbatim
+/// (a child inherits it). `start.zig` captures envp off the initial stack for
+/// the libc and freestanding start paths alike, so this replaces the libc
+/// symbol `std.c.environ`. Looking a variable *up* is `feat.env`'s job; nothing
+/// here reads this directly. Set at the top of `main`.
+var child_envp: [*:null]const ?[*:0]const u8 = @ptrCast(&[1]?[*:0]const u8{null});
 
 const DEFAULT_MODEL = "deepseek/deepseek-v4-flash-0731";
 const ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
@@ -40,9 +48,9 @@ const DEFAULT_MAX_TURNS = 24; // model round-trips per query when the caller nam
 /// `--turns N`, else `ZISH_AGENT_MAX_TURNS`, else `fallback`. Hardcoding this
 /// was the same defect as a hidden cost — a commander could not budget a
 /// worker, so a broad task died mid-collection with no way to give it room.
-fn resolveMaxTurns(explicit: ?usize, fallback: usize) usize {
+fn resolveMaxTurns(io: std.Io, explicit: ?usize, fallback: usize) usize {
     if (explicit) |n| return n;
-    const v = getEnv("ZISH_AGENT_MAX_TURNS") orelse return fallback;
+    const v = getEnv(io, "ZISH_AGENT_MAX_TURNS") orelse return fallback;
     return std.fmt.parseInt(usize, v, 10) catch fallback;
 }
 const MAX_RETRIES = 5; // per-request retry cap for 429/5xx
@@ -409,7 +417,7 @@ fn writeFile600(path: []const u8, bytes: []const u8) bool {
 /// (auth header) lives in a 0600 --config file and the body in a --data @file,
 /// so the secret is never a process argument. Returns null on spawn/read
 /// failure (caller treats as retryable).
-fn fetchCurl(home: []const u8, endpoint: []const u8, key: []const u8, request: []const u8) ?HttpReply {
+fn fetchCurl(io: std.Io, home: []const u8, endpoint: []const u8, key: []const u8, request: []const u8) ?HttpReply {
     // pid-suffixed so concurrent agent sessions never clobber each other's
     // request files; all three are unlinked before returning.
     const pid = linux.getpid();
@@ -449,7 +457,7 @@ fn fetchCurl(home: []const u8, endpoint: []const u8, key: []const u8, request: [
     var ep_argz: [4096]u8 = undefined;
     const epz = std.fmt.bufPrintZ(&ep_argz, "{s}", .{endpoint}) catch return null;
     var to_argz: [8]u8 = undefined;
-    const toz = std.fmt.bufPrintZ(&to_argz, "{s}", .{timeoutStr()}) catch return null;
+    const toz = std.fmt.bufPrintZ(&to_argz, "{s}", .{timeoutStr(io)}) catch return null;
 
     const argv = [_:null]?[*:0]const u8{
         "env", "curl", "-sS", "--max-time", toz.ptr,
@@ -493,8 +501,7 @@ fn execCapture(argv: [*:null]const ?[*:0]const u8) ?[]u8 {
         _ = linux.close(fds[0]);
         _ = linux.dup2(fds[1], 1);
         _ = linux.close(fds[1]);
-        const envp = std.c.environ;
-        _ = linux.execve("/usr/bin/env", argv, @ptrCast(envp));
+        _ = linux.execve("/usr/bin/env", argv, child_envp);
         linux.exit(127);
     }
     _ = linux.close(fds[1]);
@@ -524,37 +531,44 @@ const Config = struct {
     max_turns: ?usize = null,
 };
 
-pub fn main(init: std.process.Init.Minimal) void {
+pub fn main(init: std.process.Init) void {
+    // `std.process.Init` is the only io this feat has: every function below that
+    // reads an environment variable takes it as an argument. The environment
+    // block itself is captured once — execve hands it to children verbatim, and
+    // it is a kernel-provided constant, not a service with a lifetime.
+    const io = init.io;
+    child_envp = @ptrCast(init.minimal.environ.block.slice.ptr);
+    const args = init.minimal.args;
     // Judge mode is a plain one-shot invocation (gf/steward/benchmark exec the
     // binary directly): no session host, no hello frame, no session frames.
     // Branch before the handshake the model loop needs.
-    if (hasJudgeFlag(init.args)) {
-        linux.exit(runJudge(init.args));
+    if (hasJudgeFlag(args)) {
+        linux.exit(runJudge(io, args));
     }
     // --ask: one-shot plain-text completion (no tools, no session frames). This
     // is the seam a plain caller like `team` drives — `agent --ask <prompt>` →
     // the model's text on stdout — without speaking the session frame protocol.
-    if (hasAskFlag(init.args)) {
-        linux.exit(runAsk(init.args));
+    if (hasAskFlag(args)) {
+        linux.exit(runAsk(io, args));
     }
     // captain: the conversational front. `agent captain --thread <file> <msg>` —
     // holds a topic thread (OpenAI messages in a JSONL file), runs the tool loop
     // with the captain tool-set (dispatch_team, ask_human), appends the turn back.
     // No session host, no hello frame — it forks its tools directly.
-    if (hasCaptainFlag(init.args)) {
-        linux.exit(runCaptain(init.args));
+    if (hasCaptainFlag(args)) {
+        linux.exit(runCaptain(io, args));
     }
     // solo: a self-contained tool-using worker (loop + local run_command). No
     // session host — used by `team` to give workers real tools.
-    if (hasSoloFlag(init.args)) {
-        linux.exit(runSolo(init.args));
+    if (hasSoloFlag(args)) {
+        linux.exit(runSolo(io, args));
     }
     // edit: a region filter. `agent edit "<instruction>"` reads a snippet on
     // stdin, applies the instruction, writes the result on stdout. Meant to be
     // driven from an editor (vim `:'<,'>!agent edit "..."`) so the human keeps
     // driving and the model only touches the handed-over region.
-    if (hasEditFlag(init.args)) {
-        linux.exit(runEdit(init.args));
+    if (hasEditFlag(args)) {
+        linux.exit(runEdit(io, args));
     }
 
     // consume the hello frame (protocol v0.2+); we do not gate on caps here —
@@ -562,7 +576,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     var hbuf: [4096]u8 = undefined;
     _ = readLine(&hbuf);
 
-    const cfg = parseArgs(init.args) orelse {
+    const cfg = parseArgs(io, args) orelse {
         say("agent: usage: agent [-m model] [--turns N] [--mock file] <query>");
         emit("{\"t\":\"done\"}\n");
         return;
@@ -575,7 +589,6 @@ pub fn main(init: std.process.Init.Minimal) void {
 
     // transport setup
     var mock: ?Mock = null;
-    var home_buf: [4096]u8 = undefined;
     var home: []const u8 = "";
     var key: []const u8 = "";
     if (cfg.mock_path) |mp| {
@@ -586,19 +599,19 @@ pub fn main(init: std.process.Init.Minimal) void {
         };
         mock = .{ .lines = std.mem.splitScalar(u8, contents, '\n') };
     } else {
-        home = getHome(&home_buf) orelse {
+        home = getEnv(io, "HOME") orelse {
             say("agent: HOME not set");
             emit("{\"t\":\"done\"}\n");
             return;
         };
         // OpenRouter needs the key file; Ollama/custom endpoints send it only if
         // present (Ollama takes no auth at all).
-        if (agentNeedsKey() or getEnv("ZISH_AGENT_ENDPOINT") != null) {
+        if (agentNeedsKey(io) or getEnv(io, "ZISH_AGENT_ENDPOINT") != null) {
             var kbuf: [4096]u8 = undefined;
             const kpath = std.fmt.bufPrint(&kbuf, "{s}/.zish/openrouter.key", .{home}) catch "";
             if (readFileAlloc(kpath)) |k| {
                 key = k;
-            } else if (agentNeedsKey()) {
+            } else if (agentNeedsKey(io)) {
                 say("agent: no API key at ~/.zish/openrouter.key (create it, chmod 600)");
                 emit("{\"t\":\"done\"}\n");
                 return;
@@ -606,7 +619,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         }
     }
     var ep_buf: [512]u8 = undefined;
-    const endpoint = agentEndpoint(&ep_buf);
+    const endpoint = agentEndpoint(io, &ep_buf);
 
     // history seeds with the system prompt and the user's query
     var history: std.ArrayListUnmanaged(Message) = .empty;
@@ -614,13 +627,13 @@ pub fn main(init: std.process.Init.Minimal) void {
     history.append(alloc, .{ .role = .user, .content = cfg.query }) catch return;
 
     var turn: usize = 0;
-    const max_turns = resolveMaxTurns(cfg.max_turns, DEFAULT_MAX_TURNS);
+    const max_turns = resolveMaxTurns(io, cfg.max_turns, DEFAULT_MAX_TURNS);
     while (turn < max_turns) : (turn += 1) {
         const request = buildRequest(cfg.model, history.items, SHELL_TOOLS) catch {
             say("agent: failed to build request");
             break;
         };
-        const reply = fetchWithBackoff(&mock, home, endpoint, key, request) orelse {
+        const reply = fetchWithBackoff(io, &mock, home, endpoint, key, request) orelse {
             say("agent: request failed after retries");
             break;
         };
@@ -657,14 +670,14 @@ pub fn main(init: std.process.Init.Minimal) void {
                 for (calls) |call| {
                     // the shell tool-set has one tool; arguments carry {"command":...}
                     const command = parseCommandArg(call.arguments) orelse {
-                        appendToolResult(&history, call.id, .{ .code = 2, .out = dupe("agent: could not parse command argument") });
+                        appendToolResult(io, &history, call.id, .{ .code = 2, .out = dupe("agent: could not parse command argument") });
                         continue;
                     };
                     const res = runCommand(command) orelse {
                         aborted = true;
                         break;
                     };
-                    appendToolResult(&history, call.id, res);
+                    appendToolResult(io, &history, call.id, res);
                 }
                 if (aborted) {
                     say("agent: a command could not run (denied or session ended)");
@@ -712,13 +725,13 @@ fn renderToolCallsJson(calls: []const ToolCall) []u8 {
 // subsequent request (quadratic cost). Feed head+tail with a line-aware elision
 // marker; the model sees the shape and the ends, not the bulk. Override the window
 // with ZISH_AGENT_TOOL_CAP (bytes of head; tail is half that).
-fn toolHeadCap() usize {
-    const v = getEnv("ZISH_AGENT_TOOL_CAP") orelse return 3000;
+fn toolHeadCap(io: std.Io) usize {
+    const v = getEnv(io, "ZISH_AGENT_TOOL_CAP") orelse return 3000;
     return std.fmt.parseInt(usize, v, 10) catch 3000;
 }
 /// Bound `out` to head+tail around an elision marker, trimmed to line boundaries.
-fn boundToolOutput(out: []const u8) []u8 {
-    const head_cap = toolHeadCap();
+fn boundToolOutput(io: std.Io, out: []const u8) []u8 {
+    const head_cap = toolHeadCap(io);
     const tail_cap = head_cap / 2;
     if (out.len <= head_cap + tail_cap + 80) return dupe(out);
     // head: cut at the last newline within head_cap (else the raw cut)
@@ -736,11 +749,11 @@ fn boundToolOutput(out: []const u8) []u8 {
     return b.toOwnedSlice(alloc) catch dupe(out);
 }
 
-fn appendToolResult(history: *std.ArrayListUnmanaged(Message), id: []const u8, res: RunResult) void {
+fn appendToolResult(io: std.Io, history: *std.ArrayListUnmanaged(Message), id: []const u8, res: RunResult) void {
     var c: std.ArrayListUnmanaged(u8) = .empty;
     var hb: [32]u8 = undefined;
     c.appendSlice(alloc, std.fmt.bufPrint(&hb, "[exit {d}]\n", .{res.code}) catch "") catch {};
-    const bounded = boundToolOutput(res.out);
+    const bounded = boundToolOutput(io, res.out);
     defer alloc.free(bounded);
     c.appendSlice(alloc, bounded) catch {};
     history.append(alloc, .{
@@ -752,10 +765,10 @@ fn appendToolResult(history: *std.ArrayListUnmanaged(Message), id: []const u8, r
 
 /// One request with bounded exponential backoff on 429/5xx. Deterministic
 /// jitter (no clock in a feat): jitter derived from the attempt number.
-fn fetchWithBackoff(mock: *?Mock, home: []const u8, endpoint: []const u8, key: []const u8, request: []const u8) ?HttpReply {
+fn fetchWithBackoff(io: std.Io, mock: *?Mock, home: []const u8, endpoint: []const u8, key: []const u8, request: []const u8) ?HttpReply {
     var attempt: usize = 0;
     while (attempt < MAX_RETRIES) : (attempt += 1) {
-        const reply = if (mock.*) |*m| m.next() else fetchCurl(home, endpoint, key, request);
+        const reply = if (mock.*) |*m| m.next() else fetchCurl(io, home, endpoint, key, request);
         const r = reply orelse return null;
         if (r.status != 429 and r.status < 500) return r;
         // retryable: back off. base 200ms * 2^attempt + attempt*37ms jitter.
@@ -765,7 +778,7 @@ fn fetchWithBackoff(mock: *?Mock, home: []const u8, endpoint: []const u8, key: [
         sleepMs(base_ms + @as(u64, attempt) * 37);
     }
     // last try, whatever it is
-    return if (mock.*) |*m| m.next() else fetchCurl(home, endpoint, key, request);
+    return if (mock.*) |*m| m.next() else fetchCurl(io, home, endpoint, key, request);
 }
 
 fn sleepMs(ms: u64) void {
@@ -773,47 +786,28 @@ fn sleepMs(ms: u64) void {
     _ = linux.nanosleep(&ts, &ts);
 }
 
-fn getHome(buf: []u8) ?[]const u8 {
-    const envp = std.c.environ;
-    var i: usize = 0;
-    while (envp[i]) |line| : (i += 1) {
-        const s = std.mem.sliceTo(line, 0);
-        if (std.mem.startsWith(u8, s, "HOME=")) {
-            const v = s[5..];
-            if (v.len >= buf.len) return null;
-            @memcpy(buf[0..v.len], v);
-            return buf[0..v.len];
-        }
-    }
-    return null;
-}
-
-/// Look up an environment variable, returning a slice into `environ` (stable for
-/// the process lifetime), or null if unset.
-fn getEnv(name: []const u8) ?[]const u8 {
-    const envp = std.c.environ;
-    var i: usize = 0;
-    while (envp[i]) |line| : (i += 1) {
-        const s = std.mem.sliceTo(line, 0);
-        if (s.len > name.len and s[name.len] == '=' and std.mem.startsWith(u8, s, name))
-            return s[name.len + 1 ..];
-    }
-    return null;
+/// Look up an environment variable (HOME, ZISH_AGENT_*, OLLAMA_HOST). The
+/// shared primitive reads /proc/self/environ, which is why this feat no longer
+/// links libc for `std.c.environ`. The value is allocated once per lookup and
+/// never freed — one invocation reads a handful of variables, and the old
+/// borrow-from-environ slices were process-lifetime too.
+fn getEnv(io: std.Io, name: []const u8) ?[]const u8 {
+    return feat.env(alloc, io, name);
 }
 
 /// Backend selection. Default is OpenRouter (key from ~/.zish/openrouter.key).
 /// `ZISH_AGENT_BACKEND=ollama` targets a local Ollama over its OpenAI-compatible
 /// API (no key), honoring `OLLAMA_HOST` (host:port or full base URL). A raw
 /// `ZISH_AGENT_ENDPOINT` overrides the URL outright.
-fn backendIsOllama() bool {
-    const b = getEnv("ZISH_AGENT_BACKEND") orelse return false;
+fn backendIsOllama(io: std.Io) bool {
+    const b = getEnv(io, "ZISH_AGENT_BACKEND") orelse return false;
     return std.mem.eql(u8, b, "ollama");
 }
 
-fn agentEndpoint(buf: []u8) []const u8 {
-    if (getEnv("ZISH_AGENT_ENDPOINT")) |e| return e;
-    if (backendIsOllama()) {
-        const host = getEnv("OLLAMA_HOST") orelse "127.0.0.1:11434";
+fn agentEndpoint(io: std.Io, buf: []u8) []const u8 {
+    if (getEnv(io, "ZISH_AGENT_ENDPOINT")) |e| return e;
+    if (backendIsOllama(io)) {
+        const host = getEnv(io, "OLLAMA_HOST") orelse "127.0.0.1:11434";
         if (std.mem.startsWith(u8, host, "http"))
             return std.fmt.bufPrint(buf, "{s}/v1/chat/completions", .{host}) catch ENDPOINT;
         return std.fmt.bufPrint(buf, "http://{s}/v1/chat/completions", .{host}) catch ENDPOINT;
@@ -822,24 +816,24 @@ fn agentEndpoint(buf: []u8) []const u8 {
 }
 
 /// Only default OpenRouter requires a key file; Ollama needs none.
-fn agentNeedsKey() bool {
-    if (getEnv("ZISH_AGENT_ENDPOINT")) |_| return false;
-    return !backendIsOllama();
+fn agentNeedsKey(io: std.Io) bool {
+    if (getEnv(io, "ZISH_AGENT_ENDPOINT")) |_| return false;
+    return !backendIsOllama(io);
 }
 
 /// Per-request curl timeout in seconds. Default 120; `ZISH_AGENT_TIMEOUT` raises
 /// it for slow local models (a big Ollama model can take minutes to load+generate).
 /// Validated to digits so it stays a clean curl argument.
-fn timeoutStr() []const u8 {
-    const v = getEnv("ZISH_AGENT_TIMEOUT") orelse return "120";
+fn timeoutStr(io: std.Io) []const u8 {
+    const v = getEnv(io, "ZISH_AGENT_TIMEOUT") orelse return "120";
     if (v.len == 0 or v.len > 6) return "120";
     for (v) |c| if (c < '0' or c > '9') return "120";
     return v;
 }
 
-fn parseArgs(args: std.process.Args) ?Config {
+fn parseArgs(io: std.Io, args: std.process.Args) ?Config {
     var cfg = Config{};
-    cfg.model = getEnv("ZISH_AGENT_MODEL") orelse DEFAULT_MODEL; // -m overrides
+    cfg.model = getEnv(io, "ZISH_AGENT_MODEL") orelse DEFAULT_MODEL; // -m overrides
     var it = std.process.Args.Iterator.init(args);
     _ = it.skip(); // argv[0]
     var query: std.ArrayListUnmanaged(u8) = .empty;
@@ -916,11 +910,11 @@ fn hasJudgeFlag(args: std.process.Args) bool {
     return false;
 }
 
-fn parseJudgeArgs(args: std.process.Args) ?JudgeCfg {
+fn parseJudgeArgs(io: std.Io, args: std.process.Args) ?JudgeCfg {
     var cfg = JudgeCfg{};
     // model default from env (so a caller like `aur`, which doesn't take -m,
     // still selects the model); an explicit -m overrides.
-    cfg.model = getEnv("ZISH_AGENT_MODEL") orelse DEFAULT_MODEL;
+    cfg.model = getEnv(io, "ZISH_AGENT_MODEL") orelse DEFAULT_MODEL;
     var subs: std.ArrayListUnmanaged([]const u8) = .empty;
     var it = std.process.Args.Iterator.init(args);
     _ = it.skip();
@@ -944,7 +938,7 @@ fn parseJudgeArgs(args: std.process.Args) ?JudgeCfg {
 
 /// Build a plain chat-completions request (no tools) from an explicit system
 /// and user message.
-fn buildJudgeRequest(model: []const u8, system: []const u8, user: []const u8) ![]u8 {
+fn buildJudgeRequest(io: std.Io, model: []const u8, system: []const u8, user: []const u8) ![]u8 {
     var b: std.ArrayListUnmanaged(u8) = .empty;
     try b.appendSlice(alloc, "{\"model\":\"");
     try jsonEscape(&b, model);
@@ -955,7 +949,7 @@ fn buildJudgeRequest(model: []const u8, system: []const u8, user: []const u8) ![
     try b.appendSlice(alloc, "\"}]");
     // ZISH_AGENT_MAX_TOKENS caps completion per call — the hard bound on cost, so
     // no single call can run away (a 40k-token generation becomes impossible).
-    if (getEnv("ZISH_AGENT_MAX_TOKENS")) |mt| {
+    if (getEnv(io, "ZISH_AGENT_MAX_TOKENS")) |mt| {
         var ok = mt.len > 0 and mt.len < 8;
         for (mt) |c| if (c < '0' or c > '9') {
             ok = false;
@@ -1061,8 +1055,8 @@ fn splitReasoning(content: []const u8) struct { think: []const u8, answer: []con
 /// When ZISH_ASK_META is set, write `{"pt","ct","think"}` — token usage (from the
 /// response's `usage`) and the reasoning (a `reasoning` field, else the `<think>`
 /// block) — so a caller like `team` can surface real tokens/cost + thinking.
-fn writeAskMeta(body: []const u8, inline_think: []const u8, model: []const u8) void {
-    const mp = getEnv("ZISH_ASK_META") orelse return;
+fn writeAskMeta(io: std.Io, body: []const u8, inline_think: []const u8, model: []const u8) void {
+    const mp = getEnv(io, "ZISH_ASK_META") orelse return;
     var pt: i64 = 0;
     var ct: i64 = 0;
     var reasoning: []const u8 = "";
@@ -1093,13 +1087,13 @@ fn writeAskMeta(body: []const u8, inline_think: []const u8, model: []const u8) v
     _ = writeFile600(mp, m.items);
 }
 
-fn runAsk(args: std.process.Args) u8 {
-    var model: []const u8 = getEnv("ZISH_AGENT_MODEL") orelse DEFAULT_MODEL;
+fn runAsk(io: std.Io, args: std.process.Args) u8 {
+    var model: []const u8 = getEnv(io, "ZISH_AGENT_MODEL") orelse DEFAULT_MODEL;
     var mock_path: ?[]const u8 = null;
     // system prompt: --system <text> wins, else $ZISH_AGENT_SYSTEM, else the
     // default team-member instruction. Lets a caller (e.g. the `captain` feat)
     // reuse this plain-completion transport with its own persona.
-    var system: []const u8 = getEnv("ZISH_AGENT_SYSTEM") orelse ASK_SYSTEM;
+    var system: []const u8 = getEnv(io, "ZISH_AGENT_SYSTEM") orelse ASK_SYSTEM;
     var prompt: std.ArrayListUnmanaged(u8) = .empty;
     defer prompt.deinit(alloc);
     var it = std.process.Args.Iterator.init(args);
@@ -1128,7 +1122,6 @@ fn runAsk(args: std.process.Args) u8 {
 
     // transport: same seam as the judge (mock file or curl + key + backend)
     var mock: ?Mock = null;
-    var home_buf: [4096]u8 = undefined;
     var home: []const u8 = "";
     var key: []const u8 = "";
     if (mock_path) |mp| {
@@ -1138,34 +1131,34 @@ fn runAsk(args: std.process.Args) u8 {
         };
         mock = .{ .lines = std.mem.splitScalar(u8, contents, '\n') };
     } else {
-        home = getHome(&home_buf) orelse {
+        home = getEnv(io, "HOME") orelse {
             warn("agent: HOME not set\n");
             return 2;
         };
-        if (agentNeedsKey() or getEnv("ZISH_AGENT_ENDPOINT") != null) {
+        if (agentNeedsKey(io) or getEnv(io, "ZISH_AGENT_ENDPOINT") != null) {
             var kbuf: [4096]u8 = undefined;
             const kpath = std.fmt.bufPrint(&kbuf, "{s}/.zish/openrouter.key", .{home}) catch "";
             if (readFileAlloc(kpath)) |k| {
                 key = k;
-            } else if (agentNeedsKey()) {
+            } else if (agentNeedsKey(io)) {
                 warn("agent: no API key at ~/.zish/openrouter.key\n");
                 return 2;
             }
         }
     }
     var ep_buf: [512]u8 = undefined;
-    const endpoint = agentEndpoint(&ep_buf);
+    const endpoint = agentEndpoint(io, &ep_buf);
 
     var attempt: usize = 0;
     while (attempt < JUDGE_RETRIES) : (attempt += 1) {
-        const request = buildJudgeRequest(model, system, prompt.items) catch return 2;
-        const reply = fetchWithBackoff(&mock, home, endpoint, key, request) orelse continue;
+        const request = buildJudgeRequest(io, model, system, prompt.items) catch return 2;
+        const reply = fetchWithBackoff(io, &mock, home, endpoint, key, request) orelse continue;
         if (reply.status < 200 or reply.status >= 300) continue;
         switch (parseResponse(reply.body)) {
             .text => |t| {
                 const trimmed = std.mem.trim(u8, t, " \t\r\n");
                 const sr = splitReasoning(trimmed); // one splitter, all tags
-                writeAskMeta(reply.body, sr.think, model); // tokens + model + thinking → sidecar
+                writeAskMeta(io, reply.body, sr.think, model); // tokens + model + thinking → sidecar
                 emit(sr.answer); // the answer, reasoning removed
                 emit("\n");
                 return 0;
@@ -1196,8 +1189,6 @@ fn hasEditFlag(args: std.process.Args) bool {
     if (it.next()) |a| return std.mem.eql(u8, a, "edit");
     return false;
 }
-
-extern "c" fn isatty(fd: c_int) c_int;
 
 /// Read all of stdin (the region to transform, or a piped captain message).
 /// EINTR-safe; caps at 8 MiB so a runaway pipe can't exhaust memory.
@@ -1240,10 +1231,10 @@ test "stripFences unwraps a fence, preserves indentation, leaves plain text" {
     try std.testing.expectEqualStrings("```not closed", stripFences("```not closed"));
 }
 
-fn runEdit(args: std.process.Args) u8 {
-    var model: []const u8 = getEnv("ZISH_AGENT_MODEL") orelse DEFAULT_MODEL;
+fn runEdit(io: std.Io, args: std.process.Args) u8 {
+    var model: []const u8 = getEnv(io, "ZISH_AGENT_MODEL") orelse DEFAULT_MODEL;
     var mock_path: ?[]const u8 = null;
-    var system: []const u8 = getEnv("ZISH_AGENT_SYSTEM") orelse EDIT_SYSTEM;
+    var system: []const u8 = getEnv(io, "ZISH_AGENT_SYSTEM") orelse EDIT_SYSTEM;
     var instr: std.ArrayListUnmanaged(u8) = .empty;
     defer instr.deinit(alloc);
     var it = std.process.Args.Iterator.init(args);
@@ -1283,7 +1274,6 @@ fn runEdit(args: std.process.Args) u8 {
 
     // transport: same seam as runAsk (mock file, or curl + key + backend)
     var mock: ?Mock = null;
-    var home_buf: [4096]u8 = undefined;
     var home: []const u8 = "";
     var key: []const u8 = "";
     if (mock_path) |mp| {
@@ -1293,34 +1283,34 @@ fn runEdit(args: std.process.Args) u8 {
         };
         mock = .{ .lines = std.mem.splitScalar(u8, contents, '\n') };
     } else {
-        home = getHome(&home_buf) orelse {
+        home = getEnv(io, "HOME") orelse {
             warn("agent: HOME not set\n");
             return 2;
         };
-        if (agentNeedsKey() or getEnv("ZISH_AGENT_ENDPOINT") != null) {
+        if (agentNeedsKey(io) or getEnv(io, "ZISH_AGENT_ENDPOINT") != null) {
             var kbuf: [4096]u8 = undefined;
             const kpath = std.fmt.bufPrint(&kbuf, "{s}/.zish/openrouter.key", .{home}) catch "";
             if (readFileAlloc(kpath)) |k| {
                 key = k;
-            } else if (agentNeedsKey()) {
+            } else if (agentNeedsKey(io)) {
                 warn("agent: no API key at ~/.zish/openrouter.key\n");
                 return 2;
             }
         }
     }
     var ep_buf: [512]u8 = undefined;
-    const endpoint = agentEndpoint(&ep_buf);
+    const endpoint = agentEndpoint(io, &ep_buf);
 
     var attempt: usize = 0;
     while (attempt < JUDGE_RETRIES) : (attempt += 1) {
-        const request = buildJudgeRequest(model, system, content.items) catch return 2;
-        const reply = fetchWithBackoff(&mock, home, endpoint, key, request) orelse continue;
+        const request = buildJudgeRequest(io, model, system, content.items) catch return 2;
+        const reply = fetchWithBackoff(io, &mock, home, endpoint, key, request) orelse continue;
         if (reply.status < 200 or reply.status >= 300) continue;
         switch (parseResponse(reply.body)) {
             .text => |t| {
                 const trimmed = std.mem.trim(u8, t, " \t\r\n");
                 const sr = splitReasoning(trimmed); // strip any <think>
-                writeAskMeta(reply.body, sr.think, model); // tokens/model → sidecar, off stdout
+                writeAskMeta(io, reply.body, sr.think, model); // tokens/model → sidecar, off stdout
                 const out = stripFences(sr.answer); // hand the editor clean code
                 emit(out);
                 if (out.len == 0 or out[out.len - 1] != '\n') emit("\n");
@@ -1424,7 +1414,7 @@ fn spawnDetached(args: []const []const u8) ?i32 {
             _ = linux.dup2(@intCast(nfd), 1);
             _ = linux.dup2(@intCast(nfd), 2);
         }
-        _ = linux.execve("/usr/bin/env", argvz, @ptrCast(std.c.environ));
+        _ = linux.execve("/usr/bin/env", argvz, child_envp);
         linux.exit(127);
     }
     return @intCast(pid);
@@ -1651,11 +1641,11 @@ fn execCaptainTool(home: []const u8, thread_path: []const u8, budget: []const u8
     return .{ .result = std.fmt.allocPrint(alloc, "unknown tool: {s}", .{name}) catch dupe("unknown tool"), .run = dupe("") };
 }
 
-fn runCaptain(args: std.process.Args) u8 {
-    var model: []const u8 = getEnv("ZISH_CAPTAIN_MODEL") orelse (getEnv("ZISH_AGENT_MODEL") orelse DEFAULT_MODEL);
+fn runCaptain(io: std.Io, args: std.process.Args) u8 {
+    var model: []const u8 = getEnv(io, "ZISH_CAPTAIN_MODEL") orelse (getEnv(io, "ZISH_AGENT_MODEL") orelse DEFAULT_MODEL);
     var thread_path: ?[]const u8 = null;
     var from: []const u8 = "human";
-    var budget: []const u8 = getEnv("ZISH_CAPTAIN_BUDGET") orelse "8";
+    var budget: []const u8 = getEnv(io, "ZISH_CAPTAIN_BUDGET") orelse "8";
     var mock_path: ?[]const u8 = null;
     var msg: std.ArrayListUnmanaged(u8) = .empty;
     defer msg.deinit(alloc);
@@ -1684,7 +1674,7 @@ fn runCaptain(args: std.process.Args) u8 {
     // (`git log -1 --format=%s | agent captain --thread f`). Only read stdin when
     // it isn't a tty — an interactive shell with no message is the real error,
     // and we must not block waiting for keyboard input.
-    if (msg.items.len == 0 and isatty(0) == 0) {
+    if (msg.items.len == 0 and !feat.stdinIsTty(io)) {
         const piped = readAllStdin();
         const trimmed = std.mem.trim(u8, piped, " \t\r\n");
         if (trimmed.len > 0) msg.appendSlice(alloc, trimmed) catch {};
@@ -1696,7 +1686,6 @@ fn runCaptain(args: std.process.Args) u8 {
 
     // transport (same seam as runAsk)
     var mock: ?Mock = null;
-    var home_buf: [4096]u8 = undefined;
     var home: []const u8 = "";
     var key: []const u8 = "";
     if (mock_path) |mp| {
@@ -1705,25 +1694,25 @@ fn runCaptain(args: std.process.Args) u8 {
             return 2;
         };
         mock = .{ .lines = std.mem.splitScalar(u8, contents, '\n') };
-        home = getHome(&home_buf) orelse "";
+        home = getEnv(io, "HOME") orelse "";
     } else {
-        home = getHome(&home_buf) orelse {
+        home = getEnv(io, "HOME") orelse {
             warn("agent captain: HOME not set\n");
             return 2;
         };
-        if (agentNeedsKey() or getEnv("ZISH_AGENT_ENDPOINT") != null) {
+        if (agentNeedsKey(io) or getEnv(io, "ZISH_AGENT_ENDPOINT") != null) {
             var kbuf: [4096]u8 = undefined;
             const kpath = std.fmt.bufPrint(&kbuf, "{s}/.zish/openrouter.key", .{home}) catch "";
             if (readFileAlloc(kpath)) |k| {
                 key = k;
-            } else if (agentNeedsKey()) {
+            } else if (agentNeedsKey(io)) {
                 warn("agent captain: no API key at ~/.zish/openrouter.key\n");
                 return 2;
             }
         }
     }
     var ep_buf: [512]u8 = undefined;
-    const endpoint = agentEndpoint(&ep_buf);
+    const endpoint = agentEndpoint(io, &ep_buf);
 
     // seed history: persona + prior thread + the new message
     var history: std.ArrayListUnmanaged(Message) = .empty;
@@ -1736,7 +1725,7 @@ fn runCaptain(args: std.process.Args) u8 {
     var turn: usize = 0;
     while (turn < CAPTAIN_MAX_TURNS) : (turn += 1) {
         const request = buildRequest(model, history.items, CAPTAIN_TOOLS) catch return 1;
-        const reply = fetchWithBackoff(&mock, home, endpoint, key, request) orelse {
+        const reply = fetchWithBackoff(io, &mock, home, endpoint, key, request) orelse {
             warn("agent captain: request failed\n");
             break;
         };
@@ -1802,8 +1791,8 @@ const SOLO_SYSTEM =
     \\findings report and NO tool call.
 ;
 
-fn soloMaxTurns() usize {
-    return resolveMaxTurns(null, 12);
+fn soloMaxTurns(io: std.Io) usize {
+    return resolveMaxTurns(io, null, 12);
 }
 
 /// run_command executed locally: fork+exec `sh -c <command>`, merge stdout+stderr,
@@ -1826,7 +1815,7 @@ fn runCommandLocal(command: []const u8) ?RunResult {
         _ = linux.dup2(fds[1], 1);
         _ = linux.dup2(fds[1], 2); // merge stderr — compiler/checker errors matter
         _ = linux.close(fds[1]);
-        _ = linux.execve("/usr/bin/env", &argv, @ptrCast(std.c.environ));
+        _ = linux.execve("/usr/bin/env", &argv, child_envp);
         linux.exit(127);
     }
     _ = linux.close(fds[1]);
@@ -1862,8 +1851,8 @@ fn hasSoloFlag(args: std.process.Args) bool {
     return false;
 }
 
-fn runSolo(args: std.process.Args) u8 {
-    var model: []const u8 = getEnv("ZISH_AGENT_MODEL") orelse DEFAULT_MODEL;
+fn runSolo(io: std.Io, args: std.process.Args) u8 {
+    var model: []const u8 = getEnv(io, "ZISH_AGENT_MODEL") orelse DEFAULT_MODEL;
     var mock_path: ?[]const u8 = null;
     var prompt: std.ArrayListUnmanaged(u8) = .empty;
     defer prompt.deinit(alloc);
@@ -1887,7 +1876,6 @@ fn runSolo(args: std.process.Args) u8 {
 
     // transport (same seam as --ask)
     var mock: ?Mock = null;
-    var home_buf: [4096]u8 = undefined;
     var home: []const u8 = "";
     var key: []const u8 = "";
     if (mock_path) |mp| {
@@ -1897,23 +1885,23 @@ fn runSolo(args: std.process.Args) u8 {
         };
         mock = .{ .lines = std.mem.splitScalar(u8, contents, '\n') };
     } else {
-        home = getHome(&home_buf) orelse {
+        home = getEnv(io, "HOME") orelse {
             warn("agent solo: HOME not set\n");
             return 2;
         };
-        if (agentNeedsKey() or getEnv("ZISH_AGENT_ENDPOINT") != null) {
+        if (agentNeedsKey(io) or getEnv(io, "ZISH_AGENT_ENDPOINT") != null) {
             var kbuf: [4096]u8 = undefined;
             const kpath = std.fmt.bufPrint(&kbuf, "{s}/.zish/openrouter.key", .{home}) catch "";
             if (readFileAlloc(kpath)) |k| {
                 key = k;
-            } else if (agentNeedsKey()) {
+            } else if (agentNeedsKey(io)) {
                 warn("agent solo: no API key at ~/.zish/openrouter.key\n");
                 return 2;
             }
         }
     }
     var ep_buf: [512]u8 = undefined;
-    const endpoint = agentEndpoint(&ep_buf);
+    const endpoint = agentEndpoint(io, &ep_buf);
 
     var history: std.ArrayListUnmanaged(Message) = .empty;
     history.append(alloc, .{ .role = .system, .content = SOLO_SYSTEM }) catch return 2;
@@ -1926,10 +1914,10 @@ fn runSolo(args: std.process.Args) u8 {
     // budget for nothing. If the identical command comes back 3× running, stop.
     var last_cmd: []const u8 = "";
     var repeats: usize = 0;
-    const max = soloMaxTurns();
+    const max = soloMaxTurns(io);
     while (turn < max) : (turn += 1) {
         const request = buildRequest(model, history.items, SHELL_TOOLS) catch return 1;
-        const reply = fetchWithBackoff(&mock, home, endpoint, key, request) orelse {
+        const reply = fetchWithBackoff(io, &mock, home, endpoint, key, request) orelse {
             warn("agent solo: request failed\n");
             return 1;
         };
@@ -1948,7 +1936,7 @@ fn runSolo(args: std.process.Args) u8 {
             },
             .text => |t| {
                 const sr = splitReasoning(std.mem.trim(u8, t, " \t\r\n"));
-                writeSoloMeta(pt_sum, ct_sum, model, sr.think); // summed tokens + model → sidecar
+                writeSoloMeta(io, pt_sum, ct_sum, model, sr.think); // summed tokens + model → sidecar
                 emit(sr.answer);
                 emit("\n");
                 return 0;
@@ -1957,7 +1945,7 @@ fn runSolo(args: std.process.Args) u8 {
                 appendAssistantToolCalls(&history, calls);
                 for (calls) |call| {
                     const cmd = parseCommandArg(call.arguments) orelse {
-                        appendToolResult(&history, call.id, .{ .code = 2, .out = dupe("agent: could not parse command argument") });
+                        appendToolResult(io, &history, call.id, .{ .code = 2, .out = dupe("agent: could not parse command argument") });
                         continue;
                     };
                     // loop guard
@@ -1968,29 +1956,29 @@ fn runSolo(args: std.process.Args) u8 {
                         last_cmd = dupe(cmd);
                     }
                     if (repeats >= 2) { // this is the 3rd identical command
-                        writeSoloMeta(pt_sum, ct_sum, model, "");
+                        writeSoloMeta(io, pt_sum, ct_sum, model, "");
                         emit("agent solo: aborted — repeated the same command 3× (loop guard). Partial work above.\n");
                         return 0;
                     }
                     const res = runCommandLocal(cmd) orelse {
-                        appendToolResult(&history, call.id, .{ .code = 127, .out = dupe("agent: command could not run") });
+                        appendToolResult(io, &history, call.id, .{ .code = 127, .out = dupe("agent: command could not run") });
                         continue;
                     };
-                    appendToolResult(&history, call.id, res); // bounded inside
+                    appendToolResult(io, &history, call.id, res); // bounded inside
                 }
             },
         }
     }
     // ran out of turns — emit whatever the last assistant text would be as a stub
-    writeSoloMeta(pt_sum, ct_sum, model, "");
+    writeSoloMeta(io, pt_sum, ct_sum, model, "");
     emit("agent solo: reached the turn limit without a final answer\n");
     return 0;
 }
 
 /// summed usage + model → the ZISH_ASK_META sidecar, so `team` accounts a solo
 /// worker's whole run (all tool round-trips), not just its last call.
-fn writeSoloMeta(pt: i64, ct: i64, model: []const u8, think: []const u8) void {
-    const mp = getEnv("ZISH_ASK_META") orelse return;
+fn writeSoloMeta(io: std.Io, pt: i64, ct: i64, model: []const u8, think: []const u8) void {
+    const mp = getEnv(io, "ZISH_ASK_META") orelse return;
     var m: std.ArrayListUnmanaged(u8) = .empty;
     defer m.deinit(alloc);
     var nb: [64]u8 = undefined;
@@ -2002,8 +1990,8 @@ fn writeSoloMeta(pt: i64, ct: i64, model: []const u8, think: []const u8) void {
     _ = writeFile600(mp, m.items);
 }
 
-fn runJudge(args: std.process.Args) u8 {
-    const cfg = parseJudgeArgs(args) orelse {
+fn runJudge(io: std.Io, args: std.process.Args) u8 {
+    const cfg = parseJudgeArgs(io, args) orelse {
         warn("agent: usage: agent --judge [-m model] [--mock file] <rubric> <subject...>\n");
         return 2;
     };
@@ -2031,7 +2019,6 @@ fn runJudge(args: std.process.Args) u8 {
 
     // transport: same seam as the model loop (mock file or curl + key)
     var mock: ?Mock = null;
-    var home_buf: [4096]u8 = undefined;
     var home: []const u8 = "";
     var key: []const u8 = "";
     if (cfg.mock_path) |mp| {
@@ -2041,28 +2028,28 @@ fn runJudge(args: std.process.Args) u8 {
         };
         mock = .{ .lines = std.mem.splitScalar(u8, contents, '\n') };
     } else {
-        home = getHome(&home_buf) orelse {
+        home = getEnv(io, "HOME") orelse {
             warn("agent: HOME not set\n");
             return 2;
         };
-        if (agentNeedsKey() or getEnv("ZISH_AGENT_ENDPOINT") != null) {
+        if (agentNeedsKey(io) or getEnv(io, "ZISH_AGENT_ENDPOINT") != null) {
             var kbuf: [4096]u8 = undefined;
             const kpath = std.fmt.bufPrint(&kbuf, "{s}/.zish/openrouter.key", .{home}) catch "";
             if (readFileAlloc(kpath)) |k| {
                 key = k;
-            } else if (agentNeedsKey()) {
+            } else if (agentNeedsKey(io)) {
                 warn("agent: no API key at ~/.zish/openrouter.key\n");
                 return 2;
             }
         }
     }
     var ep_buf: [512]u8 = undefined;
-    const endpoint = agentEndpoint(&ep_buf);
+    const endpoint = agentEndpoint(io, &ep_buf);
 
     var attempt: usize = 0;
     while (attempt < JUDGE_RETRIES) : (attempt += 1) {
-        const request = buildJudgeRequest(cfg.model, JUDGE_SYSTEM, user.items) catch return 2;
-        const reply = fetchWithBackoff(&mock, home, endpoint, key, request) orelse continue;
+        const request = buildJudgeRequest(io, cfg.model, JUDGE_SYSTEM, user.items) catch return 2;
+        const reply = fetchWithBackoff(io, &mock, home, endpoint, key, request) orelse continue;
         if (reply.status < 200 or reply.status >= 300) continue;
         switch (parseResponse(reply.body)) {
             .text => |t| {
@@ -2141,7 +2128,7 @@ test "verdictValid requires pass|fail plus a scores object" {
 }
 
 test "buildJudgeRequest has no tools and escapes content" {
-    const req = try buildJudgeRequest("m", "sys \"q\"", "review this");
+    const req = try buildJudgeRequest(std.testing.io, "m", "sys \"q\"", "review this");
     defer alloc.free(req);
     try std.testing.expect(std.mem.indexOf(u8, req, "run_command") == null);
     try std.testing.expect(std.mem.indexOf(u8, req, "\"role\":\"system\"") != null);

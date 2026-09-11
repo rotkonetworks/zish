@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const feat = @import("lib/feat.zig");
 const alloc = std.heap.page_allocator;
 
 const MAX_IN = 4 * 1024 * 1024;
@@ -57,11 +58,6 @@ fn detect(tag: []const u8) ?Lang {
 }
 
 // --- syscall-shaped helpers (match feats/team style) ------------------------
-fn getEnv(name: [:0]const u8) ?[]const u8 {
-    const v = std.c.getenv(name.ptr) orelse return null;
-    return std.mem.span(v);
-}
-
 fn toZ(buf: []u8, s: []const u8) ?[*:0]const u8 {
     if (s.len >= buf.len) return null;
     @memcpy(buf[0..s.len], s);
@@ -112,8 +108,10 @@ fn unlinkPath(path: []const u8) void {
 }
 
 /// Is `name` an executable on PATH?
-fn onPath(name: []const u8) bool {
-    const path_env = getEnv("PATH") orelse "/usr/bin:/bin";
+fn onPath(init: std.process.Init, name: []const u8) bool {
+    // The shared primitive hands back allocated values; the process arena owns
+    // them, so they live exactly as long as the environ memory they replaced.
+    const path_env = feat.env(init.arena.allocator(), init.io, "PATH") orelse "/usr/bin:/bin";
     var it = std.mem.splitScalar(u8, path_env, ':');
     while (it.next()) |dir| {
         if (dir.len == 0) continue;
@@ -130,13 +128,13 @@ const Run = struct { out: []u8, code: u8 };
 
 /// fork+exec `env timeout <n> <argv…>` capturing stdout+stderr merged. The child
 /// is a compiler, never the checked code.
-fn runChecker(args: []const []const u8, timeout_s: u32) ?Run {
-    return runCheckerIn(args, timeout_s, null);
+fn runChecker(init: std.process.Init, args: []const []const u8, timeout_s: u32) ?Run {
+    return runCheckerIn(init, args, timeout_s, null);
 }
 
 /// Same, with the child chdir'd into `cwd` before exec (still under `timeout`).
 /// The parent's cwd is never touched.
-fn runCheckerIn(args: []const []const u8, timeout_s: u32, cwd: ?[]const u8) ?Run {
+fn runCheckerIn(init: std.process.Init, args: []const []const u8, timeout_s: u32, cwd: ?[]const u8) ?Run {
     var cwdz_buf: [4096]u8 = undefined;
     const cwdz: ?[*:0]const u8 = if (cwd) |d| (toZ(&cwdz_buf, d) orelse return null) else null;
 
@@ -183,7 +181,9 @@ fn runCheckerIn(args: []const []const u8, timeout_s: u32, cwd: ?[]const u8) ?Run
         // the parent verified the dir is enterable; a failure here is still
         // surfaced as a distinct exit (126) rather than a blank build failure.
         if (cwdz) |d| if (@as(isize, @bitCast(linux.chdir(d))) < 0) linux.exit(126);
-        _ = linux.execve("/usr/bin/env", argvz, @ptrCast(std.c.environ));
+        // The checker inherits this process's environment block, taken from the
+        // startup data Zig already holds — no libc environ needed.
+        _ = linux.execve("/usr/bin/env", argvz, init.minimal.environ.block.slice.ptr);
         linux.exit(127);
     }
     _ = linux.close(fds[1]);
@@ -197,8 +197,8 @@ fn runCheckerIn(args: []const []const u8, timeout_s: u32, cwd: ?[]const u8) ?Run
 
 /// Compile-check `code` as language `l`. Returns exit 0 (ok) / 1 (fail); prints
 /// diagnostics. Writes a temp file (0600) with the right extension, reaps it.
-fn verifyTimeout(default: u32) u32 {
-    const v = getEnv("ZISH_VERIFY_TIMEOUT") orelse return default;
+fn verifyTimeout(init: std.process.Init, default: u32) u32 {
+    const v = feat.env(init.arena.allocator(), init.io, "ZISH_VERIFY_TIMEOUT") orelse return default;
     return std.fmt.parseInt(u32, v, 10) catch default;
 }
 
@@ -229,9 +229,9 @@ fn proofHole(l: Lang, code: []const u8) ?[]const u8 {
     return null;
 }
 
-fn check(l: Lang, code: []const u8) u8 {
+fn check(init: std.process.Init, l: Lang, code: []const u8) u8 {
     const sp = spec(l);
-    const home = getEnv("HOME") orelse "/tmp";
+    const home = feat.env(init.arena.allocator(), init.io, "HOME") orelse "/tmp";
     const pid = linux.getpid();
     const path = std.fmt.allocPrint(alloc, "{s}/.zish-verify-{d}.{s}", .{ home, pid, sp.ext }) catch return 2;
     defer alloc.free(path);
@@ -248,24 +248,24 @@ fn check(l: Lang, code: []const u8) u8 {
 
     // proof oracles can be slow (Kani model-checking, Lean elaboration) — give
     // them room; override with ZISH_VERIFY_TIMEOUT.
-    const t: u32 = if (isProof(l)) verifyTimeout(300) else verifyTimeout(60);
+    const t: u32 = if (isProof(l)) verifyTimeout(init, 300) else verifyTimeout(init, 60);
     const res: ?Run = switch (l) {
-        .zig => runChecker(&.{ "zig", "ast-check", path }, t),
-        .rust => runChecker(&.{ "rustc", "--edition", "2021", "--crate-type", "lib", "--emit=metadata", "-o", rmeta, path }, t),
-        .python => runChecker(&.{ "python3", "-m", "py_compile", path }, t),
-        .go => runChecker(&.{ "gofmt", "-e", path }, t),
-        .c => runChecker(&.{ "cc", "-fsyntax-only", path }, t),
-        .cpp => runChecker(&.{ "c++", "-fsyntax-only", path }, t),
-        .ts => runChecker(&.{ "bun", "build", "--outdir", od, path }, t),
-        .js => runChecker(&.{ "node", "--check", path }, t),
-        .bash => runChecker(&.{ "bash", "-n", path }, t),
+        .zig => runChecker(init, &.{ "zig", "ast-check", path }, t),
+        .rust => runChecker(init, &.{ "rustc", "--edition", "2021", "--crate-type", "lib", "--emit=metadata", "-o", rmeta, path }, t),
+        .python => runChecker(init, &.{ "python3", "-m", "py_compile", path }, t),
+        .go => runChecker(init, &.{ "gofmt", "-e", path }, t),
+        .c => runChecker(init, &.{ "cc", "-fsyntax-only", path }, t),
+        .cpp => runChecker(init, &.{ "c++", "-fsyntax-only", path }, t),
+        .ts => runChecker(init, &.{ "bun", "build", "--outdir", od, path }, t),
+        .js => runChecker(init, &.{ "node", "--check", path }, t),
+        .bash => runChecker(init, &.{ "bash", "-n", path }, t),
         // lean type-checks the file (errors → non-zero); with no `sorry` a
         // successful elaboration means the theorems are proved.
-        .lean => runChecker(&.{ "lean", path }, t),
+        .lean => runChecker(init, &.{ "lean", path }, t),
         // coqc compiles the .v; Admitted/admit already rejected above.
-        .coq => runChecker(&.{ "coqc", "-q", path }, t),
+        .coq => runChecker(init, &.{ "coqc", "-q", path }, t),
         // kani model-checks the Rust harnesses; exit 0 = no counterexample found.
-        .kani => runChecker(&.{ "kani", path }, t),
+        .kani => runChecker(init, &.{ "kani", path }, t),
     };
     const r = res orelse {
         warn("verify: compiler spawn failed\n");
@@ -415,7 +415,7 @@ fn fileExists(dir: []const u8, name: []const u8) bool {
 
 /// `verify lake <dir>`: 2 usage / 1 hole-or-inconclusive-or-build-fail /
 /// 4 no lake / 0 built.
-fn checkLake(dir: []const u8) u8 {
+fn checkLake(init: std.process.Init, dir: []const u8) u8 {
     if (!fileExists(dir, "lakefile.lean") and !fileExists(dir, "lakefile.toml")) {
         var b: [4400]u8 = undefined;
         warn(std.fmt.bufPrint(&b, "verify: lake: '{s}' is not a lake project (no lakefile.lean/lakefile.toml)\n", .{dir}) catch "verify: lake: not a lake project\n");
@@ -432,12 +432,12 @@ fn checkLake(dir: []const u8) u8 {
         out(msg);
         return 1;
     }
-    if (!onPath("lake")) {
+    if (!onPath(init, "lake")) {
         warn("verify: 'lake' toolchain ('lake') not installed\n");
         return 4;
     }
     // whole-project builds (mathlib) are slow: much longer default than a snippet.
-    const r = runCheckerIn(&.{ "lake", "build" }, verifyTimeout(1800), dir) orelse {
+    const r = runCheckerIn(init, &.{ "lake", "build" }, verifyTimeout(init, 1800), dir) orelse {
         warn("verify: compiler spawn failed\n");
         return 2;
     };
@@ -453,16 +453,16 @@ fn checkLake(dir: []const u8) u8 {
 }
 
 /// Print the comma-joined names of every language whose checker is installed.
-fn printCaps() void {
+fn printCaps(init: std.process.Init) void {
     var o: std.ArrayListUnmanaged(u8) = .empty;
     defer o.deinit(alloc);
     for (ALL) |l| {
         const sp = spec(l);
-        if (!onPath(sp.bin)) continue;
+        if (!onPath(init, sp.bin)) continue;
         if (o.items.len > 0) o.appendSlice(alloc, ", ") catch {};
         o.appendSlice(alloc, sp.name) catch {};
     }
-    if (onPath("lake")) {
+    if (onPath(init, "lake")) {
         if (o.items.len > 0) o.appendSlice(alloc, ", ") catch {};
         o.appendSlice(alloc, "lake") catch {};
     }
@@ -483,12 +483,12 @@ fn usage() void {
     );
 }
 
-pub fn main(init: std.process.Init.Minimal) u8 {
-    return run(init.args);
+pub fn main(init: std.process.Init) u8 {
+    return run(init);
 }
 
-fn run(args: std.process.Args) u8 {
-    var it = args.iterate();
+fn run(init: std.process.Init) u8 {
+    var it = init.minimal.args.iterate();
     _ = it.next(); // argv[0]
     const sub = it.next() orelse {
         usage();
@@ -496,7 +496,7 @@ fn run(args: std.process.Args) u8 {
     };
 
     if (std.mem.eql(u8, sub, "caps") or std.mem.eql(u8, sub, "--caps")) {
-        printCaps();
+        printCaps(init);
         return 0;
     }
     if (std.mem.eql(u8, sub, "-h") or std.mem.eql(u8, sub, "--help") or std.mem.eql(u8, sub, "help")) {
@@ -510,7 +510,7 @@ fn run(args: std.process.Args) u8 {
             usage();
             return 2;
         };
-        return checkLake(dir);
+        return checkLake(init, dir);
     }
 
     // otherwise `sub` is a language tag; code comes on stdin
@@ -534,10 +534,10 @@ fn run(args: std.process.Args) u8 {
             return 1;
         }
     }
-    if (!onPath(spec(l).bin)) {
+    if (!onPath(init, spec(l).bin)) {
         var b: [256]u8 = undefined;
         warn(std.fmt.bufPrint(&b, "verify: '{s}' toolchain ('{s}') not installed\n", .{ spec(l).name, spec(l).bin }) catch "verify: toolchain missing\n");
         return 4; // known language, checker missing — distinct from an unknown tag (3)
     }
-    return check(l, code);
+    return check(init, l, code);
 }
