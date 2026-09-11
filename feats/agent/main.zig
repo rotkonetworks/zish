@@ -532,6 +532,9 @@ const Config = struct {
 };
 
 pub fn main(init: std.process.Init) void {
+    // Full Init installs a no-op SIGPIPE handler; a filter must die on a closed
+    // stdout like every other CLI, so restore the default before doing anything.
+    feat.restoreSigpipe();
     // `std.process.Init` is the only io this feat has: every function below that
     // reads an environment variable takes it as an argument. The environment
     // block itself is captured once — execve hands it to children verbatim, and

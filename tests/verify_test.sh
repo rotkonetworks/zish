@@ -17,6 +17,17 @@ pass=0; fail=0
 ok()  { pass=$((pass+1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
 
+# SIGPIPE regression: a filter must die (141) when the reader of its stdout is
+# gone, not swallow EPIPE and exit 0. A pipe whose read end is closed *before*
+# exec fails the first write deterministically; `| head -c1` does not for output
+# under the 64 KiB pipe buffer — the write lands before the reader exits.
+sigpipe_status() {
+    python3 -c 'import os,sys
+r, w = os.pipe(); os.close(r)
+os.dup2(w, 1); os.close(w)
+os.execvp(sys.argv[1], sys.argv[1:])' "$@" 2>/dev/null
+}
+
 echo "== caps advertises installed checkers =="
 caps=$("$V" caps); rc=$?
 [ "$rc" -eq 0 ] && ok "caps exits 0" || bad "caps exit $rc"
@@ -88,6 +99,14 @@ PATH="$T/emptybin" "$V" lake "$T/nolake" >/dev/null 2>&1
 [ $? -eq 2 ] && ok "dir without lakefile -> exit 2 (usage)" || bad "no-lakefile wrong exit"
 PATH="$T/emptybin" "$V" lake >/dev/null 2>&1
 [ $? -eq 2 ] && ok "lake without <dir> -> exit 2 (usage)" || bad "lake no-arg wrong exit"
+
+echo "== SIGPIPE: stdout closed on us kills the process (141), not a quiet 0 =="
+if command -v python3 >/dev/null 2>&1; then
+    sigpipe_status "$V" caps; rc=$?
+    [ "$rc" -eq 141 ] && ok "caps with the stdout reader gone -> exit 141" || bad "closed stdout exit $rc (want 141)"
+else
+    printf '  \033[33mSKIP\033[0m SIGPIPE case (no python3)\n'
+fi
 
 echo
 if [ "$fail" -eq 0 ]; then printf '\033[32mALL GREEN\033[0m — %d passed\n' "$pass"; exit 0

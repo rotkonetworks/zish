@@ -100,6 +100,17 @@ pass=0; fail=0
 ok()  { pass=$((pass+1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
 
+# SIGPIPE regression: a filter must die (141) when the reader of its stdout is
+# gone, not swallow EPIPE and exit 0. A pipe whose read end is closed *before*
+# exec fails the first write deterministically; `| head -c1` does not for output
+# under the 64 KiB pipe buffer — the write lands before the reader exits.
+sigpipe_status() {
+    python3 -c 'import os,sys
+r, w = os.pipe(); os.close(r)
+os.dup2(w, 1); os.close(w)
+os.execvp(sys.argv[1], sys.argv[1:])' "$@" 2>/dev/null
+}
+
 # fresh logs per run
 reset_logs() { : > "$T/agent.log"; : > "$T/spend.log"; : > "$T/split.log"; rm -f "$T/state"/*; }
 sumlog() { awk '{s+=$1} END{print s+0}' "$1"; }
@@ -249,6 +260,14 @@ if grep -q '^expert$' "$T/agent.log"; then bad "consulted a non-existent expert"
 reset_logs; : > "$T/prompt4.log"
 o=$(FAKE_WORKER_BTW=security PROMPT_LOG="$T/prompt4.log" ZISH_EXPERTS_FILE="$T/none.toml" TEAM run 12 "x")
 if grep -q 'emit ONE line' "$T/prompt4.log"; then bad "offered a consult with no experts file"; else ok "no experts file -> no consult offer (fail-open)"; fi
+
+echo "== SIGPIPE: stdout closed on us kills the process (141), not a quiet 0 =="
+if command -v python3 >/dev/null 2>&1; then
+    sigpipe_status env HOME="$T/home" ZISH_FEAT_PATH="$T/feats" "$T/team" prompts; rc=$?
+    [ "$rc" -eq 141 ] && ok "prompts with the stdout reader gone -> exit 141" || bad "closed stdout exit $rc (want 141)"
+else
+    printf '  \033[33mSKIP\033[0m SIGPIPE case (no python3)\n'
+fi
 
 echo
 total=$((pass+fail))

@@ -1453,6 +1453,9 @@ fn teamRun(io: std.Io, root_budget: i64, task: []const u8, context: []const u8) 
 // ---------------------------------------------------------------------------
 
 pub fn main(init: std.process.Init) u8 {
+    // Full Init installs a no-op SIGPIPE handler; a filter must die on a closed
+    // stdout like every other CLI, so restore the default before doing anything.
+    feat.restoreSigpipe();
     // `std.process.Init` is the only io this feat has: everything that reads an
     // environment variable takes it as an argument. The environment block itself
     // is captured once — it is a kernel-provided constant, not a service with a

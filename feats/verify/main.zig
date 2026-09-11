@@ -484,6 +484,9 @@ fn usage() void {
 }
 
 pub fn main(init: std.process.Init) u8 {
+    // Full Init installs a no-op SIGPIPE handler; a filter must die on a closed
+    // stdout like every other CLI, so restore the default before doing anything.
+    feat.restoreSigpipe();
     return run(init);
 }
 

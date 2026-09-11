@@ -18,6 +18,17 @@ pass=0; fail=0
 ok()  { pass=$((pass+1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }
 bad() { fail=$((fail+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
 
+# SIGPIPE regression: a filter must die (141) when the reader of its stdout is
+# gone, not swallow EPIPE and exit 0. A pipe whose read end is closed *before*
+# exec fails the first write deterministically; `| head -c1` does not for output
+# under the 64 KiB pipe buffer — the write lands before the reader exits.
+sigpipe_status() {
+    python3 -c 'import os,sys
+r, w = os.pipe(); os.close(r)
+os.dup2(w, 1); os.close(w)
+os.execvp(sys.argv[1], sys.argv[1:])' "$@" 2>/dev/null
+}
+
 # answer the (single) pending question with $1 once it appears
 answer_with() {
   local val="$1" i=0
@@ -143,6 +154,19 @@ el=$(( $(date +%s) - start ))
 
 echo "== answered questions clean up their files =="
 [ -z "$(ls "$T/.zish/asks" 2>/dev/null)" ] && ok "asks dir clean after answers" || bad "stale files: $(ls "$T/.zish/asks")"
+
+echo "== SIGPIPE: stdout closed on us kills the process (141), not a quiet 0 =="
+if command -v python3 >/dev/null 2>&1; then
+    ( sigpipe_status "$A" -t 10 "read by nobody?" ) &
+    spid=$!
+    answer_with "an answer nobody will read"
+    wait "$spid"; rc=$?
+    [ "$rc" -eq 141 ] && ok "answer with the stdout reader gone -> exit 141" || bad "closed stdout exit $rc (want 141)"
+    # killed by a signal: the feat's cleanup defers never ran — tidy up here
+    rm -f "$T/.zish/asks"/*
+else
+    printf '  \033[33mSKIP\033[0m SIGPIPE case (no python3)\n'
+fi
 
 echo
 if [ "$fail" -eq 0 ]; then printf '\033[32mALL GREEN\033[0m — %d passed\n' "$pass"; exit 0
