@@ -48,6 +48,7 @@ Nine wire frames, stable across v0.1 → v0.3. Direction is host↔guest.
 | `say` | `{"t":"say","text":"<text>"}` | display a line to the human (implies a trailing newline) |
 | `stream` | `{"t":"stream","text":"<text>"}` | append text with **no** implied newline (token-by-token output) |
 | `prompt` | `{"t":"prompt","text":"<question>"}` | ask the human a question; the answer arrives later as an `event` |
+| `usage` | `{"t":"usage","in":<int>,"out":<int>}` | report what this turn cost. Not a hostcall — an announcement, so no capability gates it. The host accumulates it and mirrors the running totals into `.meta`, which is the only way a supervisor ever sees what an agent spent: the host never talks to a model. Absent is not an error, so a guest that predates this frame simply never sends it |
 | `done` | `{"t":"done"}` | end the session cleanly |
 
 ### 1.2 Host → guest
@@ -167,7 +168,15 @@ separate, append-only JSONL **event log** per session
 (`~/.zish/sessions/<hostpid>-<id>-<name>.jsonl`) — a durable record, not a
 protocol. Its event vocabulary is richer and file-only:
 
-    start · say · stream · run · result · prompt · answer · denied · note · end
+    start · say · stream · run · result · prompt · answer · denied · note · usage · end
+
+`usage` records one turn's cost as a **delta** (`{"t":"usage","in":N,"out":N}`),
+because an append-only log records what happened and a ledger is the sum of it;
+the `end` line carries the session's cumulative totals in the same shape, so a
+transcript read after the fact yields the cost without summing. The registry
+record survives the session for `ENDED_META_TTL_SECS` with `state: "ended"` and
+those totals — otherwise a commander that was not polling at the instant a
+worker finished would lose the only pointer to its transcript.
 
 Every value is JSON-escaped, so `cat`-ing a transcript is terminal-safe **for
 free** (an ESC control byte is stored as the literal six-character escape

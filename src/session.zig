@@ -157,6 +157,9 @@ pub const Session = struct {
     /// `usage` frame and is mirrored into `.meta` for a supervisor to read.
     usage_in: u64 = 0,
     usage_out: u64 = 0,
+    /// Set just before the final registry write, so the record that outlives the
+    /// session says it is finished rather than lying about being live.
+    ended: bool = false,
 };
 
 // ---------------------------------------------------------------------------
@@ -478,7 +481,14 @@ fn writeMeta(shell: *Shell, s: *const Session) void {
     const alloc = shell.allocator;
     const path = metaPath(alloc, s.id) orelse return;
     defer alloc.free(path);
-    const state: []const u8 = if (s.pending_q != null) "awaiting" else if (s.tool != null) "tool" else "running";
+    const state: []const u8 = if (s.ended)
+        "ended"
+    else if (s.pending_q != null)
+        "awaiting"
+    else if (s.tool != null)
+        "tool"
+    else
+        "running";
 
     var b: std.ArrayListUnmanaged(u8) = .empty;
     defer b.deinit(alloc);
@@ -506,6 +516,10 @@ fn writeMeta(shell: *Shell, s: *const Session) void {
     b.appendSlice(alloc, std.fmt.bufPrint(&ub, "{d}", .{s.usage_in}) catch return) catch return;
     b.appendSlice(alloc, ",\"out\":") catch return;
     b.appendSlice(alloc, std.fmt.bufPrint(&ub, "{d}", .{s.usage_out}) catch return) catch return;
+    // Wall-clock stamp so a record that outlives its session can be aged out
+    // rather than accumulating in the registry forever.
+    b.appendSlice(alloc, ",\"ts\":") catch return;
+    b.appendSlice(alloc, std.fmt.bufPrint(&ub, "{d}", .{compat.timestamp()}) catch return) catch return;
     b.appendSlice(alloc, "}\n") catch return;
 
     var pz: [std.fs.max_path_bytes]u8 = undefined;
@@ -513,15 +527,6 @@ fn writeMeta(shell: *Shell, s: *const Session) void {
     const fd = compat.posix.openZ(pathz.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o600) catch return;
     defer compat.posix.close(fd);
     writeAllFd(fd, b.items);
-}
-
-fn removeMeta(shell: *Shell, id: u32) void {
-    const alloc = shell.allocator;
-    const path = metaPath(alloc, id) orelse return;
-    defer alloc.free(path);
-    var pz: [std.fs.max_path_bytes]u8 = undefined;
-    const pathz = std.fmt.bufPrintZ(&pz, "{s}", .{path}) catch return;
-    std.Io.Dir.deleteFileAbsolute(compat.io(), pathz) catch {};
 }
 
 /// Transcripts live flat under ~/.zish/sessions/, named
@@ -577,16 +582,19 @@ fn logKV(shell: *Shell, fd: compat.posix.fd_t, kind: []const u8, key: []const u8
     writeAllFd(fd, b.items);
 }
 
-/// Append `{"t":"usage","in":N,"out":N}`. Numbers stay numbers — a ledger that
+/// Append `{"t":"<kind>","in":N,"out":N}`. Numbers stay numbers — a ledger that
 /// gets summed downstream should not make its consumer parse them back out of
-/// strings, and `logKV`'s single-string shape would do exactly that.
-fn logUsage(shell: *Shell, fd: compat.posix.fd_t, in_tok: u64, out_tok: u64) void {
+/// strings, and `logKV`'s single-string shape would do exactly that. Used both
+/// for per-turn `usage` deltas and for the cumulative totals on `end`.
+fn logUsage(shell: *Shell, fd: compat.posix.fd_t, kind: []const u8, in_tok: u64, out_tok: u64) void {
     if (fd < 0) return;
     const alloc = shell.allocator;
     var b: std.ArrayListUnmanaged(u8) = .empty;
     defer b.deinit(alloc);
     var num: [24]u8 = undefined;
-    b.appendSlice(alloc, "{\"t\":\"usage\",\"in\":") catch return;
+    b.appendSlice(alloc, "{\"t\":\"") catch return;
+    b.appendSlice(alloc, kind) catch return;
+    b.appendSlice(alloc, "\",\"in\":") catch return;
     b.appendSlice(alloc, std.fmt.bufPrint(&num, "{d}", .{in_tok}) catch return) catch return;
     b.appendSlice(alloc, ",\"out\":") catch return;
     b.appendSlice(alloc, std.fmt.bufPrint(&num, "{d}", .{out_tok}) catch return) catch return;
@@ -607,13 +615,6 @@ fn logResult(shell: *Shell, fd: compat.posix.fd_t, code: u8, out: []const u8) vo
     if (out.len > capped.len) b.appendSlice(alloc, "\\n[output truncated]") catch return;
     b.appendSlice(alloc, "\"}\n") catch return;
     writeAllFd(fd, b.items);
-}
-
-fn logBare(fd: compat.posix.fd_t, kind: []const u8) void {
-    if (fd < 0) return;
-    writeAllFd(fd, "{\"t\":\"");
-    writeAllFd(fd, kind);
-    writeAllFd(fd, "\"}\n");
 }
 
 /// A session fd (or its HUP) came up readable in the input poll: drain it and
@@ -720,7 +721,7 @@ fn handleAsyncFrame(shell: *Shell, s: *Session, line: []const u8) !bool {
         // session rather than replaying a transcript that can be megabytes.
         s.usage_in +|= in_delta;
         s.usage_out +|= out_delta;
-        logUsage(shell, s.transcript_fd, in_delta, out_delta);
+        logUsage(shell, s.transcript_fd, "usage", in_delta, out_delta);
         writeMeta(shell, s);
         return false;
     }
@@ -983,11 +984,31 @@ fn deliverAnswer(shell: *Shell, s: *Session, text: []const u8) bool {
     return true;
 }
 
+/// How long a finished session's registry record is kept. Long enough that a
+/// commander which was not polling at the instant it ended can still account
+/// for what it cost; short enough that the registry does not grow forever.
+const ENDED_META_TTL_SECS = 60 * 60;
+
+/// Remove a registry record and its control FIFO. They are keyed by the record,
+/// so they must be swept together or the FIFOs accumulate.
+fn sweepRecord(full: []const u8, parsed: std.json.Value) void {
+    std.Io.Dir.deleteFileAbsolute(compat.io(), full) catch {};
+    if (objStr(parsed, "ctl")) |ctl| {
+        if (ctl.len > 0) {
+            var cz: [std.fs.max_path_bytes]u8 = undefined;
+            if (std.fmt.bufPrintZ(&cz, "{s}", .{ctl})) |ctlz| {
+                std.Io.Dir.deleteFileAbsolute(compat.io(), ctlz) catch {};
+            } else |_| {}
+        }
+    }
+}
+
 /// Print the file-based org registry: every `.meta` under ~/.zish/sessions,
 /// across all hosting shells (this is what makes `session list` work from a
 /// separate process — a Claude Code / IRC front-end reads the same records).
 /// A record whose host process is gone is shown as `[stale]` and its file is
-/// swept, so a crashed shell leaves no permanent ghost.
+/// swept, so a crashed shell leaves no permanent ghost. A finished session's
+/// record survives for `ENDED_META_TTL_SECS` so its cost outlives it.
 pub fn listRegistry(shell: *Shell, json: bool) !void {
     const alloc = shell.allocator;
     const out = shell.stdout();
@@ -1023,19 +1044,19 @@ pub fn listRegistry(shell: *Shell, json: bool) !void {
         const tok_out: i64 = objInt(parsed.value, "out") orelse 0;
 
         // liveness: kill(host, 0) — 0 or EPERM = exists, ESRCH = gone.
+        const ended = std.mem.eql(u8, state, "ended");
         const alive = host > 0 and hostAlive(@intCast(host));
-        if (!alive) {
-            std.Io.Dir.deleteFileAbsolute(compat.io(), full) catch {};
-            // sweep the dead host's control FIFO too, or crashes accumulate them
-            if (objStr(parsed.value, "ctl")) |ctl| {
-                if (ctl.len > 0) {
-                    var cz: [std.fs.max_path_bytes]u8 = undefined;
-                    if (std.fmt.bufPrintZ(&cz, "{s}", .{ctl})) |ctlz| {
-                        std.Io.Dir.deleteFileAbsolute(compat.io(), ctlz) catch {};
-                    } else |_| {}
-                }
-            }
-        }
+        const ts: i64 = objInt(parsed.value, "ts") orelse 0;
+        const expired = ended and ts > 0 and compat.timestamp() - ts > ENDED_META_TTL_SECS;
+        // Swept when the host died without finishing, or when a finished record
+        // has outlived its window. A finished record stays even if its host is
+        // gone: for a spawned-and-reclaimed worker the host dying *is* the
+        // normal end, and its cost is exactly what needs to remain readable.
+        if (expired or (!alive and !ended)) sweepRecord(full, parsed.value);
+        // Routine aging of a finished record is bookkeeping, not an event: a
+        // supervisor needs to see a *worker* vanish, not a TTL fire.
+        if (expired) continue;
+        const shown: []const u8 = if (!alive and !ended) "stale" else state;
         if (json) {
             // One record per session, swept ones included — a supervisor wants
             // to see a worker disappear, not infer it from a gap. Fields are
@@ -1051,7 +1072,7 @@ pub fn listRegistry(shell: *Shell, json: bool) !void {
             try line.appendSlice(alloc, ",\"name\":\"");
             try appendJsonEscaped(&line, alloc, name);
             try line.appendSlice(alloc, "\",\"state\":\"");
-            try appendJsonEscaped(&line, alloc, if (alive) state else "stale");
+            try appendJsonEscaped(&line, alloc, shown);
             try line.appendSlice(alloc, "\",\"q\":\"");
             try appendJsonEscaped(&line, alloc, q);
             // Cost is the number a commander steers a fleet by, so it belongs in
@@ -1062,10 +1083,10 @@ pub fn listRegistry(shell: *Shell, json: bool) !void {
             try line.appendSlice(alloc, std.fmt.bufPrint(&num, "{d}", .{tok_out}) catch "0");
             try line.appendSlice(alloc, "}\n");
             try out.writeAll(line.items);
-        } else if (!alive) {
+        } else if (!alive and !ended) {
             try out.print("[{d}] {s}  [stale host {d}, swept]\n", .{ id, name, host });
         } else {
-            try out.print("[{d}] {s}  {s}  host={d}  {s}\n", .{ id, name, state, host, transcript });
+            try out.print("[{d}] {s}  {s}  host={d}  {s}\n", .{ id, name, shown, host, transcript });
             if (q.len > 0) try out.print("    ? {s}\n", .{q});
         }
         found = true;
@@ -1211,7 +1232,12 @@ fn sendRemoteCtl(shell: *Shell, id: u32, line: []const u8) !u8 {
 pub fn finishSession(shell: *Shell, idx: usize) void {
     const alloc = shell.allocator;
     var s = shell.sessions.orderedRemove(idx);
-    removeMeta(shell, s.id); // drop the registry record
+    // The registry record outlives the session: a commander that was not polling
+    // at the moment it finished still needs its cost, and deleting the record
+    // deletes the only pointer to the transcript holding the per-turn deltas.
+    // `ended` marks it so `session list` can age it out instead of calling it live.
+    s.ended = true;
+    writeMeta(shell, &s);
     if (s.ctl_fd >= 0) compat.posix.close(s.ctl_fd);
     if (s.ctl_path) |cp| {
         var pz: [std.fs.max_path_bytes]u8 = undefined;
@@ -1241,7 +1267,9 @@ pub fn finishSession(shell: *Shell, idx: usize) void {
     compat.posix.close(s.r);
     reapSessionChild(s.pid);
     if (s.transcript_fd >= 0) {
-        logBare(s.transcript_fd, "end");
+        // The `end` line carries the cumulative totals, so a transcript read
+        // after the fact yields the cost without summing the per-turn deltas.
+        logUsage(shell, s.transcript_fd, "end", s.usage_in, s.usage_out);
         compat.posix.close(s.transcript_fd);
     }
 
