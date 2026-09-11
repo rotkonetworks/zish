@@ -67,6 +67,9 @@ The manifest is **data from a possibly-hostile source**. zish reads **only**:
     tier        (string, required)  one of "core"|"standard"|"extra"
     version     (string, required)  semver, pinned
     help        (string, required)  one-line description
+    kind        (string, optional)  "oneshot" (default) | "session", see §0
+    usage       (string, optional)  one invocation line, for `help` and catalogs
+    summary     (string, optional)  a few words; the prose-free form of `help`
     bin         (string, optional)  executable name; default = <name>
     completion  (array, optional)   CLI hints, see §6
 
@@ -77,8 +80,15 @@ or over-large manifest is rejected as invalid; it is never silently defaulted.
 
 Wired into `builtins.zig` via `isBuiltin`/`dispatch` under the name `feat`.
 
-    zish feat list [--core|--standard|--extra]
-                          list installed feats, optionally filtered by tier
+    zish feat list [-n] [--json[=brief|full]]
+                          list installed feats, ordered by tier then name so a
+                          program can diff or cache the result. `-n` prints
+                          names only; `--json` prints one JSON object per line
+                          with no prose (name, tier, kind, summary), which is
+                          the cheapest structured form; `--json=full` adds
+                          version, bin, usage, and help. A harness renders its
+                          own tool schema from the JSONL form, so a newly
+                          installed feat is callable with no harness change.
     zish feat help <name> print the feat's `help` line
     zish feat run <name> [args...]
                           resolve <name> in the registry, exec its bin with args

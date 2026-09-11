@@ -1314,7 +1314,7 @@ fn writeAllFd(fd: compat.posix.fd_t, bytes: []const u8) void {
     }
 }
 
-fn appendJsonEscaped(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, s: []const u8) !void {
+pub fn appendJsonEscaped(out: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, s: []const u8) !void {
     for (s) |c| switch (c) {
         '"' => try out.appendSlice(alloc, "\\\""),
         '\\' => try out.appendSlice(alloc, "\\\\"),

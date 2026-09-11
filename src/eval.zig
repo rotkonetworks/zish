@@ -4074,18 +4074,65 @@ fn featExec(shell: *Shell, tier: FeatTier, bin_path: []const u8, sub_args: []con
     return out.code;
 }
 
-fn featList(shell: *Shell, alloc: std.mem.Allocator) !u8 {
+/// How much of each feat `list` emits. One axis, because the cost is prose: an
+/// agent scanning for a name it can call and a harness rendering a tool schema
+/// want opposite ends of the same catalog.
+///   names      — one name per line, no structure
+///   json_brief — JSONL, no prose: the stable cheap catalog
+///   json_full  — JSONL with help/usage/version/bin
+///   tsv        — the human/greppable `tier\tname\thelp` line
+const FeatListFormat = enum { names, json_brief, json_full, tsv };
+
+const FeatEntry = struct {
+    tier: []const u8,
+    name: []const u8,
+    kind: []const u8,
+    version: []const u8,
+    bin: []const u8,
+    usage: []const u8,
+    /// The optional short description. Empty when the manifest omits it, which
+    /// is why `json_brief` stays cheap: prose is opt-in per feat, never derived.
+    summary: []const u8,
+    help: []const u8,
+};
+
+fn featEntryLessThan(_: void, a: FeatEntry, b: FeatEntry) bool {
+    if (std.mem.order(u8, a.tier, b.tier) != .eq) return std.mem.order(u8, a.tier, b.tier) == .lt;
+    return std.mem.order(u8, a.name, b.name) == .lt;
+}
+
+fn appendJsonField(
+    out: *std.ArrayListUnmanaged(u8),
+    alloc: std.mem.Allocator,
+    first: *bool,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    if (!first.*) try out.append(alloc, ',');
+    first.* = false;
+    try out.append(alloc, '"');
+    try out.appendSlice(alloc, key);
+    try out.appendSlice(alloc, "\":\"");
+    try session.appendJsonEscaped(out, alloc, value);
+    try out.append(alloc, '"');
+}
+
+/// `feat list [-n] [--json[=brief|full]]`. Ordered by tier then name, never by
+/// directory iteration: a catalog a program diffs, caches, or renders into a
+/// tool schema has to come back byte-identical for the same set of feats.
+fn featList(shell: *Shell, alloc: std.mem.Allocator, format: FeatListFormat) !u8 {
     var root_bufs: [2][std.fs.max_path_bytes]u8 = undefined;
     var roots: [2][]const u8 = undefined;
     const nroots = featRoots(alloc, &root_bufs, &roots);
 
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const aa = arena_state.allocator();
+
     // dedup by "tier/name": a feat in an earlier (user) root shadows the shipped
     // system one, so it lists once — matching what featResolve would dispatch.
     var seen: std.ArrayListUnmanaged([]u8) = .empty;
-    defer {
-        for (seen.items) |s| alloc.free(s);
-        seen.deinit(alloc);
-    }
+    var entries: std.ArrayListUnmanaged(FeatEntry) = .empty;
 
     var ri: usize = 0;
     while (ri < nroots) : (ri += 1) {
@@ -4114,12 +4161,53 @@ fn featList(shell: *Shell, alloc: std.mem.Allocator) !u8 {
                 const mf_path = std.fmt.bufPrint(&mf_path_buf, "{s}/{s}/feat.toml", .{ tier_dir, entry.name }) catch continue;
                 const content = std.Io.Dir.cwd().readFileAlloc(compat.io(), mf_path, alloc, .limited(16 * 1024)) catch continue;
                 defer alloc.free(content);
-                const help = featManifestField(content, "help") orelse "";
-                try shell.stdout().print("{s}\t{s}\t{s}\n", .{ tier_name, entry.name, help });
-                seen.append(alloc, alloc.dupe(u8, key) catch continue) catch {};
+
+                // Manifest strings are owned by the arena; they outlive `content`.
+                const get = struct {
+                    fn f(a: std.mem.Allocator, c: []const u8, k: []const u8, dflt: []const u8) []const u8 {
+                        return a.dupe(u8, featManifestField(c, k) orelse dflt) catch dflt;
+                    }
+                }.f;
+
+                entries.append(aa, .{
+                    .tier = tier_name,
+                    .name = get(aa, content, "name", entry.name),
+                    .kind = get(aa, content, "kind", "oneshot"),
+                    .version = get(aa, content, "version", ""),
+                    .bin = get(aa, content, "bin", entry.name),
+                    .usage = get(aa, content, "usage", ""),
+                    .summary = get(aa, content, "summary", ""),
+                    .help = get(aa, content, "help", ""),
+                }) catch continue;
+                seen.append(aa, aa.dupe(u8, key) catch continue) catch {};
             }
         }
     }
+
+    std.mem.sort(FeatEntry, entries.items, {}, featEntryLessThan);
+
+    for (entries.items) |e| switch (format) {
+        .names => try shell.stdout().print("{s}\n", .{e.name}),
+        .tsv => try shell.stdout().print("{s}\t{s}\t{s}\n", .{ e.tier, e.name, e.help }),
+        .json_brief, .json_full => {
+            var line: std.ArrayListUnmanaged(u8) = .empty;
+            defer line.deinit(aa);
+            var first = true;
+            line.append(aa, '{') catch continue;
+            try appendJsonField(&line, aa, &first, "name", e.name);
+            try appendJsonField(&line, aa, &first, "tier", e.tier);
+            try appendJsonField(&line, aa, &first, "kind", e.kind);
+            try appendJsonField(&line, aa, &first, "summary", e.summary);
+            if (format == .json_full) {
+                try appendJsonField(&line, aa, &first, "version", e.version);
+                try appendJsonField(&line, aa, &first, "bin", e.bin);
+                try appendJsonField(&line, aa, &first, "usage", e.usage);
+                try appendJsonField(&line, aa, &first, "help", e.help);
+            }
+            line.appendSlice(aa, "}\n") catch continue;
+            try shell.stdout().writeAll(line.items);
+        },
+    };
     return 0;
 }
 
@@ -4150,11 +4238,30 @@ fn featHelp(shell: *Shell, alloc: std.mem.Allocator, raw: []const u8) !u8 {
 fn featCmd(shell: *Shell, args: []const []const u8) !u8 {
     const alloc = shell.allocator;
     if (args.len < 2) {
-        try shell.stdout().writeAll("feat: usage: feat list | help <name> | run <name> [args...]\n");
+        try shell.stdout().writeAll("feat: usage: feat list [-n|--json[=full]] | help <name> | run <name> [args...]\n");
         return 2;
     }
     const sub = args[1];
-    if (std.mem.eql(u8, sub, "list")) return try featList(shell, alloc);
+    if (std.mem.eql(u8, sub, "list")) {
+        // One verbosity axis: `-n` for names, `--json` for the structured
+        // catalog, `--json=full` when a consumer needs the prose too.
+        var format: FeatListFormat = .tsv;
+        for (args[2..]) |arg| {
+            if (std.mem.eql(u8, arg, "-n") or std.mem.eql(u8, arg, "--names")) {
+                format = .names;
+            } else if (std.mem.eql(u8, arg, "--json")) {
+                format = .json_brief;
+            } else if (std.mem.eql(u8, arg, "--json=full")) {
+                format = .json_full;
+            } else if (std.mem.eql(u8, arg, "--json=brief")) {
+                format = .json_brief;
+            } else {
+                try shell.stderr().print("feat: unknown list option: {s}\n", .{arg});
+                return 2;
+            }
+        }
+        return try featList(shell, alloc, format);
+    }
     if (std.mem.eql(u8, sub, "help")) {
         if (args.len < 3) return 2;
         return try featHelp(shell, alloc, args[2]);
