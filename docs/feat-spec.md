@@ -198,3 +198,34 @@ These seven are literally the operations I used Python for this session.
   project already adopts).
 - `zig build` compiles feats and stages them into the registry tree so `feat
   list`/`run` reflect the shipped standard set.
+
+### 11.1 Shared code — `feats/lib/feat.zig`
+
+Feats do not share a process, but they may share *source*: `feats/lib/feat.zig`
+is a primitives-only library (env, slurp stdin, terse output, JSON escaping,
+atomic publish, exit-code constants). Sharing it does not touch the
+`fork + exec + argv + stdio` boundary — the coupling the tier system forbids is
+*in-process plugin* coupling, not a statically-linked module.
+
+Primitives only, and no policy: a helper that makes a decision on the caller's
+behalf belongs in the caller.
+
+**Importing it.** Zig confines an import to the root file's own directory tree,
+so `@import("../lib/feat.zig")` does not compile under the pinned command
+`zig build-exe feats/<name>/main.zig` — and no `..` form does, in any mode
+(local, `-lc`, `-target x86_64-linux-musl`) or under `zig test`. So each feat
+carries a relative symlink and imports through it:
+
+    feats/<name>/lib/feat.zig -> ../../lib/feat.zig
+    const feat = @import("lib/feat.zig");
+
+The module-flag form (`-Mroot` / `--dep`) also compiles but would move the cost
+onto every build site, including the shipped `tests/*_test.sh`; the symlink keeps
+them unchanged. Keep the name exactly `lib/feat.zig`.
+
+**Zero libc.** Zig 0.16 removed `std.posix.getenv` and
+`std.process.getEnvVarOwned`, which is why feats used to link libc for one
+lookup; `feat.env` reads `/proc/self/environ`. `FEAT_LIBC` in the `Makefile`
+lists only the feats that still need libc for something real, with the reason
+noted there. A feat that newly needs libc is a change to that list *and* to its
+justification — not a quiet `-lc`.
