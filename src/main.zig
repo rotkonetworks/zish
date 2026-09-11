@@ -10,6 +10,7 @@ const Shell = @import("Shell.zig");
 const build_options = @import("build_options");
 const compat = @import("compat.zig");
 const trace = @import("trace.zig");
+const session = @import("session.zig");
 
 pub fn main(init: std.process.Init) void {
     compat.setIo(init.io);
@@ -148,6 +149,21 @@ pub fn main(init: std.process.Init) void {
     }
 
     if (res.isSet("version")) {
+        // `--json` is the capability probe a harness runs before depending on
+        // anything: the version string alone cannot tell it whether this binary
+        // understands `session list --json`, reports `usage`, or can sandbox.
+        // Without that, a stale binary looks exactly like a broken feature.
+        if (res.isSet("json")) {
+            var jbuf: [256]u8 = undefined;
+            const json = std.fmt.bufPrint(
+                &jbuf,
+                "{{\"version\":\"{s}\",\"build\":\"{s}\",\"protocol\":{d}," ++
+                    "\"features\":[\"feats\",\"sessions\",\"usage\",\"sandbox\",\"trace\"]}}\n",
+                .{ build.version, @tagName(builtin.mode), session.PROTO },
+            ) catch "{\"version\":\"unknown\"}\n";
+            compat.writeAll(.stdout(), json) catch {};
+            return;
+        }
         // The build mode is part of the version because it changes the
         // security properties, not just the speed: ReleaseFast removes the
         // bounds, overflow and alignment checks that turn a memory bug into a
@@ -264,6 +280,7 @@ fn setPositionals(shell: *Shell, allocator: std.mem.Allocator, positionals: []co
 const params = [_]cli.Flag{
     .{ .short = 'h', .long = "help", .help = "Display this help and exit." },
     .{ .short = 'v', .long = "version", .help = "Print version and exit." },
+    .{ .long = "json", .help = "Machine-readable output (with --version)." },
     .{ .short = 'l', .long = "login", .help = "Start as a login shell." },
     .{ .short = 'd', .long = "debug-log-file", .help = "File to write debug info to.", .takes_value = true, .value_name = "FILE" },
     .{ .short = 'c', .help = "Command to execute.", .takes_value = true, .value_name = "CMD" },

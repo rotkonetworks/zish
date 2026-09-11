@@ -244,12 +244,25 @@ fn strippedEnv(alloc: std.mem.Allocator) ?[*:null]const ?[*:0]const u8 {
     return @ptrCast(envp.ptr);
 }
 
+/// Frame-protocol revision announced in `hello`. Bumped only when the wire
+/// changes in a way a guest must know about; `usage` did not qualify, being
+/// additive and ignorable in both directions. Exposed so `--version --json`
+/// reports what the host actually announces instead of a second copy of the
+/// number that can drift away from it.
+pub const PROTO = 0;
+
 /// Announce the session's world to the guest: protocol version + granted
 /// hostcalls, first frame on its stdin. Returns false if the write failed.
 fn sendHello(w: compat.posix.fd_t, caps: Caps) bool {
     var buf: [160]u8 = undefined;
     var fbs: std.Io.Writer = .fixed(&buf);
-    fbs.writeAll("{\"t\":\"hello\",\"proto\":0,\"caps\":[\"say\",\"stream\",\"done\"") catch return false;
+    var head_buf: [96]u8 = undefined;
+    const head = std.fmt.bufPrint(
+        &head_buf,
+        "{{\"t\":\"hello\",\"proto\":{d},\"caps\":[\"say\",\"stream\",\"done\"",
+        .{PROTO},
+    ) catch return false;
+    fbs.writeAll(head) catch return false;
     if (caps.run) fbs.writeAll(",\"run\"") catch return false;
     if (caps.prompt) fbs.writeAll(",\"prompt\"") catch return false;
     fbs.writeAll("]}\n") catch return false;
