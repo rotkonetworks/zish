@@ -1,5 +1,49 @@
 # changelog
 
+## v0.23.1
+
+Two ways the shell was quietly wrong, and the feats actually reaching a fresh
+install. 0.23.0 shipped a catalog a machine could not read, a lexer that
+rewrote words across a continuation, and an AUR package with no feats in it.
+
+### fixed
+- **A line continuation rewrote the word before it.** The lexer's double buffer
+  was rotated once per *scan*, so a scan that emitted no token — a continuation,
+  a comment — consumed a rotation for nothing, and `buf_idx` came back around to
+  the buffer still holding the last *emitted* token. The parser holds one token
+  of lookahead, so those bytes were still live, and the next word's leading
+  bytes landed on top of them:
+
+      echo 'xaa' \
+        "A"
+
+  printed `Aaa A`; bash prints `xaa A`. It needed a *quoted* word directly
+  before the continuation — an unquoted word is a slice of the input, not the
+  buffer — which is why it survived this long, and why it read as a `printf`
+  bug at first. Rotation now happens per emitted token, so two consecutive
+  emitted tokens never share a buffer. This silently corrupted multi-line
+  commands, and a harness that routes its commands through `zish -c` writes
+  printf formats, sed and jq filters across lines with quotes.
+- **`feat list --json` emitted `"summary":""`** for every feat that declared
+  only `help` — 19 of the 20 shipped ones — so the machine-readable catalog an
+  agent picks tools from was a list of names with blank descriptions.
+  `summary` now falls back to `help`: a manifest may still curate a terser
+  phrase, and a blank entry now means the feat genuinely describes nothing.
+- **`feat -h` / `feat list -h`, and every error path, print the usage line**, so
+  the natural mistake `feat --json=full` — the flag belongs to `list` — is
+  corrected rather than answered with `unknown subcommand`.
+
+### changed
+- **The AUR package ships the standard feat set.** It installed only the binary,
+  so a fresh install had an empty `feat list` and no way out of it: `gf`, the
+  feat that installs feats, is itself one of them. The feats now install to
+  `<prefix>/share/zish/feats/standard` — the path the shell derives from its own
+  location, searched after `~/.zish/feats`, so a user feat still shadows a
+  shipped one. The PKGBUILD builds them through the repo's own `make feats`,
+  which already owns which feats exist and which need libc.
+- `make feats` takes `ZISH_RUBRIC_DIR`, so a package build stages rubrics in the
+  build tree instead of writing into the builder's `$HOME`.
+
 ## v0.23.0
 
 The shell stops disagreeing with bash in ways nobody asked about, feats stop
