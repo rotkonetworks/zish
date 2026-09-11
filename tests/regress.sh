@@ -813,6 +813,19 @@ esac
 echo ok'
 same_as_bash "case empty arm, esac-ended"  'case b in a) ;; b) echo hit ;; esac'
 
+# printf: `*` takes its width (and precision) from the arguments. zish parsed
+# `%*` as an unknown conversion and then treated the following `s` as a literal,
+# so `printf '[%*s]' 5 x` printed `[s][s]`. A negative width means left-justify
+# with that magnitude, exactly as in C — not a huge width.
+same_as_bash "printf star width"          "printf '[%*s]' 5 x"
+same_as_bash "printf star left-justify"   "printf '[%-*s]' 5 x"
+same_as_bash "printf star negative width" "printf '[%*s]' -5 x"
+same_as_bash "printf star precision"      "printf '[%.*s]' 3 abcdef"
+same_as_bash "printf star width+prec"     "printf '[%*.*s]' 8 3 abcdef"
+same_as_bash "printf star zero-pad"       "printf '[%0*d]' 5 42"
+same_as_bash "printf star no value arg"   "printf '[%*s]' 3"
+same_as_bash "printf star chained"        "printf '[%*s|%*s]' 3 a 5 b"
+
 # ---------------------------------------------------------------------------
 printf '\n%s\n' "para feat"
 # ---------------------------------------------------------------------------

@@ -428,10 +428,23 @@ fn printf(shell: *Shell, args: []const []const u8) !u8 {
                 try writer.writeByte(escaped.char);
                 i += 1 + escaped.len;
             } else if (format[i] == '%') {
-                const spec = printfParseSpec(format[i..]);
+                var spec = printfParseSpec(format[i..]);
                 if (spec.specifier == '%') {
                     try writer.writeByte('%');
                 } else {
+                    // `*` takes its width — and its precision — from the
+                    // argument list, before the value argument. Without this a
+                    // `%*s` was parsed as the unknown conversion `*` followed by
+                    // the literal `s`, so `printf '[%*s]' 5 x` printed `[s][s]`.
+                    if (spec.width_star) {
+                        applyStarWidth(&spec, if (arg_idx < args.len) args[arg_idx] else "0");
+                        if (arg_idx < args.len) arg_idx += 1;
+                    }
+                    if (spec.precision_star) {
+                        const p = if (arg_idx < args.len) args[arg_idx] else "0";
+                        if (arg_idx < args.len) arg_idx += 1;
+                        spec.precision = std.fmt.parseInt(usize, std.mem.trim(u8, p, " \t"), 10) catch 0;
+                    }
                     const arg = if (arg_idx < args.len) args[arg_idx] else "";
                     if (arg_idx < args.len) arg_idx += 1;
                     // %b's \c aborts the whole printf: rest of the format,
@@ -454,6 +467,10 @@ const PrintfSpec = struct {
     specifier: u8,
     width: ?usize = null,
     precision: ?usize = null,
+    /// The width/precision came from a `*` and must be consumed from the
+    /// argument list before the value argument itself.
+    width_star: bool = false,
+    precision_star: bool = false,
     left_align: bool = false,
     zero_pad: bool = false,
     len: usize,
@@ -479,21 +496,34 @@ fn printfParseSpec(fmt: []const u8) PrintfSpec {
         pos += 1;
     }
 
-    // width
+    // width — a literal count, or `*`: take it from the next argument
     var width: ?usize = null;
-    const width_start = pos;
-    while (pos < fmt.len and fmt[pos] >= '0' and fmt[pos] <= '9') : (pos += 1) {}
-    if (pos > width_start) {
-        width = std.fmt.parseInt(usize, fmt[width_start..pos], 10) catch null;
+    var width_star = false;
+    if (pos < fmt.len and fmt[pos] == '*') {
+        width_star = true;
+        pos += 1;
+    } else {
+        const width_start = pos;
+        while (pos < fmt.len and fmt[pos] >= '0' and fmt[pos] <= '9') : (pos += 1) {}
+        if (pos > width_start) {
+            width = std.fmt.parseInt(usize, fmt[width_start..pos], 10) catch null;
+        }
     }
 
-    // precision
+    // precision — `.` then a literal count, `.*` (from the next argument), or a
+    // bare `.` meaning zero
     var precision: ?usize = null;
+    var precision_star = false;
     if (pos < fmt.len and fmt[pos] == '.') {
         pos += 1;
-        const prec_start = pos;
-        while (pos < fmt.len and fmt[pos] >= '0' and fmt[pos] <= '9') : (pos += 1) {}
-        precision = std.fmt.parseInt(usize, fmt[prec_start..pos], 10) catch 0;
+        if (pos < fmt.len and fmt[pos] == '*') {
+            precision_star = true;
+            pos += 1;
+        } else {
+            const prec_start = pos;
+            while (pos < fmt.len and fmt[pos] >= '0' and fmt[pos] <= '9') : (pos += 1) {}
+            precision = std.fmt.parseInt(usize, fmt[prec_start..pos], 10) catch 0;
+        }
     }
 
     // specifier
@@ -504,10 +534,24 @@ fn printfParseSpec(fmt: []const u8) PrintfSpec {
         .specifier = specifier,
         .width = width,
         .precision = precision,
+        .width_star = width_star,
+        .precision_star = precision_star,
         .left_align = left_align,
         .zero_pad = zero_pad,
         .len = pos,
     };
+}
+
+/// Resolve a `*` width from an argument. C (and bash) read a negative value as
+/// "left-justify by this much" — the same instruction as the `-` flag — so the
+/// sign is folded into `left_align` rather than becoming a bogus huge width.
+fn applyStarWidth(spec: *PrintfSpec, text: []const u8) void {
+    const t = std.mem.trim(u8, text, " \t\n\r");
+    const negative = t.len > 0 and t[0] == '-';
+    const digits = if (negative) t[1..] else t;
+    const mag: u64 = std.fmt.parseInt(u64, digits, 10) catch 0;
+    if (negative) spec.left_align = true;
+    spec.width = @intCast(mag);
 }
 
 /// Rewrite Zig's float exponent (`3.142e4`, `1e-4`) into C printf's `e+04` /
