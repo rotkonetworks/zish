@@ -13,10 +13,9 @@ T=$(mktemp -d /tmp/budget-test-XXXXXX)
 trap 'rm -rf "$T"' EXIT
 export ZISH_BUDGET_DIR="$T/store"
 
-echo "building budget..."
-zig build-exe -lc feats/budget/main.zig -femit-bin="$T/budget" >/dev/null 2>&1 || {
-    echo "FAIL: budget does not compile"; exit 1; }
+FEAT_BIN=${FEAT_BIN:-$(cd "$(dirname "$0")/.." && pwd)/zig-out/share/zish/feats/standard}
 B="$T/budget"
+cp "$FEAT_BIN/budget/bin/budget" "$B" || { echo "FAIL: $FEAT_BIN/budget not built — run: zig build -Dfeats=all"; exit 1; }
 
 pass=0; fail=0
 ok()  { pass=$((pass+1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }

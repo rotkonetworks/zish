@@ -39,7 +39,7 @@ fn readAllStdin(alloc: std.mem.Allocator) ![]u8 {
 
 pub fn main(init: std.process.Init) void {
     const alloc = init.gpa;
-    const argv = init.minimal.args.toSlice(alloc) catch return;
+    const argv = init.minimal.args.toSlice(init.arena.allocator()) catch return;
     var key: ?[]const u8 = null;
     var path: ?[]const u8 = null;
     var i: usize = 1;

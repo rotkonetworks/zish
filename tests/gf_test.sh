@@ -12,9 +12,8 @@ T=$(mktemp -d /tmp/gf-test-XXXXXX)
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/home" "$T/feats"
 
-echo "building gf..."
-zig build-exe -lc feats/gf/main.zig -femit-bin="$T/gf" >/dev/null 2>&1 || {
-    echo "FAIL: gf does not compile"; exit 1; }
+FEAT_BIN=${FEAT_BIN:-$(cd "$(dirname "$0")/.." && pwd)/zig-out/share/zish/feats/standard}
+cp "$FEAT_BIN/gf/bin/gf" "$T/gf" || { echo "FAIL: $FEAT_BIN/gf not built — run: zig build -Dfeats=all"; exit 1; }
 
 GF() { HOME="$T/home" ZISH_FEAT_PATH="$T/feats" "$T/gf" "$@"; }
 ZC() { HOME="$T/home" ZISH_FEAT_PATH="$T/feats" ZISH_BYPASS_PASSWORD=1 "$ZISH" -c "$@"; }
@@ -157,9 +156,9 @@ grep -q '"name":"srcdemo"' "$L" && ok "source install also attested" \
 # Stage the REAL agent feat (built with mock transport) so gf can exec it as
 # the reviewer, plus the rubric and a mock verdict. Then a source install must
 # gain a review record joined to its install by sha256.
-echo "building agent feat for review tests..."
+echo "staging agent feat for review tests..."
 mkdir -p "$T/feats/standard/agent/bin" "$T/rubrics"
-if zig build-exe -lc feats/agent/main.zig -femit-bin="$T/feats/standard/agent/bin/agent" >/dev/null 2>&1; then
+if cp "$FEAT_BIN/agent/bin/agent" "$T/feats/standard/agent/bin/agent" 2>/dev/null; then
     printf 'name = "agent"\ntier = "standard"\nkind = "session"\nbin = "agent"\n' > "$T/feats/standard/agent/feat.toml"
     cp -f feats/gf/rubrics/feat-review-v1.toml "$T/rubrics/feat-review-v1.toml"
     # mock verdict: content is a JSON verdict; wrap as an OpenRouter completion

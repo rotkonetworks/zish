@@ -13,12 +13,12 @@ mkdir -p "$T/home/.zish" \
          "$T/feats/standard/verify/bin" \
          "$T/state"
 
-echo "building team..."
-zig build-exe -lc feats/team/main.zig -femit-bin="$T/team" >/dev/null 2>&1 || {
-    echo "FAIL: team does not compile"; exit 1; }
+FEAT_BIN=${FEAT_BIN:-$(cd "$(dirname "$0")/.." && pwd)/zig-out/share/zish/feats/standard}
+cp "$FEAT_BIN/team/bin/team" "$T/team" || { echo "FAIL: $FEAT_BIN/team not built — run: zig build -Dfeats=all"; exit 1; }
 # the REAL verify feat (team execs it as the compiler gate)
-zig build-exe -lc feats/verify/main.zig -femit-bin="$T/feats/standard/verify/bin/verify" >/dev/null 2>&1 || {
-    echo "FAIL: verify does not compile"; exit 1; }
+mkdir -p "$T/feats/standard/verify/bin"
+cp "$FEAT_BIN/verify/bin/verify" "$T/feats/standard/verify/bin/verify" \
+    || { echo "FAIL: $FEAT_BIN/verify not built — run: zig build -Dfeats=all"; exit 1; }
 
 # ---- fake agent: detects its role from the prompt (last arg) and logs it -----
 cat > "$T/feats/standard/agent/bin/agent" <<'SH'

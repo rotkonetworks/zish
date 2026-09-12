@@ -2070,7 +2070,7 @@ fn runJudge(io: std.Io, args: std.process.Args) u8 {
 }
 
 // ===========================================================================
-// unit tests (run via `zig test feats/agent/main.zig`)
+// unit tests (run via `zig build test-feats -Dfeats=all`)
 // ===========================================================================
 
 test "jsonEscape handles quotes, newlines, controls" {

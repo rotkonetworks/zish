@@ -10,10 +10,15 @@ export HOME="$T"
 mkdir -p "$T/.zish"
 
 echo "building bus..."
-# No -lc: the feat must stay libc-free, or the shared lib has regressed.
-zig build-exe -O ReleaseFast -fstrip feats/bus/main.zig -femit-bin="$T/bus" >/dev/null 2>&1 || {
-    echo "FAIL: bus does not compile without libc"; exit 1; }
+FEAT_BIN=${FEAT_BIN:-$(cd "$(dirname "$0")/.." && pwd)/zig-out/share/zish/feats/standard}
 B="$T/bus"
+cp "$FEAT_BIN/bus/bin/bus" "$B" || { echo "FAIL: $FEAT_BIN/bus not built — run: zig build -Dfeats=all"; exit 1; }
+# The feat must stay libc-free, or the shared lib has regressed. That used to be
+# asserted by passing no -lc here; build.zig owns the link decision now (only
+# `para` links libc), so assert the property on the artefact.
+if command -v file >/dev/null 2>&1 && file "$B" | grep -q 'dynamically linked'; then
+    echo "FAIL: bus links libc (it must not)"; exit 1
+fi
 
 pass=0; fail=0
 ok()  { pass=$((pass+1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }

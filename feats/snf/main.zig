@@ -19,7 +19,7 @@ fn extensionOf(path: []const u8) []const u8 {
 
 pub fn main(init: std.process.Init) void {
     const alloc = init.gpa;
-    const argv = init.minimal.args.toSlice(alloc) catch return;
+    const argv = init.minimal.args.toSlice(init.arena.allocator()) catch return;
     if (argv.len < 2) return;
 
     var ob: [8192]u8 = undefined;

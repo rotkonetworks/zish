@@ -191,13 +191,18 @@ These seven are literally the operations I used Python for this session.
 
 ## 11. Build/host contract for seed feats
 
-- Feats live under `feats/<name>/` in the repo, each a single `main.zig` (plus
-  optional `feat.toml` copied into the registry at install).
-- Compiled as standalone static Zig binaries with `zig build-exe -O ReleaseFast
-  -static -fstrip` (or the project `build.zig` `install` step, whichever the
-  project already adopts).
-- `zig build` compiles feats and stages them into the registry tree so `feat
-  list`/`run` reflect the shipped standard set.
+- Feats live under `feats/<name>/` in the repo: `main.zig`, its `feat.toml`, and
+  any data it owns under `rubrics/`.
+- **`build.zig` is the only thing that compiles a feat.** One list decides which
+  feats exist, whether each links libc, and where it installs — `-Dfeats` takes
+  `core` (default), `all`, or an explicit comma-separated list, and
+  `-Dfeat-layout` selects the install shape. There is no Makefile loop and no
+  per-suite `zig build-exe`: a second build site is a second answer to "what is
+  a feat", and those answers had already drifted apart.
+- The registry tree the shell reads is
+  `<prefix>/share/zish/feats/standard/<name>/{bin/<name>,feat.toml}`, and
+  `-Dfeat-layout=registry` writes the same thing rooted at the prefix instead —
+  so `feat list`/`run` reflect the shipped set either way.
 
 ### 11.1 Shared code — `feats/lib/feat.zig`
 
@@ -211,21 +216,21 @@ Primitives only, and no policy: a helper that makes a decision on the caller's
 behalf belongs in the caller.
 
 **Importing it.** Zig confines an import to the root file's own directory tree,
-so `@import("../lib/feat.zig")` does not compile under the pinned command
-`zig build-exe feats/<name>/main.zig` — and no `..` form does, in any mode
+so `@import("../lib/feat.zig")` does not compile — no `..` form does, in any mode
 (local, `-lc`, `-target x86_64-linux-musl`) or under `zig test`. So each feat
 carries a relative symlink and imports through it:
 
     feats/<name>/lib/feat.zig -> ../../lib/feat.zig
     const feat = @import("lib/feat.zig");
 
-The module-flag form (`-Mroot` / `--dep`) also compiles but would move the cost
-onto every build site, including the shipped `tests/*_test.sh`; the symlink keeps
-them unchanged. Keep the name exactly `lib/feat.zig`.
+Keep the name exactly `lib/feat.zig`. The module form (`-Mroot` / `--dep`) is
+also viable now that `build.zig` is the only build site — it would delete the
+sixteen symlinks — but it is a migration to make deliberately, not a
+prerequisite for anything here.
 
 **Zero libc.** Zig 0.16 removed `std.posix.getenv` and
 `std.process.getEnvVarOwned`, which is why feats used to link libc for one
-lookup; `feat.env` reads `/proc/self/environ`. `FEAT_LIBC` in the `Makefile`
-lists only the feats that still need libc for something real, with the reason
-noted there. A feat that newly needs libc is a change to that list *and* to its
-justification — not a quiet `-lc`.
+lookup; `feat.env` reads `/proc/self/environ`. The `feat_libc` list in
+`build.zig` names only the feats that still need libc for something real
+(`para`, for `execvp`), with the reason noted there. A feat that newly needs
+libc is a change to that list *and* to its justification — not a quiet `-lc`.

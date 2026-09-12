@@ -74,33 +74,84 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
-    // Ship the CORE feat set beside the binary — the lean base, grown with the
-    // package manager (Arch = base + pacman, not everything preinstalled):
-    // <prefix>/share/zish/feats/standard/<name>/{bin/<name>, feat.toml}. Core is
-    // the zero-dep unix utilities plus gf itself; the heavy/situational feats
-    // (agent, team, web, aur, budget, verify, ask) are published to the gf index
-    // by `make dist-all` and installed on demand, so the base carries no
-    // LLM-agent stack and the Nix closure stays small. The resolver searches this
-    // system tier plus the writable ~/.zish/feats (where gf installs), so core is
-    // present out of the box like curl on $PATH. `zig build --prefix $out` ships
-    // core for nix; `make feats` stays the local-dev path into ~/.zish.
-    // -Dfeats selects which set ships beside the binary: "core" (default — the
-    // zero-dep utils + gf, the lean base) or "all" (also the heavy/situational
-    // feats, for a batteries-included build). Nix exposes both as separate flake
-    // packages (zish / zish-full), so `nix run …#zish-full` gets everything.
+    // Ship the feat set beside the binary — the lean base, grown with the
+    // package manager (Arch = base + pacman, not everything preinstalled). Core
+    // is the zero-dep unix utilities plus gf; the heavy/situational feats
+    // (agent, team, web, aur, budget, verify, ask, bus) are published to the gf
+    // index by `make dist-all` and installed on demand, so the base carries no
+    // LLM-agent stack and the nix closure stays small. The resolver searches
+    // this system tier plus the writable ~/.zish/feats (where gf installs), so
+    // core is present out of the box like curl on $PATH.
+    //
+    // Which set ships: "core" (default) or "all". ONE list, one owner — this is
+    // the only place that decides a feat exists, whether it links libc, and
+    // where it installs.
+    //
+    // It has to be: the Makefile carried a second copy and the suites a third,
+    // and they had drifted three ways — the Makefile shipped `bus` which this
+    // list omitted, this list linked libc for eight feats the Makefile said
+    // needed none, and the per-suite `zig build-exe` calls compiled a different
+    // binary than either installed. So the suites were validating something
+    // other than what ships.
     const feat_set = b.option([]const u8, "feats", "feat set to ship: 'core' (default) or 'all'") orelse "core";
+    // Where a feat lands relative to --prefix:
+    //   system   <prefix>/share/zish/feats/standard/<name>/  the shell's own
+    //            system root — what a package or the nix derivation installs
+    //   registry <prefix>/standard/<name>/                   a feat registry
+    //            root — so `--prefix ~/.zish/feats -Dfeat-layout=registry` is
+    //            the local-dev staging that `make feats` used to do in shell
+    const feat_layout = b.option([]const u8, "feat-layout", "feat layout: 'system' (default) or 'registry'") orelse "system";
+    const registry_layout = std.mem.eql(u8, feat_layout, "registry");
+
     const core_feats = [_][]const u8{ "cnt", "pk", "frq", "snf", "jls", "calc", "para", "gf" };
     const all_feats = [_][]const u8{
         "cnt", "pk",  "frq",    "snf",    "jls", "calc", "para", "agent",
-        "gf",  "aur", "budget", "verify", "ask", "team", "web",
+        "gf",  "aur", "budget", "verify", "ask", "team", "web",  "bus",
     };
-    const feat_names: []const []const u8 = if (std.mem.eql(u8, feat_set, "all")) &all_feats else &core_feats;
-    const feat_libc = [_][]const u8{ "para", "agent", "gf", "aur", "budget", "verify", "ask", "team", "web" };
+    // -Dfeats takes "core" (default), "all", or an explicit comma-separated list
+    // ("agent,aur") so a packaging step builds exactly what it packs instead of
+    // a whole set to throw most of it away. An unknown name fails the build
+    // here rather than shipping a set that is quietly missing a member.
+    var explicit: std.ArrayListUnmanaged([]const u8) = .empty;
+    const feat_names: []const []const u8 = if (std.mem.eql(u8, feat_set, "all"))
+        &all_feats
+    else if (std.mem.eql(u8, feat_set, "core"))
+        &core_feats
+    else blk: {
+        var it = std.mem.splitScalar(u8, feat_set, ',');
+        while (it.next()) |raw| {
+            const n = std.mem.trim(u8, raw, " \t");
+            if (n.len == 0) continue;
+            var known = false;
+            for (all_feats) |f| {
+                if (std.mem.eql(u8, f, n)) known = true;
+            }
+            if (!known) std.debug.panic("unknown feat '{s}': -Dfeats takes 'core', 'all', or comma-separated names from all_feats", .{n});
+            explicit.append(b.allocator, n) catch @panic("OOM");
+        }
+        if (explicit.items.len == 0) std.debug.panic("-Dfeats={s} names no feat", .{feat_set});
+        break :blk explicit.items;
+    };
+    // Only `para` links libc, and only for execvp (PATH search + environ). Every
+    // other feat reaches the environment through feats/lib/feat.zig, which reads
+    // /proc/self/environ. bus_test and agent_test assert that property, so a
+    // regression fails loudly instead of quietly re-growing a libc dependency.
+    const feat_libc = [_][]const u8{"para"};
+
+    const install_feats = b.step("install-feats", "Install the feat set (-Dfeats, -Dfeat-layout)");
+    b.getInstallStep().dependOn(install_feats);
+
+    const test_feats = b.step("test-feats", "Run each feat's own unit tests");
+
     for (feat_names) |name| {
         var needs_libc = false;
         for (feat_libc) |l| {
             if (std.mem.eql(u8, l, name)) needs_libc = true;
         }
+        const special = if (registry_layout)
+            b.fmt("standard/{s}", .{name})
+        else
+            b.fmt("share/zish/feats/standard/{s}", .{name});
         const feat_exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
@@ -112,15 +163,29 @@ pub fn build(b: *std.Build) void {
             }),
         });
         const bin_inst = b.addInstallArtifact(feat_exe, .{
-            .dest_dir = .{ .override = .{ .custom = b.fmt("share/zish/feats/standard/{s}/bin", .{name}) } },
+            .dest_dir = .{ .override = .{ .custom = b.fmt("{s}/bin", .{special}) } },
         });
-        b.getInstallStep().dependOn(&bin_inst.step);
+        install_feats.dependOn(&bin_inst.step);
         const toml_inst = b.addInstallFileWithDir(
             b.path(b.fmt("feats/{s}/feat.toml", .{name})),
-            .{ .custom = b.fmt("share/zish/feats/standard/{s}", .{name}) },
+            .{ .custom = special },
             "feat.toml",
         );
-        b.getInstallStep().dependOn(&toml_inst.step);
+        install_feats.dependOn(&toml_inst.step);
+
+        // The feat's unit tests, compiled from the same module with the same
+        // link decision — so `zig build test-feats` cannot test a differently
+        // built binary than the one that installs.
+        const feat_tests = b.addTest(.{
+            .name = b.fmt("{s}-test", .{name}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(b.fmt("feats/{s}/main.zig", .{name})),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = needs_libc,
+            }),
+        });
+        test_feats.dependOn(&b.addRunArtifact(feat_tests).step);
     }
 
     const run_step = b.step("run", "Run the app");
@@ -166,4 +231,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_fuzz_tests.step);
+    // The feats' own unit tests live here too: they were two hand-written lines
+    // in the Makefile, which is why only two of sixteen feats had any.
+    test_step.dependOn(test_feats);
 }

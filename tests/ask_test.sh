@@ -9,10 +9,9 @@ trap 'rm -rf "$T"' EXIT
 export HOME="$T"                 # ask writes under $HOME/.zish/asks
 mkdir -p "$T/.zish"
 
-echo "building ask..."
-zig build-exe -O ReleaseFast -lc feats/ask/main.zig -femit-bin="$T/ask" >/dev/null 2>&1 || {
-    echo "FAIL: ask does not compile"; exit 1; }
+FEAT_BIN=${FEAT_BIN:-$(cd "$(dirname "$0")/.." && pwd)/zig-out/share/zish/feats/standard}
 A="$T/ask"
+cp "$FEAT_BIN/ask/bin/ask" "$A" || { echo "FAIL: $FEAT_BIN/ask not built — run: zig build -Dfeats=all"; exit 1; }
 
 pass=0; fail=0
 ok()  { pass=$((pass+1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }

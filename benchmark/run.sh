@@ -38,9 +38,9 @@ live=0
 command -v python3 >/dev/null 2>&1 || { echo "benchmark: python3 required"; exit 2; }
 [ -f "$RUBRIC" ] || { echo "benchmark: rubric not found: $RUBRIC"; exit 2; }
 
-echo "building agent..."
-zig build-exe -lc feats/agent/main.zig -femit-bin="$AGENT" >/dev/null 2>&1 || {
-    echo "benchmark: agent does not compile"; exit 2; }
+echo "using the agent feat built by zig build..."
+cp "${FEAT_BIN:-$PWD/zig-out/share/zish/feats/standard}/agent/bin/agent" "$AGENT" || {
+    echo "benchmark: agent not built — run: zig build -Dfeats=all"; exit 2; }
 
 T=$(mktemp -d /tmp/bench-XXXXXX)
 trap 'rm -rf "$T"' EXIT

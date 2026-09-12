@@ -159,7 +159,7 @@ fn buildArgv(
 
 pub fn main(init: std.process.Init) void {
     const alloc = init.gpa;
-    const args = init.minimal.args.toSlice(alloc) catch die("out of memory");
+    const args = init.minimal.args.toSlice(init.arena.allocator()) catch die("out of memory");
 
     var seed: [8]u8 = undefined;
     _ = linux.getrandom(&seed, seed.len, 0);

@@ -27,8 +27,8 @@ const linux = std.os.linux;
 const alloc = std.heap.page_allocator;
 // Shared feat primitives. Zig confines imports to the root file's own
 // directory, so this feat dir carries a `lib/feat.zig` symlink to
-// ../lib/feat.zig — which keeps the Makefile's `zig build-exe
-// feats/<name>/main.zig` recipe (and the musl dist build) exact.
+// ../lib/feat.zig. build.zig is the only thing that compiles this file —
+// including whether it links libc.
 const feat = @import("lib/feat.zig");
 
 const MAX_STATE = 16 * 1024 * 1024;

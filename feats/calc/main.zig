@@ -214,8 +214,7 @@ pub fn format(v: f64, buf: []u8) []const u8 {
 }
 
 pub fn main(init: std.process.Init) void {
-    const alloc = init.gpa;
-    const argv = init.minimal.args.toSlice(alloc) catch return;
+    const argv = init.minimal.args.toSlice(init.arena.allocator()) catch return;
 
     var ob: [4096]u8 = undefined;
     var w = std.Io.File.stdout().writer(init.io, &ob);

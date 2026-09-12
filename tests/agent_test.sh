@@ -21,10 +21,18 @@ unset ZISH_AGENT_ENDPOINT ZISH_AGENT_BACKEND ZISH_AGENT_MODEL ZISH_AGENT_MAX_TUR
       ZISH_AGENT_TIMEOUT ZISH_AGENT_MAX_TOKENS ZISH_ASK_META
 
 echo "building agent..."
-# no -lc: the feat is libc-free, and this suite depends on that.
-zig build-exe -O ReleaseFast -fstrip feats/agent/main.zig -femit-bin="$T/agent" >/dev/null 2>&1 || {
-    echo "FAIL: agent does not compile"; exit 1; }
+# The feat under test is the one `zig build` installed — a suite that picks its
+# own compile flags can validate a differently linked binary than ships, which
+# is what every suite here used to do.
+FEAT_BIN=${FEAT_BIN:-$(cd "$(dirname "$0")/.." && pwd)/zig-out/share/zish/feats/standard}
 A="$T/agent"
+cp "$FEAT_BIN/agent/bin/agent" "$A" || { echo "FAIL: $FEAT_BIN/agent not built — run: zig build -Dfeats=all"; exit 1; }
+# It must stay libc-free. That used to be asserted by passing no -lc here; the
+# decision now lives in build.zig (only `para` links libc), so assert the
+# property on the artefact instead.
+if command -v file >/dev/null 2>&1 && file "$A" | grep -q 'dynamically linked'; then
+    echo "FAIL: agent links libc (it must not)"; exit 1
+fi
 
 pass=0; fail=0
 ok()  { pass=$((pass+1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }

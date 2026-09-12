@@ -19,11 +19,8 @@
 //! ## How a feat uses this
 //!
 //! Zig 0.16 confines an import to the *root file's own directory tree*, so
-//! `@import("../lib/feat.zig")` cannot work when the build command is
-//! `zig build-exe feats/<name>/main.zig` — and a `..` form fails in every mode
-//! (local, `-lc`, `-target x86_64-linux-musl`) and under `zig test`. The module
-//! flag form (`-Mroot`/`--dep`) compiles but would force every build site,
-//! including the shipped `tests/*_test.sh`, to change.
+//! `@import("../lib/feat.zig")` cannot work — no `..` form does, in any mode
+//! (local, `-lc`, `-target x86_64-linux-musl`) or under `zig test`.
 //!
 //! So each feat carries a relative symlink and imports through it:
 //!
@@ -32,8 +29,17 @@
 //!
 //! Keep the name exactly `lib/feat.zig`: one convention, verifiable at a glance.
 //!
+//! `build.zig` is the only build site now, so the module form
+//! (`-Mroot`/`--dep`) is viable too and would delete the sixteen symlinks. That
+//! is a migration to make deliberately, not a prerequisite for anything here.
+//!
 //! Take the full `std.process.Init` and use `init.io` / `init.gpa`. `init.arena`
-//! is the right home for values from `env`, so nothing needs freeing.
+//! is the right home for values from `env` — and for the argv slice, so
+//! `toSlice(init.arena.allocator())` is the idiom. `toSlice(init.gpa)` leaks:
+//! harmless for a process that is about to exit, but ReleaseSafe's
+//! DebugAllocator reports it on every run (stderr noise a caller reads as an
+//! error), and in a session feat — which lives for a whole session — it is a
+//! leak that actually accumulates.
 
 const std = @import("std");
 

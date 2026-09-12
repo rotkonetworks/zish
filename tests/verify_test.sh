@@ -8,10 +8,9 @@ cd "$(dirname "$0")/.."
 T=$(mktemp -d /tmp/verify-test-XXXXXX)
 trap 'rm -rf "$T"' EXIT
 
-echo "building verify..."
-zig build-exe -lc feats/verify/main.zig -femit-bin="$T/verify" >/dev/null 2>&1 || {
-    echo "FAIL: verify does not compile"; exit 1; }
+FEAT_BIN=${FEAT_BIN:-$(cd "$(dirname "$0")/.." && pwd)/zig-out/share/zish/feats/standard}
 V="$T/verify"
+cp "$FEAT_BIN/verify/bin/verify" "$V" || { echo "FAIL: $FEAT_BIN/verify not built — run: zig build -Dfeats=all"; exit 1; }
 
 pass=0; fail=0
 ok()  { pass=$((pass+1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }

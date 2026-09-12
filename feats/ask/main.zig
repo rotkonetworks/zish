@@ -393,21 +393,7 @@ fn run(init: std.process.Init) u8 {
 /// the caller can echo the raw answer (a typed "Other") verbatim instead.
 fn printChecked(ans: []const u8, options: []const []const u8) bool {
     var picked: [4]usize = undefined;
-    var n: usize = 0;
-    var it = std.mem.splitScalar(u8, ans, ',');
-    while (it.next()) |tok| {
-        const t = std.mem.trim(u8, tok, " \t");
-        if (t.len == 0) return false;
-        const idx = std.fmt.parseInt(usize, t, 10) catch return false;
-        if (idx >= options.len) return false;
-        var dup = false;
-        for (picked[0..n]) |p| dup = dup or p == idx;
-        if (dup) continue;
-        if (n >= picked.len) return false;
-        picked[n] = idx;
-        n += 1;
-    }
-    if (n == 0) return false;
+    const n = parseChecked(ans, options, &picked) orelse return false;
     for (picked[0..n], 0..) |idx, i| {
         if (i > 0) out("\n");
         out(options[idx]);
@@ -415,16 +401,48 @@ fn printChecked(ans: []const u8, options: []const []const u8) bool {
     return true;
 }
 
-test "printChecked accepts in-range comma lists and rejects anything else" {
+/// The picks in `ans` ("2, 0,2") as indices into `options`, deduped, in input
+/// order. Null when the answer is empty, out of range, or malformed.
+///
+/// Pure on purpose: deciding the picks and WRITING them are separate concerns,
+/// and the write side owns fd 1. A test that exercised the printing version
+/// wrote into fd 1 — which, under `zig build test`, is the test runner's own
+/// protocol, so the writes corrupted the handshake and the runner reported a
+/// bogus "zig version mismatch". The verdict is what needs testing; the output
+/// is a loop.
+fn parseChecked(ans: []const u8, options: []const []const u8, picked: *[4]usize) ?usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, ans, ',');
+    while (it.next()) |tok| {
+        const t = std.mem.trim(u8, tok, " \t");
+        if (t.len == 0) return null;
+        const idx = std.fmt.parseInt(usize, t, 10) catch return null;
+        if (idx >= options.len) return null;
+        var dup = false;
+        for (picked[0..n]) |p| dup = dup or p == idx;
+        if (dup) continue;
+        if (n >= picked.len) return null;
+        picked[n] = idx;
+        n += 1;
+    }
+    if (n == 0) return null;
+    return n;
+}
+
+test "parseChecked accepts in-range comma lists and rejects anything else" {
     const opts = [_][]const u8{ "a", "b", "c" };
-    // silent success paths (output goes to fd 1; only the verdict is checked here)
-    try std.testing.expect(printChecked("0", &opts));
-    try std.testing.expect(printChecked("2, 0,2", &opts));
-    try std.testing.expect(!printChecked("", &opts));
-    try std.testing.expect(!printChecked("3", &opts));
-    try std.testing.expect(!printChecked("0,", &opts));
-    try std.testing.expect(!printChecked("0,x", &opts));
-    try std.testing.expect(!printChecked("something else", &opts));
+    var picked: [4]usize = undefined;
+    // The verdict only. Parsing is separate from printing precisely so this
+    // test never writes to fd 1 — that is the runner's protocol under
+    // `zig build test`.
+    try std.testing.expect(parseChecked("0", &opts, &picked).? == 1);
+    try std.testing.expect(parseChecked("2, 0,2", &opts, &picked).? == 2); // dedup
+    try std.testing.expect(parseChecked("0,2", &opts, &picked).? == 2);
+    try std.testing.expect(parseChecked("", &opts, &picked) == null);
+    try std.testing.expect(parseChecked("3", &opts, &picked) == null);
+    try std.testing.expect(parseChecked("0,", &opts, &picked) == null);
+    try std.testing.expect(parseChecked("0,x", &opts, &picked) == null);
+    try std.testing.expect(parseChecked("something else", &opts, &picked) == null);
 }
 
 fn usageErr() u8 {

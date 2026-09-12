@@ -1,5 +1,67 @@
 # changelog
 
+## v0.24.0
+
+Conformance and ownership. Two POSIX behaviours bash has and zish did not, and
+one owner for building a feat — of which there were three, and they disagreed.
+
+### added
+- **A file with no shebang runs as a script.** POSIX requires the shell to
+  interpret a file `exec` refuses with ENOEXEC; zish said `command not found`.
+  It now runs in the forked child through a fresh non-interactive shell —
+  arguments through, `$0`/`$1…` bound, status propagated — with bash's state
+  semantics: exported variables and the cwd carry over, unexported shell state
+  does not. A missing file is still 127 and a valid shebang still execs. The
+  interpreter lives in one place (`Shell.runScriptFile`), shared with
+  `zish <script>`, so the two cannot drift.
+- **`set -f` / `set -o noglob`.** Pathname expansion had no switch at all.
+  `-f`/`+f` and the long forms work, patterns reach the command verbatim,
+  subshells inherit without leaking to the parent, and `$-` carries `f` while
+  set. `$-`/`${-}` are implemented too, reporting only the options zish
+  actually honours (`e`, `u`, `x`, `f`) — printing bash's `h`/`B`/`c` would be
+  a letter a script could test and get a wrong answer from.
+- Binary-looking files (a NUL in the first 80 bytes, bash's own rule) are
+  refused with 126 instead of being fed to the parser, for both
+  `<file>` as a command and `zish <file>`.
+- `tests/feat_leaks_test.sh` — every feat's happy path must not print an
+  allocator leak report.
+
+### fixed
+- **Seven feats leaked their argv slice** (`toSlice(init.gpa)`), and `cnt` leaked
+  the whole file it had just counted. ReleaseSafe's allocator reports these on
+  stderr at exit; nothing saw it because the dev staging compiled with
+  `-O ReleaseFast`, where the tracking is compiled out, so only the shipped
+  build showed it. argv now lives in `init.arena` — freed by the runtime at
+  exit — and `cnt`'s buffer is freed on both branches.
+
+### changed
+- **`build.zig` is the only thing that compiles a feat.** The Makefile kept a
+  second list and the test suites a third, and all three had drifted: the
+  Makefile shipped `bus` that build.zig omitted; build.zig linked libc for eight
+  feats the Makefile said needed none *and* 0.23.0's notes claimed were
+  libc-free; and each suite passed its own `-lc`, so the suites validated a
+  differently linked binary than any install ships. There is now one list, one
+  libc decision (`para`, for `execvp`), `-Dfeats=core|all|<names>` for the set
+  and `-Dfeat-layout=system|registry` for the two install shapes. Every suite
+  execs the artefact `zig build` produced, and `zig build test` runs each feat's
+  own unit tests — previously two of sixteen had any, which is how a leaking
+  `ask` test went unnoticed until it was wired in.
+- **A feat's data belongs to the feat, and travels inside it.** The rubrics moved
+  from the repo root (they are not core software — `src/` references one
+  nowhere) into `feats/<name>/rubrics/`, and are compiled in with `@embedFile`
+  the way the shared library already is. That is what makes them reach every
+  install: a file staged beside the binary has to be re-delivered by each
+  packager, and `gf install` — whose package format is `feat.toml` plus one
+  payload directory — delivered none at all. Overrides are unchanged and still
+  win: `ZISH_RUBRIC_DIR`, then `~/.zish/rubrics`. `ZISH_LENS_FILE` and
+  `ZISH_EXPERTS_FILE` are gone; `ZISH_RUBRIC_DIR` already did that job.
+- **nix builds `--release=safe`.** It used `--release=fast`, so nix users were
+  the only ones without the bounds/overflow/alignment checks that build.zig's
+  own comment calls the difference between a crash and an exploitable primitive.
+  The package version is now read from `build.zig.zon` (the file said 0.22.0),
+  and the fixed-output `zig build --fetch` derivation is gone — there are no Zig
+  dependencies left to prefetch.
+
 ## v0.23.1
 
 Two ways the shell was quietly wrong, and the feats actually reaching a fresh

@@ -27,7 +27,7 @@ fn readAllStdin(alloc: std.mem.Allocator) ![]u8 {
 
 pub fn main(init: std.process.Init) void {
     const alloc = init.gpa;
-    const argv = init.minimal.args.toSlice(alloc) catch return;
+    const argv = init.minimal.args.toSlice(init.arena.allocator()) catch return;
 
     var top: usize = 0; // 0 = all
     var field: usize = 0; // 0 = whole-line tokens

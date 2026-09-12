@@ -17,38 +17,20 @@
 let
   src = lib.cleanSource ../.;
 
-  # zish has one Zig package dependency (clap), fetched over the network by
-  # `zig build`. Nix builds are sandboxed and offline, so the fetch happens here
-  # in a fixed-output derivation and the populated cache is handed to the real
-  # build below.
-  #
-  # After changing build.zig.zon, update `outputHash`: set it to
-  # lib.fakeHash, run the build, and copy the hash nix reports.
-  deps = stdenv.mkDerivation {
-    pname = "zish-deps";
-    version = "0.22.0";
-    inherit src;
-
-    nativeBuildInputs = [ zig ];
-
-    dontConfigure = true;
-    dontInstall = true;
-    dontFixup = true;
-
-    buildPhase = ''
-      export ZIG_GLOBAL_CACHE_DIR=$out
-      zig build --fetch
-    '';
-
-    outputHashMode = "recursive";
-    outputHashAlgo = "sha256";
-    outputHash = "sha256-pQpattmS9VmO3ZIQUFn66az8GSmB4IvYhTTCFn6SUmo=";
-  };
+  # From build.zig.zon, the only place the version is declared (the release
+  # workflow refuses a tag that disagrees with it). A second copy here is
+  # another thing to forget — this file still said 0.22.0 while the tree was
+  # three releases further on.
+  version =
+    let
+      m = builtins.match ".*\\.version = \"([0-9.]+)\".*"
+        (builtins.replaceStrings [ "\n" ] [ " " ] (builtins.readFile ../build.zig.zon));
+    in
+    if m == null then "0.0.0" else builtins.head m;
 in
 stdenv.mkDerivation {
   pname = "zish";
-  version = "0.22.0";
-  inherit src;
+  inherit version src;
 
   nativeBuildInputs = [
     zig
@@ -60,9 +42,18 @@ stdenv.mkDerivation {
 
   buildPhase = ''
     runHook preBuild
+    # --release=safe, matching the Makefile, the PKGBUILD and CI. build.zig's own
+    # comment argues these checks are "the difference between a crash and an
+    # exploitable primitive" in a shell an agent drives; this said
+    # `--release=fast`, so nix users were the only ones without them.
+    #
+    # ZIG_GLOBAL_CACHE_DIR is pointed into the build's own tmp: zish has no Zig
+    # package dependencies (build.zig.zon's `.dependencies` is empty), so no
+    # prefetch derivation is needed, and if one is ever added the build fails
+    # loudly here — which is the right signal, rather than a pinned hash in this
+    # file that nobody remembers to update.
     export ZIG_GLOBAL_CACHE_DIR=$TMPDIR/zig-cache
-    cp -r --no-preserve=mode,ownership ${deps} $ZIG_GLOBAL_CACHE_DIR
-    zig build --release=fast --prefix $out -Dfeats=${featSet}
+    zig build --release=safe --prefix $out -Dfeats=${featSet}
     runHook postBuild
   '';
 

@@ -12,7 +12,13 @@ fn countIt(io: std.Io, alloc: std.mem.Allocator, path: ?[]const u8, want: Want) 
     var data: []const u8 = undefined;
     var owned: ?[]u8 = null;
     if (path) |p| {
-        data = try std.Io.Dir.cwd().readFileAlloc(io, p, alloc, .limited(1 << 30));
+        // The buffer is owned by us either way, so it goes in `owned` and the
+        // defer below frees it. Leaving it out leaked the whole file contents
+        // on every `cnt FILE` — invisible while the dev build used ReleaseFast,
+        // where the allocator does not track.
+        const d = try std.Io.Dir.cwd().readFileAlloc(io, p, alloc, .limited(1 << 30));
+        data = d;
+        owned = d;
     } else {
         var cap: usize = 8192;
         var buf = try alloc.alloc(u8, cap);
@@ -55,7 +61,7 @@ fn countIt(io: std.Io, alloc: std.mem.Allocator, path: ?[]const u8, want: Want) 
 
 pub fn main(init: std.process.Init) void {
     const alloc = init.gpa;
-    const argv = init.minimal.args.toSlice(alloc) catch return;
+    const argv = init.minimal.args.toSlice(init.arena.allocator()) catch return;
 
     var want: Want = .lines;
     var path: ?[]const u8 = null;

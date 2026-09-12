@@ -15,9 +15,8 @@ T=$(mktemp -d /tmp/web-test-XXXXXX)
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/home" "$T/stub"
 
-echo "building web..."
-zig build-exe -lc feats/web/main.zig -femit-bin="$T/web" >/dev/null 2>&1 || {
-    echo "FAIL: web does not compile"; exit 1; }
+FEAT_BIN=${FEAT_BIN:-$(cd "$(dirname "$0")/.." && pwd)/zig-out/share/zish/feats/standard}
+cp "$FEAT_BIN/web/bin/web" "$T/web" || { echo "FAIL: $FEAT_BIN/web not built — run: zig build -Dfeats=all"; exit 1; }
 
 pass=0; fail=0
 ok()  { pass=$((pass+1)); printf '  \033[32mPASS\033[0m %s\n' "$1"; }

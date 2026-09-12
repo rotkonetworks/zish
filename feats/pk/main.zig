@@ -36,7 +36,7 @@ fn printUsage(io: std.Io) void {
 
 pub fn main(init: std.process.Init) void {
     const alloc = init.gpa;
-    const argv = init.minimal.args.toSlice(alloc) catch return;
+    const argv = init.minimal.args.toSlice(init.arena.allocator()) catch return;
 
     var n: usize = 10;
     var rng: ?LineRange = null;

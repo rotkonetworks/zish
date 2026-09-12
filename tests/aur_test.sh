@@ -11,11 +11,10 @@ T=$(mktemp -d /tmp/aur-test-XXXXXX)
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/home/.zish/feats/standard/agent/bin" "$T/home/.zish/rubrics"
 
-echo "building aur + agent..."
-zig build-exe -lc feats/aur/main.zig -femit-bin="$T/aur" >/dev/null 2>&1 || {
-    echo "FAIL: aur does not compile"; exit 1; }
-zig build-exe -lc feats/agent/main.zig -femit-bin="$T/home/.zish/feats/standard/agent/bin/agent" >/dev/null 2>&1 || {
-    echo "FAIL: agent does not compile"; exit 1; }
+FEAT_BIN=${FEAT_BIN:-$(cd "$(dirname "$0")/.." && pwd)/zig-out/share/zish/feats/standard}
+cp "$FEAT_BIN/aur/bin/aur" "$T/aur" || { echo "FAIL: $FEAT_BIN/aur not built — run: zig build -Dfeats=all"; exit 1; }
+cp "$FEAT_BIN/agent/bin/agent" "$T/home/.zish/feats/standard/agent/bin/agent" \
+    || { echo "FAIL: $FEAT_BIN/agent not built — run: zig build -Dfeats=all"; exit 1; }
 printf 'name = "agent"\ntier = "standard"\nkind = "session"\nbin = "agent"\n' > "$T/home/.zish/feats/standard/agent/feat.toml"
 cp -f feats/aur/rubrics/pkgbuild-review-v1.toml "$T/home/.zish/rubrics/"
 
