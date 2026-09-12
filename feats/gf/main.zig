@@ -550,11 +550,19 @@ fn reviewInstalled(init: std.process.Init, root: []const u8, dest: []const u8, n
         print("gf: no agent feat installed; install it to enable review-on-install\n", .{});
         return;
     };
-    var rbuf: [4096]u8 = undefined;
-    const rubric = feat.rubricFile(init.arena.allocator(), init.io, &rbuf, "feat-review-v1.toml") orelse {
+    // The review sheet is prompt data: an override file if one is configured,
+    // else the one this binary compiled in. The judge takes a PATH, so the bytes
+    // are spilled to a private file for it and unlinked on the way out.
+    const rubric_bytes = feat.rubric(init.arena.allocator(), init.io, "feat-review-v1.toml", @embedFile("rubrics/feat-review-v1.toml")) orelse {
         print("gf: no review rubric found; skipping review\n", .{});
         return;
     };
+    var rbuf: [4096]u8 = undefined;
+    const rubric = feat.spillTemp(init.arena.allocator(), init.io, &rbuf, "gf-rubric", rubric_bytes) orelse {
+        print("gf: cannot stage the review rubric; skipping review\n", .{});
+        return;
+    };
+    defer feat.unlink(rubric);
     var mfbuf: [4096]u8 = undefined;
     const manifest = std.fmt.bufPrint(&mfbuf, "{s}/feat.toml", .{dest}) catch return;
 

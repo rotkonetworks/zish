@@ -946,7 +946,16 @@ fn reviewPager(init: std.process.Init) u8 {
     var agentb: [4096]u8 = undefined;
     var rubb: [4096]u8 = undefined;
     const agent_bin: ?[]const u8 = if (featRootPath(init, &rootb)) |root| resolveAgentBin(root, &agentb) else null;
-    const rubric: ?[]const u8 = feat.rubricFile(init.arena.allocator(), init.io, &rubb, RUBRIC ++ ".toml");
+    // Override file if one is configured, else the sheet compiled into this
+    // binary; the judge wants a PATH, so either way the bytes are spilled.
+    const rub_bytes = feat.rubric(init.arena.allocator(), init.io, RUBRIC ++ ".toml", @embedFile("rubrics/pkgbuild-review-v1.toml"));
+    const rubric: ?[]const u8 = if (rub_bytes) |b|
+        feat.spillTemp(init.arena.allocator(), init.io, &rubb, "aur-rubric", b)
+    else
+        null;
+    defer {
+        if (rubric) |p| feat.unlink(p);
+    }
 
     const home = feat.env(init.arena.allocator(), init.io, "HOME") orelse return 0;
     var subjb: [4096]u8 = undefined;
@@ -1016,10 +1025,15 @@ fn checkGate(init: std.process.Init, json: bool, targets: []const []const u8) u8
         return 2;
     };
     var rubb: [4096]u8 = undefined;
-    const rubric = feat.rubricFile(init.arena.allocator(), init.io, &rubb, RUBRIC ++ ".toml") orelse {
+    const rubric_bytes = feat.rubric(init.arena.allocator(), init.io, RUBRIC ++ ".toml", @embedFile("rubrics/pkgbuild-review-v1.toml")) orelse {
         warn("aur: pkgbuild-review rubric not found — cannot review.\n");
         return 2;
     };
+    const rubric = feat.spillTemp(init.arena.allocator(), init.io, &rubb, "aur-rubric", rubric_bytes) orelse {
+        warn("aur: cannot stage the pkgbuild-review rubric — cannot review.\n");
+        return 2;
+    };
+    defer feat.unlink(rubric);
 
     // scratch clone dir for fetched PKGBUILDs
     var baseb: [256]u8 = undefined;

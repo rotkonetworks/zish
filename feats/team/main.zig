@@ -689,24 +689,17 @@ fn reap(cpid: i32) void {
 // ---------------------------------------------------------------------------
 // persona lenses (data, not code) — each role embodies a distinct style, not a
 // biography. Diversity across workers is the point: different lenses catch
-// failures. Loaded from lenses.toml: ZISH_LENS_FILE if set, else
-// feat.rubricFile (ZISH_RUBRIC_DIR, then ~/.zish/rubrics, then the feat's own
-// rubrics/ beside the binary). Fail-open: no file → plain role prompts,
-// unchanged behaviour. Never code — just prompt data.
+// failures. Loaded from lenses.toml: an override in ZISH_RUBRIC_DIR or
+// ~/.zish/rubrics, else the sheet compiled into this binary. Fail-open: no file
+// and no override → plain role prompts, unchanged behaviour. Never code — just
+// prompt data.
 // ---------------------------------------------------------------------------
 const Lens = struct { role: []const u8, name: []const u8, style: []const u8 };
-
-fn lensPath(io: std.Io, buf: []u8) ?[]const u8 {
-    if (getEnv(io, "ZISH_LENS_FILE")) |p| return p;
-    return feat.rubricFile(alloc, io, buf, "lenses.toml");
-}
 
 /// Parse `[[lens]]` blocks (role/name/style keys). Returns the owning content
 /// buffer (Lens slices point into it — keep it alive), or null if no file.
 fn loadLenses(io: std.Io, list: *std.ArrayListUnmanaged(Lens)) ?[]u8 {
-    var pb: [4096]u8 = undefined;
-    const path = lensPath(io, &pb) orelse return null;
-    const content = readFileAlloc(path, MAX_OUT) orelse return null;
+    const content = feat.rubric(alloc, io, "lenses.toml", @embedFile("rubrics/lenses.toml")) orelse return null;
     var role: []const u8 = "";
     var name: []const u8 = "";
     var style: []const u8 = "";
@@ -766,19 +759,13 @@ fn lensIntro(lens: ?Lens) []u8 {
 // expert and drops the answer on the blackboard. The org pays for the round-trip
 // (charged to root, budget-gated so a consult can never breach the grant or the
 // critic/synth reserve). Data-driven + fail-open, same as lenses:
-// experts.toml (ZISH_EXPERTS_FILE if set, else feat.rubricFile).
+// experts.toml (an override in ZISH_RUBRIC_DIR or ~/.zish/rubrics, else the
+// sheet compiled into this binary).
 // ---------------------------------------------------------------------------
 const Expert = struct { name: []const u8, style: []const u8 };
 
-fn expertsPath(io: std.Io, buf: []u8) ?[]const u8 {
-    if (getEnv(io, "ZISH_EXPERTS_FILE")) |p| return p;
-    return feat.rubricFile(alloc, io, buf, "experts.toml");
-}
-
 fn loadExperts(io: std.Io, list: *std.ArrayListUnmanaged(Expert)) ?[]u8 {
-    var pb: [4096]u8 = undefined;
-    const path = expertsPath(io, &pb) orelse return null;
-    const content = readFileAlloc(path, MAX_OUT) orelse return null;
+    const content = feat.rubric(alloc, io, "experts.toml", @embedFile("rubrics/experts.toml")) orelse return null;
     var name: []const u8 = "";
     var style: []const u8 = "";
     var open = false;

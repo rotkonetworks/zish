@@ -221,16 +221,17 @@ name = "CRITICLENS"
 style = "assume adversarial input"
 EOF
 reset_logs; : > "$T/prompt.log"
-o=$(PROMPT_LOG="$T/prompt.log" ZISH_LENS_FILE="$T/lenses.toml" TEAM run 6 "task delta"); rc=$?
+o=$(PROMPT_LOG="$T/prompt.log" ZISH_RUBRIC_DIR="$T" TEAM run 6 "task delta"); rc=$?
 [ "$rc" -eq 0 ] && ok "lensed run exits 0" || bad "exit $rc: $o"
 grep -q 'You approach this like CAPTAINLENS' "$T/prompt.log" && ok "captain prompt carries its lens" || bad "no captain lens injected"
 grep -q 'You approach this like WORKERLENS' "$T/prompt.log" && ok "worker prompt carries its lens" || bad "no worker lens injected"
 grep -q 'You approach this like CRITICLENS' "$T/prompt.log" && ok "critic prompt carries its lens" || bad "no critic lens injected"
 grep -q '^worker$' "$T/agent.log" && ok "role detection still works with a lens prepended" || bad "lens broke role detection"
 
-# fail-open: a missing lens file must NOT inject anything
+# fail-open: an override directory that lacks lenses.toml must NOT inject anything
+# (an explicit override is explicit — it does not fall back to the default)
 reset_logs; : > "$T/prompt2.log"
-o=$(PROMPT_LOG="$T/prompt2.log" ZISH_LENS_FILE="$T/does-not-exist.toml" TEAM run 6 "task epsilon")
+o=$(PROMPT_LOG="$T/prompt2.log" ZISH_RUBRIC_DIR="$T/no-such-rubrics" TEAM run 6 "task epsilon")
 if grep -q 'You approach this like' "$T/prompt2.log"; then bad "injected a lens with no file (should fail-open)"; else ok "no lens file -> plain prompts (fail-open)"; fi
 
 echo "== org experts: a worker consults a specialist (BTW-ASK, lateral edge) =="
@@ -243,7 +244,7 @@ name = "git"
 style = "worktrees and branches"
 EOF
 reset_logs; : > "$T/prompt3.log"
-o=$(FAKE_WORKER_BTW=security PROMPT_LOG="$T/prompt3.log" ZISH_EXPERTS_FILE="$T/experts.toml" TEAM run 12 "ship a feature"); rc=$?
+o=$(FAKE_WORKER_BTW=security PROMPT_LOG="$T/prompt3.log" ZISH_RUBRIC_DIR="$T" TEAM run 12 "ship a feature"); rc=$?
 [ "$rc" -eq 0 ] && ok "run with consults exits 0" || bad "exit $rc: $o"
 grep -q '^expert$' "$T/agent.log" && ok "a worker's BTW-ASK reached an expert" || bad "no expert was consulted"
 grep -q "org's security expert" "$T/prompt3.log" && ok "consult routed to the NAMED expert (security)" || bad "wrong/no expert routed"
@@ -253,12 +254,12 @@ spent=$(sumlog "$T/spend.log")
 
 # unknown expert -> graceful, no consult, conservation intact
 reset_logs
-o=$(FAKE_WORKER_BTW=ghost ZISH_EXPERTS_FILE="$T/experts.toml" TEAM run 12 "ship a feature")
+o=$(FAKE_WORKER_BTW=ghost ZISH_RUBRIC_DIR="$T" TEAM run 12 "ship a feature")
 if grep -q '^expert$' "$T/agent.log"; then bad "consulted a non-existent expert"; else ok "unknown expert -> no consult (graceful)"; fi
 
 # no experts file -> workers are not offered consults at all (fail-open)
 reset_logs; : > "$T/prompt4.log"
-o=$(FAKE_WORKER_BTW=security PROMPT_LOG="$T/prompt4.log" ZISH_EXPERTS_FILE="$T/none.toml" TEAM run 12 "x")
+o=$(FAKE_WORKER_BTW=security PROMPT_LOG="$T/prompt4.log" ZISH_RUBRIC_DIR="$T/no-such-rubrics" TEAM run 12 "x")
 if grep -q 'emit ONE line' "$T/prompt4.log"; then bad "offered a consult with no experts file"; else ok "no experts file -> no consult offer (fail-open)"; fi
 
 echo "== SIGPIPE: stdout closed on us kills the process (141), not a quiet 0 =="

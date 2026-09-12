@@ -24,9 +24,9 @@ build() {
     # Standard feats. The repo's own target decides which feats exist and which
     # need libc (FEAT_NAMES/FEAT_LIBC), so there is no second list here to drift,
     # and it stages exactly the registry layout the shell reads:
-    # <stage>/<name>/{feat.toml,bin/<name>,rubrics/}. Each feat's rubrics ride
-    # along in its own directory — data that travels with the feat that reads it,
-    # so a packaged install needs no separate data root.
+    # <stage>/<name>/{feat.toml,bin/<name>}. A feat's rubrics are compiled into
+    # its binary, the same way the shared library is, so there is no data file
+    # for a package to carry and no way to ship a feat without one.
     make feats ZISH_FEAT_DIR="$srcdir/feats-standard"
 }
 

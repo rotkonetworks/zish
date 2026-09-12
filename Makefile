@@ -87,10 +87,6 @@ feats:
 			echo "FEAT BUILD FAILED: $$f (not staged)" >&2; failed="$$failed $$f"; continue; \
 		fi; \
 		cp -f feats/$$f/feat.toml $(ZISH_FEAT_DIR)/$$f/feat.toml; \
-		if [ -d feats/$$f/rubrics ]; then \
-			mkdir -p $(ZISH_FEAT_DIR)/$$f/rubrics; \
-			cp -f feats/$$f/rubrics/*.toml $(ZISH_FEAT_DIR)/$$f/rubrics/; \
-		fi; \
 		echo "staged feat: $$f"; \
 	done; \
 	if [ -n "$$failed" ]; then echo "FEATS FAILED TO BUILD:$$failed" >&2; exit 1; fi
