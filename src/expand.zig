@@ -153,6 +153,15 @@ pub fn allocOpt(sh: *Shell, input: []const u8, expand_tilde: bool) ![]const u8 {
                 continue;
             }
 
+            // $- - the shell's option letters (an empty string when none are
+            // set, like bash). Never a variable lookup: `-` is not a name.
+            if (i < input.len and input[i] == '-') {
+                var flags_buf: [4]u8 = undefined;
+                try result.appendSlice(sh.allocator, sh.optionFlags(&flags_buf));
+                i += 1;
+                continue;
+            }
+
             // $! - PID of the most recent background command
             if (i < input.len and input[i] == '!') {
                 if (sh.last_bg_pid != 0) {
@@ -231,6 +240,14 @@ pub fn allocOpt(sh: *Shell, input: []const u8, expand_tilde: bool) ![]const u8 {
             // Handle ${VAR} and ${VAR:-default} syntax
             if (i < input.len and input[i] == '{') {
                 i += 1; // skip {
+
+                // ${-} is the same parameter as $-, in braced form.
+                if (i + 1 < input.len and input[i] == '-' and input[i + 1] == '}') {
+                    var flags_buf: [4]u8 = undefined;
+                    try result.appendSlice(sh.allocator, sh.optionFlags(&flags_buf));
+                    i += 2;
+                    continue;
+                }
 
                 // ${!name} - indirect expansion: the value of `name` names the
                 // variable to expand (e.g. ref=v; ${!ref} yields $v).

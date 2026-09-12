@@ -203,8 +203,10 @@ pub fn main(init: std.process.Init) void {
     }
 
     if (res.value("c")) |command| {
-        setPositionals(shell_instance, allocator, res.positionals);
-        // $# = count of $1..$n ($0 excluded). Without this $#/$@/$* were empty.
+        // $0 is the first operand when there is one, $1.. are the rest.
+        const name: ?[]const u8 = if (res.positionals.len > 0) res.positionals[0] else null;
+        const args: []const []const u8 = if (res.positionals.len > 0) res.positionals[1..] else &.{};
+        shell_instance.setPositionals(name, args);
         const exit_code = shell_instance.executeCommand(command) catch |err| {
             std.debug.print("zish: error executing command: {}\n", .{err});
             std.process.exit(1);
@@ -216,22 +218,7 @@ pub fn main(init: std.process.Init) void {
         std.process.exit(exit_code);
     } else if (res.positionals.len > 0) {
         // script file mode
-        const script_path = res.positionals[0];
-        setPositionals(shell_instance, allocator, res.positionals);
-
-        const script_content = std.Io.Dir.cwd().readFileAlloc(compat.io(), script_path, allocator, .limited(1024 * 1024)) catch |err| {
-            std.debug.print("zish: cannot read script '{s}': {}\n", .{ script_path, err });
-            std.process.exit(1);
-        };
-        defer allocator.free(script_content);
-
-        const exit_code = shell_instance.executeCommand(script_content) catch |err| {
-            std.debug.print("zish: error executing script: {}\n", .{err});
-            std.process.exit(1);
-        };
-        shell_instance.runExitTrap();
-        shell_instance.stdout().flush() catch {};
-        std.process.exit(exit_code);
+        shell_instance.runScriptFile(res.positionals[0], res.positionals[1..]);
     } else {
         // interactive mode
         shell_instance.run() catch |err| {
@@ -239,42 +226,6 @@ pub fn main(init: std.process.Init) void {
             std.process.exit(1);
         };
     }
-}
-
-// Bind positional parameters: $0 is the command or script name, $1.. are its
-// arguments, and $# is the count excluding $0. Without $#, `$@`/`$*`/`$#` and
-// `for a in "$@"` were all empty in -c and script modes.
-//
-// clap returned positionals as a *tuple* of slices, which forced an `inline
-// for` and the `idx * 100 + arg_idx` key arithmetic. A flat slice makes this a
-// plain loop.
-fn setPositionals(shell: *Shell, allocator: std.mem.Allocator, positionals: []const []const u8) void {
-    for (positionals, 0..) |arg, i| {
-        var kbuf: [16]u8 = undefined;
-        const key = std.fmt.bufPrint(&kbuf, "{d}", .{i}) catch continue;
-        const key_copy = allocator.dupe(u8, key) catch continue;
-        const val_copy = allocator.dupe(u8, arg) catch {
-            allocator.free(key_copy);
-            continue;
-        };
-        shell.variables.put(key_copy, val_copy) catch {
-            allocator.free(key_copy);
-            allocator.free(val_copy);
-        };
-    }
-
-    const n = if (positionals.len > 0) positionals.len - 1 else 0;
-    var buf: [16]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{d}", .{n}) catch return;
-    const key = allocator.dupe(u8, "#") catch return;
-    const val = allocator.dupe(u8, s) catch {
-        allocator.free(key);
-        return;
-    };
-    shell.variables.put(key, val) catch {
-        allocator.free(key);
-        allocator.free(val);
-    };
 }
 
 const params = [_]cli.Flag{

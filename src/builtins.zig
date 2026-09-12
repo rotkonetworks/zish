@@ -1293,6 +1293,7 @@ fn set(shell: *Shell, args: []const []const u8) !u8 {
         try shell.stdout().print("errexit\t{s}\n", .{if (shell.opt_errexit) "on" else "off"});
         try shell.stdout().print("nounset\t{s}\n", .{if (shell.opt_nounset) "on" else "off"});
         try shell.stdout().print("xtrace\t{s}\n", .{if (shell.opt_xtrace) "on" else "off"});
+        try shell.stdout().print("noglob\t{s}\n", .{if (shell.opt_noglob) "on" else "off"});
         try shell.stdout().print("pipefail\t{s}\n", .{if (shell.opt_pipefail) "on" else "off"});
         return 0;
     }
@@ -1344,6 +1345,8 @@ fn set(shell: *Shell, args: []const []const u8) !u8 {
                 shell.opt_nounset = enable;
             } else if (std.mem.eql(u8, opt_name, "xtrace")) {
                 shell.opt_xtrace = enable;
+            } else if (std.mem.eql(u8, opt_name, "noglob")) {
+                shell.opt_noglob = enable;
             } else if (std.mem.eql(u8, opt_name, "pipefail")) {
                 shell.opt_pipefail = enable;
             } else {
@@ -1361,6 +1364,7 @@ fn set(shell: *Shell, args: []const []const u8) !u8 {
                     'e' => shell.opt_errexit = enable,
                     'u' => shell.opt_nounset = enable,
                     'x' => shell.opt_xtrace = enable,
+                    'f' => shell.opt_noglob = enable,
                     'o' => {}, // handled above as -o name
                     else => {
                         try shell.stderr().print("set: invalid option: -{c}\n", .{c});
@@ -1386,6 +1390,9 @@ fn set(shell: *Shell, args: []const []const u8) !u8 {
             if (i + 1 < args.len) i += 1;
         } else if (std.mem.eql(u8, arg, "xtrace")) {
             shell.opt_xtrace = enabled;
+            if (i + 1 < args.len) i += 1;
+        } else if (std.mem.eql(u8, arg, "noglob")) {
+            shell.opt_noglob = enabled;
             if (i + 1 < args.len) i += 1;
         } else if (std.mem.eql(u8, arg, "pipefail")) {
             shell.opt_pipefail = enabled;

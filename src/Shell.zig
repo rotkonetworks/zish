@@ -211,11 +211,12 @@ local_scopes: std.ArrayList(std.ArrayList(SavedLocal)) = .empty,
 // deleted when that top-level executeCommand call returns so they don't leak.
 heredoc_temps: std.ArrayList([]const u8) = .empty,
 
-// shell options (set -e, -u, -x, -o pipefail)
+// shell options (set -e, -u, -x, -o pipefail, -f/noglob)
 opt_errexit: bool = false, // -e: exit on error
 opt_nounset: bool = false, // -u: error on undefined variable
 opt_xtrace: bool = false, // -x: print commands before execution
 opt_pipefail: bool = false, // pipefail: pipeline fails if any command fails
+opt_noglob: bool = false, // -f / -o noglob: no pathname expansion
 // Nesting depth of executeCommand. Command substitution and PROMPT_COMMAND
 // re-enter it, and the session trace records only depth 0.
 exec_depth: u16 = 0,
@@ -667,6 +668,93 @@ pub fn markExported(self: *Shell, name: []const u8) !void {
 /// Whether `name` should be placed in a child process's environment.
 pub fn isExported(self: *Shell, name: []const u8) bool {
     return self.exported.contains(name);
+}
+
+/// `$-`: the single-letter shell options currently set, one letter each, in a
+/// fixed order. bash reports only the options it has on, and only the ones
+/// zish actually implements are reported here (`e`, `u`, `x`, `f`) — printing
+/// a letter for an option nothing honours would be a lie a script could test.
+pub fn optionFlags(self: *Shell, buf: *[4]u8) []const u8 {
+    var n: usize = 0;
+    if (self.opt_errexit) {
+        buf[n] = 'e';
+        n += 1;
+    }
+    if (self.opt_nounset) {
+        buf[n] = 'u';
+        n += 1;
+    }
+    if (self.opt_xtrace) {
+        buf[n] = 'x';
+        n += 1;
+    }
+    if (self.opt_noglob) {
+        buf[n] = 'f';
+        n += 1;
+    }
+    return buf[0..n];
+}
+
+/// Bind the positional parameters of one shell invocation: $0 is `name` (when
+/// the invocation has one), $1..$n are `args`, and $# is their count, $0
+/// excluded. `-c`, a script file and the POSIX ENOEXEC fallback all bind
+/// through here, so no form can drift on what $0 or $# means.
+pub fn setPositionals(self: *Shell, name: ?[]const u8, args: []const []const u8) void {
+    const put = struct {
+        fn walk(shell: *Shell, key: []const u8, value: []const u8) void {
+            const k = shell.allocator.dupe(u8, key) catch return;
+            const v = shell.allocator.dupe(u8, value) catch {
+                shell.allocator.free(k);
+                return;
+            };
+            shell.variables.put(k, v) catch {
+                shell.allocator.free(k);
+                shell.allocator.free(v);
+            };
+        }
+    }.walk;
+
+    var kbuf: [16]u8 = undefined;
+    if (name) |n| put(self, "0", n);
+    for (args, 1..) |arg, i| {
+        const key = std.fmt.bufPrint(&kbuf, "{d}", .{i}) catch continue;
+        put(self, key, arg);
+    }
+    const count = std.fmt.bufPrint(&kbuf, "{d}", .{args.len}) catch return;
+    put(self, "#", count);
+}
+
+/// Run a script file the way `zish <script> <args>` does: bind $0/$1.., read
+/// the file, execute it, run the EXIT trap and exit with its status. Returns
+/// nothing — both callers (main's script mode and the POSIX ENOEXEC fallback
+/// in eval) are finished with this process once the script has run, and
+/// sharing the owner is what makes the fallback behave like a script
+/// invocation rather than merely resemble one.
+pub fn runScriptFile(self: *Shell, script_path: []const u8, args: []const []const u8) noreturn {
+    self.setPositionals(script_path, args);
+
+    const content = std.Io.Dir.cwd().readFileAlloc(compat.io(), script_path, self.allocator, .limited(1024 * 1024)) catch |err| {
+        std.debug.print("zish: cannot read script '{s}': {}\n", .{ script_path, err });
+        std.process.exit(1);
+    };
+    defer self.allocator.free(content);
+
+    // A file that is not text is not a shell script: walking a binary's bytes
+    // into the parser reports a syntax error for something that was never
+    // shell syntax at all. bash refuses these with 126 after sampling the
+    // first 80 bytes — the same sample size, so the same files are refused.
+    if (std.mem.indexOfScalar(u8, content[0..@min(content.len, 80)], 0) != null) {
+        std.debug.print("zish: {s}: cannot execute binary file\n", .{script_path});
+        std.process.exit(126);
+    }
+
+    const exit_code = self.executeCommand(content) catch |err| {
+        std.debug.print("zish: error executing script: {}\n", .{err});
+        std.process.exit(1);
+    };
+    self.runExitTrap();
+    self.stdout().flush() catch {};
+    std.process.exit(exit_code);
 }
 
 // cursor styles for vim modes

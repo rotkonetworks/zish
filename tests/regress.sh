@@ -707,6 +707,16 @@ same_as_bash "glob leading // kept"       'mkdir -p ga/a && touch ga/a/x; echo /
 # `**` kept the '/' on its suffix, so `**/z.t` compared "/z.t" against
 # filenames and never matched. bash needs globstar for this, so pin it.
 expect "glob ** recursive"                'gr/a/b/z.t gr/z.t' 0 'mkdir -p gr/a/b && touch gr/a/b/z.t gr/z.t; echo gr/**/z.t'
+# --- set -f / set -o noglob: pathname expansion is switchable ---
+# zish rejected both forms (`set: invalid option: -f`, `set: unknown option:
+# noglob`), so a script could not turn globbing off at all, and `$-` never
+# carried `f`. bash pins both the option and its effect on expansion.
+same_as_bash "noglob -f stops globbing"    'mkdir -p ng && touch ng/a.zz ng/b.zz; set -f; echo ng/*.zz; set +f; echo ng/*.zz'
+same_as_bash "noglob -o long form"         'mkdir -p ng2 && touch ng2/a.zz; set -o noglob; echo ng2/*.zz; set +o noglob; echo ng2/*.zz'
+same_as_bash "noglob literal for-words"    'mkdir -p ng3 && touch ng3/a.zz; set -f; for f in ng3/*.zz; do echo "$f"; done'
+same_as_bash "noglob stays in its subshell" 'mkdir -p ng4 && touch ng4/a.zz; ( set -f; echo ng4/*.zz ); echo ng4/*.zz'
+same_as_bash "noglob shows f in \$-"       'set -f; case $- in *f*) echo on;; *) echo off;; esac'
+same_as_bash "noglob cleared from \$-"     'set -f; set +f; case $- in *f*) echo on;; *) echo off;; esac'
 same_as_bash "for custom IFS split"       'IFS=:; for x in a:b:c; do printf "[%s]" "$x"; done'
 same_as_bash "for quoted word one field"  'for x in "a b" c; do printf "[%s]" "$x"; done'
 same_as_bash "for empty word list"        'for x in; do echo no; done'
@@ -749,6 +759,29 @@ same_as_bash "command -v missing rc"       'command -v nosuchcmd_zzz; echo rc=$?
 same_as_bash "command -v function"         'f() { :; }; command -v f'
 same_as_bash "command runs echo"           'command echo hi'
 same_as_bash "command bypasses function"   'echo() { echo NOPE; }; command echo real'
+
+# --- POSIX ENOEXEC: an executable file that is not an executable image ---
+# A file that exists and is executable but is not a valid executable image —
+# no shebang, or a shebang naming something that is itself not executable —
+# must be interpreted by the shell itself, arguments and $0 passed through.
+# zish exec'd it, got ENOEXEC, exited 127 and reported "command not found" for
+# a file the user can see, while bash ran it.
+same_as_bash "ENOEXEC no-shebang script runs" 'printf "echo noshebang\n" > nb.$$; chmod +x nb.$$; ./nb.$$; rm -f nb.$$'
+# `$0` and the arguments reach the interpreted script; the file name is fixed
+# because a `$$` suffix would print a pid and make the two shells' output
+# differ for the wrong reason.
+same_as_bash "ENOEXEC gets args and \$0"   'printf "echo \"[\$0][\$1][\$#]\"\n" > enoexec_args.sh; chmod +x enoexec_args.sh; ./enoexec_args.sh A B; rm -f enoexec_args.sh'
+same_as_bash "ENOEXEC exit status kept"    'printf "exit 3\n" > ne.$$; chmod +x ne.$$; ./ne.$$; echo rc=$?; rm -f ne.$$'
+# `ip.$$` is executable but only text, so the kernel rejects the shebang with
+# ENOEXEC — the same fallback, reached through a shebang line.
+same_as_bash "ENOEXEC unusable shebang"    'printf "echo inner\n" > ip.$$; chmod +x ip.$$; printf "#!%s/ip.$$\necho outer\n" "$PWD" > un.$$; chmod +x un.$$; ./un.$$; rm -f ip.$$ un.$$'
+# The fallback must not swallow what it is not for: a valid shebang still
+# execs, and a path that does not exist is still a missing command (127).
+same_as_bash "shebang still execs"         'printf "#!/bin/sh\necho shebang\n" > sb.$$; chmod +x sb.$$; ./sb.$$; rm -f sb.$$'
+# A binary is not a shell script either: parsing its bytes reported a syntax
+# error for something that was never shell syntax. bash refuses it (126).
+same_as_bash "binary executable refused"   'printf "ELF\0\0\0\0\0\0\0" > binb.$$; chmod +x binb.$$; ./binb.$$; echo rc=$?; rm -f binb.$$'
+expect "missing command stays 127"         "zish: ./nosuch_cmd_zz: command not found" 127 './nosuch_cmd_zz'
 
 # Builtin diagnostics go to stderr (bash parity): 2>/dev/null silences them and
 # command substitution does not capture them.

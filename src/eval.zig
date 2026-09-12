@@ -1393,9 +1393,11 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
     if (shell.exec_in_place_node == node) {
         // Build environment in child process (after fork, safe from parent interference)
         const envp = buildEnvironment(shell) catch @as([*:null]const ?[*:0]const u8, @ptrCast(std.c.environ));
-        compat.posix.execvpeZ(argv[0].?, argv, envp) catch {
-            compat.posix.exit(127);
-        };
+        // execvpeZ returns an error *value* (it never returns on success):
+        // an ENOEXEC file is a shell script this shell must interpret itself.
+        const exec_err = compat.posix.execvpeZ(argv[0].?, argv, envp);
+        if (exec_err == error.InvalidExe) runScriptFallback(shell, argv);
+        compat.posix.exit(127);
         unreachable;
     }
 
@@ -1416,9 +1418,12 @@ pub fn evaluateCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
 
         // Build environment in child process (after fork, safe from parent interference)
         const envp = buildEnvironment(shell) catch @as([*:null]const ?[*:0]const u8, @ptrCast(std.c.environ));
-        compat.posix.execvpeZ(argv[0].?, argv, envp) catch {
-            compat.posix.exit(127);
-        };
+        // execvpeZ returns an error *value* (it never returns on success):
+        // POSIX ENOEXEC means the file is a shell script, not a missing
+        // command, so interpret it instead of reporting command-not-found.
+        const exec_err = compat.posix.execvpeZ(argv[0].?, argv, envp);
+        if (exec_err == error.InvalidExe) runScriptFallback(shell, argv);
+        compat.posix.exit(127);
     }
 
     // parent: also set child's pgrp (race avoidance)
@@ -1508,6 +1513,55 @@ fn needsExpansion(node: *const ast.AstNode) bool {
     return false;
 }
 
+// POSIX ENOEXEC fallback, shared by every exec site below.
+//
+// exec failed with ENOEXEC: the file exists and is executable, but is not a
+// valid executable image — no `#!` line at all, or a shebang whose
+// interpreter is itself not executable. POSIX (and bash) require the shell to
+// interpret such a file *itself* as a shell script, with the arguments passed
+// through and $0/$1.. set as for a script, instead of reporting "command not
+// found".
+//
+// The script is interpreted here, in this forked child, by a fresh
+// non-interactive shell — not by re-execing zish. The child already owns the
+// state the script must inherit (pgroup, terminal handover, default signal
+// dispositions, redirections), and Shell.runScriptFile is the same owner that
+// runs `zish <script> <args>`, so the fallback cannot drift from a real script
+// invocation. Never returns.
+fn runScriptFallback(shell: *Shell, argv: [*:null]const ?[*:0]const u8) noreturn {
+    const script = std.mem.sliceTo(argv[0].?, 0);
+
+    // No '/' means the shell never resolved the name itself — execvpeZ's own
+    // PATH search found the file. Without the path there is nothing to
+    // interpret, and guessing (a same-named file in the cwd) would run
+    // something the user never named. Fail closed instead.
+    if (std.mem.indexOfScalar(u8, script, '/') == null) fallbackUnexecutable(script);
+
+    var argc: usize = 0;
+    while (argv[argc] != null) argc += 1;
+    const args = std.heap.page_allocator.alloc([]const u8, argc) catch fallbackUnexecutable(script);
+    for (0..argc) |i| args[i] = std.mem.sliceTo(argv[i].?, 0);
+
+    // Output buffered by this shell belongs to the command's stdout; the
+    // interpreting shell below writes through the same descriptor.
+    shell.stdout().flush() catch {};
+
+    // A fresh shell, like bash's fallback (verified): the environment and cwd
+    // carry over, while the invoking shell's shell-local variables, functions
+    // and aliases do not.
+    const script_shell = Shell.initNonInteractive(std.heap.page_allocator) catch fallbackUnexecutable(script);
+    script_shell.runScriptFile(script, args[1..]);
+}
+
+/// The fallback could not be started. Loud, and 126 rather than 127: the file
+/// was found and is executable, so "command not found" would be a lie.
+fn fallbackUnexecutable(script: []const u8) noreturn {
+    var buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "zish: {s}: cannot execute\n", .{script}) catch "zish: cannot execute\n";
+    compat.writeAll(.stderr(), msg) catch {};
+    compat.posix.exit(126);
+}
+
 // Exec a simple command directly (no variable expansion needed)
 fn execSimpleCommand(shell: *Shell, node: *const ast.AstNode) void {
     // AST node values (and lookupCommand results) are plain []const u8 — NOT
@@ -1531,7 +1585,10 @@ fn execSimpleCommand(shell: *Shell, node: *const ast.AstNode) void {
     const argv_store = argv_mod.fromSlices(shell.allocator, raw) catch compat.posix.exit(127);
     const argv = argv_store.view();
     const envp = buildEnvironment(shell) catch @as([*:null]const ?[*:0]const u8, @ptrCast(std.c.environ));
-    compat.posix.execvpeZ(argv[0].?, argv, envp) catch {};
+    // execvpeZ returns an error *value* (it never returns on success):
+    // POSIX ENOEXEC means an executable file that is a shell script.
+    const exec_err = compat.posix.execvpeZ(argv[0].?, argv, envp);
+    if (exec_err == error.InvalidExe) runScriptFallback(shell, argv);
     compat.posix.exit(127);
 }
 
@@ -2792,8 +2849,10 @@ fn expandUnquotedWordInto(shell: *Shell, raw: []const u8, out: *std.ArrayList([]
 
 // Step 4 of the pipeline: glob-expand one field, appending each match — or the
 // field itself when the pattern matches nothing (bash keeps the pattern).
+// `set -f` / `set -o noglob` skips this step entirely, so the pattern reaches
+// the command verbatim, which is the whole point of the option.
 fn appendGlobbedField(shell: *Shell, word: []const u8, out: *std.ArrayList([]const u8)) !void {
-    if (glob.hasGlobChars(word)) {
+    if (!shell.opt_noglob and glob.hasGlobChars(word)) {
         const glob_results = try glob.expandGlob(shell.allocator, word);
         defer glob.freeGlobResults(shell.allocator, glob_results);
         if (glob_results.len != 0) {
@@ -3410,6 +3469,7 @@ fn isShellOption(shell: *Shell, name: []const u8) bool {
     if (std.mem.eql(u8, name, "errexit")) return shell.opt_errexit;
     if (std.mem.eql(u8, name, "nounset")) return shell.opt_nounset;
     if (std.mem.eql(u8, name, "xtrace")) return shell.opt_xtrace;
+    if (std.mem.eql(u8, name, "noglob")) return shell.opt_noglob;
     if (std.mem.eql(u8, name, "pipefail")) return shell.opt_pipefail;
     return false;
 }
