@@ -1,6 +1,7 @@
 // eval.zig - AST evaluation for zish
 const std = @import("std");
 const compat = @import("compat.zig");
+const arith = @import("arith.zig");
 const ast = @import("ast.zig");
 const argv_mod = @import("argv.zig");
 const glob = @import("glob.zig");
@@ -513,51 +514,6 @@ fn hasCommandSubstitution(input: []const u8) bool {
     return false;
 }
 
-// Expand $VAR references within arithmetic expressions (no allocation)
-// Returns error.BufferTooSmall if result would be truncated
-fn expandArithmeticVars(shell: *Shell, expr: []const u8, dest: *[256]u8) !usize {
-    var out_pos: usize = 0;
-    var i: usize = 0;
-
-    while (i < expr.len) {
-        if (expr[i] == '$' and i + 1 < expr.len) {
-            i += 1;
-            const name_start = i;
-            while (i < expr.len and (std.ascii.isAlphanumeric(expr[i]) or expr[i] == '_')) {
-                i += 1;
-            }
-            if (i > name_start) {
-                const var_name = expr[name_start..i];
-                if (shell.variables.get(var_name)) |value| {
-                    if (value.len > 256 - out_pos) return error.BufferTooSmall;
-                    @memcpy(dest[out_pos..][0..value.len], value);
-                    out_pos += value.len;
-                } else if (compat.posix.getenv(var_name)) |value| {
-                    if (value.len > 256 - out_pos) return error.BufferTooSmall;
-                    @memcpy(dest[out_pos..][0..value.len], value);
-                    out_pos += value.len;
-                } else {
-                    // Unknown variable = 0 in arithmetic
-                    if (out_pos >= 256) return error.BufferTooSmall;
-                    dest[out_pos] = '0';
-                    out_pos += 1;
-                }
-            } else {
-                // Lone $ - copy it
-                if (out_pos >= 256) return error.BufferTooSmall;
-                dest[out_pos] = '$';
-                out_pos += 1;
-            }
-        } else {
-            if (out_pos >= 256) return error.BufferTooSmall;
-            dest[out_pos] = expr[i];
-            out_pos += 1;
-            i += 1;
-        }
-    }
-    return out_pos;
-}
-
 // Fast variable expansion that writes to a provided buffer (no allocation)
 // Returns error.BufferTooSmall if result would be truncated - caller should fall back to full expansion
 fn expandVariableFast(shell: *Shell, input: []const u8, dest: *[256]u8) !usize {
@@ -635,10 +591,18 @@ fn expandVariableFast(shell: *Shell, input: []const u8, dest: *[256]u8) !usize {
                 if (paren_count == 0 and i > 0) {
                     const expr = input[expr_start .. i - 1];
                     i += 1; // skip final )
-                    // Expand variables within the arithmetic expression first
-                    var expr_buf: [256]u8 = undefined;
-                    const expanded_expr_len = try expandArithmeticVars(shell, expr, &expr_buf);
-                    const arith_result = shell.evaluateArithmetic(expr_buf[0..expanded_expr_len]) catch {
+                    // An expression carrying expansions goes to the full path:
+                    // expanding it needs the real expander (`${x:-0}`, `$(cmd)`,
+                    // backticks), and a second copy of one down here is how
+                    // `$((` diverged from `$(( ))` in the first place.
+                    if (std.mem.indexOfScalar(u8, expr, '$') != null or
+                        std.mem.indexOfScalar(u8, expr, '`') != null or
+                        std.mem.indexOfScalar(u8, expr, Shell.LIT_DOLLAR) != null or
+                        std.mem.indexOfScalar(u8, expr, Shell.LIT_BACKTICK) != null)
+                    {
+                        return error.BufferTooSmall;
+                    }
+                    const arith_result = shell.evaluateArithmetic(expr) catch {
                         std.debug.print("zish: division by 0\n", .{});
                         break;
                     };
@@ -2490,7 +2454,7 @@ pub fn evaluateAssignment(shell: *Shell, node: *const ast.AstNode) !u8 {
 
             // parse index (can be arithmetic expression)
             const index = if (index_str.len > 0)
-                @as(usize, @intCast(@max(0, shell.evaluateArithmetic(index_str) catch 0)))
+                @as(usize, @intCast(@max(0, arith.evaluateArithSource(shell, index_str) catch 0)))
             else
                 0;
 
@@ -2527,7 +2491,7 @@ pub fn evaluateAssignment(shell: *Shell, node: *const ast.AstNode) !u8 {
     // fast path for pure arithmetic assignments like i=$((i+1))
     if (!is_append and value.len >= 5 and std.mem.startsWith(u8, value, "$((") and value[value.len - 2] == ')' and value[value.len - 1] == ')') {
         const expr = value[3 .. value.len - 2];
-        const arith_result = shell.evaluateArithmetic(expr) catch 0;
+        const arith_result = arith.evaluateArithSource(shell, expr) catch 0;
 
         var result_buf: [32]u8 = undefined;
         const result_str = std.fmt.bufPrint(&result_buf, "{d}", .{arith_result}) catch return 1;
@@ -2624,7 +2588,7 @@ pub fn evaluateArithCommand(shell: *Shell, node: *const ast.AstNode) !u8 {
         const e = std.mem.trim(u8, part, " \t");
         if (e.len == 0) continue;
         any = true;
-        result = shell.evaluateArithmetic(e) catch return 1;
+        result = arith.evaluateArithSource(shell, e) catch return 1;
     }
     if (!any) return 1;
     return if (result != 0) 0 else 1;
@@ -2646,13 +2610,13 @@ pub fn evaluateCForLoop(shell: *Shell, node: *const ast.AstNode) !u8 {
     const cond_expr = parts[1];
     const update_expr = parts[2];
 
-    if (init_expr.len > 0) _ = shell.evaluateArithmetic(init_expr) catch {};
+    if (init_expr.len > 0) _ = arith.evaluateArithSource(shell, init_expr) catch {};
 
     var last_status: u8 = 0;
     while (true) {
         // An empty condition is always true (for ((;;)) loops forever).
         if (cond_expr.len > 0) {
-            const c = shell.evaluateArithmetic(cond_expr) catch 0;
+            const c = arith.evaluateArithSource(shell, cond_expr) catch 0;
             if (c == 0) break;
         }
         const body_status = try evaluateAst(shell, body);
@@ -2661,7 +2625,7 @@ pub fn evaluateCForLoop(shell: *Shell, node: *const ast.AstNode) !u8 {
             .continue_loop => last_status = 0, // fall through to the update step
             .normal => last_status = body_status,
         }
-        if (update_expr.len > 0) _ = shell.evaluateArithmetic(update_expr) catch {};
+        if (update_expr.len > 0) _ = arith.evaluateArithSource(shell, update_expr) catch {};
     }
     return last_status;
 }
@@ -4061,6 +4025,180 @@ fn featResolve(alloc: std.mem.Allocator, raw: []const u8) ?struct { tier: FeatTi
     return null;
 }
 
+// ---------------------------------------------------------------------------
+// script feat dependencies
+// ---------------------------------------------------------------------------
+//
+// A script declares the feats it needs in its leading comment block:
+//
+//     #!/usr/local/bin/zish
+//     # zish-deps: web jget calc pen
+//
+// The declaration is a comment, so the file stays a valid shell script: bash,
+// and any zish older than this, ignores it. zish parses it and refuses to run
+// the script when a dependency does not resolve — the difference between a run
+// dying halfway through with a bare "not found" and refusing to start with the
+// names that are missing and the roots that were searched. (The deploy this
+// replaces diffed `feat list` against a hand-kept list.)
+//
+// Only the leading block is read: shebang, then comment and blank lines. A
+// `zish-deps:` line in the body — or inside a heredoc — is data, not a claim.
+//
+// `extra` is refused rather than resolved: feat-spec §1.3 says an untrusted
+// extra feat is never auto-used by a script.
+pub const MaxScriptDeps = 32;
+
+pub const ScriptDeps = struct {
+    names: [MaxScriptDeps][]const u8 = undefined,
+    n: usize = 0,
+    missing: [MaxScriptDeps][]const u8 = undefined,
+    nmissing: usize = 0,
+    extra: [MaxScriptDeps][]const u8 = undefined,
+    nextra: usize = 0,
+
+    pub fn ok(self: *const ScriptDeps) bool {
+        return self.nmissing == 0 and self.nextra == 0;
+    }
+};
+
+/// Parse the `# zish-deps:` lines of `content`'s leading comment block into
+/// `out` (the name slices borrow `content`). Names are whitespace- or
+/// comma-separated; `#` starts a trailing comment. Returns the count.
+pub fn parseScriptDeps(content: []const u8, out: *[MaxScriptDeps][]const u8) usize {
+    const directive = "zish-deps:";
+    var n: usize = 0;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    var line_no: usize = 0;
+    while (lines.next()) |raw| {
+        defer line_no += 1;
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line_no == 0 and std.mem.startsWith(u8, line, "#!")) continue;
+        if (line.len == 0) continue;
+        if (line[0] != '#') break;
+        const body = std.mem.trimStart(u8, line[1..], " \t");
+        if (!std.mem.startsWith(u8, body, directive)) continue;
+        var toks = std.mem.tokenizeAny(u8, body[directive.len..], " \t,");
+        while (toks.next()) |t| {
+            if (t[0] == '#') break;
+            if (n == out.len) return n;
+            out[n] = t;
+            n += 1;
+        }
+    }
+    return n;
+}
+
+/// Resolve every declared dependency. Silent: the callers decide what a
+/// failure means — `runScriptFile` refuses to run, `feat deps` reports, and
+/// both diagnose through `scriptDepsDiagnose`.
+pub fn checkScriptDeps(alloc: std.mem.Allocator, content: []const u8) ScriptDeps {
+    var d = ScriptDeps{};
+    d.n = parseScriptDeps(content, &d.names);
+    for (d.names[0..d.n]) |name| {
+        const resolved = featResolve(alloc, name) orelse {
+            d.missing[d.nmissing] = name;
+            d.nmissing += 1;
+            continue;
+        };
+        defer alloc.free(resolved.bin);
+        if (resolved.tier == .extra) {
+            d.extra[d.nextra] = name;
+            d.nextra += 1;
+        }
+    }
+    return d;
+}
+
+/// Report unresolved dependencies on stderr: one line per name, then the roots
+/// that were searched. A missing feat is nearly always a registry that is not
+/// the one the caller assumed (`ZISH_FEAT_PATH` pointing at an image built
+/// without it), so naming the roots is the actionable half of the message.
+pub fn scriptDepsDiagnose(shell: *Shell, script: []const u8, d: *const ScriptDeps) void {
+    var i: usize = 0;
+    while (i < d.nmissing) : (i += 1) {
+        shell.stderr().print("zish: {s}: missing feat dependency: {s}\n", .{ script, d.missing[i] }) catch {};
+    }
+    i = 0;
+    while (i < d.nextra) : (i += 1) {
+        shell.stderr().print("zish: {s}: extra feat dependency: {s} — extra feats are never auto-used by a script\n", .{ script, d.extra[i] }) catch {};
+    }
+    var root_bufs: [2][std.fs.max_path_bytes]u8 = undefined;
+    var roots: [2][]const u8 = undefined;
+    const nroots = featRoots(shell.allocator, &root_bufs, &roots);
+    i = 0;
+    while (i < nroots) : (i += 1) {
+        shell.stderr().print("zish:   searched: {s}\n", .{roots[i]}) catch {};
+    }
+    shell.stderr().writeAll("zish:   install the feat into one of those, or set ZISH_FEAT_PATH to a registry that has it\n") catch {};
+}
+
+/// Check what an executable's own header declares, before exec'ing it. A
+/// non-script binary has no header and checks nothing; a static binary is
+/// megabytes of image and no comment block, so only the head is read.
+fn checkExecutableDeps(shell: *Shell, path: []const u8) u8 {
+    const head = std.Io.Dir.cwd().readFileAlloc(compat.io(), path, shell.allocator, .limited(16 * 1024)) catch return 0;
+    defer shell.allocator.free(head);
+    const d = checkScriptDeps(shell.allocator, head);
+    if (d.ok()) return 0;
+    scriptDepsDiagnose(shell, path, &d);
+    return 127;
+}
+
+/// `feat deps <file|->` — the static half of the contract: one
+/// `tier\tname\tpath` line per declared feat (`-\tname\tmissing` when it does
+/// not resolve), exit 0 only if every one does. A deploy can run this against
+/// the scripts it just shipped, to prove the image can run them without
+/// running them.
+fn featDepsReport(shell: *Shell, path: []const u8) !u8 {
+    if (std.mem.eql(u8, path, "-")) {
+        var buf: [16 * 1024]u8 = undefined;
+        var n: usize = 0;
+        while (n < buf.len) {
+            const r = std.Io.File.stdin().readStreaming(compat.io(), &.{buf[n..]}) catch |err| switch (err) {
+                // The streaming API reports EOF as an error; a pipe ending is
+                // not a failure to read it (see history_log.zig).
+                error.EndOfStream => break,
+                else => {
+                    try shell.stderr().print("feat: cannot read stdin: {}\n", .{err});
+                    return 1;
+                },
+            };
+            if (r == 0) break;
+            n += r;
+        }
+        return try featDepsPrint(shell, buf[0..n]);
+    }
+    const content = std.Io.Dir.cwd().readFileAlloc(compat.io(), path, shell.allocator, .limited(1024 * 1024)) catch |err| {
+        try shell.stderr().print("feat: cannot read '{s}': {}\n", .{ path, err });
+        return 1;
+    };
+    defer shell.allocator.free(content);
+    return try featDepsPrint(shell, content);
+}
+
+fn featDepsPrint(shell: *Shell, content: []const u8) !u8 {
+    var names: [MaxScriptDeps][]const u8 = undefined;
+    const n = parseScriptDeps(content, &names);
+    var bad: u8 = 0;
+    for (names[0..n]) |name| {
+        const resolved = featResolve(shell.allocator, name) orelse {
+            try shell.stdout().print("-\t{s}\tmissing\n", .{name});
+            bad = 1;
+            continue;
+        };
+        defer shell.allocator.free(resolved.bin);
+        // Resolvable, but a script may never auto-use extra: report it as a
+        // failure so a deploy catches the declaration, not the run.
+        if (resolved.tier == .extra) bad = 1;
+        try shell.stdout().print("{s}\t{s}\t{s}\n", .{
+            if (resolved.tier == .standard) "standard" else "extra",
+            name,
+            resolved.bin,
+        });
+    }
+    return bad;
+}
+
 /// Minimal stripped envp for untrusted `extra` feats: HOME + a shrunk PATH.
 /// No other variables leak across the trust boundary.
 // NOTE: returned envp strings live for the process lifetime (like
@@ -4304,7 +4442,7 @@ fn featHelp(shell: *Shell, alloc: std.mem.Allocator, raw: []const u8) !u8 {
 /// One line, printed on every usage path — including unknown option and unknown
 /// subcommand — so a caller who guesses the flag placement (`feat --json=full`)
 /// is corrected instead of stonewalled.
-const feat_usage = "feat: usage: feat list [-n|--json[=brief|full]] | help <name> | run <name> [args...]\n";
+const feat_usage = "feat: usage: feat list [-n|--json[=brief|full]] | help <name> | run <name> [args...] | deps <file|->\n";
 
 fn featCmd(shell: *Shell, args: []const []const u8) !u8 {
     const alloc = shell.allocator;
@@ -4316,6 +4454,13 @@ fn featCmd(shell: *Shell, args: []const []const u8) !u8 {
     if (std.mem.eql(u8, sub, "-h") or std.mem.eql(u8, sub, "--help")) {
         try shell.stdout().writeAll(feat_usage);
         return 0;
+    }
+    if (std.mem.eql(u8, sub, "deps")) {
+        if (args.len < 3) {
+            try shell.stderr().writeAll(feat_usage);
+            return 2;
+        }
+        return try featDepsReport(shell, args[2]);
     }
     if (std.mem.eql(u8, sub, "list")) {
         // One verbosity axis: `-n` for names, `--json` for the structured
@@ -4357,6 +4502,11 @@ fn featCmd(shell: *Shell, args: []const []const u8) !u8 {
             try shell.stdout().writeAll("feat: refusing to run extra feat as root\n");
             return 126;
         }
+        // The target declares what it needs in its own header (see
+        // parseScriptDeps): check before exec so a missing dependency is named
+        // here, rather than surfacing as "not found" from the middle of a run.
+        // A non-script bin has no header and checks nothing.
+        if (checkExecutableDeps(shell, resolved.bin) != 0) return 127;
         return try featExec(shell, resolved.tier, resolved.bin, args[3..]);
     }
     try shell.stderr().print("feat: unknown subcommand: {s}\n", .{sub});

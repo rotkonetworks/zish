@@ -25,6 +25,20 @@ one owner for building a feat — of which there were three, and they disagreed.
   `<file>` as a command and `zish <file>`.
 - `tests/feat_leaks_test.sh` — every feat's happy path must not print an
   allocator leak report.
+- **`# zish-deps:` — a script states the feats it needs, and zish holds it to
+  that before running it.** The line is a comment, so bash and older zish
+  ignore it and the file stays a valid shell script. zish parses the leading
+  comment block when it runs the script — script mode, a `#!` line pointing at
+  zish, and the ENOEXEC fallback all bind through `Shell.runScriptFile`, so no
+  entry point can miss it — and a dependency that does not resolve refuses the
+  run (127, nothing executed), naming the missing feats and the roots that were
+  searched. `feat run` checks the target's own header before exec, so a script
+  feat (`twap`) gates on `web jget calc pen rand` even though its bin is a
+  script. `feat deps <file|->` reports the same statically (`tier\tname\tpath`,
+  exit 0 only if all resolve) — the check the deploy used to make by diffing
+  `feat list` against a hand-kept list. `extra` deps are refused (§1.3), the
+  body/heredoc is never mistaken for a declaration, and 16 cases in
+  `tests/regress.sh` pin all of it.
 
 ### fixed
 - **Seven feats leaked their argv slice** (`toSlice(init.gpa)`), and `cnt` leaked

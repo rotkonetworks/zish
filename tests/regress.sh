@@ -351,6 +351,22 @@ same_as_bash "arith backtick subst"    'echo $((`printf 5` + 1))'
 same_as_bash "arith radix 16#"         'echo $((16#ff))'
 same_as_bash "arith octal"             'echo $((010 + 1))'
 same_as_bash "arith power"             'echo $((2 ** 3))'
+# Substitution is *textual*, and it happens before parsing: with x="1+2",
+# `$(( $x * 2 ))` is 1+2*2 = 5, while the bare `x` form re-evaluates the
+# variable's value as an expression and is (1+2)*2 = 6. Evaluating the
+# expansion as a sub-expression (a value) gets the first one wrong.
+same_as_bash "arith textual substitution" 'x="1+2"; echo $(($x * 2))'
+same_as_bash "arith bare var re-evaluated" 'x="1+2"; echo $((x * 2))'
+same_as_bash "arith length expansion"  'x=12345; echo $((${#x} + 1))'
+# Every arithmetic entry point expands, not just `$(( ))`: the `(( ))` command,
+# all three clauses of a C-style for, and an array subscript.
+same_as_bash "arith (( )) expansion"   'x=6; (( y = ${x:-0} + 1 )); echo $y'
+same_as_bash "arith (( )) exit status" 'x=0; (( ${x:-0} )); echo $?'
+same_as_bash "arith c-for expansion"   'x=1; for (( i=${x:-0}; i<$(printf 3); i++ )); do echo $i; done'
+same_as_bash "arith subscript expansion" 'a=(9 8 7); i=1; a[${i}+1]=5; echo ${a[2]}'
+# The fast path for `echo $(( ))` must agree with the full expander, including
+# a value that is not a bare number.
+same_as_bash "arith echo fast path"    'x=6; echo $(($x + 1)) $((${x:-0} + 1))'
 
 # ---------------------------------------------------------------------------
 printf '\n%s\n' "feats"
@@ -973,6 +989,130 @@ if [ -x "$PAR" ]; then
 else
     SKIP=$((SKIP + 8))
 fi
+
+# ---------------------------------------------------------------------------
+printf '\n%s\n' "script feat dependencies"
+# ---------------------------------------------------------------------------
+# A script declares the feats it needs in its leading comment block
+# (`# zish-deps: web calc`). The line is a comment, so bash — and any zish
+# older than this — ignores it; zish resolves it and refuses to run the script
+# when a dependency does not. Only the leading block counts, so a directive in
+# the body, or inside a heredoc, is data.
+#
+# The registry is per-case (ZISH_FEAT_PATH replaces the search roots), so it
+# cannot be exported for the suite: a global override would change what the
+# feat cases above resolve.
+DEPS_REG="$WORK/feats"
+# `$OLDPWD/$ZISH` is this suite's idiom *after* a cd; a shebang line is written
+# before any cd, so resolve the binary absolutely (and honor an override).
+REPO_ABS=$(cd "$(dirname "$0")/.." && pwd)
+case "$ZISH" in /*) DEPS_ZISH="$ZISH" ;; *) DEPS_ZISH="$REPO_ABS/${ZISH#./}" ;; esac
+mkdir -p "$DEPS_REG/standard/web/bin" "$DEPS_REG/standard/calc/bin" \
+         "$DEPS_REG/standard/broken/bin" "$DEPS_REG/extra/untrusted/bin"
+for f in web calc broken; do
+    printf 'name = "%s"\ntier = "standard"\nversion = "1.0.0"\nhelp = "mock"\n' "$f" \
+        > "$DEPS_REG/standard/$f/feat.toml"
+done
+printf '#!/bin/sh\necho web-ran\n'  > "$DEPS_REG/standard/web/bin/web"
+printf '#!/bin/sh\necho calc-ran\n' > "$DEPS_REG/standard/calc/bin/calc"
+printf '#!%s\n# zish-deps: nosuchfeat\necho BIN-RAN\n' "$DEPS_ZISH" > "$DEPS_REG/standard/broken/bin/broken"
+printf 'name = "untrusted"\ntier = "extra"\nversion = "1.0.0"\nhelp = "mock"\n' \
+    > "$DEPS_REG/extra/untrusted/feat.toml"
+printf '#!/bin/sh\necho untrusted-ran\n' > "$DEPS_REG/extra/untrusted/bin/untrusted"
+chmod +x "$DEPS_REG"/standard/*/bin/* "$DEPS_REG"/extra/*/bin/*
+
+# Every payload carries this build's shebang and the exec bit: the cases run
+# them as commands (`./deps-x.zish`), which is how a deployed feat is invoked
+# and what puts zish in the path at all. The `enoexec` pair deliberately has
+# *no* shebang, to exercise zish's own ENOEXEC fallback.
+SHEBANG="#!$DEPS_ZISH"
+printf '%s\n# zish-deps: web calc\necho BODY-RAN\n' "$SHEBANG" > "$WORK/deps-ok.zish"
+printf '%s\n# zish-deps: web nosuchfeat\necho BODY-RAN\n' "$SHEBANG" > "$WORK/deps-missing.zish"
+printf '%s\n# zish-deps: extra/untrusted\necho BODY-RAN\n' "$SHEBANG" > "$WORK/deps-extra.zish"
+printf '%s\n# zish-deps: standard/web, calc\n# zish-deps: web  # trailing prose\necho BODY-RAN\n' "$SHEBANG" > "$WORK/deps-forms.zish"
+printf '%s\n# zish-deps: web  # prose, not a name\necho BODY-RAN\n' "$SHEBANG" > "$WORK/deps-comment.zish"
+printf '%s\necho BODY-RAN\n# zish-deps: nosuchfeat\n' "$SHEBANG" > "$WORK/deps-body.zish"
+printf '%s\necho BODY-RAN\ncat <<%s\n# zish-deps: alsoNosuch\n%s\n' "$SHEBANG" "'INNER'" "'INNER'" > "$WORK/deps-heredoc.zish"
+printf '%s\necho BODY-RAN\n' "$SHEBANG" > "$WORK/deps-none.zish"
+printf 'echo BODY-RAN\n' > "$WORK/deps-enoexec-noshebang.zish"
+printf '# zish-deps: nosuchfeat\necho BODY-RAN\n' > "$WORK/deps-enoexec-missing.zish"
+cat > "$WORK/deps-heredoc.zish" <<EOF
+$SHEBANG
+echo BODY-RAN
+cat <<'INNER'
+# zish-deps: alsoNosuch
+INNER
+EOF
+chmod +x "$WORK"/deps-*.zish
+
+# Case runners for this section. `expect` shares the suite's environment, and
+# these need ZISH_FEAT_PATH set per case, with stderr kept: a refusal is
+# diagnosed there. `deps_run` pins exact stdout + status; `deps_refuse` pins a
+# non-zero status, a stderr diagnostic, and — the assertion that matters — that
+# the script body never ran. (zish's `-c` shell also prints its own
+# "command not found" to stdout whenever the child's status is 127, so refusal
+# cases cannot assert an exact stdout.)
+deps_run() { # NAME WANT_OUT WANT_STATUS WANT_ERR SCRIPT
+    local name="$1" want_out="$2" want_status="$3" want_err="$4" script="$5"
+    selected "$name" || { SKIP=$((SKIP + 1)); return; }
+
+    local out err status
+    out=$(cd "$WORK" && ZISH_FEAT_PATH="$DEPS_REG" timeout 10 "$DEPS_ZISH" -c "$script" 2>"$WORK/deps.err")
+    status=$?
+    err=$(cat "$WORK/deps.err")
+    if [ "$out" != "$want_out" ] || [ "$status" != "$want_status" ]; then
+        report_fail "$name" "$want_out (status $want_status)" "$out (status $status)" "stderr: $err"
+    elif [ -n "$want_err" ]; then
+        case "$err" in
+            *"$want_err"*) report_pass "$name" ;;
+            *) report_fail "$name" "stderr contains: $want_err" "$err" "script: $script" ;;
+        esac
+    else
+        report_pass "$name"
+    fi
+}
+
+deps_refuse() { # NAME WANT_STATUS WANT_ERR ABSENT SCRIPT
+    local name="$1" want_status="$2" want_err="$3" absent="$4" script="$5"
+    selected "$name" || { SKIP=$((SKIP + 1)); return; }
+
+    local out err status
+    out=$(cd "$WORK" && ZISH_FEAT_PATH="$DEPS_REG" timeout 10 "$DEPS_ZISH" -c "$script" 2>"$WORK/deps.err")
+    status=$?
+    err=$(cat "$WORK/deps.err")
+    if [ "$status" != "$want_status" ]; then
+        report_fail "$name" "status $want_status" "status $status" "stdout: $out / stderr: $err"
+        return
+    fi
+    case "$err" in
+        *"$want_err"*) ;;
+        *) report_fail "$name" "stderr contains: $want_err" "$err" "script: $script"; return ;;
+    esac
+    case "$out" in
+        *"$absent"*) report_fail "$name" "body did not run" "body ran" "stdout: $out" ;;
+        *) report_pass "$name" ;;
+    esac
+}
+
+deps_run   "deps: resolvable runs"     $'BODY-RAN' 0 ''                  './deps-ok.zish'
+deps_refuse "deps: missing refuses"    127 'missing feat dependency: nosuchfeat' BODY-RAN './deps-missing.zish'
+deps_refuse "deps: extra refused"      127 'extra feat dependency'              BODY-RAN './deps-extra.zish'
+deps_run   "deps: qualified and comma" $'BODY-RAN' 0 ''                  './deps-forms.zish'
+deps_run   "deps: trailing comment"    $'BODY-RAN' 0 ''                  './deps-comment.zish'
+deps_run   "deps: body ignored"        $'BODY-RAN' 0 ''                  './deps-body.zish'
+deps_run   "deps: heredoc ignored"     $'BODY-RAN\n# zish-deps: alsoNosuch' 0 '' './deps-heredoc.zish'
+deps_run   "deps: none is a no-op"     $'BODY-RAN' 0 ''                  './deps-none.zish'
+deps_run   "deps: enoexec ok"          $'BODY-RAN' 0 ''                  './deps-enoexec-noshebang.zish'
+deps_refuse "deps: enoexec fallback"   127 'missing feat dependency'    BODY-RAN './deps-enoexec-missing.zish'
+deps_refuse "deps: script mode"        127 'missing feat dependency'    BODY-RAN "$DEPS_ZISH ./deps-missing.zish"
+deps_refuse "deps: feat run pre-checks" 127 'missing feat dependency: nosuchfeat' BIN-RAN 'feat run broken'
+deps_run "deps: report resolved" \
+    $'standard\tweb\t'"$DEPS_REG"$'/standard/web/bin/web\nstandard\tcalc\t'"$DEPS_REG"$'/standard/calc/bin/calc' 0 '' "feat deps $WORK/deps-ok.zish"
+deps_run "deps: report missing" \
+    $'standard\tweb\t'"$DEPS_REG"$'/standard/web/bin/web\n-\tnosuchfeat\tmissing' 1 '' "feat deps $WORK/deps-missing.zish"
+deps_run "deps: report no deps"        ''          0   ''                "feat deps $WORK/deps-none.zish"
+deps_run "deps: report stdin" \
+    $'standard\tweb\t'"$DEPS_REG"$'/standard/web/bin/web\nstandard\tcalc\t'"$DEPS_REG"$'/standard/calc/bin/calc' 0 '' "cat $WORK/deps-ok.zish | feat deps -"
 
 # ---------------------------------------------------------------------------
 printf '\n'

@@ -16,6 +16,7 @@
 const std = @import("std");
 const Shell = @import("Shell.zig");
 const compat = @import("compat.zig");
+const arith = @import("arith.zig");
 const paramexp = @import("paramexp.zig");
 const lexer = @import("lexer.zig");
 
@@ -194,8 +195,8 @@ pub fn allocOpt(sh: *Shell, input: []const u8, expand_tilde: bool) ![]const u8 {
                     const expr = input[expr_start..i-1];
                     i += 1; // consume final ) (first one was consumed in loop)
 
-                    // Evaluate arithmetic expression
-                    const arith_result = try sh.evaluateArithmetic(expr);
+                    // Evaluate arithmetic expression (expansions first)
+                    const arith_result = try arith.evaluateArithSource(sh, expr);
                     var buf: [32]u8 = undefined;
                     const result_str = std.fmt.bufPrint(&buf, "{d}", .{arith_result}) catch "0";
                     try result.appendSlice(sh.allocator, result_str);

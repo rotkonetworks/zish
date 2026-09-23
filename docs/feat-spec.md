@@ -92,6 +92,9 @@ Wired into `builtins.zig` via `isBuiltin`/`dispatch` under the name `feat`.
     zish feat help <name> print the feat's `help` line
     zish feat run <name> [args...]
                           resolve <name> in the registry, exec its bin with args
+    zish feat deps <file|->    print what a script declares it needs
+                          (`tier\tname\tpath` per dep, `-\tname\tmissing` when
+                          unresolved), exit 0 only if all resolve — see §12
     zish feat install <src>     install an extra tier feat (copies dir into extra/)
     zish feat uninstall <name>  remove an extra feat (refuses core/standard)
 
@@ -234,3 +237,37 @@ lookup; `feat.env` reads `/proc/self/environ`. The `feat_libc` list in
 `build.zig` names only the feats that still need libc for something real
 (`para`, for `execvp`), with the reason noted there. A feat that newly needs
 libc is a change to that list *and* to its justification — not a quiet `-lc`.
+
+## 12. Script feat dependencies (`zish-deps`)
+
+A script declares the feats it needs in its **leading comment block**:
+
+    #!/usr/local/bin/zish
+    # zish-deps: web jget calc
+
+- The declaration is a **comment**, so the file stays a valid shell script:
+  bash — and any zish older than this — ignores it and runs the file as before.
+  Opting in costs nothing and breaks nothing.
+- zish parses it when it runs the script. Script mode (`zish file`), a `#!`
+  line pointing at zish, and the POSIX ENOEXEC fallback all bind through
+  `Shell.runScriptFile`, so no entry point can miss it — and a dependency that
+  does not resolve **refuses the run** (status 127, nothing executed). The
+  message names the missing feats and prints the roots that were searched,
+  because a missing feat is nearly always a registry that is not the one the
+  caller assumed.
+- `feat run <name>` checks the target's **own** header before exec'ing it, so a
+  script feat gates on what it needs even when its bin is not itself zish.
+- Only the **leading** block is read: an optional `#!` line, then comment and
+  blank lines. A `zish-deps:` line in the body — or inside a heredoc — is data,
+  never a claim.
+- Names are whitespace- or comma-separated, may be tier-qualified
+  (`standard/web`), and `#` starts a trailing comment.
+- **`extra` is refused, not resolved.** §1.3: an untrusted extra feat is never
+  auto-used by a script. Declaring one fails the run, and `feat deps`.
+- `zish feat deps <file|->` is the static half of the same contract: one
+  `tier\tname\tpath` line per declared feat (`-\tname\tmissing` when it does
+  not resolve), exit 0 only if every one resolves. A deploy proves the image it
+  just built can run a script without running it.
+- `source`/`.` is **not** gated. The declaration belongs to a *run* of a
+  script; a sourced file executes in the current shell, where the caller owns
+  what is on PATH and what has already resolved.

@@ -748,6 +748,17 @@ pub fn runScriptFile(self: *Shell, script_path: []const u8, args: []const []cons
         std.process.exit(126);
     }
 
+    // `# zish-deps:` in the leading comment block: a script that declares its
+    // feat dependencies does not get to run when they do not resolve. 127,
+    // because what is missing is a command the script needs, and nothing of
+    // the script has run yet.
+    const deps = eval.checkScriptDeps(self.allocator, content);
+    if (!deps.ok()) {
+        eval.scriptDepsDiagnose(self, script_path, &deps);
+        self.stdout().flush() catch {};
+        std.process.exit(127);
+    }
+
     const exit_code = self.executeCommand(content) catch |err| {
         std.debug.print("zish: error executing script: {}\n", .{err});
         std.process.exit(1);
