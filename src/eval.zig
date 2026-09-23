@@ -2,6 +2,7 @@
 const std = @import("std");
 const compat = @import("compat.zig");
 const arith = @import("arith.zig");
+const expand_mod = @import("expand.zig");
 const ast = @import("ast.zig");
 const argv_mod = @import("argv.zig");
 const glob = @import("glob.zig");
@@ -299,6 +300,31 @@ pub fn buildEnvironment(shell: *Shell) ![*:null]const ?[*:0]const u8 {
 
     env_ptrs[idx] = null;
     return @ptrCast(env_ptrs.ptr);
+}
+
+/// True when `value` is exactly one `$(( ))` expansion covering the whole word.
+fn isSoleArithExpansion(value: []const u8) bool {
+    if (value.len < 5 or !std.mem.startsWith(u8, value, "$((")) return false;
+    var depth: usize = 2; // the two opening parens of `$((`
+    var i: usize = 3;
+    while (i < value.len) : (i += 1) {
+        switch (value[i]) {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if (depth == 0) return i == value.len - 1;
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// Exit status for a forked child whose body failed with a Zig error. An
+/// arithmetic failure is 1 (bash: fatal to the non-interactive child, status
+/// 1); anything else keeps the old "could not run it" 127.
+fn childStatus(err: anyerror) u8 {
+    return if (arith.reported(err)) 1 else 127;
 }
 
 pub fn evaluateAst(shell: *Shell, node: *const ast.AstNode) anyerror!u8 {
@@ -602,10 +628,10 @@ fn expandVariableFast(shell: *Shell, input: []const u8, dest: *[256]u8) !usize {
                     {
                         return error.BufferTooSmall;
                     }
-                    const arith_result = shell.evaluateArithmetic(expr) catch {
-                        std.debug.print("zish: division by 0\n", .{});
-                        break;
-                    };
+                    // evaluateArithSource short-circuits on `$`-free text (the
+                    // guard above guarantees that), so this costs nothing and
+                    // keeps the diagnostic in one place.
+                    const arith_result = try arith.evaluateArithSource(shell, expr);
                     const result_str = std.fmt.bufPrint(dest[out_pos..], "{d}", .{arith_result}) catch break;
                     out_pos += result_str.len;
                     continue;
@@ -1701,7 +1727,7 @@ pub fn evaluatePipeline(shell: *Shell, node: *const ast.AstNode) !u8 {
             // may exec in place.
             shell.forked_child = true;
             shell.exec_in_place_node = child;
-            const status = evaluateAst(shell, child) catch 127;
+            const status = evaluateAst(shell, child) catch |err| childStatus(err);
             shell.stdout().flush() catch {};
             std.process.exit(status);
         } else {
@@ -2446,24 +2472,25 @@ pub fn evaluateAssignment(shell: *Shell, node: *const ast.AstNode) !u8 {
         name = name[0 .. name.len - 1];
     }
 
-    // check for array element assignment: arr[n]=value
-    if (std.mem.indexOfScalar(u8, name, '[')) |bracket_pos| {
-        if (std.mem.indexOfScalar(u8, name[bracket_pos..], ']')) |close_offset| {
-            const arr_name = name[0..bracket_pos];
-            const index_str = name[bracket_pos + 1 .. bracket_pos + close_offset];
+    // check for array element assignment: arr[n]=value. The subscript is an
+    // arithmetic expression and may be negative (counting from the end) — the
+    // same rules the reader uses, from the same place, so `a[-1]=x` and
+    // `${a[-1]}` cannot disagree.
+    if (expand_mod.splitSubscript(name)) |sub| {
+        const index = (try expand_mod.subscriptIndex(shell, sub.name, sub.index)) orelse {
+            const w = shell.stderr();
+            w.print("zish: {s}: bad array subscript\n", .{name}) catch {};
+            w.flush() catch {};
+            // Reported, so the boundary fails the command quietly — bash makes
+            // a bad subscript fatal to a non-interactive shell too.
+            return error.ArithSyntax;
+        };
 
-            // parse index (can be arithmetic expression)
-            const index = if (index_str.len > 0)
-                @as(usize, @intCast(@max(0, arith.evaluateArithSource(shell, index_str) catch 0)))
-            else
-                0;
+        const expanded_value = try shell.expandVariables(value);
+        defer shell.allocator.free(expanded_value);
 
-            const expanded_value = try shell.expandVariables(value);
-            defer shell.allocator.free(expanded_value);
-
-            try shell.setArrayElement(arr_name, index, expanded_value);
-            return 0;
-        }
+        try shell.setArrayElement(sub.name, index, expanded_value);
+        return 0;
     }
 
     // check for array assignment: arr=(a b c)
@@ -2489,9 +2516,14 @@ pub fn evaluateAssignment(shell: *Shell, node: *const ast.AstNode) !u8 {
     }
 
     // fast path for pure arithmetic assignments like i=$((i+1))
-    if (!is_append and value.len >= 5 and std.mem.startsWith(u8, value, "$((") and value[value.len - 2] == ')' and value[value.len - 1] == ')') {
+    // The whole value must be ONE `$(( ))` and nothing else. Matching only the
+    // prefix and suffix is not that: `x=$((1+2))$((3+4))` starts with `$((`
+    // and ends with `))` while being two expansions and a concatenation, and
+    // this path evaluated `1+2))$((3+4` — 3, where bash says 37. Balance the
+    // parens and require the match to land on the last two bytes.
+    if (!is_append and isSoleArithExpansion(value)) {
         const expr = value[3 .. value.len - 2];
-        const arith_result = arith.evaluateArithSource(shell, expr) catch 0;
+        const arith_result = try arith.evaluateArithSource(shell, expr);
 
         var result_buf: [32]u8 = undefined;
         const result_str = std.fmt.bufPrint(&result_buf, "{d}", .{arith_result}) catch return 1;
@@ -2610,13 +2642,13 @@ pub fn evaluateCForLoop(shell: *Shell, node: *const ast.AstNode) !u8 {
     const cond_expr = parts[1];
     const update_expr = parts[2];
 
-    if (init_expr.len > 0) _ = arith.evaluateArithSource(shell, init_expr) catch {};
+    if (init_expr.len > 0) _ = arith.evaluateArithSource(shell, init_expr) catch return 1;
 
     var last_status: u8 = 0;
     while (true) {
         // An empty condition is always true (for ((;;)) loops forever).
         if (cond_expr.len > 0) {
-            const c = arith.evaluateArithSource(shell, cond_expr) catch 0;
+            const c = arith.evaluateArithSource(shell, cond_expr) catch return 1;
             if (c == 0) break;
         }
         const body_status = try evaluateAst(shell, body);
@@ -2625,7 +2657,7 @@ pub fn evaluateCForLoop(shell: *Shell, node: *const ast.AstNode) !u8 {
             .continue_loop => last_status = 0, // fall through to the update step
             .normal => last_status = body_status,
         }
-        if (update_expr.len > 0) _ = arith.evaluateArithSource(shell, update_expr) catch {};
+        if (update_expr.len > 0) _ = arith.evaluateArithSource(shell, update_expr) catch return 1;
     }
     return last_status;
 }
@@ -3071,7 +3103,7 @@ pub fn evaluateSubshell(shell: *Shell, node: *const ast.AstNode) !u8 {
         // ( a; b ) evaluateAst descends into nodes that are not this one, and
         // those correctly fork instead of replacing this process mid-body.
         shell.exec_in_place_node = node.children[0];
-        const status = evaluateAst(shell, node.children[0]) catch 127;
+        const status = evaluateAst(shell, node.children[0]) catch |err| childStatus(err);
         shell.stdout().flush() catch {};
         compat.posix.exit(status);
     }
@@ -3130,7 +3162,7 @@ pub fn evaluateBackground(shell: *Shell, node: *const ast.AstNode) !u8 {
         shell.exec_in_place_node = command;
 
         // evaluate command and exit with its status
-        const status = evaluateAst(shell, command) catch 127;
+        const status = evaluateAst(shell, command) catch |err| childStatus(err);
         shell.stdout().flush() catch {};
         compat.posix.exit(status);
     }

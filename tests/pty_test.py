@@ -294,6 +294,29 @@ def _(sh):
     expect_soon(sh, "status=1")
 
 
+@test("arithmetic error fails the command, not the shell")
+def _(sh):
+    # A bad expression is fatal to a non-interactive shell (bash), but here it
+    # must only fail the command: the prompt has to come back. The interactive
+    # boundary used to `try` this error straight out of the REPL loop.
+    sh.sendline("echo $(( 1 + ))")
+    expect_soon(sh, "arithmetic syntax error")
+    sh.sendline("echo status=$?")
+    expect_soon(sh, "status=1")
+    sh.sendline("echo alive=$((2 + 2))")
+    expect_soon(sh, "alive=4")
+
+
+@test("self-referential variable does not crash the shell")
+def _(sh):
+    # `a=b; b=a` recursed until the stack gave out — a segfault that took the
+    # interactive shell with it.
+    sh.sendline("a=b; b=a; echo $((a))")
+    expect_soon(sh, "recursion level exceeded")
+    sh.sendline("echo alive=$((3 + 3))")
+    expect_soon(sh, "alive=6")
+
+
 # ---------------------------------------------------------------------------
 print("\njob control (signals + terminal handover)")
 # ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@
 const std = @import("std");
 const Shell = @import("Shell.zig");
 const compat = @import("compat.zig");
+const arith = @import("arith.zig");
 const posix = compat.posix;
 const heredoc = @import("heredoc.zig");
 const prompt_mod = @import("prompt.zig");
@@ -410,7 +411,14 @@ pub fn handleAction(self: *Shell, action: Action) !void {
                     defer if (processed_cmd.ptr != command.ptr) self.allocator.free(processed_cmd);
 
                     const start_ts = compat.timestamp();
-                    self.last_exit_code = try self.executeCommand(processed_cmd);
+                    // An arithmetic failure is fatal to a non-interactive
+                    // shell (bash), but here it is just a failed command: the
+                    // prompt has to come back, not the shell die under the
+                    // user's hands.
+                    self.last_exit_code = self.executeCommand(processed_cmd) catch |err| blk: {
+                        if (!arith.reported(err)) return err;
+                        break :blk 1;
+                    };
                     const elapsed = compat.timestamp() - start_ts;
 
                     // Show elapsed time for long-running commands (>1s)

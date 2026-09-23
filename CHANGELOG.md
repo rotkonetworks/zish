@@ -1,5 +1,99 @@
 # changelog
 
+## v0.25.0
+
+Arithmetic, and the silence around it. `$(( ))` mis-evaluated every expansion
+its parser could not tokenize and said nothing about it; a script could also
+state the feats it depends on and be held to them.
+
+### added
+- **`# zish-deps:` — a script states the feats it needs, and zish holds it to
+  that before running it.** The line is a comment, so bash and older zish
+  ignore it and the file stays a valid shell script. zish parses the leading
+  comment block when it runs the script — script mode, a `#!` line pointing at
+  zish, and the ENOEXEC fallback all bind through `Shell.runScriptFile`, so no
+  entry point can miss it — and a dependency that does not resolve refuses the
+  run (127, nothing executed), naming the missing feats and the roots that were
+  searched. `feat run` checks the target's own header before exec, so a script
+  feat (`twap`) gates on `web jget calc pen rand` even though its bin is a
+  script. `feat deps <file|->` reports the same statically (`tier\tname\tpath`,
+  exit 0 only if all resolve) — the check the deploy used to make by diffing
+  `feat list` against a hand-kept list. `feat need <name>...` is the runtime
+  half: resolve now, answer with the exit status, never exec what it resolved.
+  `extra` deps are refused (§1.3); the body/heredoc is never mistaken for a
+  declaration; the `zish-` namespace is reserved in the leading block, so a typo
+  (`# zish-dep: web`) is an error rather than a silent "no dependencies"; and 23
+  cases in `tests/regress.sh` pin all of it.
+
+### fixed
+- **`$(( ))` silently mis-evaluated every expansion its parser could not
+  tokenize.** ArithParser handled `$name`/`${name}` only: `${x:-0}`, `${x:+9}`,
+  `${x}${x}`, `$(cmd)` and backticks all raised SyntaxError, which
+  `evaluateArithmetic` converts to 0 *without a message* — so `$(( ${x:-0} + 1 ))`
+  was 0 while bash says 6, and an adjacent expansion was truncated rather than
+  concatenated (`$(( ${x}${x} + 1 ))` was 5 where bash says 56). Bash's model is
+  simpler than the special cases it suggests: expand the expression *text*, then
+  evaluate the result. That is now one step in one place:
+  `arith.evaluateArithSource` expands the source text through the shell's own
+  expander and hands the parser a string of numbers and operators. Every entry
+  point goes through it: `$(( ))`, the `(( ))` command, all three clauses of a
+  C-style `for`, an array subscript, and `x=$(( ))`. The parser's own `$` case
+  is gone (a `$` reaching it means a caller skipped the expansion), and so is
+  eval.zig's private `expandArithmeticVars` — a second, smaller copy of the
+  expansion rules, and how the `echo $(( ))` fast path diverged from `$(( ))`;
+  that fast path now defers to the full expander whenever the expression carries
+  an expansion.
+
+  Expanding the text first also makes the substitution *textual*, as bash's is:
+  with `x="1+2"`, `$(( $x * 2 ))` is `1+2*2` = 5 (zish said 6 — it evaluated the
+  expansion as a value). A *bare* `x` is still a variable reference whose value
+  is re-evaluated as an expression, so `$(( x * 2 ))` stays 6, like bash. Nested
+  `$(( $((1+2)) * 2 ))` works for the same reason. Radix (`16#ff`, `2#1010`),
+  octal, `**`, ternary and the shell operators already agreed with bash across a
+  43-expression differential probe; the fix is pinned by twenty-seven
+  `same_as_bash` cases in `tests/regress.sh` — twelve of them fail on v0.24.0.
+
+- **An arithmetic failure was silent, and one of them was a segfault.**
+  `evaluateArithmetic` mapped every parse failure to 0 with no message — which
+  is precisely how both halves of the expansion bug above survived two releases
+  — so `$(( 1 + ))` was 0, status 0. The evaluator now returns typed errors
+  (`ArithSyntax`, `DivideByZero`, `ArithRecursion`); one place reports them,
+  naming the expression the way bash does, and the failure propagates to the
+  shell's boundaries, which fail *quietly* because it has already been said.
+  The result matches bash case for case: an expansion error is fatal to a
+  non-interactive shell (`echo $(( 1 + ))` runs nothing and exits 1), the
+  command forms `(( ))` and `for (( ;; ))` are status 1 and the script
+  continues, a subshell or pipeline stage exits 1, and an interactive shell
+  fails the command and comes back with a prompt — that last one has a pty
+  regression, because a naked `try` in the REPL loop would have killed the
+  shell under the user's hands.
+
+  Two crashes fell out of the same silence. `a=b; b=a; $(( a ))` recursed —
+  a variable's value is re-evaluated as an expression — until the stack gave
+  out: a **segfault**, now bash's "expression recursion level exceeded" at a
+  depth of 1024. And a literal wider than 64 bits (`36#zzzzzzzzzzzzzzzz`) hit a
+  checked multiply: a ReleaseSafe **panic** from one line of arithmetic. Digits
+  are now accumulated in 64 wrapping unsigned bits and reinterpreted, like
+  bash — which also fixes `9223372036854775808` (INT_MIN's own text, written
+  into a variable and read back), `0xffffffffffffffff`, and bases above 36
+  (`62#Z`, `64#_`), where bash's uppercase letters are digits 36-61.
+- **An array subscript is an arithmetic expression.** zish read it as a literal
+  decimal, so `$(( a[1] ))` was 0, `${a[i+1]}` expanded to nothing (the `+`
+  ended the name the scanner was reading), `${a[${#a[@]}-1]}` took the first
+  `]` it saw and returned the wrong element, and a negative index wrapped into
+  a huge one instead of counting from the end. Subscripts are now one concept
+  in the evaluator (an `LValue` — `a`, `a[0]` and `a[i+1]` are the same thing
+  with and without an index, so `=`, `+=`, `++` and a bare read get arrays for
+  free) and one pair of helpers in the expander, shared with `a[i]=v` so the
+  reader and the writer cannot disagree: `${a[-1]}` and `a[-1]=x` mean the
+  last element, and an out-of-range negative is bash's "bad array subscript".
+- **`x=$((1+2))$((3+4))` assigned 3, not 37.** The assignment fast path matched
+  a value that merely *starts* with `$((` and *ends* with `))`, so two adjacent
+  expansions looked like one and it evaluated `1+2))$((3+4`. It now balances
+  the parens and takes the path only when one expansion covers the whole word.
+  The fast path stays because it earns it: 200k `n=$((n+1))` iterations run in
+  0.106s with it and 0.114s without (min of 7; bash 0.34s).
+
 ## v0.24.0
 
 Conformance and ownership. Two POSIX behaviours bash has and zish did not, and
@@ -25,23 +119,6 @@ one owner for building a feat — of which there were three, and they disagreed.
   `<file>` as a command and `zish <file>`.
 - `tests/feat_leaks_test.sh` — every feat's happy path must not print an
   allocator leak report.
-- **`# zish-deps:` — a script states the feats it needs, and zish holds it to
-  that before running it.** The line is a comment, so bash and older zish
-  ignore it and the file stays a valid shell script. zish parses the leading
-  comment block when it runs the script — script mode, a `#!` line pointing at
-  zish, and the ENOEXEC fallback all bind through `Shell.runScriptFile`, so no
-  entry point can miss it — and a dependency that does not resolve refuses the
-  run (127, nothing executed), naming the missing feats and the roots that were
-  searched. `feat run` checks the target's own header before exec, so a script
-  feat (`twap`) gates on `web jget calc pen rand` even though its bin is a
-  script. `feat deps <file|->` reports the same statically (`tier\tname\tpath`,
-  exit 0 only if all resolve) — the check the deploy used to make by diffing
-  `feat list` against a hand-kept list. `feat need <name>...` is the runtime
-  half: resolve now, answer with the exit status, never exec what it resolved.
-  `extra` deps are refused (§1.3); the body/heredoc is never mistaken for a
-  declaration; the `zish-` namespace is reserved in the leading block, so a typo
-  (`# zish-dep: web`) is an error rather than a silent "no dependencies"; and 23
-  cases in `tests/regress.sh` pin all of it.
 
 ### fixed
 - **Seven feats leaked their argv slice** (`toSlice(init.gpa)`), and `cnt` leaked
@@ -50,19 +127,6 @@ one owner for building a feat — of which there were three, and they disagreed.
   `-O ReleaseFast`, where the tracking is compiled out, so only the shipped
   build showed it. argv now lives in `init.arena` — freed by the runtime at
   exit — and `cnt`'s buffer is freed on both branches.
-- **`$(( ))` silently mis-evaluated every expansion its parser could not
-  tokenize.** ArithParser handled `$name`/`${name}` only: `${x:-0}`, `${x:+9}`,
-  `${x}${x}`, `$(cmd)` and backticks all raised SyntaxError, which
-  `evaluateArithmetic` converts to 0 *without a message* — so `$(( ${x:-0} + 1 ))`
-  was 0 while bash says 6, and an adjacent expansion was truncated rather than
-  concatenated (`$(( ${x}${x} + 1 ))` was 5 where bash says 56). Bash's model is
-  simpler than the special cases it suggests: expand the expression *text*, then
-  evaluate the result. The parser now consumes a run of expansions, expands it
-  the way the shell expands any word, and evaluates the outcome — which is why
-  `$(( $(echo 1+2) ))` is 3 and not a number. Radix (`16#ff`, `2#1010`), octal,
-  `**`, ternary and the shell operators already agreed with bash across a
-  43-expression differential probe; it is now pinned by twelve `same_as_bash`
-  cases in `tests/regress.sh`.
 
 ### changed
 - **`build.zig` is the only thing that compiles a feat.** The Makefile kept a

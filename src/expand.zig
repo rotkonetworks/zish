@@ -89,6 +89,40 @@ fn tildePrefixHome(sh: *Shell, name: []const u8) ?[]u8 {
     return sh.allocator.dupe(u8, std.mem.sliceTo(dir, 0)) catch null;
 }
 
+/// Split `a[expr]` into the array name and the subscript text. The closing
+/// bracket is found by depth, not by the first `]`: a subscript may itself
+/// contain one (`${a[${#a[@]}-1]}`), and taking the first match cut it to
+/// `${#a[@` — which evaluated to 0 and quietly returned the wrong element.
+pub fn splitSubscript(var_name: []const u8) ?struct { name: []const u8, index: []const u8 } {
+    const open = std.mem.indexOfScalar(u8, var_name, '[') orelse return null;
+    var depth: usize = 0;
+    var i = open;
+    while (i < var_name.len) : (i += 1) {
+        if (var_name[i] == '[') depth += 1;
+        if (var_name[i] == ']') {
+            depth -= 1;
+            if (depth == 0) {
+                return .{ .name = var_name[0..open], .index = var_name[open + 1 .. i] };
+            }
+        }
+    }
+    return null;
+}
+
+/// An array subscript is an arithmetic expression, not a literal number:
+/// `${a[i+1]}`, `${a[$((i+1))]}` and `${a[-1]}` are all bash. A negative index
+/// counts from the end; one that falls off either end is an unset element
+/// (null), which expands to nothing.
+pub fn subscriptIndex(sh: *Shell, arr_name: []const u8, index_str: []const u8) !?usize {
+    if (index_str.len == 0) return 0;
+    const idx = try arith.evaluateArithSource(sh, index_str);
+    if (idx >= 0) return @intCast(idx);
+    const len = sh.getArrayLen(arr_name) orelse return null;
+    const from_end = @as(i64, @intCast(len)) + idx;
+    if (from_end < 0) return null;
+    return @intCast(from_end);
+}
+
 fn getVarValue(sh: *Shell, key: []const u8) ?[]const u8 {
     return sh.variables.get(key);
 }
@@ -280,7 +314,17 @@ pub fn allocOpt(sh: *Shell, input: []const u8, expand_tilde: bool) ![]const u8 {
                 if (i < input.len and input[i] == '#') {
                     i += 1; // skip #
                     const name_start = i;
-                    while (i < input.len and input[i] != '}') {
+                    // The name runs to its own `}` — but a subscript can hold a
+                    // whole expansion of its own (`${#a[${#a[@]}-1]}`), so a
+                    // nested `${` is skipped as a unit, not stopped at.
+                    var brace_depth: usize = 0;
+                    while (i < input.len and (input[i] != '}' or brace_depth > 0)) {
+                        if (input[i] == '$' and i + 1 < input.len and input[i + 1] == '{') {
+                            brace_depth += 1;
+                            i += 2;
+                            continue;
+                        }
+                        if (input[i] == '}' and brace_depth > 0) brace_depth -= 1;
                         i += 1;
                     }
                     const var_name = input[name_start..i];
@@ -301,13 +345,10 @@ pub fn allocOpt(sh: *Shell, input: []const u8, expand_tilde: bool) ![]const u8 {
                         if (sh.getArrayLen(arr_name)) |len| {
                             var_len = len;
                         }
-                    } else if (std.mem.indexOfScalar(u8, var_name, '[')) |bracket_pos| {
+                    } else if (splitSubscript(var_name)) |sub| {
                         // ${#arr[n]} - length of element
-                        const arr_name = var_name[0..bracket_pos];
-                        if (std.mem.indexOfScalar(u8, var_name[bracket_pos..], ']')) |close_offset| {
-                            const index_str = var_name[bracket_pos + 1 .. bracket_pos + close_offset];
-                            const idx = std.fmt.parseInt(usize, index_str, 10) catch 0;
-                            if (sh.getArrayElement(arr_name, idx)) |elem| {
+                        if (try subscriptIndex(sh, sub.name, sub.index)) |idx| {
+                            if (sh.getArrayElement(sub.name, idx)) |elem| {
                                 var_len = elem.len;
                             }
                         }
@@ -360,13 +401,30 @@ pub fn allocOpt(sh: *Shell, input: []const u8, expand_tilde: bool) ![]const u8 {
                 const name_start = i;
 
                 // Find end of variable name or modifier.
-                // Stop at: } : - + ? = # % / ^ , (but not '[' so array subscripts stay
-                // part of the name)
+                // Stop at: } : - + ? = # % / ^ , — except inside a subscript,
+                // which belongs to the name and is an arithmetic expression in
+                // its own right: `${a[i+1]}` and `${a[$((i+1))]}` both contain
+                // stop characters, and scanning for them blindly cut the name
+                // to `a[i` and expanded to nothing.
                 while (i < input.len and input[i] != '}' and input[i] != ':' and
                     input[i] != '-' and input[i] != '+' and input[i] != '?' and
                     input[i] != '=' and input[i] != '#' and input[i] != '%' and
                     input[i] != '/' and input[i] != '^' and input[i] != ',')
                 {
+                    if (input[i] == '[') {
+                        var depth: usize = 0;
+                        while (i < input.len) : (i += 1) {
+                            if (input[i] == '[') depth += 1;
+                            if (input[i] == ']') {
+                                depth -= 1;
+                                if (depth == 0) {
+                                    i += 1;
+                                    break;
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     i += 1;
                 }
 
@@ -393,13 +451,10 @@ pub fn allocOpt(sh: *Shell, input: []const u8, expand_tilde: bool) ![]const u8 {
                         }
                         continue;
                     }
-                } else if (std.mem.indexOfScalar(u8, var_name, '[')) |bracket_pos| {
+                } else if (splitSubscript(var_name)) |sub| {
                     // array element: ${arr[n]}
-                    const arr_name = var_name[0..bracket_pos];
-                    if (std.mem.indexOfScalar(u8, var_name[bracket_pos..], ']')) |close_offset| {
-                        const index_str = var_name[bracket_pos + 1 .. bracket_pos + close_offset];
-                        const idx = std.fmt.parseInt(usize, index_str, 10) catch 0;
-                        if (sh.getArrayElement(arr_name, idx)) |elem| {
+                    if (try subscriptIndex(sh, sub.name, sub.index)) |idx| {
+                        if (sh.getArrayElement(sub.name, idx)) |elem| {
                             var_value = elem;
                         }
                     }

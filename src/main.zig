@@ -7,6 +7,7 @@ const cli = @import("cli.zig");
 const sandbox = @import("sandbox.zig");
 const seccomp = @import("seccomp.zig");
 const Shell = @import("Shell.zig");
+const arith = @import("arith.zig");
 const build_options = @import("build_options");
 const compat = @import("compat.zig");
 const trace = @import("trace.zig");
@@ -208,7 +209,9 @@ pub fn main(init: std.process.Init) void {
         const args: []const []const u8 = if (res.positionals.len > 0) res.positionals[1..] else &.{};
         shell_instance.setPositionals(name, args);
         const exit_code = shell_instance.executeCommand(command) catch |err| {
-            std.debug.print("zish: error executing command: {}\n", .{err});
+            // Already reported, with the expression named (arith.report).
+            if (!arith.reported(err)) std.debug.print("zish: error executing command: {}\n", .{err});
+            shell_instance.stdout().flush() catch {};
             std.process.exit(1);
         };
 

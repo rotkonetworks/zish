@@ -220,6 +220,11 @@ opt_noglob: bool = false, // -f / -o noglob: no pathname expansion
 // Nesting depth of executeCommand. Command substitution and PROMPT_COMMAND
 // re-enter it, and the session trace records only depth 0.
 exec_depth: u16 = 0,
+// Arithmetic evaluation depth. A variable's value is re-evaluated as an
+// expression, so `a=b; b=a; $(( a ))` recurses; without this counter it
+// overflowed the stack (a segfault, not an error). bash calls the limit
+// EXPR_NEST_MAX and reports "expression recursion level exceeded".
+arith_depth: u16 = 0,
 // True in a process that is already a forked child of the interactive shell
 // (pipeline stage, subshell, background job). Drives two decisions: a subshell
 // need not fork again, and a forked child must not take the terminal.
@@ -760,7 +765,10 @@ pub fn runScriptFile(self: *Shell, script_path: []const u8, args: []const []cons
     }
 
     const exit_code = self.executeCommand(content) catch |err| {
-        std.debug.print("zish: error executing script: {}\n", .{err});
+        // An arithmetic failure has already named itself and the expression;
+        // bash makes it fatal to a non-interactive shell, and so do we.
+        if (!arith.reported(err)) std.debug.print("zish: error executing script: {}\n", .{err});
+        self.stdout().flush() catch {};
         std.process.exit(1);
     };
     self.runExitTrap();
@@ -1691,7 +1699,7 @@ pub fn expandVariables(self: *Shell, input: []const u8) ![]const u8 {
     return expand.allocOpt(self, input, true);
 }
 
-pub fn evaluateArithmetic(self: *Shell, expr: []const u8) !i64 {
+pub fn evaluateArithmetic(self: *Shell, expr: []const u8) arith.SourceError!i64 {
     return arith.evaluateArithmetic(self, expr);
 }
 

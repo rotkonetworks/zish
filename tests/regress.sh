@@ -368,6 +368,52 @@ same_as_bash "arith subscript expansion" 'a=(9 8 7); i=1; a[${i}+1]=5; echo ${a[
 # a value that is not a bare number.
 same_as_bash "arith echo fast path"    'x=6; echo $(($x + 1)) $((${x:-0} + 1))'
 
+# A failed expression used to evaluate to 0 with no message at all — which is
+# how both halves of this bug survived two releases. It is now reported, and it
+# fails the way bash fails: an expansion error is fatal to a non-interactive
+# shell, while the command forms `(( ))` and `for (( ))` are just status 1.
+same_as_bash "arith syntax error fatal"  'echo $(( 1 + )); echo after'
+same_as_bash "arith bad var value"       'x="1+"; echo $((x)); echo after'
+same_as_bash "arith syntax in (( ))"     '(( 1 + )); echo s=$?'
+same_as_bash "arith syntax in c-for"     'for (( 1+ ;; )); do :; done; echo s=$?'
+same_as_bash "arith syntax in subscript" 'a[1+]=5; echo s=$?'
+same_as_bash "arith error in subshell"   '( echo $(( 1 + )) ); echo s=$?'
+same_as_bash "arith error in pipeline"   'echo $(( 1 + )) | cat; echo s=$?'
+# `a=b; b=a` recursed until the stack gave out — a segfault, not an error.
+same_as_bash "arith recursion bounded"   'a=b; b=a; echo $((a)); echo after'
+
+# An array subscript is an arithmetic expression wherever it appears — inside
+# `$(( ))`, in `${a[...]}`, and on the left of an assignment — and a negative
+# one counts from the end. zish parsed a literal decimal, so `a[1]` in
+# arithmetic was 0 and `${a[i+1]}` expanded to nothing (the `+` ended the name).
+same_as_bash "arith array element"       'a=(1 2 3); echo $(( a[1] + 1 ))'
+same_as_bash "arith array expr index"    'a=(1 2 3); i=1; echo $(( a[i+1] ))'
+same_as_bash "arith array assign"        'a=(1 2 3); (( a[2] = 9, a[0]++ )); echo ${a[@]}'
+same_as_bash "arith array compound"      'a=(1 2 3); (( a[1] += 10 )); echo ${a[@]}'
+same_as_bash "arith scalar as element 0" 'x=5; echo $(( x[0] ))'
+same_as_bash "subscript expr in \${}"     'a=(9 8 7); i=1; echo ${a[i+1]} ${a[$((i+1))]}'
+same_as_bash "subscript negative"        'a=(9 8 7); echo ${a[-1]} ${a[-3]}'
+same_as_bash "subscript nested expansion" 'a=(9 8 7); echo ${a[${#a[@]}-1]} ${#a[${#a[@]}-1]}'
+same_as_bash "subscript length of elem"  'a=(90 8 7); i=0; echo ${#a[i]}'
+same_as_bash "subscript assign expr"     'a=(1 2 3); i=1; a[i+1]=9; echo ${a[@]}'
+same_as_bash "subscript assign negative" 'a=(1 2 3); a[-1]=9; echo ${a[@]}'
+# `$((1+2))$((3+4))` is two expansions, not one: the assignment fast path
+# matched on prefix+suffix alone and evaluated `1+2))$((3+4` as one expression.
+same_as_bash "two arith expansions"      'x=$((1+2))$((3+4)); echo $x'
+same_as_bash "arith expansion plus text" 'x=$((1+2))y$((3)); echo $x'
+
+# Literals are read as 64 unsigned bits and reinterpreted, like bash: the
+# checked multiply used before *panicked* on an over-long literal (a ReleaseSafe
+# abort from one line of arithmetic), and INT_MIN's own text did not re-parse.
+same_as_bash "radix overflow wraps"      'echo $((36#zzzzzzzzzzzzzzzz))'
+same_as_bash "decimal overflow wraps"    'echo $((18446744073709551616))'
+same_as_bash "INT_MIN literal divides"   'echo $(( -9223372036854775808 / -1 ))'
+same_as_bash "hex all-ones"              'echo $((0xffffffffffffffff))'
+# bash's bases run to 64: above 36 the letter cases are distinct digits.
+same_as_bash "radix 62 uppercase"        'echo $((62#Z)) $((36#z))'
+same_as_bash "radix 64 digits"           'echo $((64#@)) $((64#_))'
+same_as_bash "radix out of range"        'echo $((65#1)); echo after'
+
 # ---------------------------------------------------------------------------
 printf '\n%s\n' "feats"
 # ---------------------------------------------------------------------------
@@ -649,11 +695,14 @@ printf '\n%s\n' "integer overflow in arithmetic"
 # minInt/-1 has no representable quotient; @divTrunc there is illegal
 # behaviour. fastParseI64 multiplied without checking, so a 19-digit literal
 # overflowed. Both crashed a --release=safe build (what the Makefile ships).
-expect "INT_MIN / -1 no crash"         $'0'  0 'x=$(( -9223372036854775807 - 1 )); echo $(( x / -1 ))'
-expect "INT_MIN %% -1 no crash"        $'0'  0 'x=$(( -9223372036854775807 - 1 )); echo $(( x % -1 ))'
+same_as_bash "INT_MIN / -1 no crash"    'x=$(( -9223372036854775807 - 1 )); echo $(( x / -1 ))'
+same_as_bash "INT_MIN %% -1 no crash"   'x=$(( -9223372036854775807 - 1 )); echo $(( x % -1 ))'
+same_as_bash "INT_MIN literal wraps"    'echo $((9223372036854775808))'
 expect "19-digit compare no crash"     $'no' 0 '[[ 9999999999999999999 -gt 1 ]] && echo yes || echo no'
 expect "19-digit test no crash"        $'no' 0 'test 9999999999999999999 -gt 1 && echo yes || echo no'
-expect "division by zero errors"       $''   0 'echo $(( 1 / 0 )) >/dev/null 2>&1; true'
+# A failed arithmetic expansion is fatal to a non-interactive shell (bash), so
+# `true` never runs and the status is 1 — it used to be a silent 0 here.
+same_as_bash "division by zero is fatal" 'echo $(( 1 / 0 )) >/dev/null 2>&1; true'
 
 # arithmetic that must keep working
 same_as_bash "arith precedence"        'echo $(( 2 + 3 * 4 ))'
