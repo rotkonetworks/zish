@@ -1,0 +1,7 @@
+name = "mcpc"
+tier = "standard"
+version = "1.0.0"
+help = "call one MCP tool once and print its result object: mcpc [-t SECS] TOOL [JSON] -- CMD ..."
+bin = "mcpc"
+usage = "mcpc [-t SECS] [-q] TOOL [JSON] -- penumbra-mcp --home DIR serve --pcli-home DIR --account 0"
+summary = "one-shot MCP tool call"

@@ -103,9 +103,9 @@ pub fn build(b: *std.Build) void {
     const feat_layout = b.option([]const u8, "feat-layout", "feat layout: 'system' (default) or 'registry'") orelse "system";
     const registry_layout = std.mem.eql(u8, feat_layout, "registry");
 
-    const core_feats = [_][]const u8{ "cnt", "pk", "frq", "snf", "jls", "calc", "para", "gf" };
+    const core_feats = [_][]const u8{ "cnt", "pk", "frq", "snf", "jls", "jget", "calc", "rand", "para", "gf" };
     const all_feats = [_][]const u8{
-        "cnt", "pk",  "frq",    "snf",    "jls", "calc", "para", "agent",
+        "cnt", "pk",  "frq",    "snf",    "jls", "calc", "para", "agent", "jget", "rand", "pen", "mcpc",
         "gf",  "aur", "budget", "verify", "ask", "team", "web",  "bus",
     };
     // -Dfeats takes "core" (default), "all", or an explicit comma-separated list

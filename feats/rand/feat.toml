@@ -1,0 +1,8 @@
+name = "rand"
+tier = "standard"
+version = "1.0.0"
+help = "uniform integer draw, size jitter, or a probability gate — CSPRNG, since $RANDOM is unbound in zish"
+bin = "rand"
+usage = "rand MIN MAX  |  rand -j PCT  |  rand -p PCT  # -j: integer in [-PCT,PCT]; -p: exit 0 with probability PCT%"
+summary = "uniform draws and jitter"
+completion = ["-j", "-p"]

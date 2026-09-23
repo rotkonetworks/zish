@@ -1,0 +1,8 @@
+name = "jget"
+tier = "standard"
+version = "1.0.0"
+help = "one value out of a JSON document by dotted path, nested objects and arrays included"
+bin = "jget"
+usage = "jget [-j|-q] PATH [FILE]   # jget result.sync_info.latest_block_height < /status; -j prints the subtree, -q the exit status only"
+summary = "JSON path extraction"
+completion = ["-j", "-q"]
