@@ -290,6 +290,25 @@ with no option to swap it, and Python's `shell=True` is hardcoded to `/bin/sh`,
 but neither matters when the restriction is inherited by every descendant.
 Recipes are in [docs/agents.md](docs/agents.md).
 
+### Keeping the model local
+
+The sandbox bounds what a wrong agent can *write*; it does nothing about what
+leaves the machine, because the model is usually somewhere else. It doesn't
+have to be.
+
+```sh
+export ZISH_AGENT_ENDPOINT=http://127.0.0.1:8080/v1/chat/completions
+export ZISH_AGENT_MODEL=<whatever the server calls it>
+export ZISH_AGENT_TIMEOUT=900     # the 120s default is a cloud-latency number
+agent solo "summarize ~/notes/today.md"
+```
+
+Those three variables are the whole integration — any OpenAI-compatible server
+(`llama-server`, ollama's `/v1`, vllm) — and `team`, `verify` and the captain
+inherit them. Worked example, including server lifecycle and how a detached job
+reports back through the `bus` feat:
+[examples/local-model](examples/local-model).
+
 ## Ghost text
 
 As you type, zish suggests the rest of the command from your history and from

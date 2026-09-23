@@ -1,0 +1,371 @@
+#!/usr/bin/env bash
+#
+# bonsai — Ternary-Bonsai-2-27B via the PrismML llama.cpp fork, and the switch
+# that points the zish harness at it instead of a cloud API.
+#
+# The model binds loopback and nothing here speaks to the network, so prompts,
+# secrets and transaction data stay on this machine. That is the only property
+# this script exists to provide; do not weaken it.
+#
+# Stock llama.cpp and ollama cannot load this model (Prism quant, Hadamard
+# runtime), so the fork's own binaries are the only ones named here.
+
+set -euo pipefail
+IFS=$'\n\t'
+
+#
+# Configuration. Every knob is an environment override with a default; nothing
+# below this block reads the environment.
+#
+
+readonly PRISM_BIN="${BONSAI_BIN:-$HOME/src/prism-llama.cpp/build/bin}"
+readonly LLAMA_CLI="$PRISM_BIN/llama-cli"
+readonly LLAMA_SERVER="$PRISM_BIN/llama-server"
+
+readonly MODEL_DIR="${BONSAI_MODELS:-$HOME/Downloads/Models/Ternary-Bonsai-2-27B}"
+readonly MODEL="$MODEL_DIR/Ternary-Bonsai-2-27B-PQ2_0.gguf"
+readonly MMPROJ="$MODEL_DIR/Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf"
+readonly VISION="${BONSAI_VISION:-0}"
+
+# 64 layers, 6.8G of weights, 8176 MiB of VRAM: a full offload leaves little
+# room for the KV cache. Drop NGL on an OOM or a wedged display engine.
+readonly NGL="${BONSAI_NGL:-56}"
+readonly CTX="${BONSAI_CTX:-4096}"
+
+# Loopback by construction, with no override: an outward bind would publish the
+# one property this script exists to provide. Not a knob, so it cannot be one.
+readonly HOST="127.0.0.1"
+readonly PORT="${BONSAI_PORT:-8080}"
+readonly BASE="http://$HOST:$PORT"
+readonly ENDPOINT="$BASE/v1/chat/completions"
+readonly ALIAS="bonsai"
+
+readonly WAIT="${BONSAI_WAIT:-180}"      # seconds to load 6.8G before giving up
+readonly TIMEOUT="${BONSAI_TIMEOUT:-900}" # agent's 120s default is a cloud number
+
+readonly RUN="${XDG_RUNTIME_DIR:-/tmp}/bonsai"
+readonly JOBS="$RUN/jobs"
+# Port-scoped: two servers must not share one pidfile, or the second `up`
+# overwrites the first's pid and `down` orphans a process.
+readonly PIDFILE="$RUN/server-$PORT.pid"
+readonly LOGFILE="$RUN/server-$PORT.log"
+
+# Containment. `solo` lets the model fork sh -c with nothing between it and the
+# filesystem, so the agent paths run inside a Landlock-restricted zish session
+# by default: writes beneath $PWD, reads anywhere, plus the roots below.
+# BONSAI_PROFILE=none opts out; it is opt-out precisely because the default is
+# the safe one. Landlock does not restrict the network, so the loopback request
+# to the model is unaffected.
+readonly PROFILE="${BONSAI_PROFILE:-workdir}"
+# $HOME/.zish: agent writes its curl config and request body there (0600) so the
+# API key is never a process argument. /tmp: too many tools assume it.
+readonly ALLOW_WRITE="${BONSAI_ALLOW_WRITE:-$HOME/.zish:/tmp}"
+readonly ZISH_BIN="${BONSAI_ZISH:-zish}"
+
+readonly BUS_CHAN="${BONSAI_BUS:-bonsai}"
+readonly BUS_BIN="$HOME/.zish/feats/standard/bus/bin/bus"
+readonly AGENT_BIN="$HOME/.zish/feats/standard/agent/bin/agent"
+
+# The whole harness switch: agent, team, verify and captain read these three.
+readonly -a HARNESS_ENV=(
+    "ZISH_AGENT_ENDPOINT=$ENDPOINT"
+    "ZISH_AGENT_MODEL=$ALIAS"
+    "ZISH_AGENT_TIMEOUT=$TIMEOUT"
+)
+
+# `agent <query>` speaks the session-frame protocol and waits for a host to
+# execute its tools; with no host the tool never runs. `solo` is the only mode
+# that is self-contained. It is a bare token, not a flag.
+readonly DEFAULT_MODE="solo"
+
+die() {
+    printf 'bonsai: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'USAGE'
+bonsai "question"             one-shot answer from the loaded server
+bonsai cli [args...]          the raw llama-cli REPL (loads its own copy)
+bonsai up|down|status         the loopback server
+bonsai env                    eval "$(bonsai env)" points the harness local
+bonsai agent <query>          server up-if-needed, then the agent tool loop
+bonsai bg <query>             same, detached: prints a job id and returns
+bonsai jobs|out <id>|wait <id>
+bonsai run <cmd> [args...]    any command, harness pointed local
+bonsai --server [args...]     raw llama-server, foreground
+
+agent/bg/run execute inside zish --profile workdir (writes under $PWD only).
+BONSAI_PROFILE=none disables it; BONSAI_ALLOW_WRITE adds roots, :-separated.
+finished jobs publish to the bus: bus read bonsai --follow
+env: BONSAI_NGL BONSAI_CTX BONSAI_PORT BONSAI_WAIT BONSAI_TIMEOUT BONSAI_VISION
+     BONSAI_PROFILE BONSAI_ALLOW_WRITE
+USAGE
+}
+
+#
+# Server lifecycle.
+#
+
+# 503 while the weights load, 200 when ready: -f makes that the exit status.
+healthy() {
+    curl -sf --max-time 3 "$BASE/health" >/dev/null 2>&1
+}
+
+# A live pid this script owns, or failure. Never infer ownership from the port.
+owner_pid() {
+    local pid
+    [[ -f $PIDFILE ]] || return 1
+    read -r pid <"$PIDFILE" || return 1
+    [[ -n $pid ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    printf '%s\n' "$pid"
+}
+
+srv_up() {
+    healthy && return 0
+    [[ -f $MODEL ]] || die "no model at $MODEL"
+    [[ -x $LLAMA_SERVER ]] || die "not built: $LLAMA_SERVER"
+    mkdir -p -- "$RUN"
+
+    local -a argv=(
+        "$LLAMA_SERVER" -m "$MODEL" -ngl "$NGL" -c "$CTX"
+        --host "$HOST" --port "$PORT" --alias "$ALIAS"
+    )
+    if [[ $VISION == 1 ]]; then
+        argv+=(--mmproj "$MMPROJ")
+    fi
+
+    "${argv[@]}" >"$LOGFILE" 2>&1 &
+    printf '%s\n' "$!" >"$PIDFILE"
+
+    # Poll health; a dead pid is failure now, not after the full timeout.
+    local i
+    for ((i = 0; i < WAIT; i++)); do
+        if healthy; then
+            printf 'bonsai: up %s ngl=%s ctx=%s\n' "$BASE" "$NGL" "$CTX" >&2
+            return 0
+        fi
+        owner_pid >/dev/null || {
+            tail -n 20 -- "$LOGFILE" >&2
+            die "server died loading; see $LOGFILE"
+        }
+        sleep 1
+    done
+    die "not healthy after ${WAIT}s; see $LOGFILE"
+}
+
+srv_down() {
+    local pid i
+    if pid=$(owner_pid); then
+        kill -- "$pid" 2>/dev/null || true
+        for ((i = 0; i < 20; i++)); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+        done
+        kill -0 "$pid" 2>/dev/null && kill -9 -- "$pid" 2>/dev/null || true
+        rm -f -- "$PIDFILE"
+        printf 'bonsai: stopped %s\n' "$pid" >&2
+        return 0
+    fi
+    rm -f -- "$PIDFILE"
+    # Refuse to kill a server this script did not start: it may be a foreground
+    # `bonsai --server`, or something else entirely holding that port.
+    if healthy; then
+        die "$BASE is served by a process this script did not start"
+    fi
+    printf 'bonsai: not running\n' >&2
+}
+
+srv_status() {
+    local pid
+    if ! healthy; then
+        printf 'down\t%s\n' "$BASE"
+        return 1
+    fi
+    pid=$(owner_pid) || pid="foreign"
+    printf 'up\t%s\t%s\tpid=%s\tprofile=%s\n' "$BASE" "$ALIAS" "$pid" "$PROFILE"
+}
+
+#
+# Harness routing.
+#
+
+agent_path() {
+    local p
+    p=$(command -v agent 2>/dev/null) && { printf '%s\n' "$p"; return 0; }
+    for p in "$AGENT_BIN" /usr/local/share/zish/feats/standard/agent/bin/agent; do
+        [[ -x $p ]] && { printf '%s\n' "$p"; return 0; }
+    done
+    die "agent feat not found"
+}
+
+# The argv that actually runs a command: the command itself, or that command
+# inside a restricted zish session. Set as a global because bash cannot return
+# an array. Quoting via %q — the -c argument is a shell string, and a query
+# reaches it verbatim.
+declare -a RUN_ARGV=()
+build_run_argv() {
+    if [[ $PROFILE == none ]]; then
+        RUN_ARGV=(env "${HARNESS_ENV[@]}" "$@")
+        return 0
+    fi
+    command -v "$ZISH_BIN" >/dev/null 2>&1 ||
+        die "BONSAI_PROFILE=$PROFILE needs $ZISH_BIN on PATH (or set it to none)"
+    local script
+    printf -v script '%q ' "$@"
+    RUN_ARGV=(
+        env "${HARNESS_ENV[@]}"
+        "$ZISH_BIN" --profile "$PROFILE" --allow-write "$ALLOW_WRITE" -c "$script"
+    )
+}
+
+# How a detached job reaches a human who has walked away: the bus feat's
+# durable channel. No bus installed is not an error — the output is still in
+# $JOBS — but $XDG_RUNTIME_DIR is tmpfs, so the bus is the record that survives.
+report() {
+    local id="$1" rc="$2" last bus
+    last=$(tail -n 1 -- "$JOBS/$id.out" 2>/dev/null | cut -c1-200) || last=""
+    bus=$(command -v bus 2>/dev/null) || bus="$BUS_BIN"
+    [[ -x $bus ]] || return 0
+    "$bus" pub "$BUS_CHAN" --from bonsai "$id rc=$rc :: $last" >/dev/null 2>&1 || true
+}
+
+job_start() {
+    local id task
+    local IFS=' '   # $* joins on IFS[0], which is a newline in this script
+    task="$*"
+    mkdir -p -- "$JOBS"
+    id="$(date +%Y%m%d-%H%M%S)-$$"
+
+    printf '%s\n' "$task" >"$JOBS/$id.task"   # the query, not the mode token
+    local -a argv=("$@")
+    case "${1-}" in
+    solo | --ask | --judge | edit | captain) ;;
+    *) argv=("$DEFAULT_MODE" "$@") ;;
+    esac
+
+    (
+        trap '' HUP                      # a closed terminal must not kill a job
+        local rc=0
+        # Nested subshell: srv_up's die() is an exit, and uncontained it would
+        # skip the .rc write and the report — the job would sit "running"
+        # forever and never reach the bus.
+        (srv_up) >>"$JOBS/$id.out" 2>&1 || rc=$?
+        if ((rc == 0)); then
+            build_run_argv "$(agent_path)" "${argv[@]}"
+            "${RUN_ARGV[@]}" >>"$JOBS/$id.out" 2>&1 || rc=$?
+        fi
+        printf '%s\n' "$rc" >"$JOBS/$id.rc"
+        report "$id" "$rc"
+    ) </dev/null >/dev/null 2>&1 &
+
+    printf '%s\n' "$id"
+}
+
+job_list() {
+    local t id rc state
+    [[ -d $JOBS ]] || return 0
+    for t in "$JOBS"/*.task; do
+        [[ -e $t ]] || continue
+        id="$(basename -- "${t%.task}")"
+        if [[ -f ${t%.task}.rc ]]; then
+            read -r rc <"${t%.task}.rc"
+            state=$(printf 'done\trc=%s' "$rc")
+        else
+            state=$(printf 'running\trc=-')
+        fi
+        printf '%s\t%s\t%s\n' "$id" "$state" "$(head -c 60 -- "$t" | tr '\n' ' ')"
+    done
+}
+
+job_wait() {
+    local id="$1" rc
+    [[ -f $JOBS/$id.task ]] || die "no such job: $id"
+    while [[ ! -f $JOBS/$id.rc ]]; do sleep 2; done
+    cat -- "$JOBS/$id.out"
+    read -r rc <"$JOBS/$id.rc"
+    exit "$rc"
+}
+
+#
+# Dispatch.
+#
+
+main() {
+    local cmd="${1-}"
+    (($#)) && shift ||:
+
+    case "$cmd" in
+    up) srv_up ;;
+    down) srv_down ;;
+    status) srv_status ;;
+    env) printf 'export %s\n' "${HARNESS_ENV[@]}" ;;
+
+    agent)
+        [[ $# -gt 0 ]] || die "usage: bonsai agent <query>"
+        local -a argv=("$@")
+        case "$1" in
+        solo | --ask | --judge | edit | captain) ;;
+        *) argv=("$DEFAULT_MODE" "$@") ;;
+        esac
+        srv_up
+        build_run_argv "$(agent_path)" "${argv[@]}"
+        exec "${RUN_ARGV[@]}"
+        ;;
+    run)
+        [[ $# -gt 0 ]] || die "usage: bonsai run <cmd> [args...]"
+        srv_up
+        build_run_argv "$@"
+        exec "${RUN_ARGV[@]}"
+        ;;
+
+    bg)
+        [[ $# -gt 0 ]] || die "usage: bonsai bg <query>"
+        job_start "$@"
+        ;;
+    jobs) job_list ;;
+    out)
+        [[ $# -gt 0 ]] || die "usage: bonsai out <job-id>"
+        [[ -f $JOBS/$1.out ]] || die "no such job: $1"
+        cat -- "$JOBS/$1.out"
+        ;;
+    wait)
+        [[ $# -gt 0 ]] || die "usage: bonsai wait <job-id>"
+        job_wait "$1"
+        ;;
+
+    --server)
+        local -a argv=(
+            "$LLAMA_SERVER" -m "$MODEL" -ngl "$NGL" -c "$CTX"
+            --host "$HOST" --port "$PORT" --alias "$ALIAS"
+        )
+        if [[ $VISION == 1 ]]; then argv+=(--mmproj "$MMPROJ"); fi
+        exec "${argv[@]}" "$@"
+        ;;
+    -h | --help | help) usage ;;
+
+    cli)
+        # The llama-cli REPL: loads its own copy of the weights, has no tools
+        # and no harness. Here because it is occasionally what you want, not
+        # because it is the way in.
+        local -a argv=("$LLAMA_CLI" -m "$MODEL" -ngl "$NGL" -c "$CTX")
+        if [[ $VISION == 1 ]]; then argv+=(--mmproj "$MMPROJ"); fi
+        exec "${argv[@]}" "$@"
+        ;;
+
+    *)
+        # Default: one question, answered by the already-loaded server. No
+        # second copy of the weights, no banner, no REPL to exit.
+        local -a query=()
+        [[ -n $cmd ]] && query+=("$cmd") || true
+        query+=("$@")
+        [[ ${query[0]-} == -p ]] && query=("${query[@]:1}") || true   # llama-cli habit
+        ((${#query[@]})) || { usage; exit 2; }
+        srv_up
+        exec env "${HARNESS_ENV[@]}" "$(agent_path)" --ask "${query[@]}"
+        ;;
+    esac
+}
+
+main "$@"
