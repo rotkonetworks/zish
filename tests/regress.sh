@@ -336,6 +336,21 @@ same_as_bash "arith positional"        'set -- 4; echo $(($1 * 2))'
 same_as_bash "arith positional func"   'double() { echo $(($1 * 2)); }; for i in 1 2 3; do double $i; done'
 same_as_bash "arith bare identifier"   'x=6; echo $((x * 2))'
 same_as_bash "arith literal"           'echo $((3 * 2))'
+# Same silent-0 shape, for expansions the parser could not tokenize either:
+# bash expands the expression text first and evaluates the result, so
+# operator-bearing braces, command substitution and *adjacent* expansions
+# (`$(( ${x}${x} + 1 ))` is 56) all have to work. Before the fix the first two
+# were 0 and the adjacent case was silently truncated.
+same_as_bash "arith default operator"  'x=6; echo $((${x:-0} + 1))'
+same_as_bash "arith default unset"     'u=; echo $((${u:-7} + 1))'
+same_as_bash "arith alternate operator" 'x=6; echo $((${x:+9} + 1))'
+same_as_bash "arith adjacent expansions" 'x=6; echo $((${x}${x} + 1))'
+same_as_bash "arith command subst"     'echo $(($(printf 5) + 1))'
+same_as_bash "arith command subst text" 'echo $(($(echo "1+2")))'
+same_as_bash "arith backtick subst"    'echo $((`printf 5` + 1))'
+same_as_bash "arith radix 16#"         'echo $((16#ff))'
+same_as_bash "arith octal"             'echo $((010 + 1))'
+same_as_bash "arith power"             'echo $((2 ** 3))'
 
 # ---------------------------------------------------------------------------
 printf '\n%s\n' "feats"

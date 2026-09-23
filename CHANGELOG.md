@@ -33,6 +33,19 @@ one owner for building a feat — of which there were three, and they disagreed.
   `-O ReleaseFast`, where the tracking is compiled out, so only the shipped
   build showed it. argv now lives in `init.arena` — freed by the runtime at
   exit — and `cnt`'s buffer is freed on both branches.
+- **`$(( ))` silently mis-evaluated every expansion its parser could not
+  tokenize.** ArithParser handled `$name`/`${name}` only: `${x:-0}`, `${x:+9}`,
+  `${x}${x}`, `$(cmd)` and backticks all raised SyntaxError, which
+  `evaluateArithmetic` converts to 0 *without a message* — so `$(( ${x:-0} + 1 ))`
+  was 0 while bash says 6, and an adjacent expansion was truncated rather than
+  concatenated (`$(( ${x}${x} + 1 ))` was 5 where bash says 56). Bash's model is
+  simpler than the special cases it suggests: expand the expression *text*, then
+  evaluate the result. The parser now consumes a run of expansions, expands it
+  the way the shell expands any word, and evaluates the outcome — which is why
+  `$(( $(echo 1+2) ))` is 3 and not a number. Radix (`16#ff`, `2#1010`), octal,
+  `**`, ternary and the shell operators already agreed with bash across a
+  43-expression differential probe; it is now pinned by twelve `same_as_bash`
+  cases in `tests/regress.sh`.
 
 ### changed
 - **`build.zig` is the only thing that compiles a feat.** The Makefile kept a

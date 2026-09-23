@@ -6,7 +6,42 @@
 //! value, all through the passed *Shell.
 const std = @import("std");
 const compat = @import("compat.zig");
+const expand = @import("expand.zig");
 const Shell = @import("Shell.zig");
+
+/// Evaluate arithmetic *source text* — `$(( ))`, `(( ))`, `for (( ;; ))`, an
+/// array subscript, `x=$(( ))`. POSIX (and bash) expand the text first —
+/// parameter expansion, command substitution, arithmetic expansion — and only
+/// then parse the result as an expression. The substitution is *textual*:
+/// with x="1+2", `$(( $x * 2 ))` is `1+2*2` = 5, not (1+2)*2 = 6. A bare
+/// `x` is different: that is a variable reference the parser resolves, and
+/// bash re-evaluates its value as an expression, so `$(( x * 2 ))` is 6.
+///
+/// Doing the expansion in one place is the whole point: every operator-bearing
+/// form (`${x:-0}`, `${#x}`, `$(cmd)`, backticks) works everywhere, and the
+/// parser below only ever sees numbers and operators.
+///
+/// Callers that must NOT expand use `evaluateArithmetic` directly: a
+/// variable's own value (bash does not re-expand it) and the fuzzer, which
+/// stays free of process side effects.
+pub const SourceError = error{ DivideByZero, OutOfMemory };
+
+pub fn evaluateArithSource(sh: *Shell, expr: []const u8) SourceError!i64 {
+    const needs = std.mem.indexOfScalar(u8, expr, '$') != null or
+        std.mem.indexOfScalar(u8, expr, '`') != null or
+        std.mem.indexOfScalar(u8, expr, Shell.LIT_DOLLAR) != null or
+        std.mem.indexOfScalar(u8, expr, Shell.LIT_BACKTICK) != null;
+    if (!needs) return evaluateArithmetic(sh, expr);
+    // Explicit error set, not an inferred one: expand.allocOpt evaluates
+    // nested `$(( ))` through this function, and two inferred sets referring
+    // to each other is a dependency loop.
+    const expanded = expand.allocOpt(sh, expr, false) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return 0, // an expansion that failed evaluates to nothing
+    };
+    defer sh.allocator.free(expanded);
+    return evaluateArithmetic(sh, expanded);
+}
 
 pub fn evaluateArithmetic(self: *Shell, expr: []const u8) !i64 {
     var p = ArithParser{ .shell = self, .src = expr, .pos = 0 };
@@ -329,45 +364,12 @@ const ArithParser = struct {
         if (std.ascii.isDigit(c)) {
             return self.parseNumber();
         }
-        // $name, ${name} and $1 — a value reference, not a variable to assign to.
-        //
-        // bash accepts both `$((x))` and `$(($x))`. zish only ever worked by
-        // accident: the outer expander usually substituted $x before this
-        // parser saw it. For a word containing `*` or `%` it doesn't, so the
-        // raw `$` reached here, fell through to SyntaxError, and
-        // evaluateArithmetic turned that into 0 — silently. That is why
-        // `$(($x * 2))` was 0 while `$(($x + 2))` was correct, and why
-        // `f() { echo $(($1 * 2)); }` returned 0 for every argument.
-        //
-        // Handling it here makes the result independent of whether an earlier
-        // pass happened to expand the word.
-        if (c == '$') {
-            self.pos += 1;
-            const braced = self.peek() == '{';
-            if (braced) self.pos += 1;
-
-            const start = self.pos;
-            if (std.ascii.isDigit(self.peek())) {
-                // Positional parameter: $1, $12. Digits only, never an ident.
-                while (self.pos < self.src.len and std.ascii.isDigit(self.src[self.pos])) {
-                    self.pos += 1;
-                }
-            } else {
-                while (self.pos < self.src.len and
-                    (std.ascii.isAlphanumeric(self.src[self.pos]) or self.src[self.pos] == '_'))
-                {
-                    self.pos += 1;
-                }
-            }
-            if (self.pos == start) return error.SyntaxError;
-            const name = self.src[start..self.pos];
-
-            if (braced) {
-                if (self.peek() != '}') return error.SyntaxError;
-                self.pos += 1;
-            }
-            return self.readVar(name);
-        }
+        // No `$` or backtick can appear here. Arithmetic *source text* is
+        // expanded before it is parsed (evaluateArithSource above), which is
+        // what bash does and what makes `${x:-0}`, `${#x}`, `$(cmd)` and
+        // adjacent expansions (`${x}${x}` is one number) work. A `$` reaching
+        // the parser means a caller passed raw source text: that is a syntax
+        // error, not a second, half-built expander living down here.
         if (std.ascii.isAlphabetic(c) or c == '_') {
             const name = self.readIdent() orelse return error.SyntaxError;
             // post-increment / post-decrement
