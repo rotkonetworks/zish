@@ -95,6 +95,10 @@ Wired into `builtins.zig` via `isBuiltin`/`dispatch` under the name `feat`.
     zish feat deps <file|->    print what a script declares it needs
                           (`tier\tname\tpath` per dep, `-\tname\tmissing` when
                           unresolved), exit 0 only if all resolve — see §12
+    zish feat need <name>...   resolve now, exit non-zero if any is missing
+                          (prints nothing when all resolve). The runtime half
+                          of §12: a dependency that depends on a mode has no
+                          declaration to read
     zish feat install <src>     install an extra tier feat (copies dir into extra/)
     zish feat uninstall <name>  remove an extra feat (refuses core/standard)
 
@@ -271,3 +275,16 @@ A script declares the feats it needs in its **leading comment block**:
 - `source`/`.` is **not** gated. The declaration belongs to a *run* of a
   script; a sourced file executes in the current shell, where the caller owns
   what is on PATH and what has already resolved.
+
+Two rules complete it:
+
+- **The runtime half is a call.** `feat need web jget || exit 1` resolves now,
+  answers with the exit status, and never execs what it resolved — for the
+  dependency that depends on a mode, which has no declaration to read. The
+  checker is part of the TCB: `feat` is a builtin, so the thing answering "is it
+  here?" cannot itself be a feat that is missing from the registry.
+- **The `zish-` namespace is reserved inside the leading block.** A comment
+  shaped like a directive that zish does not know — `# zish-dep: web`, or a lost
+  colon in `# zish-deps web` — is an **error**, not a comment, because the one
+  silent failure a declaration has is a typo reading as "no dependencies".
+  `feat deps` reports it as `!\tline\tunknown` and exits non-zero.

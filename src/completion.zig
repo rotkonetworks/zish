@@ -3321,7 +3321,7 @@ fn tryFeatCompletion(self: *Shell, cmd: []const u8, word_result: WordResult) !bo
 
     if (tokens == 1) {
         // second word: complete subcommands
-        const subcmds = [_][]const u8{ "list", "help", "run", "deps" };
+        const subcmds = [_][]const u8{ "list", "help", "run", "deps", "need" };
         var matches = try std.ArrayList([]const u8).initCapacity(self.allocator, 4);
         defer {
             for (matches.items) |m| self.allocator.free(m);

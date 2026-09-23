@@ -36,9 +36,12 @@ one owner for building a feat — of which there were three, and they disagreed.
   feat (`twap`) gates on `web jget calc pen rand` even though its bin is a
   script. `feat deps <file|->` reports the same statically (`tier\tname\tpath`,
   exit 0 only if all resolve) — the check the deploy used to make by diffing
-  `feat list` against a hand-kept list. `extra` deps are refused (§1.3), the
-  body/heredoc is never mistaken for a declaration, and 16 cases in
-  `tests/regress.sh` pin all of it.
+  `feat list` against a hand-kept list. `feat need <name>...` is the runtime
+  half: resolve now, answer with the exit status, never exec what it resolved.
+  `extra` deps are refused (§1.3); the body/heredoc is never mistaken for a
+  declaration; the `zish-` namespace is reserved in the leading block, so a typo
+  (`# zish-dep: web`) is an error rather than a silent "no dependencies"; and 23
+  cases in `tests/regress.sh` pin all of it.
 
 ### fixed
 - **Seven feats leaked their argv slice** (`toSlice(init.gpa)`), and `cnt` leaked

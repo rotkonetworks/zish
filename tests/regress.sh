@@ -1043,6 +1043,8 @@ cat <<'INNER'
 # zish-deps: alsoNosuch
 INNER
 EOF
+printf '%s\n# zish-dep: web\necho BODY-RAN\n' "$SHEBANG" > "$WORK/deps-typo.zish"
+printf '%s\necho BODY-RAN\n# zish-dep: web\n' "$SHEBANG" > "$WORK/deps-typo-body.zish"
 chmod +x "$WORK"/deps-*.zish
 
 # Case runners for this section. `expect` shares the suite's environment, and
@@ -1113,6 +1115,16 @@ deps_run "deps: report missing" \
 deps_run "deps: report no deps"        ''          0   ''                "feat deps $WORK/deps-none.zish"
 deps_run "deps: report stdin" \
     $'standard\tweb\t'"$DEPS_REG"$'/standard/web/bin/web\nstandard\tcalc\t'"$DEPS_REG"$'/standard/calc/bin/calc' 0 '' "cat $WORK/deps-ok.zish | feat deps -"
+# The runtime probe: resolves and answers with the exit status; it never execs
+# what it resolved (a `web-ran` on stdout would be the bug).
+deps_run   "deps: need resolves"       ''          0   ''                'feat need web calc'
+deps_run   "deps: need usage"          ''          2   ''                'feat need'
+deps_refuse "deps: need missing"       127 'missing feat dependency'    'web-ran' 'feat need web nosuchfeat'
+deps_refuse "deps: need extra refused" 127 'extra feat dependency'      'untrusted-ran' 'feat need extra/untrusted'
+# The one silent failure a declaration has: a typo reading as "no deps".
+deps_refuse "deps: unknown directive"   127 'unknown zish directive'    BODY-RAN './deps-typo.zish'
+deps_run   "deps: unknown in body ok"   $'BODY-RAN' 0 ''                './deps-typo-body.zish'
+deps_run   "deps: report unknown"       $'!\tzish-dep: web\tunknown' 1 '' "feat deps $WORK/deps-typo.zish"
 
 # ---------------------------------------------------------------------------
 printf '\n'

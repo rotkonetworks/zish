@@ -4029,20 +4029,32 @@ fn featResolve(alloc: std.mem.Allocator, raw: []const u8) ?struct { tier: FeatTi
 // script feat dependencies
 // ---------------------------------------------------------------------------
 //
-// A script declares the feats it needs in its leading comment block:
+// Three surfaces, one resolver:
 //
-//     #!/usr/local/bin/zish
-//     # zish-deps: web jget calc pen
+//   the declaration    `# zish-deps: web jget calc` in a script's leading
+//                      comment block: *data*, read before the script runs.
+//                      A comment, so bash and older zish ignore it and the
+//                      file stays a valid shell script; and being data, "can
+//                      this run here?" is answerable without executing
+//                      anything — which is what a deploy needs.
+//   the static report  `feat deps <file|->` — print what the declaration
+//                      resolves to (`tier\tname\tpath`, `-\tname\tmissing`).
+//   the runtime probe  `feat need <name>...` — the question a declaration
+//                      cannot express (a dependency that depends on a mode):
+//                      resolve now, answer with the exit status.
 //
-// The declaration is a comment, so the file stays a valid shell script: bash,
-// and any zish older than this, ignores it. zish parses it and refuses to run
-// the script when a dependency does not resolve — the difference between a run
-// dying halfway through with a bare "not found" and refusing to start with the
-// names that are missing and the roots that were searched. (The deploy this
-// replaces diffed `feat list` against a hand-kept list.)
+// A declaration that does not resolve refuses the run (127, nothing executed)
+// and names the missing feats and the roots that were searched. Every entry
+// point that runs a script — script mode, a `#!` line, the ENOEXEC fallback —
+// binds through Shell.runScriptFile, and `feat run` checks its target's own
+// header before exec, so none can miss it.
 //
 // Only the leading block is read: shebang, then comment and blank lines. A
 // `zish-deps:` line in the body — or inside a heredoc — is data, not a claim.
+// Inside that block the `zish-` namespace is *reserved*: something shaped like
+// a directive that this shell does not know (`# zish-dep: web`) is an error,
+// because the one silent failure a declaration has is a typo reading as "no
+// dependencies".
 //
 // `extra` is refused rather than resolved: feat-spec §1.3 says an untrusted
 // extra feat is never auto-used by a script.
@@ -4055,18 +4067,21 @@ pub const ScriptDeps = struct {
     nmissing: usize = 0,
     extra: [MaxScriptDeps][]const u8 = undefined,
     nextra: usize = 0,
+    /// Text of a leading-block directive this shell does not know.
+    unknown: ?[]const u8 = null,
 
     pub fn ok(self: *const ScriptDeps) bool {
-        return self.nmissing == 0 and self.nextra == 0;
+        return self.nmissing == 0 and self.nextra == 0 and self.unknown == null;
     }
 };
 
-/// Parse the `# zish-deps:` lines of `content`'s leading comment block into
-/// `out` (the name slices borrow `content`). Names are whitespace- or
-/// comma-separated; `#` starts a trailing comment. Returns the count.
-pub fn parseScriptDeps(content: []const u8, out: *[MaxScriptDeps][]const u8) usize {
-    const directive = "zish-deps:";
-    var n: usize = 0;
+const DepParse = struct { n: usize = 0, unknown: ?[]const u8 = null };
+
+/// Walk the leading comment block, collecting `# zish-deps:` names into `out`
+/// (the slices borrow `content`) and the first unknown directive. Names are
+/// whitespace- or comma-separated; `#` starts a trailing comment.
+fn parseLeading(content: []const u8, out: *[MaxScriptDeps][]const u8) DepParse {
+    var p = DepParse{};
     var lines = std.mem.splitScalar(u8, content, '\n');
     var line_no: usize = 0;
     while (lines.next()) |raw| {
@@ -4076,59 +4091,108 @@ pub fn parseScriptDeps(content: []const u8, out: *[MaxScriptDeps][]const u8) usi
         if (line.len == 0) continue;
         if (line[0] != '#') break;
         const body = std.mem.trimStart(u8, line[1..], " \t");
-        if (!std.mem.startsWith(u8, body, directive)) continue;
-        var toks = std.mem.tokenizeAny(u8, body[directive.len..], " \t,");
-        while (toks.next()) |t| {
-            if (t[0] == '#') break;
-            if (n == out.len) return n;
-            out[n] = t;
-            n += 1;
+
+        if (std.mem.startsWith(u8, body, "zish-deps")) {
+            const name = "zish-deps";
+            if (body.len == name.len or body[name.len] != ':') {
+                if (p.unknown == null) p.unknown = body; // a colon went missing
+                continue;
+            }
+            var toks = std.mem.tokenizeAny(u8, body[name.len + 1 ..], " \t,");
+            while (toks.next()) |t| {
+                if (t[0] == '#') break;
+                if (p.n == out.len) return p;
+                out[p.n] = t;
+                p.n += 1;
+            }
+            continue;
         }
+        if (p.unknown == null and isDirectiveShaped(body)) p.unknown = body;
     }
-    return n;
+    return p;
 }
 
-/// Resolve every declared dependency. Silent: the callers decide what a
-/// failure means — `runScriptFile` refuses to run, `feat deps` reports, and
-/// both diagnose through `scriptDepsDiagnose`.
-pub fn checkScriptDeps(alloc: std.mem.Allocator, content: []const u8) ScriptDeps {
-    var d = ScriptDeps{};
-    d.n = parseScriptDeps(content, &d.names);
-    for (d.names[0..d.n]) |name| {
+/// `zish-<name>:` — the shape of a directive, as opposed to prose that merely
+/// starts with the word zish (`# zish control-flow notes ...`).
+fn isDirectiveShaped(body: []const u8) bool {
+    if (!std.mem.startsWith(u8, body, "zish-")) return false;
+    const end = std.mem.indexOfScalar(u8, body, ':') orelse return false;
+    const name = body["zish-".len..end];
+    if (name.len == 0 or name.len > 24) return false;
+    for (name) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and ch != '-') return false;
+    }
+    return true;
+}
+
+/// Names only — what `feat deps` and the shell's own callers want.
+pub fn parseScriptDeps(content: []const u8, out: *[MaxScriptDeps][]const u8) usize {
+    return parseLeading(content, out).n;
+}
+
+/// Resolve each name into `d`: missing names and `extra` hits are recorded,
+/// nothing is printed. One resolver, so the declaration check, the static
+/// report and the runtime probe cannot disagree about what resolves.
+fn resolveFeatNames(alloc: std.mem.Allocator, names: []const []const u8, d: *ScriptDeps) void {
+    for (names) |name| {
         const resolved = featResolve(alloc, name) orelse {
-            d.missing[d.nmissing] = name;
-            d.nmissing += 1;
+            if (d.nmissing < d.missing.len) {
+                d.missing[d.nmissing] = name;
+                d.nmissing += 1;
+            }
             continue;
         };
         defer alloc.free(resolved.bin);
-        if (resolved.tier == .extra) {
+        if (resolved.tier == .extra and d.nextra < d.extra.len) {
             d.extra[d.nextra] = name;
             d.nextra += 1;
         }
     }
+}
+
+/// Resolve everything a script declares. Silent: `runScriptFile` refuses the
+/// run, `feat deps` reports, and both diagnose through `scriptDepsDiagnose`.
+pub fn checkScriptDeps(alloc: std.mem.Allocator, content: []const u8) ScriptDeps {
+    var d = ScriptDeps{};
+    const p = parseLeading(content, &d.names);
+    d.n = p.n;
+    d.unknown = p.unknown;
+    resolveFeatNames(alloc, d.names[0..d.n], &d);
     return d;
 }
 
-/// Report unresolved dependencies on stderr: one line per name, then the roots
-/// that were searched. A missing feat is nearly always a registry that is not
-/// the one the caller assumed (`ZISH_FEAT_PATH` pointing at an image built
-/// without it), so naming the roots is the actionable half of the message.
-pub fn scriptDepsDiagnose(shell: *Shell, script: []const u8, d: *const ScriptDeps) void {
-    var i: usize = 0;
-    while (i < d.nmissing) : (i += 1) {
-        shell.stderr().print("zish: {s}: missing feat dependency: {s}\n", .{ script, d.missing[i] }) catch {};
-    }
-    i = 0;
-    while (i < d.nextra) : (i += 1) {
-        shell.stderr().print("zish: {s}: extra feat dependency: {s} — extra feats are never auto-used by a script\n", .{ script, d.extra[i] }) catch {};
-    }
+/// The roots the resolver would search, one per line. A missing feat is nearly
+/// always a registry that is not the one the caller assumed (`ZISH_FEAT_PATH`
+/// pointing at an image built without it), so naming them is the actionable
+/// half of every "missing" message.
+fn featRootsDiagnose(shell: *Shell) void {
     var root_bufs: [2][std.fs.max_path_bytes]u8 = undefined;
     var roots: [2][]const u8 = undefined;
     const nroots = featRoots(shell.allocator, &root_bufs, &roots);
-    i = 0;
+    var i: usize = 0;
     while (i < nroots) : (i += 1) {
         shell.stderr().print("zish:   searched: {s}\n", .{roots[i]}) catch {};
     }
+}
+
+/// Report unresolved dependencies on stderr: one line per name, then the roots.
+/// `label` is what the caller was asked to run — a script path, or `feat need`.
+pub fn scriptDepsDiagnose(shell: *Shell, label: []const u8, d: *const ScriptDeps) void {
+    if (d.unknown) |line| {
+        shell.stderr().print("zish: {s}: unknown zish directive: {s}\n", .{ label, line }) catch {};
+        shell.stderr().writeAll("zish:   known directives: zish-deps:\n") catch {};
+    }
+    var i: usize = 0;
+    while (i < d.nmissing) : (i += 1) {
+        shell.stderr().print("zish: {s}: missing feat dependency: {s}\n", .{ label, d.missing[i] }) catch {};
+    }
+    i = 0;
+    while (i < d.nextra) : (i += 1) {
+        shell.stderr().print("zish: {s}: extra feat dependency: {s} — extra feats are never auto-used by a script\n", .{ label, d.extra[i] }) catch {};
+    }
+    // Roots are the answer to "missing"; a misspelled directive has its own.
+    if (d.nmissing == 0 and d.nextra == 0) return;
+    featRootsDiagnose(shell);
     shell.stderr().writeAll("zish:   install the feat into one of those, or set ZISH_FEAT_PATH to a registry that has it\n") catch {};
 }
 
@@ -4144,11 +4208,30 @@ fn checkExecutableDeps(shell: *Shell, path: []const u8) u8 {
     return 127;
 }
 
+/// `feat need <name>...` — the runtime half: resolve now, answer with the exit
+/// status, silent when everything is there. This is the question a declaration
+/// cannot express (a dependency that depends on a mode), and it never execs
+/// what it resolves, so it is safe to put in front of the work:
+///
+///     feat need web jget || exit 1
+fn featNeedCommand(shell: *Shell, args: []const []const u8) !u8 {
+    if (args.len == 0 or args.len > MaxScriptDeps) {
+        try shell.stderr().writeAll(feat_usage);
+        return 2;
+    }
+    var d = ScriptDeps{};
+    resolveFeatNames(shell.allocator, args, &d);
+    if (d.ok()) return 0;
+    scriptDepsDiagnose(shell, "feat need", &d);
+    return 127;
+}
+
 /// `feat deps <file|->` — the static half of the contract: one
 /// `tier\tname\tpath` line per declared feat (`-\tname\tmissing` when it does
-/// not resolve), exit 0 only if every one does. A deploy can run this against
-/// the scripts it just shipped, to prove the image can run them without
-/// running them.
+/// not resolve, `!\tline\tunknown` for a directive this shell does not know),
+/// exit 0 only if every one resolves. A deploy can run this against the
+/// scripts it just shipped, to prove the image can run them without running
+/// them.
 fn featDepsReport(shell: *Shell, path: []const u8) !u8 {
     if (std.mem.eql(u8, path, "-")) {
         var buf: [16 * 1024]u8 = undefined;
@@ -4178,9 +4261,13 @@ fn featDepsReport(shell: *Shell, path: []const u8) !u8 {
 
 fn featDepsPrint(shell: *Shell, content: []const u8) !u8 {
     var names: [MaxScriptDeps][]const u8 = undefined;
-    const n = parseScriptDeps(content, &names);
+    const p = parseLeading(content, &names);
     var bad: u8 = 0;
-    for (names[0..n]) |name| {
+    if (p.unknown) |line| {
+        try shell.stdout().print("!\t{s}\tunknown\n", .{line});
+        bad = 1;
+    }
+    for (names[0..p.n]) |name| {
         const resolved = featResolve(shell.allocator, name) orelse {
             try shell.stdout().print("-\t{s}\tmissing\n", .{name});
             bad = 1;
@@ -4442,7 +4529,7 @@ fn featHelp(shell: *Shell, alloc: std.mem.Allocator, raw: []const u8) !u8 {
 /// One line, printed on every usage path — including unknown option and unknown
 /// subcommand — so a caller who guesses the flag placement (`feat --json=full`)
 /// is corrected instead of stonewalled.
-const feat_usage = "feat: usage: feat list [-n|--json[=brief|full]] | help <name> | run <name> [args...] | deps <file|->\n";
+const feat_usage = "feat: usage: feat list [-n|--json[=brief|full]] | help <name> | run <name> [args...] | deps <file|-> | need <name>...\n";
 
 fn featCmd(shell: *Shell, args: []const []const u8) !u8 {
     const alloc = shell.allocator;
@@ -4461,6 +4548,9 @@ fn featCmd(shell: *Shell, args: []const []const u8) !u8 {
             return 2;
         }
         return try featDepsReport(shell, args[2]);
+    }
+    if (std.mem.eql(u8, sub, "need")) {
+        return try featNeedCommand(shell, args[2..]);
     }
     if (std.mem.eql(u8, sub, "list")) {
         // One verbosity axis: `-n` for names, `--json` for the structured
