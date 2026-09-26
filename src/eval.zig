@@ -573,7 +573,7 @@ fn expandVariableFast(shell: *Shell, input: []const u8, dest: *[256]u8) !usize {
 
             // Handle $$ (shell PID — /tmp/foo.$$ temp files)
             if (input[i] == '$') {
-                const s = std.fmt.bufPrint(dest[out_pos..], "{d}", .{compat.posix.getpid()}) catch break;
+                const s = std.fmt.bufPrint(dest[out_pos..], "{d}", .{shell.shell_pid}) catch break;
                 out_pos += s.len;
                 i += 1;
                 continue;
@@ -729,6 +729,16 @@ fn evaluateEchoBuiltinFast(shell: *Shell, node: *const ast.AstNode) !u8 {
             arg_slices[arg_count] = dest[0..arg.len];
         } else {
             const expanded_len = try expandVariableFast(shell, arg, dest);
+            // The result of an unquoted expansion is field-split and then
+            // pathname-expanded. This path does neither, so hand any result
+            // that would split (IFS whitespace) or glob to the full pipeline:
+            // `x='*.ts'; echo $x` lists the matches, `x='a  b'; echo $x` is `a b`.
+            if (arg_node.node_type != .double_quoted and std.mem.indexOfScalar(u8, arg, '$') != null) {
+                const result = dest[0..expanded_len];
+                if (std.mem.indexOfAny(u8, result, " \t\n") != null or
+                    (!shell.opt_noglob and glob.hasGlobChars(result)))
+                    return error.BufferTooSmall;
+            }
             // An unquoted $var that expands to nothing produces no field at all
             // (POSIX), so `echo before $empty after` prints one space, not two.
             // A quoted "" or a literal empty word still counts as a field.
