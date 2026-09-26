@@ -182,7 +182,7 @@ pub fn allocOpt(sh: *Shell, input: []const u8, expand_tilde: bool) ![]const u8 {
             // $$ - shell process ID (temp-file idiom: /tmp/foo.$$)
             if (i < input.len and input[i] == '$') {
                 var buf: [16]u8 = undefined;
-                const s = std.fmt.bufPrint(&buf, "{d}", .{compat.posix.getpid()}) catch "0";
+                const s = std.fmt.bufPrint(&buf, "{d}", .{sh.shell_pid}) catch "0";
                 try result.appendSlice(sh.allocator, s);
                 i += 1;
                 continue;

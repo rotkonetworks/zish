@@ -293,6 +293,10 @@ terminal_cursor_row: usize = 0,
 // terminal resize handling
 terminal_resized: bool = false,
 terminal_width: usize = 80,
+/// `$$`: the pid of the shell itself, fixed at startup. POSIX keeps it the
+/// parent's pid inside subshells and forked children, so it must not be a
+/// live getpid() (which would name the child).
+shell_pid: posix.pid_t = 0,
 terminal_height: usize = 24,
 last_resize_time: i64 = 0,
 
@@ -326,6 +330,7 @@ fn initWithOptions(allocator: std.mem.Allocator, load_config: bool) !*Shell {
 
     shell.* = .{
         .allocator = allocator,
+        .shell_pid = posix.getpid(),
         .running = false,
         .history = history,
         .vim_mode = .insert,
