@@ -308,11 +308,22 @@ pub const Parser = struct {
         // collect leading assignments (VAR=value prefix syntax)
         var prefix_assignments = try std.ArrayList(*const ast.AstNode).initCapacity(self.builder.arena.allocator(), 4);
 
+        // POSIX interleaves redirections with the rest of a simple command:
+        // cmd_prefix is (assignment | redirect)*, cmd_suffix is (word | redirect)*.
+        // `echo a 2>/dev/null b=c` has words after a redirect, and
+        // `x=1 >f y=2` keeps both assignments. Collect them here, in source
+        // order, and wrap the finished command in that same order below.
+        var redirects = try std.ArrayList(RedirectSpec).initCapacity(self.builder.arena.allocator(), 2);
+
         while (self.current_token.ty != .Eof) {
+            if (try self.parseredirectspec()) |r| {
+                try redirects.append(self.builder.arena.allocator(), r);
+                continue;
+            }
             switch (self.current_token.ty) {
                 .Word => {
                     // Check for POSIX function definition: name() { ... }
-                    if (words.items.len == 0 and prefix_assignments.items.len == 0 and self.peek_token.ty == .LeftParen) {
+                    if (words.items.len == 0 and prefix_assignments.items.len == 0 and redirects.items.len == 0 and self.peek_token.ty == .LeftParen) {
                         const name_token = self.current_token;
                         try self.nextToken(); // consume name
                         if (self.current_token.ty == .LeftParen) {
@@ -400,103 +411,115 @@ pub const Parser = struct {
             }
         }
 
+        const cmd = try self.buildsimplecommand(words.items, prefix_assignments.items, redirects.items);
+        var wrapped = cmd;
+        for (redirects.items) |r| wrapped = try self.wrapredirect(wrapped, r);
+        return wrapped;
+    }
+
+    fn buildsimplecommand(
+        self: *Self,
+        words: []const *const ast.AstNode,
+        prefix_assignments: []const *const ast.AstNode,
+        redirects: []const RedirectSpec,
+    ) parsererror!*const ast.AstNode {
         // bare assignments with no command following — return as-is
-        if (words.items.len == 0 and prefix_assignments.items.len > 0) {
-            if (prefix_assignments.items.len == 1) {
-                return prefix_assignments.items[0];
+        if (words.len == 0 and prefix_assignments.len > 0) {
+            if (prefix_assignments.len == 1) {
+                return prefix_assignments[0];
             }
             return self.builder.createlist(
-                prefix_assignments.items,
-                prefix_assignments.items[0].line,
-                prefix_assignments.items[0].column,
+                prefix_assignments,
+                prefix_assignments[0].line,
+                prefix_assignments[0].column,
             );
         }
 
-        if (words.items.len == 0) {
-            return error.EmptyCommand;
+        if (words.len == 0) {
+            // A command of only redirections (`>file`, `2>/dev/null`) opens,
+            // creates or truncates its targets and succeeds, as in POSIX. Run
+            // it as the no-op `:` so the redirect nodes still apply.
+            if (redirects.len == 0) return error.EmptyCommand;
+            const noop = try self.builder.createword(":", redirects[0].line, redirects[0].column);
+            return self.builder.createcommand(&.{noop}, noop.line, noop.column);
         }
 
         // if we have prefix assignments, build combined children:
         // [assign1, assign2, ..., word0, word1, ...]
         // and store assignment count in value field
-        if (prefix_assignments.items.len > 0) {
+        if (prefix_assignments.len > 0) {
             const allocator = self.builder.arena.allocator();
-            const n_prefix = prefix_assignments.items.len;
-            const total = n_prefix + words.items.len;
+            const n_prefix = prefix_assignments.len;
+            const total = n_prefix + words.len;
 
             var children = try allocator.alloc(*const ast.AstNode, total);
-            @memcpy(children[0..n_prefix], prefix_assignments.items);
-            @memcpy(children[n_prefix..total], words.items);
+            @memcpy(children[0..n_prefix], prefix_assignments);
+            @memcpy(children[n_prefix..total], words);
 
             // encode prefix count as value string
             var count_buf: [16]u8 = undefined;
             const count_str = std.fmt.bufPrint(&count_buf, "{d}", .{n_prefix}) catch "0";
 
-            var cmd = try self.builder.createnode(
+            return self.builder.createnode(
                 .command,
                 count_str,
                 children,
                 children[n_prefix].line,
                 children[n_prefix].column,
             );
-
-            cmd = try self.parseredirects(cmd);
-            return cmd;
         }
 
-        var cmd = try self.builder.createcommand(
-            words.items,
-            words.items[0].line,
-            words.items[0].column,
-        );
+        return self.builder.createcommand(words, words[0].line, words[0].column);
+    }
 
-        // parse any redirects attached to this command
-        cmd = try self.parseredirects(cmd);
+    const RedirectSpec = struct {
+        op: []const u8,
+        target: *const ast.AstNode,
+        line: u32,
+        column: u32,
+    };
 
-        return cmd;
+    /// Parse one redirection (operator + target) at the current token, or
+    /// return null when the current token is not a redirection operator.
+    fn parseredirectspec(self: *Self) parsererror!?RedirectSpec {
+        const redirect_type = switch (self.current_token.ty) {
+            .RedirectOutput => ">",
+            .RedirectAppend => ">>",
+            .RedirectInput => "<",
+            .RedirectStderr => "2>",
+            .RedirectStderrAppend => "2>>",
+            .RedirectBoth => "2>&1",
+            .RedirectToStderr => ">&2",
+            .RedirectAll => "&>",
+            .RedirectAllAppend => "&>>",
+            .RedirectHereDoc => "<<<",
+            .RedirectHereDocLiteral => "<<",
+            // generic fd redirect (n>, n>>, n>&, n<, n<&, >|, >&): the exact
+            // operator is carried in the token value; dupe it into the arena.
+            .RedirectFd => try self.builder.arena.allocator().dupe(u8, self.current_token.value),
+            else => return null,
+        };
+
+        const line = self.current_token.line;
+        const column = self.current_token.column;
+        try self.nextToken(); // consume redirect token
+
+        // fd duplications don't need a target; a dummy word keeps the node shape
+        const target = if (std.mem.eql(u8, redirect_type, "2>&1") or std.mem.eql(u8, redirect_type, ">&2"))
+            try self.builder.createword("", line, column)
+        else
+            try self.parseword(); // filename or fd
+
+        return .{ .op = redirect_type, .target = target, .line = line, .column = column };
+    }
+
+    fn wrapredirect(self: *Self, cmd: *const ast.AstNode, r: RedirectSpec) parsererror!*const ast.AstNode {
+        return self.builder.createredirect(cmd, r.op, r.target, r.line, r.column);
     }
 
     fn parseredirects(self: *Self, base_cmd: *const ast.AstNode) parsererror!*const ast.AstNode {
         var cmd = base_cmd;
-
-        while (true) {
-            const redirect_type = switch (self.current_token.ty) {
-                .RedirectOutput => ">",
-                .RedirectAppend => ">>",
-                .RedirectInput => "<",
-                .RedirectStderr => "2>",
-                .RedirectStderrAppend => "2>>",
-                .RedirectBoth => "2>&1",
-                .RedirectToStderr => ">&2",
-                .RedirectAll => "&>",
-                .RedirectAllAppend => "&>>",
-                .RedirectHereDoc => "<<<",
-                .RedirectHereDocLiteral => "<<",
-                // generic fd redirect (n>, n>>, n>&, n<, n<&, >|, >&): the exact
-                // operator is carried in the token value; dupe it into the arena.
-                .RedirectFd => try self.builder.arena.allocator().dupe(u8, self.current_token.value),
-                else => break,
-            };
-
-            const line = self.current_token.line;
-            const column = self.current_token.column;
-            try self.nextToken(); // consume redirect token
-
-            // fd duplications don't need a target
-            if (std.mem.eql(u8, redirect_type, "2>&1") or std.mem.eql(u8, redirect_type, ">&2")) {
-                // create dummy target node for consistency
-                const target = try self.builder.createword("", line, column);
-                cmd = try self.builder.createredirect(cmd, redirect_type, target, line, column);
-                continue;
-            }
-
-            // parse target (filename or fd)
-            const target = try self.parseword();
-
-            // wrap command in redirect node
-            cmd = try self.builder.createredirect(cmd, redirect_type, target, line, column);
-        }
-
+        while (try self.parseredirectspec()) |r| cmd = try self.wrapredirect(cmd, r);
         return cmd;
     }
 
