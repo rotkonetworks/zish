@@ -27,7 +27,7 @@ class VT:
         while i < len(s):
             ch = s[i]
             if ch == "\x1b":
-                m = re.match(r"\x1b\[([0-9;?]*)([A-Za-z])", s[i:])
+                m = re.match(r"\x1b\[([0-9;?]*)[ -/]*([@-~])", s[i:])  # [ -/] = CSI intermediates, e.g. DECSCUSR "\x1b[6 q"
                 if m:
                     p, cmd = m.group(1), m.group(2)
                     n = int(p) if p.isdigit() and p else 1

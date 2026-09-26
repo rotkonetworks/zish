@@ -1216,6 +1216,30 @@ pub fn enableRawMode(self: *Shell) !void {
 /// prompt could get stuck echoing "^C" and line-buffering input — the shell
 /// must own its input mode by construction, not trust every child to restore
 /// it. Cheap enough to run per command; no per-keystroke cost.
+/// Preserve a partial last line of command output before a fresh prompt.
+/// render() starts with `\r\x1b[J`, so output that didn't end in a newline
+/// (e.g. a JSON error body from curl) was drawn and then erased by the prompt.
+/// zsh's PROMPT_SP trick: print a reverse-video `%` then width-1 spaces. From
+/// column 0 that exactly fills the row (deferred wrap, no scroll) and `\r\x1b[K`
+/// erases it; from column c>0 it wraps onto a new row, so `\r\x1b[K` clears only
+/// that row and the partial line survives, marked with `%`. Written to stderr,
+/// the fd render() uses, after the caller has flushed command output.
+pub fn preservePartialLine(self: *Shell) void {
+    if (!posix.isatty(posix.STDERR_FILENO)) return;
+    const w: usize = self.terminal_width;
+    if (w < 2) return;
+    const fd = posix.STDERR_FILENO;
+    _ = posix.write(fd, "\x1b[7m%\x1b[27m") catch return;
+    const spaces = " " ** 256;
+    var left = w - 1; // must fill the row exactly, whatever the width
+    while (left > 0) {
+        const n = posix.write(fd, spaces[0..@min(left, spaces.len)]) catch return;
+        if (n == 0) return;
+        left -= n;
+    }
+    _ = posix.write(fd, "\r\x1b[K") catch {};
+}
+
 pub fn ensureRawMode(self: *Shell) void {
     const orig = self.original_termios orelse return;
     var t = orig;

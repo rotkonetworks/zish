@@ -1061,6 +1061,31 @@ def _(sh):
         sh.vt = None
 
 
+@test("output without a trailing newline survives the next prompt")
+def _(sh):
+    # render() opens with \r\x1b[J, so a partial last line (curl printing a
+    # JSON error body with no final \n) was drawn, then erased by the prompt:
+    # the response "flashed and disappeared". PROMPT_SP keeps it, marked `%`.
+    small = Shell(cols=40, rows=10)
+    try:
+        small.read()
+        small.sendline("printf NOEOL_BODY")
+        small.read(quiet_for=0.3)
+        small.sendline("echo WITH_EOL")
+        small.read(quiet_for=0.3)
+        rows = small.vt.screen()
+        screen = "\n".join("        | " + l for l in rows if l.strip())
+        body = [l for l in rows if l.startswith("NOEOL_BODY")]
+        assert body, f"partial line erased by the prompt\n{screen}"
+        assert body[0].rstrip() == "NOEOL_BODY%", f"missing % marker\n{screen}"
+        # A line that did end in \n gets no marker and no blank row.
+        i = rows.index("WITH_EOL")
+        assert "%" not in rows[i + 1] and rows[i + 1].strip(), \
+            f"stray marker/gap after newline-terminated output\n{screen}"
+    finally:
+        small.close()
+        sh.vt = None
+
 # ---------------------------------------------------------------------------
 print("\nsession feats (agent armor async substrate)")
 # ---------------------------------------------------------------------------

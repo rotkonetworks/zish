@@ -477,6 +477,8 @@ pub fn handleAction(self: *Shell, action: Action) !void {
                     if (self.history) |h| h.sync();
                     self.notifyBackgroundJobs();
                     self.runPromptCommand();
+                    self.stdout().flush() catch {};
+                    self.preservePartialLine();
                     try self.renderLine();
                 }
             }
