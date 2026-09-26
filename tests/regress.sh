@@ -1175,6 +1175,26 @@ deps_refuse "deps: unknown directive"   127 'unknown zish directive'    BODY-RAN
 deps_run   "deps: unknown in body ok"   $'BODY-RAN' 0 ''                './deps-typo-body.zish'
 deps_run   "deps: report unknown"       $'!\tzish-dep: web\tunknown' 1 '' "feat deps $WORK/deps-typo.zish"
 
+# words and assignments after a redirection (POSIX cmd_prefix/cmd_suffix
+# interleave redirects; the parser used to stop the command at the first one)
+same_as_bash "word after redirect"          'echo a 2>/dev/null b'
+same_as_bash "k=v arg after redirect"       'echo a 2>/dev/null b=c --include=*.ts'
+same_as_bash "assignment after prefix redir" 'x=1 >/dev/null y=2; echo $x $y'
+same_as_bash "redirect before command word" '>f echo hi; cat f; rm f'
+same_as_bash "redirect-only command"        '>g; test -f g && echo made; rm g'
+same_as_bash "redirect order with words"    'ls /nonexistent 2>&1 >/dev/null x | wc -l'
+same_as_bash "prefix env after redirect"    'X=5 2>/dev/null sh -c "echo \$X"'
+# printf honours the -- end-of-options marker
+same_as_bash "printf -- format"             'printf -- "x=%s\n" 1'
+# echo fast path: unquoted expansion results are field-split and globbed
+same_as_bash "echo \$x globs its value"     'touch zz_a.ts zz_b.ts; x=zz_*.ts; echo $x; rm zz_a.ts zz_b.ts'
+same_as_bash "echo \$x field-splits"        'x="a    b"; echo $x'
+same_as_bash "echo \$x noglob keeps pattern" 'x="*"; set -f; echo $x'
+# $$ is the parent shell's pid everywhere, subshells included (#7)
+same_as_bash "\$\$ same in subshell"         'a=$$; (b=$$; [ $a = $b ] && echo same)'
+same_as_bash "\$\$ same in cmd subst"        'a=$$; [ "$(echo $$)" = $a ] && echo same'
+same_as_bash "glob after \$\$ expansion"     'touch zz_$$_a zz_$$_b; ls zz_$$_* | wc -l; rm -f zz_$$_*'
+
 # ---------------------------------------------------------------------------
 printf '\n'
 # ---------------------------------------------------------------------------
