@@ -404,7 +404,10 @@ fn writeEscaped(shell: *Shell, s: []const u8) !bool {
     return false;
 }
 
-fn printf(shell: *Shell, args: []const []const u8) !u8 {
+fn printf(shell: *Shell, argv: []const []const u8) !u8 {
+    // `--` ends options: `printf -- "$fmt" args` must use "$fmt" as the
+    // format, not print a literal `--`. Drop it; args[0] stays the name slot.
+    const args = if (argv.len >= 2 and std.mem.eql(u8, argv[1], "--")) argv[1..] else argv;
     if (args.len < 2) {
         try shell.stdout().writeAll("printf: usage: printf format [arguments]\n");
         return 1;
