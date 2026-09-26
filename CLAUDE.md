@@ -52,6 +52,13 @@ code the deidrec/redshiftzero lenses.
   (`fork+exec+argv+stdio`, no plugin ABI). A feat never shadows a real binary;
   its name must not collide with an installed command. See `docs/feat-spec.md`.
 
+## Disparities with bash
+
+Any difference from bash that you hit — parse error, wrong output, missing
+expansion, slower than bash — gets filed as a GitHub issue, even when you work
+around it. `AGENTS.md` has the procedure (minimize, confirm against bash, search
+for duplicates, measure before claiming a performance gap).
+
 ## Testing (the bar for a change)
 
 - `./tests/regress.sh` — end-to-end, **differential against bash**; every case
