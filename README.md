@@ -163,6 +163,17 @@ and `feat run <name>` is the explicit form if you want it.
 A feat is just a binary zish `exec`s: no plugin ABI, no dynamic loading, no
 in-process hooks. See [docs/feat-spec.md](docs/feat-spec.md) for the contract.
 
+Feats come in tiers, and `zig build -Dfeats=core|tooling|all` builds each set:
+
+| tier | feats | |
+|---|---|---|
+| core | `cnt pk frq snf jls jget calc rand para gf` | ships with the shell |
+| tooling | `jevx mcpc web verify` | general building blocks, installed with `gf`: typed decisions from a model ([feats/jevx](feats/jevx/README.md)), MCP tool calls, web search/fetch, code checking |
+| agents | `agent team budget bus ask` | the agent-org stack built on the tooling |
+
+Domain-specific feats (`pen` for Penumbra, `aur` for Arch) live in a separate
+`rotko-feats` repo and install through the same `gf` index.
+
 ### Dashboard (zash)
 
 The `team` and `agent` feats run agent-orgs (a Captain decomposing work across

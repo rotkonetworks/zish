@@ -76,14 +76,20 @@ pub fn build(b: *std.Build) void {
 
     // Ship the feat set beside the binary — the lean base, grown with the
     // package manager (Arch = base + pacman, not everything preinstalled). Core
-    // is the zero-dep unix utilities plus gf; the heavy/situational feats
-    // (agent, team, web, aur, budget, verify, ask, bus) are published to the gf
-    // index by `make dist-all` and installed on demand, so the base carries no
-    // LLM-agent stack and the nix closure stays small. The resolver searches
+    // is the zero-dep unix utilities plus gf. Tooling is the general-purpose
+    // building blocks on top — typed decisions (jevx), MCP calls (mcpc), web
+    // search and fetch (web), code checking (verify) — and the agent stack
+    // (agent, team, budget, bus, ask) is the orchestration built on those. Both
+    // are published to the gf index by `make dist-all` and installed on demand,
+    // so the base carries no LLM-agent stack and the nix closure stays small.
+    // Feats tied to one domain (pen for Penumbra, aur for Arch) live outside
+    // this repo, in rotko-feats, and reach the index through
+    // feats/index-extra.jsonl. The resolver searches
     // this system tier plus the writable ~/.zish/feats (where gf installs), so
     // core is present out of the box like curl on $PATH.
     //
-    // Which set ships: "core" (default) or "all". ONE list, one owner — this is
+    // Which set ships: "core" (default), "tooling" (core + the tooling tier),
+    // or "all". ONE list, one owner — this is
     // the only place that decides a feat exists, whether it links libc, and
     // where it installs.
     //
@@ -93,7 +99,7 @@ pub fn build(b: *std.Build) void {
     // needed none, and the per-suite `zig build-exe` calls compiled a different
     // binary than either installed. So the suites were validating something
     // other than what ships.
-    const feat_set = b.option([]const u8, "feats", "feat set to ship: 'core' (default) or 'all'") orelse "core";
+    const feat_set = b.option([]const u8, "feats", "feat set to ship: 'core' (default), 'tooling', or 'all'") orelse "core";
     // Where a feat lands relative to --prefix:
     //   system   <prefix>/share/zish/feats/standard/<name>/  the shell's own
     //            system root — what a package or the nix derivation installs
@@ -104,17 +110,17 @@ pub fn build(b: *std.Build) void {
     const registry_layout = std.mem.eql(u8, feat_layout, "registry");
 
     const core_feats = [_][]const u8{ "cnt", "pk", "frq", "snf", "jls", "jget", "calc", "rand", "para", "gf" };
-    const all_feats = [_][]const u8{
-        "cnt", "pk",  "frq",    "snf",    "jls", "calc", "para", "agent", "jget", "rand", "pen", "mcpc",
-        "gf",  "aur", "budget", "verify", "ask", "team", "web",  "bus", "jevx",
-    };
-    // -Dfeats takes "core" (default), "all", or an explicit comma-separated list
-    // ("agent,aur") so a packaging step builds exactly what it packs instead of
-    // a whole set to throw most of it away. An unknown name fails the build
+    const tooling_feats = core_feats ++ [_][]const u8{ "jevx", "mcpc", "web", "verify" };
+    const all_feats = tooling_feats ++ [_][]const u8{ "agent", "team", "budget", "bus", "ask" };
+    // -Dfeats takes "core" (default), "tooling", "all", or an explicit
+    // comma-separated list ("agent,web") so a packaging step builds exactly
+    // what it packs instead of a whole set to throw most of it away. An unknown name fails the build
     // here rather than shipping a set that is quietly missing a member.
     var explicit: std.ArrayListUnmanaged([]const u8) = .empty;
     const feat_names: []const []const u8 = if (std.mem.eql(u8, feat_set, "all"))
         &all_feats
+    else if (std.mem.eql(u8, feat_set, "tooling"))
+        &tooling_feats
     else if (std.mem.eql(u8, feat_set, "core"))
         &core_feats
     else blk: {
@@ -126,7 +132,7 @@ pub fn build(b: *std.Build) void {
             for (all_feats) |f| {
                 if (std.mem.eql(u8, f, n)) known = true;
             }
-            if (!known) std.debug.panic("unknown feat '{s}': -Dfeats takes 'core', 'all', or comma-separated names from all_feats", .{n});
+            if (!known) std.debug.panic("unknown feat '{s}': -Dfeats takes 'core', 'tooling', 'all', or comma-separated names from all_feats", .{n});
             explicit.append(b.allocator, n) catch @panic("OOM");
         }
         if (explicit.items.len == 0) std.debug.panic("-Dfeats={s} names no feat", .{feat_set});

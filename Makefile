@@ -62,7 +62,6 @@ test: build-all
 	zig build test -Dfeats=all
 	./tests/agent_test.sh
 	./tests/gf_test.sh
-	./tests/aur_test.sh
 	./tests/budget_test.sh
 	./tests/verify_test.sh
 	./tests/ask_test.sh
@@ -110,6 +109,10 @@ dist-agent:
 		echo "dist/agent-$${v:-0.0.0}.tar.gz"
 
 # ---- the whole feat catalog: `make dist-all` ------------------------------
+# feats/index-extra.jsonl holds feats built and released in other repos (the
+# domain feats in rotko-feats). Each line is a pin produced by that repo's
+# `make dist` — immutable release URL + sha256 — reviewed like code, checked by
+# scripts/check-index-extra.sh, and appended to the index this target writes.
 # Cross-compiles EVERY feat to static musl for each DIST_ARCH and packs it as
 # the tarball `gf install` fetches (feat.toml + bin/<name> at top level), then
 # emits dist/index.jsonl — the crates.io-for-feats index gf resolves by name.
@@ -159,5 +162,10 @@ dist-all:
 		done; \
 		rm -rf $$stage; \
 	done
-	@echo "wrote dist/index.jsonl ($$(grep -c . dist/index.jsonl) entries) → publish with:"
+	@# Feats from other repos (rotko-feats …): validated pins, appended as-is.
+	@# Checked against what this build produced, so an outside feat can never
+	@# shadow one of ours.
+	@scripts/check-index-extra.sh feats/index-extra.jsonl $$(sed -n 's/.*"name":"\([^"]*\)".*/\1/p' dist/index.jsonl | sort -u)
+	@grep -v '^$$' feats/index-extra.jsonl >> dist/index.jsonl || true
+	@echo "wrote dist/index.jsonl ($$(grep -c . dist/index.jsonl) entries, $$(grep -c . feats/index-extra.jsonl) from index-extra) → publish with:"
 	@echo "  gh release create $(REL_TAG) dist/*.tar.gz dist/index.jsonl --repo $(REL_REPO)"

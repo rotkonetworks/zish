@@ -1,7 +1,0 @@
-name = "pen"
-tier = "standard"
-version = "1.0.0"
-help = "pcli, answered in JSON: balance | swap | withdraw, with tx ids and fees as fields"
-bin = "pen"
-usage = "pen balance | pen swap AMT --into DENOM [--source N] | pen withdraw AMT --to ADDR --channel N   # --home/DIR or PENUMBRA_PCLI_HOME"
-summary = "pcli as JSON fields"
