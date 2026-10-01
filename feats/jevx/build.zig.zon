@@ -1,0 +1,7 @@
+.{
+    .name = .jevx,
+    .version = "0.2.0",
+    .fingerprint = 0x1c78e6cefec774dd,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{ "build.zig", "build.zig.zon", "main.zig", "lib", "feat.toml", "README.md", "examples", "vim" },
+}

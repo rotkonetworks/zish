@@ -1,0 +1,13 @@
+#!/usr/bin/env jevx
+" triage.jevx — route a support ticket. usage: ./triage.jevx < ticket  |  ./triage.jevx "text..."
+set probs
+
+team/ Which team should handle this ticket?
+  \| billing: payments, invoices, refunds, payouts
+  \| technical: bugs, outages, integrations
+  \| sales: pricing, upgrades, new accounts
+urgent?>.6 Is the customer blocked right now?
+  \| y: cannot operate, money not moving
+  \| n: a question or minor annoyance
+mood# How frustrated is the customer?
+  \| calm \| annoyed \| angry \| furious

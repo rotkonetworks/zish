@@ -1,0 +1,8 @@
+name = "jevx"
+tier = "standard"
+version = "0.2.0"
+help = "typed decisions from TypeSafe's Jev model in one line each: 'key? yes/no', 'key/ choice \| a \| b', 'key# score \| lo \| hi', with grep-like gates, -l per-line filtering, and executable .jevx scripts"
+bin = "jevx"
+usage = "jevx [-l] [-p|-q|-j|-n] [-s TEXT|-S FILE] 'urgent?>.7 Is this urgent?' 'team/ Which team? \\| billing \\| sales' < state   # key at ~/.zish/openrouter.key"
+summary = "Jev decision questions"
+completion = ["-x", "-s", "-S", "-t", "-l", "-v", "-b", "-f", "-J", "-p", "-q", "-j", "-n", "-e", "-E", "-m", "--mock"]

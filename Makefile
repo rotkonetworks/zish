@@ -69,6 +69,7 @@ test: build-all
 	./tests/team_test.sh
 	./tests/bus_test.sh
 	./tests/web_test.sh
+	./tests/jevx_test.sh
 	./tests/feat_leaks_test.sh
 	./benchmark/run.sh --selftest
 
@@ -125,6 +126,14 @@ REL_REPO ?= rotkonetworks/zish
 REL_TAG  ?= $(shell git describe --tags --abbrev=0 2>/dev/null || echo v0.0.0)
 REL_BASE  = https://github.com/$(REL_REPO)/releases/download/$(REL_TAG)
 DIST_ARCHES ?= x86_64 aarch64
+
+# ---- the jevx mirror ---------------------------------------------------------
+# Publish feats/jevx (at HEAD) to the standalone mirror checkout, ../jevex by
+# default: resolved symlinks, built and tested on its own, one commit per sync.
+# Never pushes. See scripts/mirror-jevx.sh.
+.PHONY: mirror-jevx
+mirror-jevx:
+	scripts/mirror-jevx.sh $(if $(JEVX_MIRROR),$(JEVX_MIRROR))
 
 .PHONY: dist-all
 dist-all:

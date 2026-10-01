@@ -1,0 +1,4 @@
+#!/usr/bin/env jevx
+" fruit.jevx — grep for fruit names: ./fruit.jevx < words
+set lines
+fruit?>.5 Is \0 the name of a fruit?

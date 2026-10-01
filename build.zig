@@ -106,7 +106,7 @@ pub fn build(b: *std.Build) void {
     const core_feats = [_][]const u8{ "cnt", "pk", "frq", "snf", "jls", "jget", "calc", "rand", "para", "gf" };
     const all_feats = [_][]const u8{
         "cnt", "pk",  "frq",    "snf",    "jls", "calc", "para", "agent", "jget", "rand", "pen", "mcpc",
-        "gf",  "aur", "budget", "verify", "ask", "team", "web",  "bus",
+        "gf",  "aur", "budget", "verify", "ask", "team", "web",  "bus", "jevx",
     };
     // -Dfeats takes "core" (default), "all", or an explicit comma-separated list
     // ("agent,aur") so a packaging step builds exactly what it packs instead of

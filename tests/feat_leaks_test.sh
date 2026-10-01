@@ -69,6 +69,7 @@ leak bus   "$FEAT_BIN/bus/bin/bus" --help
 leak agent "$FEAT_BIN/agent/bin/agent" --help
 leak team  "$FEAT_BIN/team/bin/team" --help
 leak aur   "$FEAT_BIN/aur/bin/aur" --help
+leak jevx  "$FEAT_BIN/jevx/bin/jevx" -n -s x 'u? y' 't/ z \| a \| b'
 
 echo
 total=$((pass + fail))
