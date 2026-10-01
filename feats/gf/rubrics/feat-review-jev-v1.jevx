@@ -1,0 +1,32 @@
+" feat-review-jev-v1 — gf's first-pass review screen, run by the jevx feat.
+"
+" gf splits a source package into chunks of about one function each and asks
+" every question below of every chunk, in parallel, with the manifest as
+" shared state: {"manifest": "<feat.toml>"}. Each chunk starts with a
+" `// FILE:LINE` header so a flag can say where it fired.
+"
+" Each question is a red flag, scored as P(yes) per chunk. gf keeps the
+" maximum over chunks and decides in code (see jevScreen in main.zig):
+"   every flag below 0.2      -> pass
+"   any flag at 0.9 or above  -> fail, naming the chunk
+"   anything else             -> escalate to the agent judge (feat-review-v1)
+"
+" Small chunks, specific questions: Jev judges a 3 KB function far better than
+" a 95 KB file, and "does this read secrets the manifest doesn't justify" far
+" better than "how safe is this, 0-10".
+"
+" This file is DATA, not code, and versioned like feat-review-v1: a new
+" rubric is a new file, never an edit that rescopes past verdicts. Keep the
+" question keys stable; the ledger records them.
+set nul
+
+exfil? Does the code in \0 read secrets or private files (SSH keys, API tokens,
+  \ browser or wallet data) for a purpose `manifest` does not justify?
+net? Does the code in \0 open network connections, or run a program that does,
+  \ that `manifest` does not mention?
+exec? Does the code in \0 run a shell command string built from input the feat
+  \ does not control, so that the input could inject commands?
+write? Does the code in \0 write, delete or change files outside what `manifest`
+  \ says the feat does?
+hidden? Does the code in \0 do something deliberately hidden or disguised:
+  \ obfuscated code, a misleading comment, or telemetry `manifest` does not disclose?

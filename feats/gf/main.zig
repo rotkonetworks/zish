@@ -487,10 +487,10 @@ fn objStr2(v: std.json.Value, key: []const u8) ?[]const u8 {
     };
 }
 
-/// Resolve the installed agent feat's binary: standard tier first, then extra.
-fn resolveAgentBin(root: []const u8, buf: []u8) ?[]const u8 {
+/// Resolve an installed feat's binary by name: standard tier first, then extra.
+fn resolveFeatBin(root: []const u8, name: []const u8, buf: []u8) ?[]const u8 {
     for ([_][]const u8{ "standard", "extra" }) |tier| {
-        const p = std.fmt.bufPrint(buf, "{s}/{s}/agent/bin/agent", .{ root, tier }) catch continue;
+        const p = std.fmt.bufPrint(buf, "{s}/{s}/{s}/bin/{s}", .{ root, tier, name, name }) catch continue;
         if (lstatMode(p) != null) return p;
     }
     return null;
@@ -499,14 +499,15 @@ fn resolveAgentBin(root: []const u8, buf: []u8) ?[]const u8 {
 /// Append a review verdict to the ledger, joined to the install by sha256.
 /// The bare pass/fail is lifted to top level for greppability; the full
 /// verdict object rides along as an escaped string under "result".
-fn reviewLedgerAppend(init: std.process.Init, root: []const u8, sha: []const u8, verdict_word: []const u8, verdict_raw: []const u8) void {
-    const model = feat.env(init.arena.allocator(), init.io, "ZISH_JUDGE_MODEL") orelse "deepseek/deepseek-v4-flash-0731";
+fn reviewLedgerAppend(root: []const u8, sha: []const u8, rubric_id: []const u8, reviewer: []const u8, verdict_word: []const u8, verdict_raw: []const u8) void {
     var line: std.ArrayListUnmanaged(u8) = .empty;
     defer line.deinit(alloc);
     line.appendSlice(alloc, "{\"t\":\"review\",\"sha256\":\"") catch return;
     appendJsonStr(&line, sha) catch return;
-    line.appendSlice(alloc, "\",\"rubric\":\"feat-review-v1\",\"reviewer\":\"") catch return;
-    appendJsonStr(&line, model) catch return;
+    line.appendSlice(alloc, "\",\"rubric\":\"") catch return;
+    appendJsonStr(&line, rubric_id) catch return;
+    line.appendSlice(alloc, "\",\"reviewer\":\"") catch return;
+    appendJsonStr(&line, reviewer) catch return;
     line.appendSlice(alloc, "\",\"verdict\":\"") catch return;
     appendJsonStr(&line, verdict_word) catch return;
     line.appendSlice(alloc, "\",\"sig\":\"\",\"result\":\"") catch return;
@@ -532,6 +533,276 @@ fn reviewLedgerAppend(init: std.process.Init, root: []const u8, sha: []const u8,
     }
 }
 
+// ---------------------------------------------------------------------------
+// jev screen — the first, cheap pass. The jevx feat asks Jev a fixed set of
+// red-flag questions (rubrics/feat-review-jev-v1.jevx) of every chunk of the
+// source, and the verdict is computed HERE, in code, from the per-chunk
+// probabilities: clear pass and clear fail are recorded and end the review;
+// anything in between goes on to the agent judge. Jev is calibrated, under a
+// second, and about a thousandth of the LLM call it stands in front of; the
+// LLM is kept for exactly the packages Jev is unsure about.
+//
+// Why chunks: measured on the agent feat's own 95 KB source, one whole-file
+// question came back at confidence 0.28; split into 35 function-sized chunks,
+// most scored near 0 and the few that stood out named the right lines
+// (`sh -c <command>` at main.zig:1803, the curl transport at :416).
+//
+// Like the judge, the screen is advisory: it records a verdict, it never
+// fails an install.
+// ---------------------------------------------------------------------------
+
+const ScreenOutcome = enum { decided, escalate, unavailable };
+
+/// The flags' thresholds. A noul is calibrated, so these read as
+/// probabilities: below PASS everywhere is a clear no; FAIL anywhere is a
+/// clear yes. Changing them is a rubric change (bump the rubric id).
+const SCREEN_PASS_BELOW: f64 = 0.2;
+const SCREEN_FAIL_AT: f64 = 0.9;
+/// Target chunk size, bytes. ~1k tokens: one function or a few small ones.
+const CHUNK_TARGET = 3000;
+/// Per-file read cap for the screen; larger files are screened in part and
+/// the screen then cannot pass (it escalates).
+const SCREEN_FILE_CAP = 4 * 1024 * 1024;
+
+/// A line that starts a top-level declaration: column 0, not a closing brace
+/// or a blank, after a blank line (or at the top). Works for the C-family and
+/// Zig shapes feats ship; anything else still splits, just less neatly.
+fn isTopLevelStart(lines: []const []const u8, i: usize) bool {
+    const l = lines[i];
+    if (l.len == 0 or l[0] == ' ' or l[0] == '\t' or l[0] == '}' or l[0] == ')') return false;
+    if (i == 0) return true;
+    return std.mem.trim(u8, lines[i - 1], " \t\r").len == 0;
+}
+
+/// Append `text` (file `rel`) to `out` as NUL-terminated chunks of about
+/// CHUNK_TARGET bytes, each headed `// rel:LINE`. Top-level declarations are
+/// packed together until the target; one that is larger alone is cut at
+/// CHUNK_TARGET on a line boundary. Returns the number of chunks.
+fn chunkSource(out: *std.ArrayListUnmanaged(u8), rel: []const u8, text: []const u8) !usize {
+    var lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer lines.deinit(alloc);
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |l| try lines.append(alloc, l);
+
+    var count: usize = 0;
+    var start: usize = 0; // first line of the chunk being built
+    var bytes: usize = 0;
+    var i: usize = 0;
+    while (i <= lines.items.len) : (i += 1) {
+        const at_end = i == lines.items.len;
+        const boundary = !at_end and i > start and isTopLevelStart(lines.items, i);
+        const len = if (at_end) 0 else lines.items[i].len + 1;
+        if (at_end or (boundary and bytes + len > CHUNK_TARGET) or (bytes > 0 and bytes + len > 2 * CHUNK_TARGET)) {
+            if (i > start) {
+                var hb: [512]u8 = undefined;
+                try out.appendSlice(alloc, std.fmt.bufPrint(&hb, "// {s}:{d}\n", .{ rel, start + 1 }) catch "// ?\n");
+                for (lines.items[start..i], 0..) |l, k| {
+                    if (k > 0) try out.append(alloc, '\n');
+                    // a NUL inside source would split the chunk: neutralise it
+                    for (l) |c| try out.append(alloc, if (c == 0) ' ' else c);
+                }
+                try out.append(alloc, 0);
+                count += 1;
+            }
+            start = i;
+            bytes = 0;
+        }
+        bytes += len;
+    }
+    return count;
+}
+
+/// fork+exec with `input` on stdin (via a memfd, so a large input and a
+/// large output cannot deadlock on two pipes) and stdout captured. Null on
+/// any failure, including a non-zero exit.
+fn execCaptureStdin(init: std.process.Init, argv: [*:null]const ?[*:0]const u8, input: []const u8) ?[]u8 {
+    const mrc = linux.memfd_create("gf-screen", linux.MFD.CLOEXEC);
+    if (linux.errno(mrc) != .SUCCESS) return null;
+    const mfd: i32 = @intCast(mrc);
+    defer _ = linux.close(mfd);
+    var off: usize = 0;
+    while (off < input.len) {
+        const w = linux.write(mfd, input.ptr + off, input.len - off);
+        if (linux.errno(w) == .INTR) continue;
+        if (linux.errno(w) != .SUCCESS or w == 0) return null;
+        off += w;
+    }
+    if (linux.errno(linux.lseek(mfd, 0, linux.SEEK.SET)) != .SUCCESS) return null;
+
+    var fds: [2]i32 = undefined;
+    if (linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return null;
+    const pid_rc = linux.fork();
+    if (linux.errno(pid_rc) != .SUCCESS) {
+        _ = linux.close(fds[0]);
+        _ = linux.close(fds[1]);
+        return null;
+    }
+    const pid: linux.pid_t = @intCast(pid_rc);
+    if (pid == 0) {
+        if (linux.errno(linux.dup2(mfd, 0)) != .SUCCESS or linux.errno(linux.dup2(fds[1], 1)) != .SUCCESS) linux.exit(127);
+        _ = linux.execve("/usr/bin/env", argv, init.minimal.environ.block.slice.ptr);
+        linux.exit(127);
+    }
+    _ = linux.close(fds[1]);
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    var tmp: [8192]u8 = undefined;
+    while (true) {
+        const rc = linux.read(fds[0], &tmp, tmp.len);
+        if (linux.errno(rc) == .INTR) continue;
+        if (linux.errno(rc) != .SUCCESS or rc == 0) break;
+        buf.appendSlice(alloc, tmp[0..rc]) catch break;
+    }
+    _ = linux.close(fds[0]);
+    var status: u32 = 0;
+    while (linux.errno(linux.waitpid(pid, &status, 0)) == .INTR) {}
+    if (!linux.W.IFEXITED(status) or linux.W.EXITSTATUS(status) != 0) return null;
+    return buf.toOwnedSlice(alloc) catch null;
+}
+
+const Flag = struct { key: []const u8, max: f64 = 0, at: []const u8 = "" };
+
+/// The verdict from per-chunk flags, in code: the decision the rubric
+/// header documents. `complete` is false when part of the source went
+/// unscreened; such a screen can still fail, but never pass.
+fn screenVerdict(flags: []const Flag, complete: bool) []const u8 {
+    var all_low = true;
+    for (flags) |f| {
+        if (f.max >= SCREEN_FAIL_AT) return "fail";
+        if (f.max >= SCREEN_PASS_BELOW) all_low = false;
+    }
+    return if (all_low and complete) "pass" else "escalate";
+}
+
+/// Parse jevx's -0 output — `P1<TAB>P2<TAB>...<TAB>ITEM<NUL>` per chunk, the
+/// columns in rubric order — into per-flag maxima, with the `// FILE:LINE`
+/// header of the chunk that set each. False on any malformed record: a
+/// screen that cannot be read is no screen.
+fn foldFlags(out: []const u8, flags: []Flag) bool {
+    var recs = std.mem.splitScalar(u8, out, 0);
+    var any = false;
+    while (recs.next()) |rec| {
+        if (rec.len == 0) continue;
+        var cols = std.mem.splitScalar(u8, rec, '\t');
+        var ps: [32]f64 = undefined;
+        if (flags.len > ps.len) return false;
+        for (ps[0..flags.len]) |*pv| {
+            const col = cols.next() orelse return false;
+            pv.* = std.fmt.parseFloat(f64, col) catch return false;
+            if (!(pv.* >= 0 and pv.* <= 1)) return false; // also rejects NaN
+        }
+        const item = cols.rest();
+        const hdr_end = std.mem.indexOfScalar(u8, item, '\n') orelse item.len;
+        const at = if (std.mem.startsWith(u8, item, "// ")) item[3..hdr_end] else "?";
+        for (flags, ps[0..flags.len]) |*f, pv| {
+            if (f.at.len == 0 or pv > f.max) {
+                f.max = @max(f.max, pv);
+                f.at = at;
+            }
+        }
+        any = true;
+    }
+    return any;
+}
+
+/// Run the jev screen. `.unavailable` (no jevx feat, no rubric, jevx failed)
+/// falls through to the agent judge exactly as before the screen existed.
+fn jevScreen(init: std.process.Init, root: []const u8, dest: []const u8, sha: []const u8) ScreenOutcome {
+    const ar = init.arena.allocator();
+    var jbuf: [4096]u8 = undefined;
+    const jevx_bin = resolveFeatBin(root, "jevx", &jbuf) orelse return .unavailable;
+    const rubric_bytes = feat.rubric(ar, init.io, "feat-review-jev-v1.jevx", @embedFile("rubrics/feat-review-jev-v1.jevx")) orelse return .unavailable;
+    var rbuf: [4096]u8 = undefined;
+    const rubric = feat.spillTemp(ar, init.io, &rbuf, "gf-rubric-jev.jevx", rubric_bytes) orelse return .unavailable;
+    defer feat.unlink(rubric);
+
+    // the flag keys, in rubric order: the question lines' keys
+    var keys: std.ArrayListUnmanaged(Flag) = .empty;
+    var rl = std.mem.splitScalar(u8, rubric_bytes, '\n');
+    while (rl.next()) |l| {
+        var k: usize = 0;
+        while (k < l.len and (std.ascii.isAlphanumeric(l[k]) or l[k] == '_')) k += 1;
+        if (k > 0 and k < l.len and l[k] == '?' and !std.mem.startsWith(u8, l, "set")) keys.append(ar, .{ .key = l[0..k] }) catch return .unavailable;
+    }
+    if (keys.items.len == 0) return .unavailable;
+
+    // state: the manifest, as JSON
+    var mpb: [4096]u8 = undefined;
+    const mpath = std.fmt.bufPrint(&mpb, "{s}/feat.toml", .{dest}) catch return .unavailable;
+    const manifest = feat.readFile(ar, init.io, mpath, 64 * 1024) catch return .unavailable;
+    var state: std.ArrayListUnmanaged(u8) = .empty;
+    state.appendSlice(ar, "{\"manifest\":\"") catch return .unavailable;
+    // feat.jsonEscape, not appendJsonStr: that one drops control bytes, which
+    // would run the manifest's lines together.
+    feat.jsonEscape(&state, ar, manifest) catch return .unavailable;
+    state.appendSlice(ar, "\"}") catch return .unavailable;
+
+    // the chunks
+    var chunks: std.ArrayListUnmanaged(u8) = .empty;
+    var complete = true;
+    var nchunks: usize = 0;
+    var sbuf: [4096]u8 = undefined;
+    const src_dir = std.fmt.bufPrint(&sbuf, "{s}/src", .{dest}) catch return .unavailable;
+    var names_buf: [64][]u8 = undefined;
+    const srcs = listDir(init, src_dir, &names_buf) orelse return .unavailable;
+    for (srcs) |sname| {
+        var fb: [4096]u8 = undefined;
+        const fp = std.fmt.bufPrint(&fb, "{s}/{s}", .{ src_dir, sname }) catch continue;
+        const text = feat.readFile(ar, init.io, fp, SCREEN_FILE_CAP) catch {
+            complete = false;
+            continue;
+        };
+        var rel: [600]u8 = undefined;
+        nchunks += chunkSource(&chunks, std.fmt.bufPrint(&rel, "src/{s}", .{sname}) catch "src/?", text) catch return .unavailable;
+    }
+    if (nchunks == 0) return .unavailable;
+
+    // argv: env jevx -x RUBRIC -s STATE [--mock M]
+    const sz = ar.dupeZ(u8, state.items) catch return .unavailable;
+    const jz = ar.dupeZ(u8, jevx_bin) catch return .unavailable;
+    const rz = ar.dupeZ(u8, rubric) catch return .unavailable;
+    var argv: [9]?[*:0]const u8 = .{ "env", jz.ptr, "-x", rz.ptr, "-s", sz.ptr, null, null, null };
+    if (feat.env(ar, init.io, "ZISH_JEV_MOCK")) |m| {
+        argv[6] = "--mock";
+        argv[7] = (ar.dupeZ(u8, m) catch return .unavailable).ptr;
+    }
+    const out = execCaptureStdin(init, argv[0..8 :null], chunks.items) orelse {
+        print("gf: jev screen did not run (jevx failed: key? network?); trying the agent judge\n", .{});
+        return .unavailable;
+    };
+    if (!foldFlags(out, keys.items)) {
+        print("gf: jev screen output did not parse; trying the agent judge\n", .{});
+        return .unavailable;
+    }
+    const verdict = screenVerdict(keys.items, complete);
+
+    // result: {"verdict":..,"chunks":N,"flags":{"k":{"max":P,"at":"src/f:L"},..}}
+    var res: std.ArrayListUnmanaged(u8) = .empty;
+    var nb: [64]u8 = undefined;
+    res.appendSlice(ar, "{\"verdict\":\"") catch return .unavailable;
+    res.appendSlice(ar, verdict) catch return .unavailable;
+    res.appendSlice(ar, std.fmt.bufPrint(&nb, "\",\"chunks\":{d},\"complete\":{},\"flags\":{{", .{ nchunks, complete }) catch return .unavailable) catch return .unavailable;
+    for (keys.items, 0..) |f, i| {
+        if (i > 0) res.append(ar, ',') catch return .unavailable;
+        res.append(ar, '"') catch return .unavailable;
+        appendJsonStr(&res, f.key) catch return .unavailable;
+        res.appendSlice(ar, std.fmt.bufPrint(&nb, "\":{{\"max\":{d},\"at\":\"", .{f.max}) catch return .unavailable) catch return .unavailable;
+        appendJsonStr(&res, f.at) catch return .unavailable;
+        res.appendSlice(ar, "\"}") catch return .unavailable;
+    }
+    res.appendSlice(ar, "}}") catch return .unavailable;
+
+    const reviewer = feat.env(ar, init.io, "JEVX_MODEL") orelse "typesafe/jev-1.13";
+    reviewLedgerAppend(root, sha, "feat-review-jev-v1", reviewer, verdict, res.items);
+
+    // the highest flag, for the one-line report
+    var top = keys.items[0];
+    for (keys.items) |f| {
+        if (f.max > top.max) top = f;
+    }
+    print("gf: jev screen: verdict {s} over {d} chunks (highest: {s} {d:.2} at {s}; recorded in ledger)\n", .{ verdict, nchunks, top.key, top.max, top.at });
+    return if (std.mem.eql(u8, verdict, "escalate")) .escalate else .decided;
+}
+
 /// Exec `agent --judge` on the installed source and append the verdict. All
 /// failure paths are loud notes that leave the install intact and unreviewed.
 fn reviewInstalled(init: std.process.Init, root: []const u8, dest: []const u8, name: []const u8, sha: []const u8) void {
@@ -545,8 +816,13 @@ fn reviewInstalled(init: std.process.Init, root: []const u8, dest: []const u8, n
         print("gf: {s} is a binary package; skipping source review\n", .{name});
         return;
     }
+    switch (jevScreen(init, root, dest, sha)) {
+        .decided => return,
+        .escalate => print("gf: jev screen is unsure about {s}; escalating to the agent judge\n", .{name}),
+        .unavailable => {},
+    }
     var abuf: [4096]u8 = undefined;
-    const agent_bin = resolveAgentBin(root, &abuf) orelse {
+    const agent_bin = resolveFeatBin(root, "agent", &abuf) orelse {
         print("gf: no agent feat installed; install it to enable review-on-install\n", .{});
         return;
     };
@@ -624,8 +900,60 @@ fn reviewInstalled(init: std.process.Init, root: []const u8, dest: []const u8, n
     };
     defer parsed.deinit();
     const word = objStr2(parsed.value, "verdict") orelse "unknown";
-    reviewLedgerAppend(init, root, sha, word, out);
+    const model = feat.env(init.arena.allocator(), init.io, "ZISH_JUDGE_MODEL") orelse "deepseek/deepseek-v4-flash-0731";
+    reviewLedgerAppend(root, sha, "feat-review-v1", model, word, out);
     print("gf: reviewed {s}: verdict {s} (recorded in ledger)\n", .{ name, word });
+}
+
+test "chunkSource: top-level declarations packed, headed FILE:LINE, NUL-terminated" {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(alloc);
+    const n = try chunkSource(&out, "src/a.c", "int a(void) {\n  return 1;\n}\n\nint b(void) {\n  return 2;\n}\n");
+    try std.testing.expectEqual(@as(usize, 1), n); // small: packed into one
+    try std.testing.expect(std.mem.startsWith(u8, out.items, "// src/a.c:1\nint a(void)"));
+    try std.testing.expectEqual(@as(u8, 0), out.items[out.items.len - 1]);
+
+    out.clearRetainingCapacity();
+    var big: std.ArrayListUnmanaged(u8) = .empty;
+    defer big.deinit(alloc);
+    for (0..40) |k| {
+        try big.print(alloc, "int f{d}(void) {{\n", .{k});
+        for (0..10) |_| try big.appendSlice(alloc, "  something_long_enough_to_count();\n");
+        try big.appendSlice(alloc, "}\n\n");
+    }
+    const m = try chunkSource(&out, "src/b.c", big.items);
+    try std.testing.expect(m > 3);
+    var recs = std.mem.splitScalar(u8, out.items, 0);
+    while (recs.next()) |r| {
+        if (r.len == 0) continue;
+        try std.testing.expect(std.mem.startsWith(u8, r, "// src/b.c:"));
+        try std.testing.expect(r.len < 2 * CHUNK_TARGET + 600);
+    }
+}
+
+test "screen verdict: pass needs every flag low and a complete screen" {
+    var low = [_]Flag{ .{ .key = "a", .max = 0.05 }, .{ .key = "b", .max = 0.19 } };
+    try std.testing.expectEqualStrings("pass", screenVerdict(&low, true));
+    try std.testing.expectEqualStrings("escalate", screenVerdict(&low, false));
+    var mid = [_]Flag{ .{ .key = "a", .max = 0.05 }, .{ .key = "b", .max = 0.6 } };
+    try std.testing.expectEqualStrings("escalate", screenVerdict(&mid, true));
+    var high = [_]Flag{ .{ .key = "a", .max = 0.95 }, .{ .key = "b", .max = 0.1 } };
+    try std.testing.expectEqualStrings("fail", screenVerdict(&high, false));
+}
+
+test "foldFlags: per-flag max with the chunk header; malformed output is rejected" {
+    var flags = [_]Flag{ .{ .key = "exfil" }, .{ .key = "net" } };
+    const out = "0.1\t0.2\t// src/m.c:1\nint a;\x000.97\t0.05\t// src/m.c:40\nread(key);\x00";
+    try std.testing.expect(foldFlags(out, &flags));
+    try std.testing.expectEqual(@as(f64, 0.97), flags[0].max);
+    try std.testing.expectEqualStrings("src/m.c:40", flags[0].at);
+    try std.testing.expectEqual(@as(f64, 0.2), flags[1].max);
+    try std.testing.expectEqualStrings("src/m.c:1", flags[1].at);
+    var f2 = [_]Flag{ .{ .key = "a" }, .{ .key = "b" } };
+    try std.testing.expect(!foldFlags("0.1\tnot-a-number\t// x\x00", &f2));
+    var f3 = [_]Flag{.{ .key = "a" }};
+    try std.testing.expect(!foldFlags("7\t// x\x00", &f3));
+    try std.testing.expect(!foldFlags("", &f3));
 }
 
 // ===========================================================================
@@ -993,8 +1321,8 @@ fn fetchIndex(init: std.process.Init, idx_url: []const u8) ?[]u8 {
     var uz: [4096]u8 = undefined;
     const up = toZ(&uz, idx_url) orelse return null;
     const argv = [_:null]?[*:0]const u8{
-        "env",            "curl", "-fsSL",     "--max-time", "60", "--proto", "=http,https,file",
-        "--max-filesize", "4194304",           up,           null,
+        "env",            "curl",    "-fsSL", "--max-time", "60", "--proto", "=http,https,file",
+        "--max-filesize", "4194304", up,      null,
     };
     return execCapture(init, &argv);
 }
@@ -1629,7 +1957,8 @@ fn run(init: std.process.Init) u8 {
         {
             const argv = [_:null]?[*:0]const u8{
                 "env", "GIT_ALLOW_PROTOCOL=file:git:http:https:ssh", "GIT_TERMINAL_PROMPT=0",
-                "git", "clone", "--quiet", up, tp, null,
+                "git", "clone",                                      "--quiet",
+                up,    tp,                                           null,
             };
             if (execStatus(init, &argv) != 0) return fail("git clone failed: {s}", .{url});
         }
@@ -1687,10 +2016,7 @@ fn run(init: std.process.Init) u8 {
             const szp = toZ(&szz, szs) orelse return 1;
             const argv = [_:null]?[*:0]const u8{
                 "env",            "curl", "-fsSL", "--max-time", "300", "--proto", "=http,https,file",
-                "--max-filesize", szp,
-                "-o",             ap,
-                up,
-                null,
+                "--max-filesize", szp,    "-o",    ap,           up,    null,
             };
             const st = execStatus(init, &argv);
             if (st != 0) return fail("download failed (curl exit {d}): {s}", .{ st, url });

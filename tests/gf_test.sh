@@ -221,6 +221,76 @@ else
     printf '  \033[33mSKIP\033[0m review tests (agent feat did not build)\n'
 fi
 
+# ---- jev screen: the cheap first pass before the agent judge --------------
+# Stage the real jevx feat (driven by ZISH_JEV_MOCK, no network) and its
+# rubric. A clear pass or fail is recorded under feat-review-jev-v1 and ends
+# the review; an unsure screen is recorded AND escalates to the agent judge.
+echo "staging jevx feat for jev-screen tests..."
+mkdir -p "$T/feats/standard/jevx/bin" "$T/rubrics"
+if cp "$FEAT_BIN/jevx/bin/jevx" "$T/feats/standard/jevx/bin/jevx" 2>/dev/null; then
+    printf 'name = "jevx"\ntier = "standard"\nbin = "jevx"\n' > "$T/feats/standard/jevx/feat.toml"
+    cp -f feats/gf/rubrics/feat-review-jev-v1.jevx "$T/rubrics/feat-review-jev-v1.jevx"
+    cp -f feats/gf/rubrics/feat-review-v1.toml "$T/rubrics/feat-review-v1.toml"
+    jevmock() { # $1 = out file, then five P values for exfil net exec write hidden (one chunk)
+        python3 - "$@" <<'PY'
+import json, sys
+out, ps = sys.argv[1], [float(x) for x in sys.argv[2:]]
+keys = ["exfil", "net", "exec", "write", "hidden"]
+answers = {f"{k}.0": {"type": "noul", "noul": p} for k, p in zip(keys, ps)}
+body = {"model": "typesafe/jev-1.13-test", "answers": answers, "usage": {"input_tokens": 1, "output_tokens": 1}}
+open(out, "w").write(json.dumps({"status": 200, "body": json.dumps(body)}) + "\n")
+PY
+    }
+    jevmock "$T/jev-pass.jsonl" 0.01 0.02 0.01 0.03 0.04
+    jevmock "$T/jev-fail.jsonl" 0.97 0.98 0.10 0.10 0.98
+    jevmock "$T/jev-unsure.jsonl" 0.05 0.60 0.10 0.10 0.10
+    GFJ() { HOME="$T/home" ZISH_FEAT_PATH="$T/feats" ZISH_RUBRIC_DIR="$T/rubrics" \
+            ZISH_JUDGE_MOCK="$T/verdict-mock.jsonl" ZISH_JEV_MOCK="$1" "$T/gf" "file://$2"; }
+    jevpkg() { # $1 = name
+        S="$T/stage_$1"; mkdir -p "$S/src"
+        printf 'name = "%s"\ntier = "standard"\nbin = "%s"\nlang = "c"\nsrc = "main.c"\n' "$1" "$1" > "$S/feat.toml"
+        echo 'int main(void){return 0;}' > "$S/src/main.c"
+        pack "$S" "$T/$1.tar.gz"
+    }
+    shaof() { grep "\"name\":\"$1\"" "$L" | sed 's/.*"sha256":"\([0-9a-f]*\)".*/\1/'; }
+    reviews() { grep '"t":"review"' "$L" | grep "\"sha256\":\"$1\""; }
+
+    jevpkg jpass; GFJ "$T/jev-pass.jsonl" "$T/jpass.tar.gz" >"$T/out_jpass" 2>&1
+    grep -q "jev screen: verdict pass" "$T/out_jpass" && ok "clear screen: verdict pass reported" \
+        || bad "no jev pass in output: $(cat "$T/out_jpass")"
+    sha=$(shaof jpass)
+    reviews "$sha" | grep -q '"rubric":"feat-review-jev-v1".*"verdict":"pass"' \
+        && ok "jev pass recorded under feat-review-jev-v1, joined by sha256" || bad "no jev pass record"
+    reviews "$sha" | grep -q '"rubric":"feat-review-v1"' \
+        && bad "a clear pass still called the agent judge" || ok "a clear pass ends the review (no agent call)"
+
+    jevpkg jfail; GFJ "$T/jev-fail.jsonl" "$T/jfail.tar.gz" >"$T/out_jfail" 2>&1
+    grep -q "jev screen: verdict fail" "$T/out_jfail" && ok "red flags: verdict fail reported" \
+        || bad "no jev fail in output: $(cat "$T/out_jfail")"
+    reviews "$(shaof jfail)" | grep -q '"verdict":"fail".*src/main.c:1' \
+        && ok "the fail names the chunk that set it" || bad "fail record lacks the chunk location"
+    [ -x "$T/feats/extra/jfail/bin/jfail" ] && ok "the screen is advisory: install stands" \
+        || bad "a fail verdict blocked the install"
+
+    jevpkg junsure; GFJ "$T/jev-unsure.jsonl" "$T/junsure.tar.gz" >"$T/out_junsure" 2>&1
+    grep -q "escalating to the agent judge" "$T/out_junsure" && ok "an unsure screen escalates" \
+        || bad "no escalation: $(cat "$T/out_junsure")"
+    sha=$(shaof junsure)
+    reviews "$sha" | grep -q '"rubric":"feat-review-jev-v1".*"verdict":"escalate"' \
+        && ok "the escalation itself is recorded" || bad "no escalate record"
+    reviews "$sha" | grep -q '"rubric":"feat-review-v1"' \
+        && ok "and the agent judge then reviews it" || bad "escalation did not reach the agent judge"
+
+    printf '{"status":200,"body":"{\\"answers\\":{\\"exfil.0\\":{\\"type\\":\\"noul\\"}}}"}\n' > "$T/jev-bad.jsonl"
+    jevpkg jbad; GFJ "$T/jev-bad.jsonl" "$T/jbad.tar.gz" >"$T/out_jbad" 2>&1
+    reviews "$(shaof jbad)" | grep -q '"rubric":"feat-review-jev-v1"' \
+        && bad "a malformed jev answer produced a screen verdict" \
+        || ok "a malformed jev answer is no screen (falls back to the agent judge)"
+    rm -rf "$T/feats/standard/jevx"
+else
+    printf '  \033[33mSKIP\033[0m jev-screen tests (jevx feat did not build)\n'
+fi
+
 # ---- gf status: the read-side fold ----------------------------------------
 # Agent rendering (--json) must be parseable and carry the review verdict;
 # human rendering must show the feat and a verdict word.
