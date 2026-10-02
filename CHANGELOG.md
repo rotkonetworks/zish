@@ -1,435 +1,165 @@
 # changelog
 
-## v0.25.0
-
-Arithmetic, and the silence around it. `$(( ))` mis-evaluated every expansion
-its parser could not tokenize and said nothing about it; a script could also
-state the feats it depends on and be held to them.
+## unreleased
 
 ### added
-- **`# zish-deps:` — a script states the feats it needs, and zish holds it to
-  that before running it.** The line is a comment, so bash and older zish
-  ignore it and the file stays a valid shell script. zish parses the leading
-  comment block when it runs the script — script mode, a `#!` line pointing at
-  zish, and the ENOEXEC fallback all bind through `Shell.runScriptFile`, so no
-  entry point can miss it — and a dependency that does not resolve refuses the
-  run (127, nothing executed), naming the missing feats and the roots that were
-  searched. `feat run` checks the target's own header before exec, so a script
-  feat (`twap`) gates on `web jget calc pen rand` even though its bin is a
-  script. `feat deps <file|->` reports the same statically (`tier\tname\tpath`,
-  exit 0 only if all resolve) — the check the deploy used to make by diffing
-  `feat list` against a hand-kept list. `feat need <name>...` is the runtime
-  half: resolve now, answer with the exit status, never exec what it resolved.
-  `extra` deps are refused (§1.3); the body/heredoc is never mistaken for a
-  declaration; the `zish-` namespace is reserved in the leading block, so a typo
-  (`# zish-dep: web`) is an error rather than a silent "no dependencies"; and 23
-  cases in `tests/regress.sh` pin all of it.
+- `.deb` for Debian, Ubuntu and Proxmox (amd64, arm64), built and install-tested
+  in CI and attached to each release.
+- `jevx` feat: typed decisions from a model, one line each.
+- `gf` runs a jev screen before the agent review on install.
+
+### changed
+- Release binaries are static musl, so they run on any Linux distro.
+- Feats are tiered: `core` (ships with the shell), `tooling`, `all`. Select with
+  `-Dfeats=`.
+- `pen` and `aur` moved to the rotko-feats repo and install through `gf`.
+- README rewritten to be shorter.
+
+## v0.25.2
 
 ### fixed
-- **`$(( ))` silently mis-evaluated every expansion its parser could not
-  tokenize.** ArithParser handled `$name`/`${name}` only: `${x:-0}`, `${x:+9}`,
-  `${x}${x}`, `$(cmd)` and backticks all raised SyntaxError, which
-  `evaluateArithmetic` converts to 0 *without a message* — so `$(( ${x:-0} + 1 ))`
-  was 0 while bash says 6, and an adjacent expansion was truncated rather than
-  concatenated (`$(( ${x}${x} + 1 ))` was 5 where bash says 56). Bash's model is
-  simpler than the special cases it suggests: expand the expression *text*, then
-  evaluate the result. That is now one step in one place:
-  `arith.evaluateArithSource` expands the source text through the shell's own
-  expander and hands the parser a string of numbers and operators. Every entry
-  point goes through it: `$(( ))`, the `(( ))` command, all three clauses of a
-  C-style `for`, an array subscript, and `x=$(( ))`. The parser's own `$` case
-  is gone (a `$` reaching it means a caller skipped the expansion), and so is
-  eval.zig's private `expandArithmeticVars` — a second, smaller copy of the
-  expansion rules, and how the `echo $(( ))` fast path diverged from `$(( ))`;
-  that fast path now defers to the full expander whenever the expression carries
-  an expansion.
+- Words after a redirection (`echo a 2>/dev/null b`) and redirect-only commands
+  (`>file`) were parse errors.
+- `printf -- fmt` strips the `--`.
+- `echo $x` field-splits and globs the unquoted expansion.
+- `$$` is the shell's pid, fixed at startup, so it is the same in subshells and
+  command substitution.
 
-  Expanding the text first also makes the substitution *textual*, as bash's is:
-  with `x="1+2"`, `$(( $x * 2 ))` is `1+2*2` = 5 (zish said 6 — it evaluated the
-  expansion as a value). A *bare* `x` is still a variable reference whose value
-  is re-evaluated as an expression, so `$(( x * 2 ))` stays 6, like bash. Nested
-  `$(( $((1+2)) * 2 ))` works for the same reason. Radix (`16#ff`, `2#1010`),
-  octal, `**`, ternary and the shell operators already agreed with bash across a
-  43-expression differential probe; the fix is pinned by twenty-seven
-  `same_as_bash` cases in `tests/regress.sh` — twelve of them fail on v0.24.0.
+## v0.25.0
 
-- **An arithmetic failure was silent, and one of them was a segfault.**
-  `evaluateArithmetic` mapped every parse failure to 0 with no message — which
-  is precisely how both halves of the expansion bug above survived two releases
-  — so `$(( 1 + ))` was 0, status 0. The evaluator now returns typed errors
-  (`ArithSyntax`, `DivideByZero`, `ArithRecursion`); one place reports them,
-  naming the expression the way bash does, and the failure propagates to the
-  shell's boundaries, which fail *quietly* because it has already been said.
-  The result matches bash case for case: an expansion error is fatal to a
-  non-interactive shell (`echo $(( 1 + ))` runs nothing and exits 1), the
-  command forms `(( ))` and `for (( ;; ))` are status 1 and the script
-  continues, a subshell or pipeline stage exits 1, and an interactive shell
-  fails the command and comes back with a prompt — that last one has a pty
-  regression, because a naked `try` in the REPL loop would have killed the
-  shell under the user's hands.
+### added
+- `# zish-deps: web calc` in a script's header names the feats it needs. If one
+  is missing, zish refuses to run the script (status 127) and says which.
+  `feat deps <file>` checks statically, and `feat need <name>` checks at runtime.
 
-  Two crashes fell out of the same silence. `a=b; b=a; $(( a ))` recursed —
-  a variable's value is re-evaluated as an expression — until the stack gave
-  out: a **segfault**, now bash's "expression recursion level exceeded" at a
-  depth of 1024. And a literal wider than 64 bits (`36#zzzzzzzzzzzzzzzz`) hit a
-  checked multiply: a ReleaseSafe **panic** from one line of arithmetic. Digits
-  are now accumulated in 64 wrapping unsigned bits and reinterpreted, like
-  bash — which also fixes `9223372036854775808` (INT_MIN's own text, written
-  into a variable and read back), `0xffffffffffffffff`, and bases above 36
-  (`62#Z`, `64#_`), where bash's uppercase letters are digits 36-61.
-- **An array subscript is an arithmetic expression.** zish read it as a literal
-  decimal, so `$(( a[1] ))` was 0, `${a[i+1]}` expanded to nothing (the `+`
-  ended the name the scanner was reading), `${a[${#a[@]}-1]}` took the first
-  `]` it saw and returned the wrong element, and a negative index wrapped into
-  a huge one instead of counting from the end. Subscripts are now one concept
-  in the evaluator (an `LValue` — `a`, `a[0]` and `a[i+1]` are the same thing
-  with and without an index, so `=`, `+=`, `++` and a bare read get arrays for
-  free) and one pair of helpers in the expander, shared with `a[i]=v` so the
-  reader and the writer cannot disagree: `${a[-1]}` and `a[-1]=x` mean the
-  last element, and an out-of-range negative is bash's "bad array subscript".
-- **`x=$((1+2))$((3+4))` assigned 3, not 37.** The assignment fast path matched
-  a value that merely *starts* with `$((` and *ends* with `))`, so two adjacent
-  expansions looked like one and it evaluated `1+2))$((3+4`. It now balances
-  the parens and takes the path only when one expansion covers the whole word.
-  The fast path stays because it earns it: 200k `n=$((n+1))` iterations run in
-  0.106s with it and 0.114s without (min of 7; bash 0.34s).
+### fixed
+- `$(( ))` evaluated `${x:-0}`, `${x}${x}`, `$(cmd)` and backticks to 0 without
+  an error. The expression text is now expanded first, then evaluated, as in
+  bash, so `x="1+2"; $(( $x * 2 ))` is 5.
+- Arithmetic errors were silent. They now print bash's message, and they're
+  fatal in a non-interactive shell, as in bash.
+- `a=b; b=a; $(( a ))` segfaulted. It now stops at depth 1024 with bash's
+  "expression recursion level exceeded".
+- A literal wider than 64 bits panicked. It now wraps, as in bash.
+- An array subscript is an arithmetic expression: `${a[i+1]}`,
+  `${a[${#a[@]}-1]}` and `${a[-1]}` work.
+- `x=$((1+2))$((3+4))` assigned 3 instead of 37.
 
 ## v0.24.0
 
-Conformance and ownership. Two POSIX behaviours bash has and zish did not, and
-one owner for building a feat — of which there were three, and they disagreed.
-
 ### added
-- **A file with no shebang runs as a script.** POSIX requires the shell to
-  interpret a file `exec` refuses with ENOEXEC; zish said `command not found`.
-  It now runs in the forked child through a fresh non-interactive shell —
-  arguments through, `$0`/`$1…` bound, status propagated — with bash's state
-  semantics: exported variables and the cwd carry over, unexported shell state
-  does not. A missing file is still 127 and a valid shebang still execs. The
-  interpreter lives in one place (`Shell.runScriptFile`), shared with
-  `zish <script>`, so the two cannot drift.
-- **`set -f` / `set -o noglob`.** Pathname expansion had no switch at all.
-  `-f`/`+f` and the long forms work, patterns reach the command verbatim,
-  subshells inherit without leaking to the parent, and `$-` carries `f` while
-  set. `$-`/`${-}` are implemented too, reporting only the options zish
-  actually honours (`e`, `u`, `x`, `f`) — printing bash's `h`/`B`/`c` would be
-  a letter a script could test and get a wrong answer from.
-- Binary-looking files (a NUL in the first 80 bytes, bash's own rule) are
-  refused with 126 instead of being fed to the parser, for both
-  `<file>` as a command and `zish <file>`.
-- `tests/feat_leaks_test.sh` — every feat's happy path must not print an
-  allocator leak report.
+- A file without a shebang runs as a script (POSIX ENOEXEC behaviour).
+- `set -f` / `set -o noglob`, and `$-`.
+- Binary files are refused with 126 instead of being parsed.
 
 ### fixed
-- **Seven feats leaked their argv slice** (`toSlice(init.gpa)`), and `cnt` leaked
-  the whole file it had just counted. ReleaseSafe's allocator reports these on
-  stderr at exit; nothing saw it because the dev staging compiled with
-  `-O ReleaseFast`, where the tracking is compiled out, so only the shipped
-  build showed it. argv now lives in `init.arena` — freed by the runtime at
-  exit — and `cnt`'s buffer is freed on both branches.
+- Seven feats leaked their argv, and `cnt` leaked the file it counted.
 
 ### changed
-- **`build.zig` is the only thing that compiles a feat.** The Makefile kept a
-  second list and the test suites a third, and all three had drifted: the
-  Makefile shipped `bus` that build.zig omitted; build.zig linked libc for eight
-  feats the Makefile said needed none *and* 0.23.0's notes claimed were
-  libc-free; and each suite passed its own `-lc`, so the suites validated a
-  differently linked binary than any install ships. There is now one list, one
-  libc decision (`para`, for `execvp`), `-Dfeats=core|all|<names>` for the set
-  and `-Dfeat-layout=system|registry` for the two install shapes. Every suite
-  execs the artefact `zig build` produced, and `zig build test` runs each feat's
-  own unit tests — previously two of sixteen had any, which is how a leaking
-  `ask` test went unnoticed until it was wired in.
-- **A feat's data belongs to the feat, and travels inside it.** The rubrics moved
-  from the repo root (they are not core software — `src/` references one
-  nowhere) into `feats/<name>/rubrics/`, and are compiled in with `@embedFile`
-  the way the shared library already is. That is what makes them reach every
-  install: a file staged beside the binary has to be re-delivered by each
-  packager, and `gf install` — whose package format is `feat.toml` plus one
-  payload directory — delivered none at all. Overrides are unchanged and still
-  win: `ZISH_RUBRIC_DIR`, then `~/.zish/rubrics`. `ZISH_LENS_FILE` and
-  `ZISH_EXPERTS_FILE` are gone; `ZISH_RUBRIC_DIR` already did that job.
-- **nix builds `--release=safe`.** It used `--release=fast`, so nix users were
-  the only ones without the bounds/overflow/alignment checks that build.zig's
-  own comment calls the difference between a crash and an exploitable primitive.
-  The package version is now read from `build.zig.zon` (the file said 0.22.0),
-  and the fixed-output `zig build --fetch` derivation is gone — there are no Zig
-  dependencies left to prefetch.
+- `build.zig` is the only place that compiles feats. The Makefile and test
+  suites had their own lists, and those had drifted.
+- Feat rubrics are compiled into the feat binary.
+- The nix build uses `--release=safe` (it was `fast`).
 
 ## v0.23.1
 
-Two ways the shell was quietly wrong, and the feats actually reaching a fresh
-install. 0.23.0 shipped a catalog a machine could not read, a lexer that
-rewrote words across a continuation, and an AUR package with no feats in it.
-
 ### fixed
-- **A line continuation rewrote the word before it.** The lexer's double buffer
-  was rotated once per *scan*, so a scan that emitted no token — a continuation,
-  a comment — consumed a rotation for nothing, and `buf_idx` came back around to
-  the buffer still holding the last *emitted* token. The parser holds one token
-  of lookahead, so those bytes were still live, and the next word's leading
-  bytes landed on top of them:
-
-      echo 'xaa' \
-        "A"
-
-  printed `Aaa A`; bash prints `xaa A`. It needed a *quoted* word directly
-  before the continuation — an unquoted word is a slice of the input, not the
-  buffer — which is why it survived this long, and why it read as a `printf`
-  bug at first. Rotation now happens per emitted token, so two consecutive
-  emitted tokens never share a buffer. This silently corrupted multi-line
-  commands, and a harness that routes its commands through `zish -c` writes
-  printf formats, sed and jq filters across lines with quotes.
-- **`feat list --json` emitted `"summary":""`** for every feat that declared
-  only `help` — 19 of the 20 shipped ones — so the machine-readable catalog an
-  agent picks tools from was a list of names with blank descriptions.
-  `summary` now falls back to `help`: a manifest may still curate a terser
-  phrase, and a blank entry now means the feat genuinely describes nothing.
-- **`feat -h` / `feat list -h`, and every error path, print the usage line**, so
-  the natural mistake `feat --json=full` — the flag belongs to `list` — is
-  corrected rather than answered with `unknown subcommand`.
+- A line continuation after a quoted word corrupted that word
+  (`echo 'xaa' \` then `"A"` printed `Aaa A`).
+- `feat list --json` had empty summaries.
+- `feat` errors print the usage line.
 
 ### changed
-- **The AUR package ships the standard feat set.** It installed only the binary,
-  so a fresh install had an empty `feat list` and no way out of it: `gf`, the
-  feat that installs feats, is itself one of them. The feats now install to
-  `<prefix>/share/zish/feats/standard` — the path the shell derives from its own
-  location, searched after `~/.zish/feats`, so a user feat still shadows a
-  shipped one. The PKGBUILD builds them through the repo's own `make feats`,
-  which already owns which feats exist and which need libc.
-- `make feats` takes `ZISH_RUBRIC_DIR`, so a package build stages rubrics in the
-  build tree instead of writing into the builder's `$HOME`.
+- The AUR package ships the standard feats in `/usr/share/zish/feats`.
 
 ## v0.23.0
 
-The shell stops disagreeing with bash in ways nobody asked about, feats stop
-linking libc, and an agent can finally see what its workers cost. Everything
-here came out of running zish under real work for a day rather than auditing it.
-
 ### added
-- **`feats/lib/feat.zig`** — a primitives-only shared library (env, slurp,
-  terse output, JSON escaping, atomic publish, exit-code constants). Feats no
-  longer each re-implement the same six helpers, which is where the conventions
-  drifted. Imports go through a per-feat relative symlink, because Zig confines
-  an import to the root file's own directory tree.
-- **`bus`** — a durable message log between agents. One message is one file
-  created `O_EXCL`, so publishing is atomic with no locking and a reader never
-  sees a partial record; names are zero-padded microseconds, so lexicographic
-  order is chronological and a cursor is just the last name seen. A subscriber
-  that was not connected still gets the history. Threads are a record field,
-  never part of the channel name.
-- **`feat list -n | --json | --json=full`** — a machine-readable catalog,
-  ordered by tier then name, so a harness can render its own tool schema from
-  the shell instead of hardcoding one.
-- **`session list --json`**, and a **`usage` frame**: a hosted agent reports
-  per-turn token spend, the host keeps the running totals in `.meta`, and the
-  transcript records per-turn deltas with the cumulative totals on `end`. A
-  finished session now keeps its registry record (with its cost) for an hour
-  instead of vanishing.
-- **`zish --version --json`** — a capability probe (version, build mode, frame
-  protocol, feature list), so a harness can tell "this binary predates the
-  feature" from "the feature is broken".
-- **`agent --turns N`** — the turn budget is the caller's to set, via the flag
-  or `ZISH_AGENT_MAX_TURNS`. It was a hardcoded constant that a commander could
-  not raise, which killed a real run mid-collection.
+- `feats/lib/feat.zig`, a shared helper library for feats.
+- `bus` feat: a durable message log between agents.
+- `feat list --json`, `session list --json`, `zish --version --json`.
+- `agent --turns N`.
 
 ### fixed
-- **argv is sized to the command.** It was a 256-slot stack array: a longer
-  expansion silently *dropped* the tail of the argument list, and the other
-  path printed its error to **stdout**, so `ls big-glob | wc -l` counted the
-  message as data and reported 1 with exit 0.
-- **Parser limits derive from the input**, not from constants. `MAX_ARGS_COUNT
-  = 256` and `max_nodes = 1024` refused ordinary programs — a 300-argument
-  command and a 401-line script — long before any adversarial input.
-- **A case arm may be empty** (`a) ;;` is a legal no-op in bash and dash; zish
-  failed the whole script with `EmptyError`).
-- **`printf` `*` takes its width and precision from the arguments.** It was
-  parsed as the unknown conversion `*` plus a literal `s`, so
-  `printf '[%*s]' 5 x` printed `[s][s]` — on the padding idiom, in a builtin.
-- **Eight feats no longer link libc.** They linked it only because Zig 0.16
-  removed `std.posix.getenv`; `FEAT_LIBC` is now `para` alone, which genuinely
-  needs `execvp`. `feat.env` reads `/proc/self/environ` instead.
-- **Feats restore SIGPIPE.** Full `std.process.Init` installs a no-op handler
-  for its io layer, so a feat whose reader went away exited 0 instead of 141.
-- **`web fetch` reports a failed fetch** (it discarded curl's exit status, so a
-  DNS failure or timeout looked like an empty page with exit 0).
-- **`budget tree` no longer drops accounts** whose id overflowed a fixed 512-byte
-  row buffer — the row was appended as *nothing*, with exit 0.
+- Commands with more than 256 arguments lost the extra arguments.
+- The parser refused commands over 256 arguments and scripts over about 400 lines.
+- An empty case arm (`a) ;;`) was a parse error.
+- `printf '%*s'` ignored the `*` width.
+- Feats exited 0 instead of 141 on SIGPIPE.
+- `web fetch` hid curl failures.
+- `budget tree` dropped long account ids.
 
 ## v0.22.0
 
-Feats now ship with zish, and gf is a real package manager. Rolls up 0.21.x.
-
 ### added
-- **Feats ship with the shell.** The core set — the zero-dep utilities `cnt pk
-  frq snf jls calc para` plus `gf` — installs beside the binary and resolves out
-  of the box (a second, read-only system tier alongside `~/.zish/feats`). The
-  heavier feats (`agent team web aur budget verify ask`) install on demand.
-  Selectable with `-Dfeats=core|all`; Nix exposes `zish` and `zish-full`.
-- **`gf` — the feat package manager.** `gf install <name>` / `gf setup` / `gf
-  list` / `gf remove` / `gf settings`, against a signed, sha-pinned index.
-  ZFS-style CLI: booleans, get/set, exit codes 0/1/2. Untrusted installs are
-  quarantined, and the AUR build-script hole is closed (recipes are data, not
-  code). Feat binaries are static musl, so they run anywhere, NixOS included.
-- **`agent edit`** — a stdin→stdout region filter for editors; the captain
-  conversation reads a piped message, so it composes as a filter too.
+- Core feats ship with the shell; more install on demand.
+- `gf`, the feat package manager, using a sha-pinned index.
+- `agent edit`, a stdin-to-stdout filter for editors.
 
 ### fixed
-- First `gf install` on a fresh system (no `~/.zish` yet) failed — `mkdir -p` is
-  now recursive.
-- AUR publish failed on host-key verification: ssh read `/root/.ssh` (getpwuid)
-  while the workflow wrote `$HOME/.ssh`. Pinned by absolute path now, via
-  `GIT_SSH_COMMAND`.
-- CI: `OLDPWD` unbound in `regress.sh` under `set -u`; removed the macOS builds.
+- The first `gf install` on a fresh system failed.
+- AUR publishing failed on ssh host-key verification.
 
 ## v0.20.1
 
-Correctness fix release over 0.20.0. Recommended for everyone: two of these
-are glob bugs that silently returned the wrong thing.
-
 ### fixed
-- **glob with a wildcard before the last `/` never expanded.** `*/main.zig`,
-  `src/*/x.zig`, `*/`, `[ab]*/file` all came back as the literal pattern,
-  because expansion split at the last slash and tried to open the directory
-  half literally — there is no directory called `*`. Patterns now expand one
-  component at a time. A trailing `/` keeps directories only and a leading
-  `//` is preserved, as in bash.
-- **`**/name` never matched.** The recursive walker kept the `/` on its
-  suffix and compared `/name` against filenames.
-- **`-` builtin printed garbage.** It changed to `$OLDPWD` correctly but
-  printed the path after the buffer it pointed into had been freed
-  (use-after-free; the bytes were whatever the allocator did next).
-
-Regression cases for all three are in `tests/regress.sh`, differential
-against bash where bash pins the answer.
+- Globs with a wildcard before the last `/` (`*/main.zig`) did not expand.
+- `**/name` never matched.
+- `cd -` printed garbage (use-after-free).
 
 ## v0.16.1
 
-Correctness fix release. Recommended for anyone on 0.16.0.
-
 ### fixed
-- **`$(( ))` silently evaluated `$var` to 0.** The arithmetic parser had no
-  case for `$`, so it raised a syntax error that was converted to 0 without
-  any message. `$((x * 2))` was correct but `$(($x * 2))` was 0, and every
-  positional parameter in arithmetic was 0 — so
-  `double() { echo $(($1 * 2)); }` returned zeros for every argument. It only
-  ever worked because an earlier expansion pass usually substituted the
-  variable first; for a word containing `*` that pass is skipped.
-- feats could not be invoked as ordinary commands: `feat run calc 2+2` worked,
-  `calc 2+2` was "command not found"
-- the pipeline fast path exec'd without checking PATH, so `echo 1+1 | calc`
-  failed with 127 while `calc 1+1` worked
-- `compat.posix.fstat` asserted `unreachable` on EBADF, which made probing a
-  possibly-unopened descriptor a panic
+- `$(($x * 2))` and `$(($1 * 2))` evaluated to 0.
+- Feats could not be run by name (`calc 2+2`), only through `feat run`.
+- A crash when probing a closed file descriptor.
 
 ### added
-- **`calc` feat** — float arithmetic, which `$(( ))` cannot do at all
-  (`$((3/2))` is 1, `$((2**0.5))` is a syntax error). f64 throughout, real
-  division, `sqrt`/`ln`/`log(base,x)`/trig, hex and binary literals. Errors
-  exit non-zero with nothing on stdout, so `x=$(calc ...)` is a number or
-  empty, never a wrong number.
-- feats now resolve as plain commands, as a fallback after builtins, functions
-  and PATH — a feat can never shadow a real binary
-- **session trace on fd 3** — one JSON record per top-level command
-  (`zish -c 'make test' 3>trace.jsonl`), so a program driving zish never has to
-  parse ANSI escapes to learn what happened
-- gguf: metadata nesting depth is bounded and `general.alignment` validated;
-  both were crashes reachable from a downloaded model file
-
-### changed
-- README benchmark claim corrected from "3-7x" to the measured **1.5-2x**
-- docs no longer describe the removed LLM agent
-- CI now runs `tests/regress.sh` and `bench.sh` and cross-builds for
-  aarch64-linux
+- `calc` feat for floating-point arithmetic.
+- fd 3 trace: one JSON line per command.
 
 ## v0.16.0
 
-security and correctness release. upgrading is recommended for all users.
-
 ### security
-- **tab completion no longer runs a shell.** completion probed `<word> --help`
-  by building a `/bin/sh -c` string, so shell metacharacters in a typed or
-  pasted word executed on TAB — before you pressed enter. now spawned as argv
-  with stdout/stderr merged over one pipe, plus a strict allowlist on probe
-  names. affected `--help` and man-page lookups.
-- gguf model files are now parsed defensively: lengths and counts read from the
-  file are bounded against the file size before reaching an allocator, tensor
-  offsets are validated against the mapping, and `numElements` saturates
-  instead of overflowing. a malicious model could previously crash the parser.
-- lexer: fixed an out-of-bounds write when a word longer than
-  `MAX_TOKEN_LENGTH` was followed by a backslash escape.
-- crypto: password buffers are wiped on the stack and before being freed.
+- Tab completion ran a shell to probe `--help`, so metacharacters in a typed
+  word executed on TAB. It now uses argv with an allowlist.
+- Lexer out-of-bounds write on long words followed by a backslash.
+- Password buffers are wiped.
 
 ### fixed
-- `( a; b )`, `cmd | { a; b; }` and `( a; b ) &` ran only the first command and
-  silently discarded the rest
-- forked children corrupted the heap by freeing inherited allocations with a
-  different allocator (`( cd / )` was enough to trigger it)
-- here strings deadlocked above ~64 KiB and leaked a descriptor on write
-  failure; they now use a temp file, as heredocs already did
-- `$(( minInt / -1 ))` and 19-digit integer literals crashed safe builds and
-  produced wrong answers in release builds
-- `tcsetpgrp` asserted `unreachable` on recoverable errno values, crashing the
-  shell on a job-control race
-- job notifications (`[1] 1234`) went to stdout in non-interactive mode,
-  corrupting the output of scripts using `&`; now stderr, interactive only
-- cursor-shape and bracketed-paste escapes were written to a non-tty stderr
-- glob: missing length guard on directory entry names
+- `( a; b )`, `cmd | { a; b; }` and `( a; b ) &` ran only the first command.
+- Heap corruption in forked children (`( cd / )`).
+- Here-strings over 64 KiB deadlocked.
+- `$(( minInt / -1 ))` crashed.
+- A job-control race crashed the shell.
+- Job notices went to stdout in scripts.
 
 ### added
-- ghost text is now two-tone: the part completing the token you are typing is
-  cyan, the rest is italic gray, so a suggestion never reads as committed input
-- committed flags render in their own color instead of ghost gray
-- `ctrl+o` toggles ghost autosuggestion, `alt+e` accepts one character of it
-- `feat` builtin, and `make feats` to build and stage the standard feats
-- `flake.nix` — NixOS package, NixOS module and dev shell
-- `install.sh` — detects the platform, prefers your package manager, and
-  verifies the release binary against published checksums before installing
-- release builds now publish `SHA256SUMS-<target>` alongside each binary
-- `tests/regress.sh` — end-to-end regression suite, including differential
-  tests against bash and interactive tests for the completion attack surface
-- `zig build fuzz` — fuzz targets for the parser, lexer, arithmetic evaluator,
-  glob matcher and gguf parser, driven by both a randomized sweep and
-  `std.testing.fuzz`
-- `docs/security.md` — threat model and audit results
-- `LICENSE` (MIT, matching what the package metadata already declared)
+- Two-tone ghost text, `ctrl+o` to toggle it, `alt+e` to accept one character.
+- `feat` builtin, `flake.nix`, `install.sh` with checksum checks.
+- `tests/regress.sh`, `zig build fuzz`, `docs/security.md`, MIT `LICENSE`.
 
 ## v0.7.0
 
-production ready release.
-
 ### changed
-- vim mode is now always-on hybrid: vim text objects + emacs keys (ctrl+a/e/u/w) + arrow keys
-- removed `set vim on/off` toggle - vim is always available
-- removed ctrl+t vim toggle keybind
-- ctrl+right/left now use WORD boundary (stop at whitespace)
+- Vim mode is always on, alongside emacs keys.
+- `ctrl+left`/`ctrl+right` move by whitespace-separated word.
 
 ### added
-- ctrl+w deletes word backward in insert mode
+- `ctrl+w` deletes the previous word.
 
 ### fixed
-- completion menu cursor positioning (no longer jumps to bottom)
-- completion cycling display (proper redraw instead of garbled output)
-- bracketed paste escape codes now go to stderr (no longer captured by redirects)
-
-### removed
-- ~710 lines of dead code (highlight.zig, bookmark feature)
-- duplicate builtins list (completion now uses keywords.zig)
+- Completion menu cursor and redraw.
+- Bracketed-paste escapes no longer get captured by redirects.
 
 ## v0.6.4
 
-- fix completion display bugs
-- add ctrl+backspace for word delete
+- Completion display fixes, `ctrl+backspace`.
 
 ## v0.6.3
 
-- escape sequence handling fixes
-- aur package release
+- Escape-sequence fixes, AUR package.
 
 ## v0.6.0
 
-- initial public release
-- vim modal editing with text objects
-- git prompt integration
-- tab completion
-- persistent history
+- First public release: vim editing, git prompt, completion, history.
