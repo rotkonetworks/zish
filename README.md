@@ -1,198 +1,97 @@
 # zish
 
-**A fast, familiar shell written in Zig — built to be handed to an agent.**
+A POSIX/bash-compatible interactive shell written in Zig. Linux only.
 
-[![release](https://img.shields.io/github/v/release/rotkonetworks/zish?style=for-the-badge&logo=github&label=GitHub&color=24292e)](https://github.com/rotkonetworks/zish/releases/latest)
-[![AUR](https://img.shields.io/aur/version/zish?style=for-the-badge&logo=archlinux&label=AUR&color=1793d1)](https://aur.archlinux.org/packages/zish)
-[![Nix](https://img.shields.io/badge/Nix-flake-5277C3?style=for-the-badge&logo=nixos&logoColor=white)](https://github.com/rotkonetworks/zish#install)
-[![license](https://img.shields.io/github/license/rotkonetworks/zish?style=for-the-badge&color=green)](LICENSE)
+Your bash scripts and habits keep working. It runs shell code 1.2–1.8x faster
+than bash, and it can lock a session down with Landlock and seccomp, which is
+useful when the thing typing commands is an agent.
 
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/rotkonetworks/zish/main/install.sh | sh
+paru -S zish                                    # Arch (AUR)
+nix profile install github:rotkonetworks/zish   # Nix
+sudo apt install ./zish_*_amd64.deb             # Debian/Ubuntu/Proxmox, from the releases page
 ```
 
-Detects your platform, uses your package manager if zish is packaged for it,
-otherwise installs a release binary — and refuses to install one whose checksum
-it can't verify.
+Or `sh install.sh` (it checks the release checksum), or build from source with
+Zig 0.16: `zig build --release=safe`.
 
-<details>
-<summary>Prefer not to pipe curl into sh? (you're right)</summary>
-
-Piping a script from the network into a shell runs code you never saw. It's the
-convenient option, not the safe one, and this project spends a lot of effort on
-not executing things you didn't ask for — so here's the honest version:
-
-```sh
-curl -fsSLO https://raw.githubusercontent.com/rotkonetworks/zish/main/install.sh
-less install.sh          # ~170 lines, readable in a minute
-sh install.sh
-```
-
-Or skip the script entirely:
-
-```sh
-paru -S zish                                       # Arch (AUR)
-nix profile install github:rotkonetworks/zish      # Nix / NixOS
-zig build --release=safe                           # from source
-```
-</details>
-
-Your muscle memory and your POSIX/bash scripts keep working. It's a single
-binary with no interpreter startup, so it starts and runs quicker —
-**roughly 1.2–1.8x faster than bash**:
-
-| benchmark | vs bash |
-|---|---|
-| command substitution | 1.8x ± 0.3 |
-| conditionals | 1.5x ± 0.3 |
-| case | 1.4x ± 0.3 |
-| arithmetic | 1.4x ± 0.3 |
-| nested loops | 1.4x ± 0.3 |
-| for + function call | 1.4x ± 0.3 |
-| variables | 1.4x ± 0.3 |
-| functions | 1.4x ± 0.3 |
-| pipelines | 1.2x ± 0.1 |
-
-Measured on the **`--release=safe`** binary, which is what ships. Unchecked
-(`--release=fast`) is roughly 1.3–2.0x instead — the difference buys bounds,
-overflow and alignment checks, which is a trade worth making in a shell an
-agent drives.
-
-Reproduce with `./bench.sh` (hyperfine; all shells run `--norc`/`--no-rcs`
-from `/bin/sh`). The error bars are wide relative to the gaps, and numbers move
-5–10% between runs on the same machine, so treat these as "consistently faster,
-not dramatically faster" rather than precise figures. Pipelines are the weakest
-case, because the cost there is `fork`/`exec` and the kernel, not the shell.
-
-`bench.sh` validates every result against bash *before* timing, so a
-wrong-but-fast answer fails instead of scoring well. That check is what caught
-a real arithmetic bug in 0.16.0, which is the main reason it exists.
-
-Linux only.
-
-## Try it
+## Use
 
 ```sh
 zish                 # interactive
-zish -c 'echo hi'    # one-shot
-zish --version       # prints the build mode too: zish 0.16.1 (ReleaseSafe)
-man zish             # full documentation
-```
-
-To make it yours:
-
-```sh
+zish -c 'echo hi'    # one command
+man zish             # full docs, including the keymap
 cp example.zishrc ~/.zishrc
 ```
 
-## What works
+You get pipes, redirects, `$(…)`, `$((…))`, `${v:-x}`, `${v//a/b}`, `[[ ]]`,
+arrays, functions, job control, globs, heredocs and process substitution.
+Interactively: vim and emacs keys at the same time (`Esc` for vim), syntax
+highlighting, a git prompt, completion that reads `--help`, and history
+suggestions shown as grey text (`Right` accepts, `ctrl+o` toggles).
 
-Everything you'd expect from a POSIX shell: pipes, redirects, `&&`/`||`,
-`$(cmd)`, `$((math))`, `${VAR:-default}`, `[[ ]]`, functions, job control,
-globbing, heredocs.
+Not supported: `typeset`/associative arrays, zsh expansion flags like `${(k)a}`,
+glob qualifiers, `zle`/`compsys`. Arrays are 0-based like bash. A zsh script
+that indexes arrays will silently get different values.
 
-Interactively you also get hybrid vim/emacs editing (vim text objects with
-emacs keys still bound), syntax highlighting, a git-aware prompt, tab
-completion that reads `--help` and man pages, and persistent history.
+## Speed
 
-Vim mode is always on — press `Esc`. `man zish` has the full keymap.
+| | vs bash |
+|---|---|
+| command substitution | 1.8x |
+| conditionals, case, arithmetic, loops, functions | 1.4x |
+| pipelines | 1.2x |
 
-## Compatibility
-
-zish targets the shell people actually type, not all of zsh. Concretely, from
-a differential run against real `zsh` and `bash`:
-
-**Works** — `${#v}`, `${v/a/b}`, `${v//a/b}`, `${v#pat}`/`${v%pat}`,
-`${v:-default}`, `[[ $v = pre* ]]`, `[[ $v = *sub* ]]`, arrays with `a+=(x)`
-and `${#a[@]}`, `(( ))` with unprefixed variables, `[[ -o opt ]]`, `{1..3}`,
-functions, `local`, `$@`/`$#`/`shift`/`return`, job control, globbing,
-heredocs, here-strings, process substitution.
-
-**Not implemented** — `typeset`, and therefore associative arrays; zsh
-parameter-expansion flags `${(k)}`, `${(v)}`, `${(P)}`, `${(kv)}`; zsh string
-indexing `${v[2]}` and `${v[2,4]}`; `${a[(Ie)val]}`; glob qualifiers like
-`*(N)`; `zle` widgets and `compsys`.
-
-**One difference to know about:** zish arrays are **0-based, like bash**. zsh's
-are 1-based.
-
-```sh
-a=(x y z)
-${a[0]}   # zish/bash: x     zsh: (empty)
-${a[1]}   # zish/bash: y     zsh: x
-```
-
-`${#a[@]}` agrees everywhere, so this is silent — a zsh script that indexes
-arrays will compute the wrong values without an error. If you are porting from
-zsh, that is the first thing to check.
+That's the shipped `--release=safe` build, with runs varying ±0.3x. Pipelines
+gain least because their cost is fork/exec, not the shell. `./bench.sh`
+reproduces this and checks every result against bash before timing it.
 
 ## Feats
 
-Feats are small standalone binaries that answer one question each, so you don't
-reach for Python to do arithmetic or count something.
-
-Install them once, then just use them like any other command:
+Feats are small commands that ship with zish, so you don't need Python for
+everyday arithmetic or counting:
 
 ```sh
-make feats          # builds and stages into ~/.zish/feats/standard
+calc '2^0.5'          # 1.4142135623730951
+cnt file.txt          # line count, as one integer
+frq access.log        # field frequencies
+pk -t 5 build.log     # last 5 lines
+jls events.jsonl      # count records or pull a key per line
+ls *.log | para grep ERROR {}   # run in parallel, grouped output
 ```
+
+A feat runs only when no real command has that name, so installing one can't
+change what an existing script does. `feat list` shows what you have. More
+install with `gf install <name>`. Each feat is a separate binary; see
+[docs/feat-spec.md](docs/feat-spec.md).
+
+| tier | feats |
+|---|---|
+| core (shipped) | `cnt pk frq snf jls jget calc rand para gf` |
+| tooling | `jevx mcpc web verify` |
+| agents | `agent team budget bus ask` |
+
+## Sandboxing
 
 ```sh
-$ calc '2^0.5'                 # bash can't: $(( )) is integer-only
-1.4142135623730951
-$ calc 3/2
-1.5
-$ echo 1+1 | calc
-2
-$ cnt file.txt                 # a single number
-128
-$ frq access.log               # field frequency table
-$ pk -t 5 build.log            # last 5 lines
-$ snf src/                     # size, lines, ext, magic per file
-$ jls events.jsonl             # select/tally JSONL fields
-$ ls *.log | para grep ERROR {}   # run N at a time, grouped output
+zish --profile readonly -c 'make test'     # writes denied
+zish --profile workdir  -c 'make build'    # writes only under $PWD
+zish --profile workdir --allow-write "$HOME/.claude:/tmp" -c claude
 ```
 
-They resolve as ordinary commands, but only as a **fallback** — a feat can
-never shadow a real binary, so installing one can't change what an existing
-script means. `feat list` shows what you have, `feat help <name>` explains one,
-and `feat run <name>` is the explicit form if you want it.
+The kernel enforces this, not the shell: zish sets up Landlock and a seccomp
+filter once at startup, and every child process inherits them. It fails closed:
+if the kernel lacks Landlock, zish exits instead of running unrestricted.
 
-A feat is just a binary zish `exec`s: no plugin ABI, no dynamic loading, no
-in-process hooks. See [docs/feat-spec.md](docs/feat-spec.md) for the contract.
+Reads and network access are not restricted. Anything left writable (git hooks,
+Makefiles) can still run later outside the sandbox. Details are in
+[docs/security.md](docs/security.md), and recipes for wrapping agents are in
+[docs/agents.md](docs/agents.md).
 
-Feats come in tiers, and `zig build -Dfeats=core|tooling|all` builds each set:
-
-| tier | feats | |
-|---|---|---|
-| core | `cnt pk frq snf jls jget calc rand para gf` | ships with the shell |
-| tooling | `jevx mcpc web verify` | general building blocks, installed with `gf`: typed decisions from a model ([feats/jevx](feats/jevx/README.md)), MCP tool calls, web search/fetch, code checking |
-| agents | `agent team budget bus ask` | the agent-org stack built on the tooling |
-
-Domain-specific feats (`pen` for Penumbra, `aur` for Arch) live in a separate
-`rotko-feats` repo and install through the same `gf` index.
-
-### Dashboard (zash)
-
-The `team` and `agent` feats run agent-orgs (a Captain decomposing work across
-parallel workers) and write a live JSONL trace per run. **[zash](https://github.com/rotkonetworks/zash)**
-is a small SolidJS + Bun dashboard that folds that trace in real time — Captain,
-parallel workers, consults, critic, synthesis — lets you talk to the Captain
-in-chat, and shows which model actually ran each step. It lives in its own repo.
-
-## Driving zish from a program
-
-A shell an agent drives has two jobs a shell you drive doesn't: report what
-happened in a form a program can read, and be containable when the agent is
-wrong.
-
-### Structured output on fd 3
-
-Open file descriptor 3 and zish writes one JSON record per command, so a
-harness never has to parse ANSI escapes or prompt redraws to find out what
-happened:
+With fd 3 open, zish writes one JSON line per command, so a program driving it
+doesn't have to scrape the terminal:
 
 ```sh
 $ zish -c 'make test' 3>trace.jsonl
@@ -200,157 +99,15 @@ $ cat trace.jsonl
 {"ts":1786246738163,"cmd":"make test","cwd":"/src","exit":0,"ms":842,"sandbox":"none"}
 ```
 
-It's off unless fd 3 is open — no flag, no config. stdout stays exactly as the
-command left it, and internals (rc sourcing, command substitution) are not
-recorded, only what you actually submitted. Use `ZISH_TRACE_FD` for a
-different descriptor.
-
-The channel is meant to be trusted, so it is built not to be forgeable: the
-descriptor is moved out of reach of the commands zish runs (they can't write
-their own records), string fields are escaped so a crafted command or directory
-name can't inject a second record, and each line carries the `sandbox` profile
-in force so a harness can confirm the containment it asked for was applied.
-
-### Restricting what a session may touch
-
-```sh
-zish --profile readonly -c 'make test'    # may read; writes are denied
-zish --profile workdir  -c 'make build'   # may write under $PWD, read elsewhere
-zish --profile none                       # the default
-```
-
-`--allow-write` adds writable roots, `:`-separated like `PATH` — which is what
-makes it possible to wrap an agent, since the agent needs its own state
-directory:
-
-```sh
-zish --profile workdir --allow-write "$HOME/.claude:/tmp" -c 'claude'
-```
-
-**The shell is not enforcing this.** zish makes one syscall at startup
-([Landlock](https://docs.kernel.org/userspace-api/landlock.html), the kernel's
-unprivileged sandbox — no root, no container, no `LD_PRELOAD`) and then gets out
-of the way. After that the *kernel* refuses the write. There is no parser to
-trick, no quoting to get right, no allowlist to slip past.
-
-Which is why it holds for programs that never involve a shell at all:
-
-```
-$ zish --profile readonly -c 'bash -c "echo x > /tmp/A"'
-/usr/bin/bash: line 1: /tmp/A: Permission denied      # bash's own redirect
-
-$ zish --profile readonly -c 'python3 -c "open(\"/tmp/B\",\"w\")"'
-PermissionError: [Errno 13] Permission denied: '/tmp/B'
-```
-
-The restriction lives in the process's credentials: `fork` copies it, `exec`
-preserves it, and nothing can clear it. A child may add another Landlock
-ruleset, but rulesets only intersect — it is a one-way ratchet.
-
-```
-$ zish --profile readonly -c 'grep NoNewPrivs /proc/self/status'
-NoNewPrivs:  1                              # 0 outside the sandbox
-
-tried to drop no_new_privs: -1              # the kernel refuses
-```
-
-`no_new_privs` also makes the kernel ignore setuid bits and file capabilities on
-exec, so escaping by running something setuid does not work either.
-
-It is session-scoped rather than per-command, deliberately: because the kernel
-enforces it against the whole tree, it also bounds **zish itself**. Zig's safety
-checks (on in the shipped build) turn the bugs they cover into a clean abort,
-but no in-process check covers everything — zish should not be the only thing
-between an agent and your filesystem.
-
-It **fails closed**: an unknown profile, or a kernel without Landlock, exits
-non-zero rather than quietly running unrestricted. Write-only device sinks
-(`/dev/null`, `/dev/tty`, ...) stay writable under every profile, because
-`cat x >/dev/null` is a write and a sandbox that breaks it is just a broken
-shell.
-
-Every restrictive profile also installs a **seccomp syscall filter** — the
-"pledge" half to Landlock's "unveil". It rides along with no flag of its own and
-denies `ptrace` and `process_vm_readv`/`writev` (attaching to or reading another
-process's memory) and `kexec` — syscalls a shell's children have no legitimate
-need for. Denied calls return `EPERM`, so a program that tries one fails
-gracefully rather than being killed. This is deliberately a small list; the
-syscalls with real legitimate uses (`socket`, `unshare`, `mount`, `memfd`) are
-left for named profiles rather than defaulted on.
-
-#### What it does not stop
-
-Worth keeping straight, because the above sounds stronger than it is:
-
-- **Reads are unrestricted.** Every profile can read the whole filesystem —
-  SSH keys, `.env` files, tokens. This bounds damage, not disclosure.
-- **Network is unrestricted.** Combined with the above: a sandboxed process can
-  read a secret and POST it somewhere. Landlock can restrict TCP connect/bind;
-  zish does not use that yet.
-- Process creation and signals are unrestricted.
-- **Anything writable is code you will run later.** This is the one that gets
-  people. A granted root usually contains `.git/hooks`, a `Makefile`,
-  `package.json` scripts, `.envrc` — all of which execute, unsandboxed, the next
-  time *you* run git or make. Nothing has to break Landlock for that to happen.
-
-A blast radius, not a jail — which is why it belongs *underneath* an agent's own
-permission prompts rather than replacing them.
-
-You also do not have to change the agent to get it. Claude Code drives `bash`
-with no option to swap it, and Python's `shell=True` is hardcoded to `/bin/sh`,
-but neither matters when the restriction is inherited by every descendant.
-Recipes are in [docs/agents.md](docs/agents.md).
-
-### Keeping the model local
-
-The sandbox bounds what a wrong agent can *write*; it does nothing about what
-leaves the machine, because the model is usually somewhere else. It doesn't
-have to be.
-
-```sh
-export ZISH_AGENT_ENDPOINT=http://127.0.0.1:8080/v1/chat/completions
-export ZISH_AGENT_MODEL=<whatever the server calls it>
-export ZISH_AGENT_TIMEOUT=900     # the 120s default is a cloud-latency number
-agent solo "summarize ~/notes/today.md"
-```
-
-Those three variables are the whole integration — any OpenAI-compatible server
-(`llama-server`, ollama's `/v1`, vllm) — and `team`, `verify` and the captain
-inherit them. Worked example, including server lifecycle and how a detached job
-reports back through the `bus` feat:
-[examples/local-model](examples/local-model).
-
-## Ghost text
-
-As you type, zish suggests the rest of the command from your history and from
-completion candidates — shown ahead of the cursor in a dimmer colour, so a
-suggestion never reads as something you typed. `ctrl+o` toggles it, `alt+e`
-accepts one character, `Right`/`End` accept the whole thing.
-
-There is no model involved. zish used to ship a GGUF inference engine for this;
-it was removed in favour of history matching, which is where the useful
-suggestions came from anyway.
-
 ## Tests
 
 ```sh
-./tests/regress.sh     # end-to-end, incl. differential tests against bash
-python3 tests/pty_test.py  # interactive: line editor, job control, signals
-zig build test         # unit tests + randomized sweeps
-zig build fuzz         # fuzz targets on parser/lexer/arithmetic/glob
+./tests/regress.sh          # end-to-end, compared against bash
+python3 tests/pty_test.py   # line editor, job control, signals
+zig build test
 ```
 
-`tests/regress.sh` is the one to run before sending a patch. Every case in it
-is a bug that was once real, so a red case means a regression.
+Every regress case is a bug that once existed. Patches welcome: keep the
+suites green and add a case for what you fixed.
 
-See [docs/security.md](docs/security.md) for the threat model and what's
-already been found and fixed.
-
-## Contributing
-
-Patches welcome. Please make sure `./tests/regress.sh` and `zig build test`
-are green, and add a case for whatever you fixed.
-
-## License
-
-See [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
