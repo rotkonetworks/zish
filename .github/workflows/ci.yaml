@@ -59,6 +59,38 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq hyperfine zsh
           ./bench.sh
 
+  # ── Debian package ─────────────────────────────────────────────────────────
+  # Builds the static-musl .deb the release ships and install-tests it: the
+  # regression suite then runs against the installed /usr/bin/zish, so the
+  # musl binary gets the same bash-differential bar as the glibc one.
+  # Both arches on native runners, so arm64 is proven here before a tag.
+  deb:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: setup zig 0.16.0
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      - name: build .deb
+        run: packaging/deb/build.sh ${{ matrix.arch }} "" dist
+
+      - name: install-test .deb
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq lintian
+          packaging/deb/check.sh dist/zish_*.deb
+
   # ── Portability ────────────────────────────────────────────────────────────
   #
   # zish is Linux-only, but must build for non-x86 Linux too. This cross-build

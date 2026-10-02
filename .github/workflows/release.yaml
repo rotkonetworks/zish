@@ -5,6 +5,7 @@ name: release
 # the tag and build.zig.zon disagree, if tests fail, or if any build fails —
 # then creates the GitHub release with the zish binaries and the feat catalog.
 # (AUR is published by hand from packaging/PKGBUILD — see issue #6.)
+# The .debs feed the apt repo at repo.rotko.net, which pulls them from here.
 on:
   push:
     tags: ['v*']
@@ -61,9 +62,12 @@ jobs:
         with:
           version: 0.16.0
 
+      # Static musl: no glibc version floor, so the same binary runs on any
+      # Linux distro. It is the binary the .deb ships, and the deb job runs
+      # the regression suite against it on each arch.
       - name: build ${{ matrix.target }}
         run: |
-          zig build --release=safe -Dstrip=true -Dtarget=${{ matrix.target }} -Dlto=false
+          zig build --release=safe -Dstrip=true -Dtarget=${{ matrix.target }}-musl -Dlto=false
           mv zig-out/bin/zish zig-out/bin/zish-${{ matrix.target }}
 
       # install.sh refuses to install a binary it cannot verify, so the
@@ -80,6 +84,46 @@ jobs:
           files: |
             zig-out/bin/zish-${{ matrix.target }}
             zig-out/bin/SHA256SUMS-${{ matrix.target }}
+          fail_on_unmatched_files: true
+
+  # ── Debian/Ubuntu/Proxmox .deb (static musl), install-tested natively ─────
+  # One static binary per arch, so one .deb covers every Debian derivative.
+  # Each arch builds and installs on its OWN runner: check.sh runs the full
+  # regression suite against the installed /usr/bin/zish, so arm64 is tested
+  # on arm64 rather than only cross-linked. The release exists (build made it).
+  deb:
+    needs: build
+    strategy:
+      # One arch failing must not cancel the other's upload.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: setup zig 0.16.0
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      - name: build .deb
+        run: packaging/deb/build.sh ${{ matrix.arch }} "${GITHUB_REF_NAME#v}" dist
+
+      - name: install-test .deb
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq lintian
+          packaging/deb/check.sh dist/zish_*.deb
+
+      - name: attach to release
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
+        with:
+          files: dist/zish_*.deb
           fail_on_unmatched_files: true
 
   # ── Build the feat catalog (static-musl tarballs + index) that gf resolves ─

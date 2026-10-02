@@ -23,6 +23,9 @@
 set -uo pipefail
 
 ZISH=${ZISH:-./zig-out/bin/zish}
+# Cases cd into a scratch dir, so pin the binary to an absolute path up front
+# (ZISH=/usr/bin/zish to test an installed package, or a relative build path).
+case $ZISH in /*) ;; *) ZISH=$PWD/$ZISH ;; esac
 BASH_BIN=${BASH_BIN:-/bin/bash}
 
 VERBOSE=0
@@ -78,7 +81,7 @@ expect() {
     selected "$name" || { SKIP=$((SKIP + 1)); return; }
 
     local got status
-    got=$(cd "$WORK" && timeout 10 "$OLDPWD/$ZISH" -c "$script" 2>/dev/null)
+    got=$(cd "$WORK" && timeout 10 "$ZISH" -c "$script" 2>/dev/null)
     status=$?
 
     if [ "$got" = "$want" ] && [ "$status" = "$want_status" ]; then
@@ -99,7 +102,7 @@ same_as_bash() {
     if [ ! -x "$BASH_BIN" ]; then SKIP=$((SKIP + 1)); return; fi
 
     local got want gs ws
-    got=$(cd "$WORK" && timeout 10 "$OLDPWD/$ZISH" -c "$script" 2>/dev/null); gs=$?
+    got=$(cd "$WORK" && timeout 10 "$ZISH" -c "$script" 2>/dev/null); gs=$?
     want=$(cd "$WORK" && timeout 10 "$BASH_BIN" -c "$script" 2>/dev/null); ws=$?
 
     if [ "$got" = "$want" ] && [ "$gs" = "$ws" ]; then
@@ -121,7 +124,7 @@ no_exec() {
     local marker="$WORK/pwned.$$"
     rm -f "$marker"
     # shellcheck disable=SC2059
-    printf "$keys" "$marker" | (cd "$WORK" && timeout 10 "$OLDPWD/$ZISH" >/dev/null 2>&1)
+    printf "$keys" "$marker" | (cd "$WORK" && timeout 10 "$ZISH" >/dev/null 2>&1)
 
     if [ -e "$marker" ]; then
         rm -f "$marker"
@@ -444,7 +447,7 @@ if selected "feat list --json describes every feat"; then
     mkdir -p "$fr/standard/probe/bin"
     printf 'name = "probe"\ntier = "standard"\nversion = "1.0.0"\nhelp = "a probe that describes itself"\nbin = "probe"\n' \
         > "$fr/standard/probe/feat.toml"
-    got=$(cd "$WORK" && ZISH_FEAT_PATH="$fr" timeout 10 "$OLDPWD/$ZISH" -c 'feat list --json' 2>/dev/null)
+    got=$(cd "$WORK" && ZISH_FEAT_PATH="$fr" timeout 10 "$ZISH" -c 'feat list --json' 2>/dev/null)
     case "$got" in
         *'"summary":"a probe that describes itself"'*)
             report_pass "feat list --json describes every feat" ;;
@@ -458,7 +461,7 @@ if selected "feat list --json describes every feat"; then
     # overrule a feat that deliberately chose a terser phrase.
     printf 'name = "probe"\ntier = "standard"\nversion = "1.0.0"\nhelp = "the long form"\nbin = "probe"\nsummary = "terse"\n' \
         > "$fr/standard/probe/feat.toml"
-    got=$(cd "$WORK" && ZISH_FEAT_PATH="$fr" timeout 10 "$OLDPWD/$ZISH" -c 'feat list --json' 2>/dev/null)
+    got=$(cd "$WORK" && ZISH_FEAT_PATH="$fr" timeout 10 "$ZISH" -c 'feat list --json' 2>/dev/null)
     case "$got" in
         *'"summary":"terse"'*)
             report_pass "feat list --json keeps a curated summary" ;;
@@ -483,7 +486,7 @@ trace_case() {
     selected "$name" || { SKIP=$((SKIP + 1)); return; }
     local out="$WORK/trace.jsonl"
     rm -f "$out"
-    (cd "$WORK" && timeout 10 "$OLDPWD/$ZISH" -c "$script" >/dev/null 2>&1 3>"$out")
+    (cd "$WORK" && timeout 10 "$ZISH" -c "$script" >/dev/null 2>&1 3>"$out")
     local got
     got=$(python3 -c "
 import sys, json
@@ -517,7 +520,7 @@ if selected "trace cannot be forged by a child"; then
     # command (the record echoes the command line back), so match on shape:
     # a genuine record is a line beginning `{"ts":`. Any other line is a raw
     # write the child slipped in.
-    (cd "$WORK" && timeout 10 "$OLDPWD/$ZISH" -c '/bin/sh -c "echo INJECTED >&3" 2>/dev/null' >/dev/null 2>&1 3>"$WORK/t.jsonl")
+    (cd "$WORK" && timeout 10 "$ZISH" -c '/bin/sh -c "echo INJECTED >&3" 2>/dev/null' >/dev/null 2>&1 3>"$WORK/t.jsonl")
     # grep -vc prints the count but exits 1 when it is zero, so no `|| echo 0`
     # (that would append a second line and defeat the check).
     stray=$(grep -vc '^{"ts":' "$WORK/t.jsonl")
@@ -538,7 +541,7 @@ if selected "trace resists json injection"; then
     evil=$'x","exit":0}\n{"ts":0,"cmd":"INJECTED'
     injdir="$WORK/$(printf 'd\ndir')"
     mkdir -p "$injdir" 2>/dev/null || injdir="$WORK"
-    (cd "$injdir" && timeout 10 "$OLDPWD/$ZISH" -c "echo '$evil'" >/dev/null 2>&1 3>"$WORK/inj.jsonl")
+    (cd "$injdir" && timeout 10 "$ZISH" -c "echo '$evil'" >/dev/null 2>&1 3>"$WORK/inj.jsonl")
     res=$(python3 -c "
 import json,sys
 n=0
@@ -558,7 +561,7 @@ fi
 # it passed. Read it back with the sandbox off (needs no kernel support).
 if selected "trace records the sandbox profile"; then
     rm -f "$WORK/sb.jsonl"
-    (cd "$WORK" && timeout 10 "$OLDPWD/$ZISH" --profile none -c 'echo hi' >/dev/null 2>&1 3>"$WORK/sb.jsonl")
+    (cd "$WORK" && timeout 10 "$ZISH" --profile none -c 'echo hi' >/dev/null 2>&1 3>"$WORK/sb.jsonl")
     got=$(python3 -c "import json;print(json.load(open('$WORK/sb.jsonl')).get('sandbox','MISSING'))" 2>/dev/null)
     if [ "$got" = "none" ]; then report_pass "trace records the sandbox profile"
     else report_fail "trace records the sandbox profile" "sandbox=none" "sandbox=$got" "no attestation"; fi
@@ -567,7 +570,7 @@ fi
 # exit status and duration must be real, not placeholders
 if selected "trace exit and timing"; then
     rm -f "$WORK/t.jsonl"
-    (cd "$WORK" && timeout 10 "$OLDPWD/$ZISH" -c 'sleep 0.2; false' >/dev/null 2>&1 3>"$WORK/t.jsonl")
+    (cd "$WORK" && timeout 10 "$ZISH" -c 'sleep 0.2; false' >/dev/null 2>&1 3>"$WORK/t.jsonl")
     res=$(python3 -c "
 import json
 r = json.load(open('$WORK/t.jsonl'))
@@ -605,7 +608,7 @@ if selected "heredoc resists /tmp symlink attack"; then
     v=$(mktemp); printf 'SACRED' > "$v"
     now=$(date +%s%3N 2>/dev/null || echo 0)
     for d in $(seq 0 400); do ln -sf "$v" "/tmp/zish_heredoc_e_$((now+d))_1" 2>/dev/null; done
-    (cd "$WORK" && "$OLDPWD/$ZISH" -c 'cat <<EOF >/dev/null
+    (cd "$WORK" && "$ZISH" -c 'cat <<EOF >/dev/null
 PWNED
 EOF') >/dev/null 2>&1
     if [ "$(cat "$v")" = "SACRED" ]; then report_pass "heredoc resists /tmp symlink attack"
@@ -1052,10 +1055,8 @@ printf '\n%s\n' "script feat dependencies"
 # cannot be exported for the suite: a global override would change what the
 # feat cases above resolve.
 DEPS_REG="$WORK/feats"
-# `$OLDPWD/$ZISH` is this suite's idiom *after* a cd; a shebang line is written
-# before any cd, so resolve the binary absolutely (and honor an override).
-REPO_ABS=$(cd "$(dirname "$0")/.." && pwd)
-case "$ZISH" in /*) DEPS_ZISH="$ZISH" ;; *) DEPS_ZISH="$REPO_ABS/${ZISH#./}" ;; esac
+# $ZISH is already absolute (resolved at the top of the suite).
+DEPS_ZISH=$ZISH
 mkdir -p "$DEPS_REG/standard/web/bin" "$DEPS_REG/standard/calc/bin" \
          "$DEPS_REG/standard/broken/bin" "$DEPS_REG/extra/untrusted/bin"
 for f in web calc broken; do
