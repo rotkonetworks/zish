@@ -1,6 +1,6 @@
 # changelog
 
-## unreleased
+## v0.25.3
 
 ### added
 - `.deb` for Debian, Ubuntu and Proxmox (amd64, arm64), built and install-tested
