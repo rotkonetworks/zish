@@ -6,7 +6,7 @@ if exists('b:current_syntax') | finish | endif
 syn match   jevxComment   /^\s*".*$/ contains=@Spell
 syn match   jevxContinue  /^\s*\\\ze[^|]/
 syn match   jevxSet       /^\s*set\>/ nextgroup=jevxOption skipwhite
-syn match   jevxOption    /\<\(lines\|probs\|quiet\|text\|invert\|json\|export\|model\|batch\)\>\(=\S*\)\?/ contained nextgroup=jevxOption skipwhite
+syn match   jevxOption    /\<\(lines\|nul\|probs\|quiet\|text\|invert\|json\|local\|export\|model\|batch\)\>\(=\S*\)\?/ contained nextgroup=jevxOption skipwhite
 
 " KEY SIGIL GATE at the start of a question: team/=billing~.8  urgent?>.7  mood#
 syn match   jevxHead      /^\s*[A-Za-z0-9_.-]*[?/#]\S*/ contains=jevxKey,jevxSigil,jevxGate

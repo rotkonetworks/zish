@@ -108,6 +108,17 @@
 //   api.typesafe.ai directly (model jev-latest). JEVX_ENDPOINT overrides the URL
 //   (https only) and then takes its key from JEVX_API_KEY alone — the
 //   OpenRouter key never follows an override to another host.
+//
+//   --local (`set local`, or JEVX_BACKEND=shingi) is a local Shingi server
+//   (kortexa-ai/shingi-27b) and nothing else. It is reached over a Unix
+//   socket, $JEVX_SOCKET or $XDG_RUNTIME_DIR/jevx/shingi.sock, never TCP: an
+//   address on 127.0.0.1 says nothing about who is listening on it (any
+//   process can take a free port), and a file can say who owns it. Before
+//   stdin is read or a byte is sent, the socket must be a socket, not a
+//   symlink, owned by you, in a directory owned by you with no group or other
+//   bits — the key-file rule. --local reads no key, sends no Authorization
+//   header, and ignores JEVX_ENDPOINT and JEVX_MODEL (those name hosted
+//   services); -m still applies.
 //   Key: ~/.zish/openrouter.key, else ~/.config/jevx/openrouter.key (or under
 //   $XDG_CONFIG_HOME), else OPENROUTER_API_KEY; for the typesafe backend the
 //   same with typesafe.key / TYPESAFE_API_KEY. Key files must be 0600. The key and
@@ -141,6 +152,16 @@ const OPENROUTER_ENDPOINT = "https://openrouter.ai/api/alpha/decisions";
 const OPENROUTER_MODEL = "typesafe/jev-1.13";
 const TYPESAFE_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
 const TYPESAFE_MODEL = "jev-latest";
+/// --local: Shingi's System One route, over the socket below. The host in the
+/// URL is never resolved; curl only needs one to form the request.
+const SHINGI_URL = "http://shingi/v1/systemone";
+const SHINGI_MODEL = "shingi-27b";
+/// Under $XDG_RUNTIME_DIR, unless $JEVX_SOCKET names the socket.
+const SHINGI_SOCKET = "jevx/shingi.sock";
+/// Digits after the point in printed and exported numbers; trailing zeros are
+/// dropped, so 0.950 prints as 0.95. Gates compare the unrounded value, and -j
+/// shows the response as it came.
+const DECIMALS = 3;
 const MAX_INPUT = 16 * 1024 * 1024;
 const MAX_CHOICE = 255;
 const MAX_SCORE = 10;
@@ -430,7 +451,7 @@ fn setOption(a: std.mem.Allocator, tok: []const u8, flags: *std.ArrayListUnmanag
     const bare = [_]Bare{
         .{ .n = "lines", .f = "-l" }, .{ .n = "probs", .f = "-p" },  .{ .n = "quiet", .f = "-q" },
         .{ .n = "text", .f = "-t" },  .{ .n = "invert", .f = "-v" }, .{ .n = "json", .f = "-j" },
-        .{ .n = "nul", .f = "-0" },
+        .{ .n = "nul", .f = "-0" },   .{ .n = "local", .f = "--local" },
     };
     for (bare) |b| if (std.mem.eql(u8, name, b.n)) {
         if (val != null) return fail("this `set` option takes no value");
@@ -446,7 +467,7 @@ fn setOption(a: std.mem.Allocator, tok: []const u8, flags: *std.ArrayListUnmanag
             return flags.append(a, try a.dupeZ(u8, v));
         }
         return flags.append(a, "-e");
-    } else return fail("unknown `set` option (lines nul probs quiet text invert json export[=PFX] model=M batch=N)");
+    } else return fail("unknown `set` option (lines nul probs quiet text invert json local export[=PFX] model=M batch=N)");
     try flags.append(a, flag);
     try flags.append(a, try a.dupeZ(u8, val orelse return fail("this `set` option needs =VALUE")));
 }
@@ -484,14 +505,14 @@ fn exportLine(b: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, name: []cons
 fn exportAnswer(b: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, name: []const u8, ans: Answer) !void {
     var nb: [64]u8 = undefined;
     switch (ans.kind) {
-        .noul => try exportLine(b, a, name, "", std.fmt.bufPrint(&nb, "{d}", .{ans.value}) catch "0"),
+        .noul => try exportLine(b, a, name, "", numText(&nb, ans.value)),
         .choice => {
             try exportLine(b, a, name, "", ans.choice);
-            try exportLine(b, a, name, "_conf", std.fmt.bufPrint(&nb, "{d}", .{ans.conf.?}) catch "0");
+            try exportLine(b, a, name, "_conf", numText(&nb, ans.conf.?));
         },
         .score => {
-            try exportLine(b, a, name, "", std.fmt.bufPrint(&nb, "{d}", .{ans.value}) catch "0");
-            try exportLine(b, a, name, "_conf", std.fmt.bufPrint(&nb, "{d}", .{ans.conf.?}) catch "0");
+            try exportLine(b, a, name, "", numText(&nb, ans.value));
+            try exportLine(b, a, name, "_conf", numText(&nb, ans.conf.?));
         },
     }
 }
@@ -790,8 +811,22 @@ fn passes(q: Question, ans: Answer) bool {
     };
 }
 
+/// `v` to DECIMALS places, trailing zeros and a bare point dropped.
+fn numText(buf: []u8, v: f64) []const u8 {
+    const t = std.fmt.bufPrint(buf, std.fmt.comptimePrint("{{d:.{d}}}", .{DECIMALS}), .{v}) catch return "0";
+    var n = t.len;
+    if (std.mem.indexOfScalar(u8, t, '.') != null) {
+        while (t[n - 1] == '0') n -= 1;
+        if (t[n - 1] == '.') n -= 1;
+    }
+    // A tiny negative rounds to "-0"; no answer is negative, so print 0.
+    if (std.mem.eql(u8, t[0..n], "-0")) return "0";
+    return t[0..n];
+}
+
 fn fmtNum(b: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, v: f64) !void {
-    try b.print(a, "{d}", .{v});
+    var nb: [64]u8 = undefined;
+    try b.appendSlice(a, numText(&nb, v));
 }
 
 /// The answer's value fields, space-separated, no key, no newline. Shaped by
@@ -871,26 +906,69 @@ fn memfd(name: [*:0]const u8, bytes: []const u8) ?i32 {
 /// --url (an endpoint beginning with `-` is not an option), no redirects
 /// (curl's default; a redirect would carry the key), a size cap. Its exit
 /// status is checked — `-w` alone cannot tell a timeout from an answer.
-fn fetchCurl(a: std.mem.Allocator, endpoint: []const u8, key: []const u8, body: []const u8) ?Reply {
-    const cfg_text = std.fmt.allocPrint(a, "header = \"Authorization: Bearer {s}\"\n", .{key}) catch return null;
+/// The --local socket, held to the key-file rule: a socket, not a symlink,
+/// owned by you, and its directory owned by you and closed to everyone else
+/// (no group or other bits). Ownership is what stands in for authenticating
+/// the server: no other user can create a file you own, and no other user can
+/// put one in a 0700 directory of yours.
+fn checkSocket(a: std.mem.Allocator, p: []const u8) error{ SocketUnsafe, OutOfMemory }!void {
+    if (!std.fs.path.isAbsolute(p)) return sockErr(p, "is not an absolute path");
+    const mask: linux.STATX = .{ .TYPE = true, .MODE = true, .UID = true };
+    var sx: linux.Statx = undefined;
+    const pz = try a.dupeZ(u8, p);
+    switch (linux.errno(linux.statx(linux.AT.FDCWD, pz, linux.AT.SYMLINK_NOFOLLOW, mask, &sx))) {
+        .SUCCESS => {},
+        .NOENT, .NOTDIR => return sockErr(p, "does not exist: is the local server running?"),
+        else => return sockErr(p, "cannot be checked"),
+    }
+    if (sx.mode & linux.S.IFMT == linux.S.IFLNK) return sockErr(p, "is a symlink");
+    if (sx.mode & linux.S.IFMT != linux.S.IFSOCK) return sockErr(p, "is not a socket");
+    if (sx.uid != linux.getuid()) return sockErr(p, "is not owned by you");
+    const dir = try a.dupeZ(u8, std.fs.path.dirname(p) orelse "/");
+    switch (linux.errno(linux.statx(linux.AT.FDCWD, dir, linux.AT.SYMLINK_NOFOLLOW, mask, &sx))) {
+        .SUCCESS => {},
+        else => return sockErr(dir, "cannot be checked"),
+    }
+    if (sx.mode & linux.S.IFMT != linux.S.IFDIR) return sockErr(dir, "is not a directory (a symlink?)");
+    if (sx.uid != linux.getuid()) return sockErr(dir, "is not owned by you");
+    if (sx.mode & 0o077 != 0) return sockErr(dir, "is open to others (chmod 700)");
+}
+
+var sock_msg: []const u8 = "";
+
+fn sockErr(path: []const u8, why: []const u8) error{SocketUnsafe} {
+    sock_msg = std.fmt.allocPrint(std.heap.page_allocator, "{s} {s}", .{ path, why }) catch why;
+    return error.SocketUnsafe;
+}
+
+/// With `socket` (--local, already checked) the request goes over that Unix
+/// socket as plain http and carries no key at all.
+fn fetchCurl(a: std.mem.Allocator, endpoint: []const u8, socket: ?[]const u8, key: []const u8, body: []const u8) ?Reply {
+    const cfg_text = if (key.len == 0) "" else std.fmt.allocPrint(a, "header = \"Authorization: Bearer {s}\"\n", .{key}) catch return null;
     const cfg_fd = memfd("jevx-cfg", cfg_text) orelse return null;
     defer _ = linux.close(cfg_fd);
     const body_fd = memfd("jevx-body", body) orelse return null;
     defer _ = linux.close(body_fd);
     const url = a.dupeZ(u8, endpoint) catch return null;
 
-    const argv = [_:null]?[*:0]const u8{
+    var av: std.ArrayListUnmanaged(?[*:0]const u8) = .empty;
+    av.appendSlice(a, &.{
         "env",            "curl",
         "-q",             "-sS",
-        "--proto",        "=https",
+        "--proto",        if (socket != null) "=http" else "=https",
         "--max-time",     "60",
         "--max-filesize", "16777216",
         "-K",             "/dev/fd/3",
         "-H",             "Content-Type: application/json",
         "--data-binary",  "@/dev/fd/4",
         "-w",             "\n%{http_code}",
-        "--url",          url.ptr,
-    };
+    }) catch return null;
+    if (socket) |sp| {
+        const spz = a.dupeZ(u8, sp) catch return null;
+        av.appendSlice(a, &.{ "--unix-socket", spz.ptr }) catch return null;
+    }
+    av.appendSlice(a, &.{ "--url", url.ptr, null }) catch return null;
+    const argv: [*:null]const ?[*:0]const u8 = @ptrCast(av.items.ptr);
 
     var fds: [2]i32 = undefined;
     if (!sysOk(linux.pipe2(&fds, .{ .CLOEXEC = true }))) return null;
@@ -910,7 +988,7 @@ fn fetchCurl(a: std.mem.Allocator, endpoint: []const u8, key: []const u8, body: 
         _ = linux.close(200);
         _ = linux.close(201);
         _ = linux.close(202);
-        _ = linux.execve("/usr/bin/env", &argv, child_envp);
+        _ = linux.execve("/usr/bin/env", argv, child_envp);
         linux.exit(127);
     }
     _ = linux.close(fds[1]);
@@ -972,12 +1050,13 @@ const Mock = struct {
 const Transport = struct {
     mock: ?Mock,
     endpoint: []const u8,
+    socket: ?[]const u8 = null,
     key: []const u8,
 
     fn send(self: *Transport, a: std.mem.Allocator, body: []const u8) ?Reply {
         var attempt: u32 = 0;
         while (true) : (attempt += 1) {
-            const r = if (self.mock) |*m| m.next(a) else fetchCurl(a, self.endpoint, self.key, body);
+            const r = if (self.mock) |*m| m.next(a) else fetchCurl(a, self.endpoint, self.socket, self.key, body);
             const retryable = if (r) |rr| rr.status == 429 or rr.status == 529 or rr.status == 0 else true;
             if (!retryable or attempt + 1 >= RETRIES) return r;
             if (self.mock == null) sleepMs(@as(u64, 500) << @intCast(attempt));
@@ -1020,6 +1099,8 @@ const USAGE =
     \\  -x FILE | X.jevx    run a script: #! line, set lines/probs/model=M/export..., questions;
     \\                      extra args are the state ("$*")
     \\  -m MODEL (default typesafe/jev-1.13)   --mock FILE   JEVX_BACKEND=typesafe JEVX_MODEL
+    \\  --local             only a local Shingi, over $XDG_RUNTIME_DIR/jevx/shingi.sock (or
+    \\                      $JEVX_SOCKET): yours, 0700 dir, no key; also JEVX_BACKEND=shingi
     \\  JEVX_ENDPOINT=https://... with JEVX_API_KEY
     \\  key: ~/.zish/openrouter.key, ~/.config/jevx/openrouter.key, or $OPENROUTER_API_KEY
     \\
@@ -1204,6 +1285,7 @@ fn run(init: std.process.Init) !u8 {
     var dry = false;
     var model_opt: ?[]const u8 = null;
     var mock_path: ?[]const u8 = null;
+    var local_only = false;
     var stdin_used = false;
 
     var i: usize = 1;
@@ -1245,6 +1327,8 @@ fn run(init: std.process.Init) !u8 {
             if (batch == 0 or batch > MAX_BATCH) return fail("-b takes a count in 1..1000");
         } else if (std.mem.eql(u8, arg, "-m")) {
             model_opt = try needs.val(argv, &i);
+        } else if (std.mem.eql(u8, arg, "--local")) {
+            local_only = true;
         } else if (std.mem.eql(u8, arg, "--mock")) {
             mock_path = try needs.val(argv, &i);
         } else if (std.mem.eql(u8, arg, "-t")) {
@@ -1316,11 +1400,27 @@ fn run(init: std.process.Init) !u8 {
     }
 
     // backend
-    const backend_ts = if (feat.env(a, io, "JEVX_BACKEND")) |b| std.mem.eql(u8, b, "typesafe") else false;
-    const custom_ep = feat.env(a, io, "JEVX_ENDPOINT");
-    const endpoint = custom_ep orelse if (backend_ts) TYPESAFE_ENDPOINT else OPENROUTER_ENDPOINT;
-    if (!std.mem.startsWith(u8, endpoint, "https://")) return die(io, "JEVX_ENDPOINT must be an https:// URL (the request carries a bearer key)", .{});
-    const model = model_opt orelse feat.env(a, io, "JEVX_MODEL") orelse if (backend_ts) TYPESAFE_MODEL else OPENROUTER_MODEL;
+    const backend = feat.env(a, io, "JEVX_BACKEND");
+    const backend_ts = if (backend) |b| std.mem.eql(u8, b, "typesafe") else false;
+    const local = local_only or (if (backend) |b| std.mem.eql(u8, b, "shingi") else false);
+    // --local never looks at JEVX_ENDPOINT: the socket is the only way out.
+    const custom_ep = if (local) null else feat.env(a, io, "JEVX_ENDPOINT");
+    const endpoint = if (local) SHINGI_URL else custom_ep orelse if (backend_ts) TYPESAFE_ENDPOINT else OPENROUTER_ENDPOINT;
+    if (!local and !std.mem.startsWith(u8, endpoint, "https://")) return die(io, "JEVX_ENDPOINT must be an https:// URL (the request carries a bearer key)", .{});
+    const model = model_opt orelse if (local) SHINGI_MODEL else feat.env(a, io, "JEVX_MODEL") orelse if (backend_ts) TYPESAFE_MODEL else OPENROUTER_MODEL;
+    // Checked before stdin is read, so a refused --local has consumed nothing.
+    var socket: ?[]const u8 = null;
+    if (local and !dry and mock_path == null) {
+        const sp = feat.env(a, io, "JEVX_SOCKET") orelse if (feat.env(a, io, "XDG_RUNTIME_DIR")) |rd|
+            try std.fs.path.join(a, &.{ rd, SHINGI_SOCKET })
+        else
+            return die(io, "--local: no socket: set $JEVX_SOCKET, or $XDG_RUNTIME_DIR for {s} under it", .{SHINGI_SOCKET});
+        checkSocket(a, sp) catch |e| switch (e) {
+            error.SocketUnsafe => return die(io, "--local: refusing socket: {s}; nothing sent", .{sock_msg}),
+            else => return e,
+        };
+        socket = sp;
+    }
 
     // state / items
     var items: []const []const u8 = &.{};
@@ -1342,9 +1442,16 @@ fn run(init: std.process.Init) !u8 {
     }
     const sj: []const u8 = if (state_text) |t| try stateJson(a, t, force_text) else "null";
 
-    var transport = Transport{ .mock = null, .endpoint = endpoint, .key = "" };
+    var transport = Transport{ .mock = null, .endpoint = endpoint, .socket = socket, .key = "" };
     if (!dry) {
-        if (mock_path) |mp| {
+        if (local) {
+            // No key: the socket's owner is the authentication, and a key in
+            // the environment for some other service must not ride along.
+            if (mock_path) |mp| {
+                const mt = feat.readFile(a, io, mp, MAX_INPUT) catch return die(io, "cannot read {s}", .{mp});
+                transport.mock = .{ .lines = std.mem.splitScalar(u8, mt, '\n') };
+            }
+        } else if (mock_path) |mp| {
             const mt = feat.readFile(a, io, mp, MAX_INPUT) catch return die(io, "cannot read {s}", .{mp});
             transport.mock = .{ .lines = std.mem.splitScalar(u8, mt, '\n') };
         } else {
@@ -1608,6 +1715,17 @@ test "export: identifiers sanitised and prefixed, values single-quoted" {
     try std.testing.expect(!isIdent("1x"));
     try std.testing.expect(!isIdent("a-b"));
     try std.testing.expect(isIdent("_t9"));
+}
+
+test "numbers print to DECIMALS places, trailing zeros dropped" {
+    var nb: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("0.906", numText(&nb, 0.9058798144168277));
+    try std.testing.expectEqualStrings("0.95", numText(&nb, 0.95));
+    try std.testing.expectEqualStrings("1", numText(&nb, 0.99999));
+    try std.testing.expectEqualStrings("0", numText(&nb, 0.0001));
+    try std.testing.expectEqualStrings("0", numText(&nb, -0.0001));
+    try std.testing.expectEqualStrings("1.04", numText(&nb, 1.0400001));
+    try std.testing.expectEqualStrings("2", numText(&nb, 2));
 }
 
 test "gates evaluate against answers" {

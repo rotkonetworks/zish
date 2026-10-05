@@ -130,6 +130,39 @@ STUB="$T/stub" STUB_EXIT=28 PATH="$T/stub:$PATH" "$J" -q -s hello '?>.5 y' 2>/de
 eq "curl failing (e.g. timeout) exits 2, not a decision" "$?" 2
 rm -f "$T/.zish/openrouter.key"
 
+echo "--local: a Unix socket you own, in a directory only you can enter"
+mksock() { python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$1"; }
+mkdir -p "$T/run/jevx" && chmod 700 "$T/run" "$T/run/jevx" && mksock "$T/run/jevx/shingi.sock"
+echo sk-or-stubkey > "$T/.zish/openrouter.key"; chmod 600 "$T/.zish/openrouter.key"
+out=$(XDG_RUNTIME_DIR="$T/run" JEVX_API_KEY=sk-should-not-travel JEVX_ENDPOINT=https://example.invalid JEVX_MODEL=typesafe/jev-1.13 \
+    STUB="$T/stub" PATH="$T/stub:$PATH" "$J" --local -s hello '? y')
+eq "--local answers over the socket" "$out" "0.8"
+eq "the socket is handed to curl" "$(grep -x -A1 -- --unix-socket "$T/stub/argv" | tail -1)" "$T/run/jevx/shingi.sock"
+eq "--local ignores JEVX_ENDPOINT" "$(grep -x -A1 -- --url "$T/stub/argv" | tail -1)" "http://shingi/v1/systemone"
+grep -qx -- '=http' "$T/stub/argv" && ok "plain http only inside the socket (--proto =http)" || bad "no --proto =http for --local"
+eq "--local sends no key, not even JEVX_API_KEY" "$(cat "$T/stub/cfg")" ""
+grep -q '"model":"shingi-27b"' "$T/stub/body" && ok "--local ignores JEVX_MODEL (it names a hosted model)" || bad "JEVX_MODEL leaked into --local"
+out=$(JEVX_SOCKET="$T/run/jevx/shingi.sock" JEVX_BACKEND=shingi STUB="$T/stub" PATH="$T/stub:$PATH" "$J" -s hello '? y')
+eq "JEVX_BACKEND=shingi is --local, JEVX_SOCKET names the socket" "$out" "0.8"
+rm -f "$T/.zish/openrouter.key"
+eq "-n --local compiles for shingi-27b without a server" "$(XDG_RUNTIME_DIR=/nonexistent "$J" -n --local -s x '? y' | grep -o '"model":"[^"]*"')" '"model":"shingi-27b"'
+printf 'set local\n? y\n' > "$T/l.jevx"; eq "set local in a script is --local" "$(XDG_RUNTIME_DIR="$T/run" STUB="$T/stub" PATH="$T/stub:$PATH" "$J" -x "$T/l.jevx" hello)" "0.8"
+refused() {  # refused NAME EXPECTED-REASON env...
+    local name=$1 why=$2; shift 2
+    local err; err=$(env "$@" STUB="$T/stub" PATH="$T/stub:$PATH" "$J" --local -s x '? y' 2>&1); local rc=$?
+    case $rc:$err in 2:*"$why"*) ok "$name" ;; *) bad "$name (rc=$rc: $err)" ;; esac
+}
+: > "$T/stub/argv"
+refused "no socket: refused, nothing sent" "does not exist" XDG_RUNTIME_DIR="$T/nowhere"
+[ -s "$T/stub/argv" ] && bad "curl ran for a refused --local" || ok "a refused --local never starts curl"
+refused "no XDG_RUNTIME_DIR and no JEVX_SOCKET: refused" "no socket" -u XDG_RUNTIME_DIR -u JEVX_SOCKET
+: > "$T/run/jevx/file"; refused "a regular file is not a socket" "is not a socket" JEVX_SOCKET="$T/run/jevx/file"
+ln -s "$T/run/jevx/shingi.sock" "$T/run/jevx/link.sock"; refused "a symlink to a good socket is refused" "is a symlink" JEVX_SOCKET="$T/run/jevx/link.sock"
+refused "a relative socket path is refused" "absolute" JEVX_SOCKET=jevx/shingi.sock
+chmod 755 "$T/run/jevx"; refused "a directory others can enter is refused" "open to others" XDG_RUNTIME_DIR="$T/run"; chmod 700 "$T/run/jevx"
+mkdir -p "$T/real" && chmod 700 "$T/real" && mksock "$T/real/s.sock" && ln -s "$T/real" "$T/run/linkdir"
+refused "a socket reached through a symlinked directory is refused" "is not a directory" JEVX_SOCKET="$T/run/linkdir/s.sock"
+
 echo "key file"
 echo sk-or-x > "$T/.zish/openrouter.key"; chmod 644 "$T/.zish/openrouter.key"
 err=$("$J" -s x '? y' 2>&1); rc=$?

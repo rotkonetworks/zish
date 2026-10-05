@@ -306,6 +306,11 @@ mood 1.04 0.94
 With a **single question** the key is dropped, so `x=$(jevx '? …')` is the bare
 value.
 
+Numbers print to 3 decimals with trailing zeros dropped (`0.906`, `0.95`, `1`),
+in lines, `-p` and `-e` alike. Gates compare the unrounded value, and `-j`
+shows the response exactly as it came. The precision is one constant,
+`DECIMALS` in `main.zig`.
+
 | Flag | Output |
 |---|---|
 | `-p` | adds the distribution, in the order you wrote it: `team billing 0.99 billing=0.99 technical=0.01 sales=0`; score levels by index `0=0 1=0.96 2=0.04` |
@@ -393,6 +398,7 @@ Several per line, like vim: `set lines probs`.
 | `text` | `-t` | state is always text |
 | `invert` | `-v` | print failing lines |
 | `json` | `-j` | raw response |
+| `local` | `--local` | only a local Shingi; see [Local](#local-shingi-on-this-machine) |
 | `export` | `-e` | shell assignments |
 | `export=PFX` | `-E PFX` | … with a prefix other than `jev_` |
 | `model=M` | `-m M` | model |
@@ -466,6 +472,7 @@ jevx SCRIPT.jevx [opts] [WORDS...]      jevx -x FILE [opts] [WORDS...]
 | `-j` | print the raw response |
 | `-n` | print the request, send nothing |
 | `-m MODEL` | model (default `typesafe/jev-1.13`) |
+| `--local` | only a local Shingi over a checked Unix socket; nothing leaves the machine |
 | `--mock FILE` | replay canned responses instead of the network |
 | `-h` | usage |
 
@@ -477,6 +484,8 @@ jevx SCRIPT.jevx [opts] [WORDS...]      jevx -x FILE [opts] [WORDS...]
 |---|---|
 | `JEVX_MODEL` | model, like `-m` |
 | `JEVX_BACKEND=typesafe` | talk to `api.typesafe.ai` directly (model `jev-latest`) |
+| `JEVX_BACKEND=shingi` | the same as `--local` |
+| `JEVX_SOCKET` | the `--local` socket, instead of `$XDG_RUNTIME_DIR/jevx/shingi.sock` |
 | `JEVX_ENDPOINT` | a custom URL (https only) |
 | `JEVX_API_KEY` | the key for `JEVX_ENDPOINT`, and only for it |
 
@@ -498,6 +507,33 @@ a version.
 A key file must be a regular file you own, not a symlink, with no group or
 other permission bits (`chmod 600`) — the rule ssh uses for private keys. A key
 file that fails it is refused, not skipped.
+
+### Local: Shingi on this machine
+
+`--local` (or `set local` in a script, or `JEVX_BACKEND=shingi`) asks a local
+[Shingi 27B](https://huggingface.co/kortexa-ai/shingi-27b) server and nothing
+else: for state that must not leave the machine. Run Shingi on a socket:
+
+```sh
+shingi-27b --executable … --uds "$XDG_RUNTIME_DIR/jevx/shingi.sock"
+jevx --local 'urgent? Does this convey urgency?' < private.txt
+```
+
+The socket is `$JEVX_SOCKET`, else `$XDG_RUNTIME_DIR/jevx/shingi.sock`. It is
+a Unix socket and never TCP, because an address on `127.0.0.1` says nothing
+about who is listening: any process can take a free port, and a request to the
+wrong one hands it your state and lets it answer your gates. A file can say who
+owns it. So before stdin is read or a byte is sent, jevx checks the key-file
+rule: the path is absolute, a socket, not a symlink, owned by you, in a
+directory owned by you with no group or other bits (`chmod 700`). Anything else
+is exit 2 with nothing sent, and there is no fallback to a hosted backend.
+
+`--local` reads no key and sends no `Authorization` header; the socket's owner
+is the authentication. It ignores `JEVX_ENDPOINT` and `JEVX_MODEL`, which name
+hosted services, and sends model `shingi-27b` unless `-m` says otherwise.
+
+Shingi is not Jev: answers and calibration differ, so re-check thresholds you
+tuned against Jev.
 
 **Jev Router is something else.** `typesafe/jev-router` on OpenRouter is a
 chat-completions model that *uses* Jev to pick a model for each prompt; it is

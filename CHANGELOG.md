@@ -1,5 +1,13 @@
 # changelog
 
+## unreleased
+
+### added
+- `jevx --local` (`set local`, `JEVX_BACKEND=shingi`): ask a local Shingi over an owner-checked Unix socket, nothing sent elsewhere.
+
+### changed
+- `jevx` prints numbers to 3 decimals (`DECIMALS`); gates and `-j` keep full precision.
+
 ## v0.25.3
 
 ### added
