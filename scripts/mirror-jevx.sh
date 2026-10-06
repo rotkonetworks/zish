@@ -71,6 +71,24 @@ cp "$snap/src/feats/lib/feat.zig" "$out/lib/feat.zig"      # the symlink, resolv
 cp "$snap/src/tests/jevx_test.sh" "$out/tests/jevx_test.sh"
 cp "$snap/src/LICENSE" "$out/LICENSE"
 printf 'zig-out/\n.zig-cache/\n' > "$out/.gitignore"
+# The mirror's own CI. Generated here because a sync replaces every file.
+mkdir -p "$out/.github/workflows"
+cat > "$out/.github/workflows/ci.yaml" <<'YAML'
+name: ci
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+      - run: zig build test
+      - run: zig build suite
+YAML
 cat > "$out/MIRROR" <<EOF
 This repository is generated. It is a read-only mirror of feats/jevx in zish:
   https://github.com/rotkonetworks/zish

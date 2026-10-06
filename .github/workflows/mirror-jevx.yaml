@@ -1,0 +1,56 @@
+name: mirror-jevx
+
+# Publish feats/jevx to rotkonetworks/jevx whenever it changes on main.
+# scripts/mirror-jevx.sh builds and tests the standalone snapshot before it
+# commits, so a broken mirror is never pushed. It pushes with a write deploy
+# key on the jevx repo (secret JEVX_MIRROR_KEY): a deploy key may push the
+# mirror's own workflow file, GITHUB_TOKEN may not.
+on:
+  push:
+    branches: [main]
+    paths:
+      - feats/jevx/**
+      - feats/lib/feat.zig
+      - tests/jevx_test.sh
+      - scripts/mirror-jevx.sh
+      - LICENSE
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror-jevx
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0   # the sync commit lists the jevx commits since the last sync
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      - name: ssh
+        env:
+          KEY: ${{ secrets.JEVX_MIRROR_KEY }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$KEY" > ~/.ssh/jevx && chmod 600 ~/.ssh/jevx
+          # github.com's published ed25519 host key (api.github.com/meta)
+          echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > ~/.ssh/known_hosts
+          echo "GIT_SSH_COMMAND=ssh -i $HOME/.ssh/jevx -o IdentitiesOnly=yes" >> "$GITHUB_ENV"
+
+      - name: sync
+        run: |
+          git clone -q git@github.com:rotkonetworks/jevx.git "$RUNNER_TEMP/jevx"
+          git -C "$RUNNER_TEMP/jevx" config user.name 'zish mirror'
+          git -C "$RUNNER_TEMP/jevx" config user.email 'hq@rotko.net'
+          scripts/mirror-jevx.sh "$RUNNER_TEMP/jevx"
+
+      - name: push
+        run: git -C "$RUNNER_TEMP/jevx" push origin HEAD:main
