@@ -35,6 +35,9 @@ cat > "$T/three.jsonl" <<'JSONL'
 JSONL
 Q=('u? Does this convey urgency?' 'd/ Which team? \| billing: Payments \| technical: Bugs \| sales' 'f# How frustrated? \| Calm \| Frustrated \| Very angry')
 
+echo "version"
+eq "--version matches feat.toml" "$("$J" --version)" "jevx $(sed -n 's/^version = "\(.*\)"/\1/p' feats/jevx/feat.toml)"
+
 echo "request"
 want='{"state":"Help! My payouts have been failing for 3 days.","model":"typesafe/jev-1.13","questions":{"u":{"type":"noul","instructions":"Does this convey urgency?"},"d":{"type":"choice","instructions":"Which team?","criteria":{"billing":"Payments","technical":"Bugs","sales":null}},"f":{"type":"score","instructions":"How frustrated?","criteria":["Calm","Frustrated","Very angry"]}}}'
 eq "-n compiles the docs' example exactly" "$("$J" -n -s "$M" "${Q[@]}")" "$want"

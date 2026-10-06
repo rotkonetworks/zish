@@ -165,6 +165,8 @@ const DECIMALS = 3;
 const MAX_INPUT = 16 * 1024 * 1024;
 const MAX_CHOICE = 255;
 const MAX_SCORE = 10;
+/// Kept equal to feat.toml's version; tests/jevx_test.sh checks it.
+const VERSION = "0.3.0";
 const DEFAULT_BATCH = 100;
 /// Items per request. Each is a question per item in one 64k-token request,
 /// so far below this the API refuses anyway; the bound is what keeps the
@@ -1091,7 +1093,8 @@ const USAGE =
     \\  sigils: ? noul (yes/no)   / choice (\| opt[: desc] ...)   # score (\| low \| ... \| high)
     \\  gates:  ?>N ?<=N   /=OPT /!=OPT /~CONF   #>=N~CONF        exit 0 pass, 1 fail, 2 error
     \\  -s TEXT | -S FILE   state (default: stdin; JSON object/array sent as structure, -t: as text)
-    \\  -l [-v] [-b N]      lines mode: ask per stdin line (\0 = the line), print passing lines
+    \\  -l [-b N]           lines mode: ask per stdin line (\0 = the line), print passing lines
+    \\  -v                  with -l: print the failing lines instead (like grep -v)
     \\  -0                  like -l, but items are NUL-separated (multi-line chunks), output too
     \\  -f FILE  questions file ("comments, \continuation)   -J KEY=JSON  raw question object
     \\  -p probabilities   -q quiet   -j raw response   -n print request, send nothing
@@ -1103,6 +1106,7 @@ const USAGE =
     \\                      $JEVX_SOCKET): yours, 0700 dir, no key; also JEVX_BACKEND=shingi
     \\  JEVX_ENDPOINT=https://... with JEVX_API_KEY
     \\  key: ~/.zish/openrouter.key, ~/.config/jevx/openrouter.key, or $OPENROUTER_API_KEY
+    \\  -h help   -V version
     \\
 ;
 
@@ -1300,6 +1304,9 @@ fn run(init: std.process.Init) !u8 {
         };
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             _ = feat.out(io, USAGE);
+            return feat.EXIT_OK;
+        } else if (std.mem.eql(u8, arg, "-V") or std.mem.eql(u8, arg, "--version")) {
+            _ = feat.out(io, "jevx " ++ VERSION ++ "\n");
             return feat.EXIT_OK;
         } else if (std.mem.eql(u8, arg, "-s")) {
             state_text = try needs.val(argv, &i);
