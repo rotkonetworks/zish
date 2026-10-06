@@ -1,5 +1,13 @@
 # changelog
 
+## v0.25.5
+
+### added
+- `jevx -V` / `--version`.
+
+### changed
+- `jevx --help` says what `-v` does: with `-l`, print the failing lines instead.
+
 ## v0.25.4
 
 ### added

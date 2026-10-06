@@ -166,7 +166,7 @@ const MAX_INPUT = 16 * 1024 * 1024;
 const MAX_CHOICE = 255;
 const MAX_SCORE = 10;
 /// Kept equal to feat.toml's version; tests/jevx_test.sh checks it.
-const VERSION = "0.3.0";
+const VERSION = "0.3.1";
 const DEFAULT_BATCH = 100;
 /// Items per request. Each is a question per item in one 64k-token request,
 /// so far below this the API refuses anyway; the bound is what keeps the

@@ -1,4 +1,4 @@
-# jevx — typed decisions, one line each
+# jevx
 
 > jevx is developed in [zish](https://github.com/rotkonetworks/zish), at
 > `feats/jevx/`. [rotkonetworks/jevx](https://github.com/rotkonetworks/jevx) is
