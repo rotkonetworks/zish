@@ -104,7 +104,7 @@ find "$out" -type l | grep -q . && die "the snapshot still contains a symlink: $
 if [ "$check" = 1 ]; then
     echo "mirror-jevx: checking the snapshot builds and passes its tests on its own..."
     ( cd "$out" && zig build >/dev/null && zig build test >/dev/null && zig build suite >"$snap/suite.log" 2>&1 ) \
-        || { tail -20 "$snap/suite.log" 2>/dev/null; die "the snapshot does not build or test cleanly on its own"; }
+        || { grep -a -B1 FAIL "$snap/suite.log" 2>/dev/null; tail -20 "$snap/suite.log" 2>/dev/null; die "the snapshot does not build or test cleanly on its own"; }
     tail -1 "$snap/suite.log"
     rm -rf "$out/zig-out" "$out/.zig-cache"
 fi
