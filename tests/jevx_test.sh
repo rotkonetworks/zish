@@ -12,7 +12,7 @@ T=$(mktemp -d /tmp/jevx-test-XXXXXX)
 trap 'rm -rf "$T"' EXIT
 export HOME="$T"
 mkdir -p "$T/.zish"
-unset JEVX_BACKEND JEVX_ENDPOINT JEVX_MODEL OPENROUTER_API_KEY TYPESAFE_API_KEY
+unset JEVX_BACKEND JEVX_ENDPOINT JEVX_MODEL OPENROUTER_API_KEY TYPESAFE_API_KEY XDG_CONFIG_HOME
 
 # The binary under test: $JEVX if given (the standalone build: `zig build
 # suite` passes its own), else what zish's `zig build` installed.
