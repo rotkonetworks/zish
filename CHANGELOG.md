@@ -1,6 +1,6 @@
 # changelog
 
-## unreleased
+## v0.25.4
 
 ### added
 - `jevx --local` (`set local`, `JEVX_BACKEND=shingi`): ask a local Shingi over an owner-checked Unix socket, nothing sent elsewhere.
