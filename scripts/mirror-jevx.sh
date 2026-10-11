@@ -89,6 +89,84 @@ jobs:
       - run: zig build test
       - run: zig build suite
 YAML
+# A release for every feat.toml version that has none yet: static musl
+# tarballs for x86_64 and aarch64 plus SHA256SUMS, built and smoke-tested here.
+cat > "$out/.github/workflows/release.yaml" <<'YAML'
+name: release
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: release
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: version
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ver=$(sed -n 's/^version = "\(.*\)"/\1/p' feat.toml)
+          [ -n "$ver" ] || { echo "no version in feat.toml" >&2; exit 1; }
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+          if gh release view "v$ver" >/dev/null 2>&1; then
+            echo "v$ver is already released"
+            echo "new=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "new=1" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.v.outputs.new == '1'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+      - name: build
+        if: steps.v.outputs.new == '1'
+        env:
+          VER: ${{ steps.v.outputs.ver }}
+        run: |
+          zig build test
+          zig build suite
+          mkdir dist
+          for a in x86_64 aarch64; do
+            zig build -Doptimize=ReleaseSafe -Dtarget=$a-linux-musl --prefix "out-$a"
+            d=jevx-$VER-$a-linux-musl
+            mkdir "$d"
+            cp "out-$a/bin/jevx" README.md LICENSE "$d/"
+            cp -R examples vim "$d/"
+            tar -czf "dist/$d.tar.gz" "$d"
+          done
+          # the shipped x86_64 binary must report the version it is released as
+          [ "$(out-x86_64/bin/jevx --version)" = "jevx $VER" ]
+          cd dist && sha256sum *.tar.gz > SHA256SUMS
+      - name: publish
+        if: steps.v.outputs.new == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VER: ${{ steps.v.outputs.ver }}
+        run: |
+          cat > notes.md <<EOF
+          Static Linux binaries. The only runtime dependency is curl.
+
+          \`\`\`sh
+          a=x86_64   # or aarch64
+          curl -fsSLO https://github.com/rotkonetworks/jevx/releases/download/v$VER/jevx-$VER-\$a-linux-musl.tar.gz
+          curl -fsSLO https://github.com/rotkonetworks/jevx/releases/download/v$VER/SHA256SUMS
+          sha256sum -c --ignore-missing SHA256SUMS
+          tar -xzf jevx-$VER-\$a-linux-musl.tar.gz
+          install -m755 jevx-$VER-\$a-linux-musl/jevx ~/.local/bin/
+          \`\`\`
+
+          Changes: https://github.com/rotkonetworks/zish/blob/main/CHANGELOG.md
+
+          Built from $(sed -n 's/^Source: //p' MIRROR). Inside zish: gf install jevx.
+          EOF
+          gh release create "v$VER" dist/* --title "jevx $VER" --notes-file notes.md --target "$GITHUB_SHA"
+YAML
 cat > "$out/MIRROR" <<EOF
 This repository is generated. It is a read-only mirror of feats/jevx in zish:
   https://github.com/rotkonetworks/zish
