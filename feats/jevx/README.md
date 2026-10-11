@@ -511,12 +511,19 @@ file that fails it is refused, not skipped.
 
 `--local` (or `set local` in a script, or `JEVX_BACKEND=shingi`) asks a local
 [Shingi 27B](https://huggingface.co/kortexa-ai/shingi-27b) server and nothing
-else: for state that must not leave the machine. Run Shingi on a socket:
+else: for state that must not leave the machine.
+
+Shingi itself only listens on TCP (`127.0.0.1:8765` by default), so put a
+socket in front of it with socat:
 
 ```sh
-shingi-27b --executable … --uds "$XDG_RUNTIME_DIR/jevx/shingi.sock"
+mkdir -p -m 700 "$XDG_RUNTIME_DIR/jevx"
+socat UNIX-LISTEN:"$XDG_RUNTIME_DIR/jevx/shingi.sock",fork,mode=600 TCP:127.0.0.1:8765 &
 jevx --local 'urgent? Does this convey urgency?' < private.txt
 ```
+
+The socket is checked, the TCP hop behind it is not: run Shingi on a machine
+where you trust what listens on localhost.
 
 The socket is `$JEVX_SOCKET`, else `$XDG_RUNTIME_DIR/jevx/shingi.sock`. It is
 a Unix socket and never TCP, because an address on `127.0.0.1` says nothing
