@@ -7,7 +7,7 @@
 
 `jevx` asks TypeSafe's **Jev** model typed questions about some input and
 prints the answers as plain lines a shell can use: a probability, a chosen
-option, a score — and an exit status.
+option, a score, and an exit status.
 
 ```sh
 $ jevx 'urgent? Does this convey urgency?' <<<'Help! My payouts have been failing for 3 days.'
@@ -18,12 +18,11 @@ apple
 banana
 ```
 
-Jev is a *System One* model: it does not write text. It takes a **state** (what
-you are asking about) and a set of **typed questions**, evaluates every question
-in parallel, and returns a calibrated answer for each — in 70–500 ms, at
-$0.042 per million input tokens with output free. Its wire format is JSON;
-`jevx` is a compiler from a terse, vim-regex-flavoured line to that JSON, so a
-script never hand-writes nested quoting to ask "is this urgent?".
+Jev is a decision model. It does not write text. You give it a **state** (what
+you are asking about) and some **typed questions** (yes/no, pick one, score),
+and it returns one answer per question with a probability. The API takes JSON;
+`jevx` turns a short one-line question into that JSON, so a script never
+hand-writes nested quoting to ask "is this urgent?".
 
 - [Quick start](#quick-start)
 - [Questions](#questions)

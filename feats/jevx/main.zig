@@ -8,7 +8,7 @@
 //   jevx -q 'spam?>.8 Is this unsolicited bulk mail?' <mail && mv mail spam/  (see Trust)
 //   jevx -l 'fruit?>.5 Is \0 a fruit?' <words                 (prints the fruits)
 //
-// Jev is a "System One" model: it does not write text, it takes a state and a
+// Jev is a decision model: it does not write text, it takes a state and a
 // map of typed questions and returns a typed answer with a probability for
 // each. The wire format is JSON (docs.typesafe.ai/api); this feat is a compiler
 // from a terse, vim-regex-flavoured line to that JSON, so a shell script never
@@ -152,7 +152,7 @@ const OPENROUTER_ENDPOINT = "https://openrouter.ai/api/alpha/decisions";
 const OPENROUTER_MODEL = "typesafe/jev-1.13";
 const TYPESAFE_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
 const TYPESAFE_MODEL = "jev-latest";
-/// --local: Shingi's System One route, over the socket below. The host in the
+/// --local: Shingi's decision endpoint, over the socket below. The host in the
 /// URL is never resolved; curl only needs one to form the request.
 const SHINGI_URL = "http://shingi/v1/systemone";
 const SHINGI_MODEL = "shingi-27b";

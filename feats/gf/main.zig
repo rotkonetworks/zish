@@ -538,9 +538,9 @@ fn reviewLedgerAppend(root: []const u8, sha: []const u8, rubric_id: []const u8, 
 // red-flag questions (rubrics/feat-review-jev-v1.jevx) of every chunk of the
 // source, and the verdict is computed HERE, in code, from the per-chunk
 // probabilities: clear pass and clear fail are recorded and end the review;
-// anything in between goes on to the agent judge. Jev is calibrated, under a
-// second, and about a thousandth of the LLM call it stands in front of; the
-// LLM is kept for exactly the packages Jev is unsure about.
+// anything in between goes on to the agent judge. Jev answers in under a
+// second for about a thousandth of the LLM call it stands in front of; the
+// LLM is kept for the packages where Jev's answer is in between.
 //
 // Why chunks: measured on the agent feat's own 95 KB source, one whole-file
 // question came back at confidence 0.28; split into 35 function-sized chunks,
@@ -553,8 +553,8 @@ fn reviewLedgerAppend(root: []const u8, sha: []const u8, rubric_id: []const u8, 
 
 const ScreenOutcome = enum { decided, escalate, unavailable };
 
-/// The flags' thresholds. A noul is calibrated, so these read as
-/// probabilities: below PASS everywhere is a clear no; FAIL anywhere is a
+/// The flags' thresholds, read as probabilities (TypeSafe says a noul is
+/// calibrated; we have not measured that): below PASS everywhere is a clear no; FAIL anywhere is a
 /// clear yes. Changing them is a rubric change (bump the rubric id).
 const SCREEN_PASS_BELOW: f64 = 0.2;
 const SCREEN_FAIL_AT: f64 = 0.9;
